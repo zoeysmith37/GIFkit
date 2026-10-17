@@ -227,6 +227,7 @@ fn bench_real_gif() {
     let a = io::load_animation(&p).unwrap();
     for (name, o) in [
         ("default", GifOptions::default()),
+        ("nomerge", GifOptions { merge_duplicates: false, ..Default::default() }),
         ("global", GifOptions { global_palette: true, ..Default::default() }),
         ("lossy40", GifOptions { lossy: 40, ..Default::default() }),
         ("lossy40 global", GifOptions { lossy: 40, global_palette: true, ..Default::default() }),
@@ -548,4 +549,140 @@ fn write_demo_preset() {
     q.transform = None;
     q.layers = Some(vec![PresetLayer::Shield { visible: true, shield: Default::default() }]);
     crate::presets::save(&q).unwrap();
+}
+
+#[test]
+#[ignore]
+fn size_probe() {
+    let path = std::env::var("PROBE").unwrap_or_else(|_| "testdata/test.gif".into());
+    let a = io::load_animation(std::path::Path::new(&path)).unwrap();
+    eprintln!("{path}: original {} bytes, {} frames", std::fs::metadata(&path).unwrap().len(), a.len());
+    for (name, o) in [
+        ("default", GifOptions::default()),
+        ("nomerge", GifOptions { merge_duplicates: false, ..Default::default() }),
+        ("global", GifOptions { global_palette: true, ..Default::default() }),
+        ("nodiff", GifOptions { frame_diff: false, merge_duplicates: false, ..Default::default() }),
+    ] {
+        let b = encode_gif(&a, &o, None).unwrap();
+        let back = io::decode_gif_bytes(&b).unwrap();
+        eprintln!("{name}: {} bytes, maxdiff {}", b.len(), max_diff(&a, &back));
+    }
+}
+
+#[test]
+fn lossless_256_colours_and_sprites() {
+    // 256 distinct colours in one frame: must stay exact even though differencing
+    // wants a transparent slot
+    let img = RgbaImage::from_fn(64, 64, |x, y| {
+        let i = (y / 4 * 16 + x / 4) as u8;
+        Rgba([i, 255 - i, i.wrapping_mul(7), 255])
+    });
+    let mut img2 = img.clone();
+    img2.put_pixel(3, 3, Rgba([1, 2, 3, 255]));
+    let a = Animation { frames: vec![Frame::new(img, 10), Frame::new(img2, 10)], loop_count: None };
+    let b = encode_gif(&a, &GifOptions::default(), None).unwrap();
+    assert_eq!(max_diff(&a, &io::decode_gif_bytes(&b).unwrap()), 0);
+
+    // transparent sprite: frames are trimmed to the visible area, still exact
+    let s = synth(true);
+    let b = encode_gif(&s, &GifOptions::default(), None).unwrap();
+    let back = io::decode_gif_bytes(&b).unwrap();
+    assert_eq!(max_diff(&s, &back), 0);
+    let full: usize = s.len() * (96 * 64) / 2; // generous bound for untrimmed frames
+    assert!(b.len() < full, "{} bytes", b.len());
+}
+
+#[test]
+fn webp_roundtrip_and_smaller() {
+    let a = synth(false);
+    let lossless = io::encode_webp(&a, &io::WebpOptions { lossless: true, ..Default::default() }).unwrap();
+    let back = io::load_animation_bytes(&lossless).unwrap();
+    assert_eq!(back.len(), a.len());
+    for (fa, fb) in a.frames.iter().zip(&back.frames) {
+        for (x, y, pa) in fa.image.enumerate_pixels() {
+            let pb = fb.image.get_pixel(x, y);
+            if pa != pb {
+                panic!("lossless WebP differs at {x},{y}: {pa:?} vs {pb:?}");
+            }
+        }
+    }
+    let lossy = io::encode_webp(&a, &io::WebpOptions { lossless: false, quality: 60.0, method: 4 }).unwrap();
+    assert!(io::load_animation_bytes(&lossy).unwrap().len() == a.len());
+    // transparency survives
+    let t = synth(true);
+    let b = io::encode_webp(&t, &io::WebpOptions { lossless: true, ..Default::default() }).unwrap();
+    let back = io::load_animation_bytes(&b).unwrap();
+    assert_eq!(back.frames[0].image.get_pixel(0, 0)[3], 0);
+}
+
+#[test]
+fn fit_to_target_size() {
+    use crate::target::{fit, TargetFormat};
+    let a = io::load_animation(std::path::Path::new("testdata/test.gif")).unwrap();
+    let trials = AtomicUsize::new(0);
+    let base = encode_gif(&a, &GifOptions::default(), None).unwrap().len() as u64;
+    // generous target: first rung, untouched settings
+    let f = fit(&a, &TargetFormat::Gif(GifOptions::default()), base + 10, &trials).unwrap();
+    assert!(f.reached && f.bytes.len() as u64 <= base + 10);
+    // tight target: must shrink and still fit
+    let goal = base / 3;
+    let f = fit(&a, &TargetFormat::Gif(GifOptions::default()), goal, &trials).unwrap();
+    assert!(f.reached, "{}", f.settings);
+    assert!(f.bytes.len() as u64 <= goal);
+    assert!(io::decode_gif_bytes(&f.bytes).is_ok());
+    // WebP
+    let f = fit(&a, &TargetFormat::Webp(io::WebpOptions::default()), 150_000, &trials).unwrap();
+    assert!(f.reached && f.bytes.len() <= 150_000, "{} {}", f.bytes.len(), f.settings);
+}
+
+#[test]
+fn avif_export_if_ffmpeg() {
+    if !io::ffmpeg_available() {
+        return;
+    }
+    let a = synth(true);
+    let b = io::encode_avif(&a, 50).unwrap();
+    assert!(b.len() > 100 && &b[4..8] == b"ftyp", "not an AVIF");
+}
+
+#[test]
+#[ignore]
+fn dump_webp() {
+    let a = synth(false);
+    let b = io::encode_webp(&a, &io::WebpOptions { lossless: true, ..Default::default() }).unwrap();
+    let d = std::env::var("DUMP").unwrap();
+    std::fs::write(format!("{d}/l.webp"), &b).unwrap();
+    for (i, f) in a.frames.iter().enumerate() {
+        f.image.save(format!("{d}/f{i}.png")).unwrap();
+    }
+}
+
+#[test]
+#[ignore]
+fn webp_probe() {
+    let path = std::env::var("PROBE").unwrap_or_else(|_| "testdata/test.gif".into());
+    let a = io::load_animation(std::path::Path::new(&path)).unwrap();
+    for (l, q, m) in [(true, 75.0, 4u8), (true, 100.0, 6), (false, 90.0, 4), (false, 75.0, 4), (false, 50.0, 4), (false, 20.0, 6)] {
+        let t = std::time::Instant::now();
+        let b = io::encode_webp(&a, &io::WebpOptions { lossless: l, quality: q, method: m }).unwrap();
+        eprintln!("webp lossless={l} q={q} m={m}: {} bytes ({:.1}s)", b.len(), t.elapsed().as_secs_f32());
+    }
+    for q in [80u8, 60, 40] {
+        let t = std::time::Instant::now();
+        if let Ok(b) = io::encode_avif(&a, q) {
+            eprintln!("avif q={q}: {} bytes ({:.1}s)", b.len(), t.elapsed().as_secs_f32());
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn encode_timing() {
+    let path = std::env::var("PROBE").unwrap_or_else(|_| "testdata/test.gif".into());
+    let a = io::load_animation(std::path::Path::new(&path)).unwrap();
+    for o in [GifOptions::default(), GifOptions { lossy: 60, ..Default::default() }, GifOptions { lossy: 200, ..Default::default() }, GifOptions { lossy: 60, colors: 128, ..Default::default() }] {
+        let t = std::time::Instant::now();
+        let b = encode_gif(&a, &o, None).unwrap();
+        eprintln!("lossy {}: {} bytes in {:.2}s", o.lossy, b.len(), t.elapsed().as_secs_f32());
+    }
 }

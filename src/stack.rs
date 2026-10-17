@@ -363,6 +363,20 @@ impl Layer {
     }
 }
 
+/// Hash of a layer's content (not its id or visibility).
+pub fn layer_signature(l: &Layer) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match &l.kind {
+        LayerKind::Effects(fx) => format!("{fx:?}").hash(&mut h),
+        LayerKind::Text(t) => format!("{t:?}").hash(&mut h),
+        LayerKind::Censor(c) => format!("{c:?}").hash(&mut h),
+        LayerKind::Overlay(o) => (o.opacity.to_bits(), format!("{:?}", o.placements), Arc::as_ptr(&o.src) as usize).hash(&mut h),
+        LayerKind::Watermark(w) => (format!("{w:?}"), w.image.as_ref().map(|i| Arc::as_ptr(i) as usize)).hash(&mut h),
+        LayerKind::Shield(sh) => format!("{sh:?}").hash(&mut h),
+    }
+    h.finish()
+}
+
 #[derive(Clone, Default)]
 pub struct Stack {
     pub transform: Transform,
@@ -429,15 +443,7 @@ impl Stack {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         format!("{:?}", self.transform).hash(&mut h);
         for l in &self.layers {
-            (l.id, l.visible).hash(&mut h);
-            match &l.kind {
-                LayerKind::Effects(fx) => format!("{fx:?}").hash(&mut h),
-                LayerKind::Text(t) => format!("{t:?}").hash(&mut h),
-                LayerKind::Censor(c) => format!("{c:?}").hash(&mut h),
-                LayerKind::Overlay(o) => (o.opacity.to_bits(), format!("{:?}", o.placements), Arc::as_ptr(&o.src) as usize).hash(&mut h),
-                LayerKind::Watermark(w) => (format!("{w:?}"), w.image.as_ref().map(|i| Arc::as_ptr(i) as usize)).hash(&mut h),
-                LayerKind::Shield(sh) => format!("{sh:?}").hash(&mut h),
-            }
+            (l.id, l.visible, layer_signature(l)).hash(&mut h);
         }
         h.finish()
     }

@@ -34,8 +34,18 @@ impl BitWriter {
 /// `palette` is RGB triplets; `max_dist` is the largest Euclidean RGB distance
 /// a substituted pixel may have (0 = lossless).
 pub fn encode(indices: &[u8], palette: &[u8], transparent: Option<u8>, max_dist: f32) -> Vec<u8> {
+    encode_ex(indices, None, palette, transparent, max_dist).0
+}
+
+/// Like [`encode`], but pixel `i` may also be written as `alt[i]` (when it
+/// differs from `indices[i]`) if that continues the current dictionary string.
+/// Used for unchanged pixels, which can be either transparent or their own
+/// colour with identical results. Returns the LZW data and the indices
+/// actually written.
+pub fn encode_ex(indices: &[u8], alt: Option<&[u8]>, palette: &[u8], transparent: Option<u8>, max_dist: f32) -> (Vec<u8>, Vec<u8>) {
+    let mut chosen = indices.to_vec();
     let pal_len = (palette.len() / 3).max(2);
-    let max_idx = indices.iter().copied().max().unwrap_or(0) as usize + 1;
+    let max_idx = indices.iter().chain(alt.unwrap_or(&[]).iter()).copied().max().unwrap_or(0) as usize + 1;
     let needed = pal_len.max(max_idx).max(4);
     let min_code_size = (needed.next_power_of_two().trailing_zeros()).clamp(2, 8);
 
@@ -48,7 +58,7 @@ pub fn encode(indices: &[u8], palette: &[u8], transparent: Option<u8>, max_dist:
         bw.put(clear, min_code_size + 1);
         bw.put(eoi, min_code_size + 1);
         bw.flush();
-        return bw.out;
+        return (bw.out, chosen);
     }
 
     // allowed substitutions table: allowed[a*256+b] when colour b may stand in for a
@@ -88,6 +98,18 @@ pub fn encode(indices: &[u8], palette: &[u8], transparent: Option<u8>, max_dist:
             cur = c;
             i += 1;
             continue;
+        }
+        if let Some(a) = alt {
+            let ap = a[i];
+            if ap != px {
+                let c2 = child[cur as usize * 256 + ap as usize];
+                if c2 != 0 {
+                    cur = c2;
+                    chosen[i] = ap;
+                    i += 1;
+                    continue;
+                }
+            }
         }
         if lossy {
             // find the closest existing continuation that is "close enough"
@@ -139,5 +161,5 @@ pub fn encode(indices: &[u8], palette: &[u8], transparent: Option<u8>, max_dist:
     bw.put(cur, code_size);
     bw.put(eoi, code_size);
     bw.flush();
-    bw.out
+    (bw.out, chosen)
 }

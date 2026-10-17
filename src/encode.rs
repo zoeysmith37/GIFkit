@@ -246,7 +246,77 @@ fn same_image(a: &RgbaImage, b: &RgbaImage) -> bool {
     a.as_raw() == b.as_raw()
 }
 
+/// Every distinct opaque colour in the animation with its pixel count, most
+/// frequent first. `None` when there are more than `cap` distinct colours.
+fn colour_census(frames: &[Prepared], thr: u8, cap: usize) -> Option<Vec<([u8; 3], u64)>> {
+    let mut map: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+    for f in frames {
+        for p in f.rgba.pixels() {
+            if p[3] >= thr {
+                *map.entry(u32::from_le_bytes([p[0], p[1], p[2], 0])).or_insert(0) += 1;
+            }
+        }
+        if map.len() > cap {
+            return None;
+        }
+    }
+    let mut v: Vec<([u8; 3], u64)> = map.into_iter().map(|(k, n)| {
+        let b = k.to_le_bytes();
+        ([b[0], b[1], b[2]], n)
+    }).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    Some(v)
+}
+
+impl Palette {
+    /// Exact palette from a colour list (no quantiser).
+    fn exact(colours: &[[u8; 3]], need_transparent: bool) -> Palette {
+        let mut rgb: Vec<u8> = colours.iter().flatten().copied().collect();
+        if rgb.is_empty() {
+            rgb.extend_from_slice(&[0, 0, 0]);
+        }
+        let mut transparent = None;
+        if need_transparent {
+            transparent = Some((rgb.len() / 3) as u8);
+            rgb.extend_from_slice(&[0, 0, 0]);
+        }
+        Palette { nq: None, rgb, transparent }
+    }
+
+    /// True if every colour in `set` is an exact entry of this palette.
+    fn contains_all(&self, set: &std::collections::HashSet<[u8; 3]>) -> bool {
+        if self.nq.is_some() {
+            return false;
+        }
+        let mine: std::collections::HashSet<[u8; 3]> = (0..self.opaque_len()).map(|i| self.color(i as u8)).collect();
+        set.iter().all(|c| mine.contains(c))
+    }
+}
+
+/// Bytes a local colour table costs (padded to a power of two).
+fn local_table_bytes(pal: &Palette) -> usize {
+    3 * pal.len().max(2).next_power_of_two()
+}
+
+/// One way of writing a frame, with its encoded size.
+struct Candidate<'a> {
+    pal: &'a Palette,
+    local: bool,
+    masked: bool,
+    wildcard: bool,
+    data: Vec<u8>,
+    indices: Vec<u8>,
+}
+
 /// Encode an animation to GIF bytes.
+///
+/// Lossless size optimisations (identical pixels, smaller file):
+/// - an exact global colour table built from the animation's most common
+///   colours; frames whose colours all fit it skip their local table
+/// - per frame, the cheapest of: changed pixels with transparency vs. the whole
+///   changed rectangle, and global vs. local table (each trial-encoded)
+/// - local tables only as large as needed (smaller LZW code size)
+/// - transparent animations: each frame trimmed to its visible area
 pub fn encode_gif(anim: &Animation, opt: &GifOptions, progress: Option<&AtomicUsize>) -> anyhow::Result<Vec<u8>> {
     let frames = anim.enabled_frames();
     anyhow::ensure!(!frames.is_empty(), "No enabled frames to encode");
@@ -274,13 +344,28 @@ pub fn encode_gif(anim: &Animation, opt: &GifOptions, progress: Option<&AtomicUs
     // each frame must clear the previous one ("don't stack frames").
     let use_diff = opt.frame_diff && !transparent_anim;
     let need_transparent_idx = transparent_anim || use_diff;
+    let max_n = {
+        // colours available when a transparent slot is reserved
+        let n = opt.colors.clamp(2, 256) as usize;
+        if need_transparent_idx { (n - 1).max(1) } else { n }
+    };
 
-    let global = if opt.global_palette {
-        let imgs: Vec<&RgbaImage> = prepared.iter().map(|p| &p.rgba).collect();
-        let samples = collect_samples(&imgs, thr, 600_000);
-        Some(Palette::build(&samples, opt.colors, need_transparent_idx, opt.quant_speed))
-    } else {
-        None
+    // Global colour table: exact when the animation's colours allow it.
+    let census = colour_census(&prepared, thr, 1 << 16);
+    let forced_global = opt.global_palette;
+    let global: Option<Palette> = match (&census, forced_global) {
+        (Some(c), _) if c.len() <= max_n => Some(Palette::exact(&c.iter().map(|x| x.0).collect::<Vec<_>>(), need_transparent_idx)),
+        // exactly one colour too many for a transparent slot: keep it exact; only
+        // frames written without transparency can use it
+        (Some(c), _) if !transparent_anim && c.len() <= opt.colors.clamp(2, 256) as usize => Some(Palette::exact(&c.iter().map(|x| x.0).collect::<Vec<_>>(), false)),
+        (_, true) => {
+            let imgs: Vec<&RgbaImage> = prepared.iter().map(|p| &p.rgba).collect();
+            let samples = collect_samples(&imgs, thr, 600_000);
+            Some(Palette::build(&samples, opt.colors, need_transparent_idx, opt.quant_speed))
+        }
+        // too many colours overall: the most common ones still serve frames that only use them
+        (Some(c), false) => Some(Palette::exact(&c.iter().take(max_n).map(|x| x.0).collect::<Vec<_>>(), need_transparent_idx)),
+        (None, false) => None,
     };
 
     let mut buf = Vec::new();
@@ -300,6 +385,7 @@ pub fn encode_gif(anim: &Animation, opt: &GifOptions, progress: Option<&AtomicUs
         // pixels whose only difference is palette error, while bounding lossy drift.
         let mut canvas: Vec<[u8; 4]> = vec![[0, 0, 0, 0]; (w * h) as usize];
         let tol = (opt.lossy as i32 * opt.lossy as i32) / 4; // squared distance tolerance
+        let max_dist = opt.lossy as f32 / 2.0;
 
         for (fi, pf) in prepared.iter().enumerate() {
             let img = &pf.rgba;
@@ -307,7 +393,6 @@ pub fn encode_gif(anim: &Animation, opt: &GifOptions, progress: Option<&AtomicUs
             let mut mask: Option<Vec<bool>> = None;
 
             if use_diff && fi > 0 {
-                // Compute changed mask against canvas.
                 let mut changed = vec![false; (w * h) as usize];
                 let (mut minx, mut miny, mut maxx, mut maxy) = (u32::MAX, u32::MAX, 0u32, 0u32);
                 for y in 0..h {
@@ -315,11 +400,8 @@ pub fn encode_gif(anim: &Animation, opt: &GifOptions, progress: Option<&AtomicUs
                         let i = (y * w + x) as usize;
                         let p = img.get_pixel(x, y);
                         let c = canvas[i];
-                        let d = (p[0] as i32 - c[0] as i32).pow(2)
-                            + (p[1] as i32 - c[1] as i32).pow(2)
-                            + (p[2] as i32 - c[2] as i32).pow(2);
-                        let ch = c[3] == 0 || d > tol;
-                        if ch {
+                        let d = (p[0] as i32 - c[0] as i32).pow(2) + (p[1] as i32 - c[1] as i32).pow(2) + (p[2] as i32 - c[2] as i32).pow(2);
+                        if c[3] == 0 || d > tol {
                             changed[i] = true;
                             minx = minx.min(x);
                             miny = miny.min(y);
@@ -329,17 +411,11 @@ pub fn encode_gif(anim: &Animation, opt: &GifOptions, progress: Option<&AtomicUs
                     }
                 }
                 if minx == u32::MAX {
-                    // Nothing changed: emit a 1x1 transparent frame to hold the delay.
-                    x0 = 0;
-                    y0 = 0;
-                    x1 = 0;
-                    y1 = 0;
+                    // Nothing changed: a 1x1 transparent frame holds the delay.
+                    (x0, y0, x1, y1) = (0, 0, 0, 0);
                     changed[0] = false;
                 } else {
-                    x0 = minx;
-                    y0 = miny;
-                    x1 = maxx;
-                    y1 = maxy;
+                    (x0, y0, x1, y1) = (minx, miny, maxx, maxy);
                 }
                 let rw = x1 - x0 + 1;
                 let rh = y1 - y0 + 1;
@@ -350,38 +426,125 @@ pub fn encode_gif(anim: &Animation, opt: &GifOptions, progress: Option<&AtomicUs
                     }
                 }
                 mask = Some(m);
+            } else if transparent_anim {
+                // Each frame clears its own area afterwards, so only the visible
+                // part needs storing.
+                let (mut minx, mut miny, mut maxx, mut maxy) = (u32::MAX, u32::MAX, 0u32, 0u32);
+                for (x, y, p) in img.enumerate_pixels() {
+                    if p[3] >= thr {
+                        minx = minx.min(x);
+                        miny = miny.min(y);
+                        maxx = maxx.max(x);
+                        maxy = maxy.max(y);
+                    }
+                }
+                if minx == u32::MAX {
+                    (x0, y0, x1, y1) = (0, 0, 0, 0);
+                } else {
+                    (x0, y0, x1, y1) = (minx, miny, maxx, maxy);
+                }
             }
 
             let rw = x1 - x0 + 1;
             let rh = y1 - y0 + 1;
+            let nothing_changed = mask.as_ref().map(|m| !m.iter().any(|v| *v)).unwrap_or(false);
 
-            // Palette for this frame.
-            let local;
-            let pal: &Palette = if let Some(g) = &global {
-                g
-            } else {
-                let mut samples = Vec::with_capacity((rw * rh * 4) as usize);
+            // Colours each mode needs.
+            let colours_of = |masked: bool| -> (std::collections::HashSet<[u8; 3]>, Vec<u8>) {
+                let mut set = std::collections::HashSet::new();
+                let mut samples = Vec::new();
                 for yy in 0..rh {
                     for xx in 0..rw {
-                        let keep = mask.as_ref().map(|m| m[(yy * rw + xx) as usize]).unwrap_or(true);
+                        let keep = !masked || mask.as_ref().map(|m| m[(yy * rw + xx) as usize]).unwrap_or(true);
                         let p = img.get_pixel(x0 + xx, y0 + yy);
                         if keep && p[3] >= thr {
+                            if set.len() <= 256 {
+                                set.insert([p[0], p[1], p[2]]);
+                            }
                             samples.extend_from_slice(&[p[0], p[1], p[2], 255]);
                         }
                     }
                 }
-                local = Palette::build(&samples, opt.colors, need_transparent_idx, opt.quant_speed);
-                &local
+                (set, samples)
             };
 
-            let indices = map_region(img, x0, y0, rw, rh, pal, mask.as_deref(), thr, opt.dither);
+            // Build the candidate (palette, mode) list.
+            let mut locals: Vec<(bool, Palette)> = Vec::new(); // (masked, palette)
+            let mut plans: Vec<(bool, bool, Option<usize>, bool)> = Vec::new(); // (masked, local, local idx, wildcard)
+            let modes: &[bool] = if mask.is_some() && !nothing_changed { &[true, false] } else { &[true] };
+            for &masked in modes {
+                let (set, samples) = colours_of(masked);
+                let n_all = opt.colors.clamp(2, 256) as usize;
+                let uses_t = transparent_anim || (masked && mask.is_some());
+                let cap = if uses_t { n_all - 1 } else { n_all };
+                let exact_fits = set.len() <= cap;
+                let fits_global = global.as_ref().map(|g| (g.transparent.is_some() || !uses_t) && (forced_global || g.contains_all(&set))).unwrap_or(false);
+                let global_wild = global.as_ref().map(|g| g.transparent.is_some()).unwrap_or(false);
+                // the unmasked variant is only worth it when it stays lossless-cheap
+                if !masked && !exact_fits && !fits_global {
+                    continue;
+                }
+                if fits_global {
+                    plans.push((masked, false, None, false));
+                    if !masked && global_wild {
+                        // transparent-or-own-colour for unchanged pixels
+                        plans.push((true, false, None, true));
+                    }
+                }
+                if !forced_global {
+                    let pal = if exact_fits {
+                        let mut v: Vec<[u8; 3]> = set.into_iter().collect();
+                        v.sort();
+                        // keep a transparent slot when it fits, so the wildcard mode can use it
+                        let slot = uses_t || (mask.is_some() && v.len() < n_all);
+                        Palette::exact(&v, slot)
+                    } else {
+                        Palette::build(&samples, opt.colors, true, opt.quant_speed)
+                    };
+                    let exact = pal.nq.is_none() && pal.transparent.is_some();
+                    locals.push((masked, pal));
+                    plans.push((masked, true, Some(locals.len() - 1), false));
+                    if !masked && exact {
+                        plans.push((true, true, Some(locals.len() - 1), true));
+                    }
+                }
+            }
+            if plans.is_empty() {
+                // forced global but nothing else fits: use it anyway (quantised)
+                plans.push((true, false, None, false));
+            }
+
+            let mask_ref = mask.as_deref();
+            let cands: Vec<Candidate> = plans
+                .par_iter()
+                .map(|&(masked, local, li, wildcard)| {
+                    let pal: &Palette = match li {
+                        Some(i) => &locals[i].1,
+                        None => global.as_ref().unwrap(),
+                    };
+                    let m = if masked { mask_ref } else { None };
+                    let indices = map_region(img, x0, y0, rw, rh, pal, m, thr, opt.dither);
+                    let (data, indices) = if wildcard {
+                        let full = map_region(img, x0, y0, rw, rh, pal, None, thr, opt.dither);
+                        crate::lzw::encode_ex(&indices, Some(&full), &pal.rgb, pal.transparent, max_dist)
+                    } else {
+                        (crate::lzw::encode(&indices, &pal.rgb, pal.transparent, max_dist), indices)
+                    };
+                    Candidate { pal, local, masked, wildcard, data, indices }
+                })
+                .collect();
+            let best = cands
+                .into_iter()
+                .min_by_key(|c| c.data.len() + if c.local { local_table_bytes(c.pal) } else { 0 })
+                .unwrap();
 
             // Remember the source colour of every pixel we (re)painted.
             if use_diff {
                 for yy in 0..rh {
                     for xx in 0..rw {
-                        let idx = indices[(yy * rw + xx) as usize];
-                        if Some(idx) != pal.transparent {
+                        let idx = best.indices[(yy * rw + xx) as usize];
+                        if Some(idx) != best.pal.transparent || !best.masked {
+                            let _ = best.wildcard;
                             let p = img.get_pixel(x0 + xx, y0 + yy);
                             canvas[((y0 + yy) * w + x0 + xx) as usize] = [p[0], p[1], p[2], 255];
                         }
@@ -389,29 +552,20 @@ pub fn encode_gif(anim: &Animation, opt: &GifOptions, progress: Option<&AtomicUs
                 }
             }
 
-            let lzw_data = if opt.lossy > 0 || opt.force_custom_lzw {
-                Some(crate::lzw::encode(&indices, &pal.rgb, pal.transparent, opt.lossy as f32 / 2.0))
-            } else {
-                None
-            };
             let frame = gif::Frame {
                 delay: pf.delay,
                 dispose: if use_diff { gif::DisposalMethod::Keep } else if transparent_anim { gif::DisposalMethod::Background } else { gif::DisposalMethod::Any },
-                transparent: pal.transparent,
+                transparent: best.pal.transparent,
                 needs_user_input: false,
                 top: y0 as u16,
                 left: x0 as u16,
                 width: rw as u16,
                 height: rh as u16,
                 interlaced: false,
-                palette: if global.is_some() { None } else { Some(pal.rgb.clone()) },
-                buffer: Cow::Owned(lzw_data.unwrap_or(indices)),
+                palette: if best.local { Some(best.pal.rgb.clone()) } else { None },
+                buffer: Cow::Owned(best.data),
             };
-            if opt.lossy > 0 || opt.force_custom_lzw {
-                enc.write_lzw_pre_encoded_frame(&frame)?;
-            } else {
-                enc.write_frame(&frame)?;
-            }
+            enc.write_lzw_pre_encoded_frame(&frame)?;
             if let Some(p) = progress {
                 p.fetch_add(1, Ordering::Relaxed);
             }

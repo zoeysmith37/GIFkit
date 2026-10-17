@@ -150,6 +150,8 @@ fn kind_tool(k: Kind) -> Tool {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ExportFormat {
     Gif,
+    Webp,
+    Avif,
     Apng,
     Mp4,
     Webm,
@@ -158,10 +160,12 @@ enum ExportFormat {
 }
 
 impl ExportFormat {
-    const ALL: [ExportFormat; 6] = [ExportFormat::Gif, ExportFormat::Apng, ExportFormat::Mp4, ExportFormat::Webm, ExportFormat::Frames, ExportFormat::Sheet];
+    const ALL: [ExportFormat; 8] = [ExportFormat::Gif, ExportFormat::Webp, ExportFormat::Avif, ExportFormat::Apng, ExportFormat::Mp4, ExportFormat::Webm, ExportFormat::Frames, ExportFormat::Sheet];
     fn label(self) -> &'static str {
         match self {
             ExportFormat::Gif => "GIF",
+            ExportFormat::Webp => "WebP",
+            ExportFormat::Avif => "AVIF",
             ExportFormat::Apng => "APNG",
             ExportFormat::Mp4 => "MP4",
             ExportFormat::Webm => "WebM",
@@ -170,7 +174,22 @@ impl ExportFormat {
         }
     }
     fn needs_ffmpeg(self) -> bool {
-        matches!(self, ExportFormat::Mp4 | ExportFormat::Webm)
+        matches!(self, ExportFormat::Mp4 | ExportFormat::Webm | ExportFormat::Avif)
+    }
+    fn can_target(self) -> bool {
+        matches!(self, ExportFormat::Gif | ExportFormat::Webp | ExportFormat::Avif)
+    }
+    fn tip(self) -> &'static str {
+        match self {
+            ExportFormat::Gif => "Plays everywhere",
+            ExportFormat::Webp => "Usually 30–70% smaller than GIF. Browsers, Discord, most apps",
+            ExportFormat::Avif => "Smallest files. Modern browsers only",
+            ExportFormat::Apng => "Lossless, full colour + alpha. Browsers",
+            ExportFormat::Mp4 => "Video, no transparency",
+            ExportFormat::Webm => "Video with transparency",
+            ExportFormat::Frames => "One image per frame",
+            ExportFormat::Sheet => "Sprite sheet for game engines",
+        }
     }
 }
 
@@ -212,6 +231,9 @@ struct Prerender {
 struct Snapshot {
     anim: Animation,
     stack: Stack,
+    gif: GifOptions,
+    /// the edit made after this state (shown in History)
+    label: String,
 }
 
 /// Texture cache invalidated by a key.
@@ -524,6 +546,16 @@ pub struct GifForgeApp {
     font_preview_queue: Vec<String>,
     preview_fonts: HashMap<String, bool>,
     prep_cache: Option<(u64, Arc<stack::Prepared>)>,
+    webp_opts: io::WebpOptions,
+    avif_quality: u8,
+    target_on: bool,
+    target_val: f32,
+    target_mb: bool,
+    history_open: bool,
+    /// last committed live state for automatic undo entries: (signature, stack, gif options)
+    committed: Option<(u64, Stack, GifOptions)>,
+    pending_sig: u64,
+    commit_since: f64,
     last_comp: Option<(usize, TextureHandle)>,
 }
 
@@ -551,6 +583,131 @@ fn fmt_size(b: u64) -> String {
 
 fn to_color_image(img: &RgbaImage) -> egui::ColorImage {
     egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw())
+}
+
+/// History label for a structural edit key like "delay3" or "dup12 4.5".
+fn key_label(key: &str) -> String {
+    let word: String = key.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+    match word.as_str() {
+        "reorder" => "Reorder layers".into(),
+        "del" => "Delete".into(),
+        "preset" => "Apply preset".into(),
+        "addcensor" => "Add censor".into(),
+        "delay" => "Frame delay".into(),
+        "range" => "Skip / enable frames".into(),
+        "loop" => "Loop count".into(),
+        "dup" | "duplicate" => "Duplicate frame".into(),
+        "skip" | "toggle" => "Skip / enable frame".into(),
+        "left" | "right" | "move" => "Move frame".into(),
+        "" => "Edit".into(),
+        w => {
+            let mut c = w.chars();
+            c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+        }
+    }
+}
+
+/// Names of the settings that differ between two versions of a layer.
+fn changed_fields(a: &LayerKind, b: &LayerKind) -> String {
+    let val = |k: &LayerKind| -> Option<serde_json::Value> {
+        match k {
+            LayerKind::Effects(x) => serde_json::to_value(&**x).ok(),
+            LayerKind::Text(x) => serde_json::to_value(x).ok(),
+            LayerKind::Censor(x) => serde_json::to_value(x).ok(),
+            LayerKind::Watermark(x) => serde_json::to_value(&**x).ok(),
+            LayerKind::Shield(x) => serde_json::to_value(x).ok(),
+            LayerKind::Overlay(_) => None,
+        }
+    };
+    if let (LayerKind::Overlay(x), LayerKind::Overlay(y)) = (a, b) {
+        return if x.opacity != y.opacity { "opacity".into() } else { "move / size".into() };
+    }
+    let (Some(serde_json::Value::Object(x)), Some(serde_json::Value::Object(y))) = (val(a), val(b)) else { return String::new() };
+    let mut keys: Vec<String> = x.iter().filter(|(k, v)| y.get(*k) != Some(*v)).map(|(k, _)| k.clone()).collect();
+    // group position fields
+    if keys.iter().any(|k| k == "x" || k == "y") {
+        keys.retain(|k| k != "x" && k != "y");
+        keys.insert(0, "move".into());
+    }
+    if keys.iter().any(|k| k == "w" || k == "h") {
+        keys.retain(|k| k != "w" && k != "h");
+        keys.insert(0, "size".into());
+    }
+    let n = keys.len();
+    let mut out: Vec<String> = keys.into_iter().take(2).map(|k| k.replace('_', " ")).collect();
+    if n > 2 {
+        out.push(format!("+{}", n - 2));
+    }
+    out.join(", ")
+}
+
+/// Short description of what changed between two live states.
+fn describe_edit(os: &Stack, og: &GifOptions, ns: &Stack, ng: &GifOptions) -> String {
+    use std::collections::HashMap;
+    let old: HashMap<u64, &stack::Layer> = os.layers.iter().map(|l| (l.id, l)).collect();
+    let new: HashMap<u64, &stack::Layer> = ns.layers.iter().map(|l| (l.id, l)).collect();
+    let short = |l: &stack::Layer| elide(&l.name(), 24);
+    let added: Vec<&&stack::Layer> = ns.layers.iter().filter(|l| !old.contains_key(&l.id)).map(|l| new.get(&l.id).unwrap()).collect();
+    let removed: Vec<&stack::Layer> = os.layers.iter().filter(|l| !new.contains_key(&l.id)).collect();
+    let mut parts: Vec<String> = Vec::new();
+    for l in &added {
+        parts.push(format!("Add {}", short(l)));
+    }
+    for l in &removed {
+        parts.push(format!("Delete {}", short(l)));
+    }
+    let common_old: Vec<u64> = os.layers.iter().map(|l| l.id).filter(|id| new.contains_key(id)).collect();
+    let common_new: Vec<u64> = ns.layers.iter().map(|l| l.id).filter(|id| old.contains_key(id)).collect();
+    if common_old != common_new {
+        parts.push("Reorder layers".into());
+    }
+    if added.is_empty() {
+        for l in &ns.layers {
+            if let Some(o) = old.get(&l.id) {
+                if o.visible != l.visible {
+                    parts.push(format!("{} {}", if l.visible { "Show" } else { "Hide" }, short(l)));
+                } else if stack::layer_signature(o) != stack::layer_signature(l) {
+                    let what = changed_fields(&o.kind, &l.kind);
+                    let name = match l.kind() {
+                        Kind::Effects => "Effects".to_string(),
+                        _ => short(l),
+                    };
+                    parts.push(if what.is_empty() { format!("Edit {name}") } else { format!("{name}: {what}") });
+                }
+            }
+        }
+    }
+    let (a, b) = (&os.transform, &ns.transform);
+    if a != b {
+        let mut t: Vec<&str> = Vec::new();
+        if (a.cut_on, a.cut_by_time, a.cut_start, a.cut_end, a.cut_t0.to_bits(), a.cut_t1.to_bits()) != (b.cut_on, b.cut_by_time, b.cut_start, b.cut_end, b.cut_t0.to_bits(), b.cut_t1.to_bits()) {
+            t.push("Cut");
+        }
+        if (a.speed_on, a.speed_mode, a.speed_val.to_bits()) != (b.speed_on, b.speed_mode, b.speed_val.to_bits()) {
+            t.push("Speed");
+        }
+        if (a.reverse, a.boomerang, a.set_loop, a.loop_count) != (b.reverse, b.boomerang, b.set_loop, b.loop_count) {
+            t.push("Reverse / loop");
+        }
+        if (a.crop_on, a.crop) != (b.crop_on, b.crop) {
+            t.push("Crop");
+        }
+        if (a.resize_on, a.rs_w, a.rs_h, a.rs_pct.to_bits(), a.rs_mode, a.rs_filter) != (b.resize_on, b.rs_w, b.rs_h, b.rs_pct.to_bits(), b.rs_mode, b.rs_filter) {
+            t.push("Resize");
+        }
+        if t.is_empty() {
+            t.push("Rotate / flip");
+        }
+        parts.push(t.join(", "));
+    }
+    if og != ng {
+        parts.push("Compression".into());
+    }
+    match parts.len() {
+        0 => "Edit".into(),
+        1 | 2 => parts.join(" · "),
+        n => format!("{} + {} more", parts[0], n - 1),
+    }
 }
 
 fn kind_key(k: Kind) -> &'static str {
@@ -805,6 +962,15 @@ impl GifForgeApp {
             font_preview_queue: Vec::new(),
             preview_fonts: HashMap::new(),
             prep_cache: None,
+            webp_opts: io::WebpOptions::default(),
+            avif_quality: 60,
+            target_on: false,
+            target_val: 8.0,
+            target_mb: true,
+            history_open: false,
+            committed: None,
+            commit_since: 0.0,
+            pending_sig: 0,
             last_comp: None,
         };
         // scan system fonts in the background
@@ -922,16 +1088,17 @@ impl GifForgeApp {
         self.job = None;
         match res {
             JobOutput::Anim(Ok(a)) => {
-                self.set_base_with_undo(a, None);
+                self.set_base_with_undo(a, None, &label);
                 self.info(format!("✔ {label}"));
             }
             JobOutput::Baked(Ok((a, s))) => {
-                self.set_base_with_undo(a, Some(s));
+                self.set_base_with_undo(a, Some(s), &label);
                 self.info(format!("✔ {label}"));
             }
             JobOutput::Loaded(Ok((a, path, size))) => {
                 self.undo.clear();
                 self.redo.clear();
+                self.committed = None;
                 self.path = path;
                 self.file_size = size;
                 self.modified = false;
@@ -977,11 +1144,13 @@ impl GifForgeApp {
         self.timing_rev += 1;
     }
 
-    fn set_base_with_undo(&mut self, a: Animation, new_stack: Option<Stack>) {
+    fn set_base_with_undo(&mut self, a: Animation, new_stack: Option<Stack>, label: &str) {
         let size_changed = self.base.as_ref().map(|o| (o.width(), o.height(), o.len())) != Some((a.width(), a.height(), a.len()));
+        self.flush_live_edit();
         if let Some(old) = self.base.take() {
-            self.push_undo(Snapshot { anim: old, stack: self.stack.clone() });
+            self.push_undo(Snapshot { anim: old, stack: self.stack.clone(), gif: self.gif_opts.clone(), label: label.to_string() });
         }
+        self.committed = None;
         self.redo.clear();
         self.base = Some(a);
         if let Some(s) = new_stack {
@@ -995,7 +1164,7 @@ impl GifForgeApp {
 
     fn push_undo(&mut self, s: Snapshot) {
         self.undo.push(s);
-        if self.undo.len() > 60 {
+        if self.undo.len() > 100 {
             self.undo.remove(0);
         }
     }
@@ -1008,35 +1177,158 @@ impl GifForgeApp {
                 return;
             }
         }
+        self.flush_live_edit();
         if let Some(a) = &self.base {
-            let s = Snapshot { anim: a.clone(), stack: self.stack.clone() };
+            let s = Snapshot { anim: a.clone(), stack: self.stack.clone(), gif: self.gif_opts.clone(), label: key_label(key) };
             self.push_undo(s);
             self.redo.clear();
         }
+        self.committed = None;
         self.last_coalesce = Some((key.to_string(), now));
         self.modified = true;
     }
 
     fn do_undo(&mut self) {
+        self.flush_live_edit();
         if let Some(prev) = self.undo.pop() {
+            let label = prev.label.clone();
             if let Some(cur) = self.base.replace(prev.anim) {
-                self.redo.push(Snapshot { anim: cur, stack: std::mem::replace(&mut self.stack, prev.stack) });
+                let stack = std::mem::replace(&mut self.stack, prev.stack);
+                let gif = std::mem::replace(&mut self.gif_opts, prev.gif);
+                self.redo.push(Snapshot { anim: cur, stack, gif, label: label.clone() });
             }
             self.last_coalesce = None;
+            self.committed = None;
             self.bump();
             self.after_base_change(false);
-            self.info("Undo");
+            self.info(format!("Undo: {label}"));
         }
     }
 
     fn do_redo(&mut self) {
         if let Some(next) = self.redo.pop() {
+            let label = next.label.clone();
             if let Some(cur) = self.base.replace(next.anim) {
-                self.undo.push(Snapshot { anim: cur, stack: std::mem::replace(&mut self.stack, next.stack) });
+                let stack = std::mem::replace(&mut self.stack, next.stack);
+                let gif = std::mem::replace(&mut self.gif_opts, next.gif);
+                self.undo.push(Snapshot { anim: cur, stack, gif, label: label.clone() });
             }
+            self.committed = None;
             self.bump();
             self.after_base_change(false);
-            self.info("Redo");
+            self.info(format!("Redo: {label}"));
+        }
+    }
+
+    fn live_sig(&self) -> u64 {
+        hash_parts(&[self.stack.signature(), hash_str(&format!("{:?}", self.gif_opts))])
+    }
+
+    /// Turn a pending (not yet recorded) live edit into an undo entry now.
+    fn flush_live_edit(&mut self) {
+        let Some((sig, old_stack, old_gif)) = self.committed.take() else { return };
+        if sig == self.live_sig() {
+            self.committed = Some((sig, old_stack, old_gif));
+            return;
+        }
+        let Some(a) = &self.base else { return };
+        let label = describe_edit(&old_stack, &old_gif, &self.stack, &self.gif_opts);
+        let s = Snapshot { anim: a.clone(), stack: old_stack, gif: old_gif, label };
+        self.push_undo(s);
+        self.redo.clear();
+        self.committed = Some((self.live_sig(), self.stack.clone(), self.gif_opts.clone()));
+    }
+
+    /// Record live edits (sliders, layers, compression) as undo entries once
+    /// they have settled.
+    fn track_live_edits(&mut self, ctx: &egui::Context, now: f64) {
+        if self.base.is_none() || self.busy() {
+            return;
+        }
+        let sig = self.live_sig();
+        let Some((csig, _, _)) = &self.committed else {
+            self.committed = Some((sig, self.stack.clone(), self.gif_opts.clone()));
+            self.pending_sig = sig;
+            return;
+        };
+        if sig == *csig {
+            self.pending_sig = sig;
+            return;
+        }
+        if sig != self.pending_sig {
+            self.pending_sig = sig;
+            self.commit_since = now;
+        }
+        let busy_input = ctx.input(|i| i.pointer.any_down()) || ctx.dragged_id().is_some() || self.box_drag.is_some() || self.drag.is_some() || ctx.egui_wants_keyboard_input();
+        if busy_input || now - self.commit_since < 0.7 {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            return;
+        }
+        self.flush_live_edit();
+    }
+
+    /// Jump through history: positive = redo n steps, negative = undo.
+    fn history_jump(&mut self, steps: i64) {
+        if steps < 0 {
+            for _ in 0..(-steps) {
+                self.do_undo();
+            }
+        } else {
+            for _ in 0..steps {
+                self.do_redo();
+            }
+        }
+    }
+
+    fn history_window(&mut self, ctx: &egui::Context) {
+        if !self.history_open || self.base.is_none() {
+            return;
+        }
+        let pal = *p();
+        let mut open = true;
+        let mut jump: Option<i64> = None;
+        let n_undo = self.undo.len();
+        egui::Window::new(RichText::new("History").font(theme::medium(15.0)))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(260.0)
+            .default_height(360.0)
+            .default_pos(ctx.content_rect().right_top() + vec2(-640.0, 70.0))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+                    ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        let row = |ui: &mut egui::Ui, text: String, current: bool, future: bool| -> bool {
+                            let col = if future { pal.fg_muted } else { pal.fg };
+                            let t = RichText::new(elide(&text, 36)).color(col);
+                            let t = if future { t.italics() } else { t };
+                            ui.add(egui::Button::selectable(current, t).min_size(vec2(0.0, 24.0))).on_hover_text(text).clicked()
+                        };
+                        if row(ui, "Opened".into(), n_undo == 0, false) {
+                            jump = Some(-(n_undo as i64));
+                        }
+                        for i in 0..n_undo {
+                            let current = i + 1 == n_undo;
+                            if row(ui, self.undo[i].label.clone(), current, false) {
+                                jump = Some(i as i64 + 1 - n_undo as i64);
+                            }
+                        }
+                        for (j, s) in self.redo.iter().rev().enumerate() {
+                            if row(ui, s.label.clone(), false, true) {
+                                jump = Some(j as i64 + 1);
+                            }
+                        }
+                    });
+                });
+            });
+        if !open {
+            self.history_open = false;
+        }
+        if let Some(j) = jump {
+            if j != 0 {
+                self.history_jump(j);
+            }
         }
     }
 
@@ -1754,6 +2046,8 @@ impl eframe::App for GifForgeApp {
         });
 
         self.export_window(&ctx);
+        self.history_window(&ctx);
+        self.track_live_edits(&ctx, now);
         self.presets_window(&ctx);
         clear_group_command(&ctx);
         if std::env::var_os("GIFFORGE_PERF").is_some() {
@@ -1790,11 +2084,17 @@ impl GifForgeApp {
                 self.open_sequence_dialog(ctx);
             }
             toolbar_sep(ui);
-            if icon_button(ui, "↶", idle && !self.undo.is_empty()).on_hover_text("Undo (Ctrl+Z)").clicked() {
+            let pending = self.committed.as_ref().map(|c| c.0 != self.live_sig()).unwrap_or(false);
+            let undo_tip = self.undo.last().map(|u| format!("Undo {} (Ctrl+Z)", u.label)).unwrap_or_else(|| "Undo (Ctrl+Z)".into());
+            if icon_button(ui, "↶", idle && (pending || !self.undo.is_empty())).on_hover_text(undo_tip).clicked() {
                 self.do_undo();
             }
-            if icon_button(ui, "↷", idle && !self.redo.is_empty()).on_hover_text("Redo (Ctrl+Y)").clicked() {
+            let redo_tip = self.redo.last().map(|u| format!("Redo {} (Ctrl+Y)", u.label)).unwrap_or_else(|| "Redo (Ctrl+Y)".into());
+            if icon_button(ui, "↷", idle && !self.redo.is_empty()).on_hover_text(redo_tip).clicked() {
                 self.do_redo();
+            }
+            if toggle_icon(ui, "☰", self.history_open, "History") {
+                self.history_open = !self.history_open;
             }
             toolbar_sep(ui);
             let pr = ui.add_enabled(has, egui::Button::new(RichText::new("❖  Presets").color(if self.presets_open { Color32::WHITE } else { pal.fg })).selected(self.presets_open).frame_when_inactive(self.presets_open).min_size(vec2(0.0, 30.0)));
@@ -2299,7 +2599,7 @@ impl GifForgeApp {
                     for f in ExportFormat::ALL {
                         let en = !f.needs_ffmpeg() || self.ffmpeg;
                         let r = ui.add_enabled(en, egui::Button::new(f.label()).selected(self.export_fmt == f).min_size(vec2(0.0, 26.0)));
-                        let r = if en { r } else { r.on_disabled_hover_text("Needs ffmpeg on PATH") };
+                        let r = if en { r.on_hover_text(f.tip()) } else { r.on_disabled_hover_text("Needs ffmpeg on PATH") };
                         if r.clicked() {
                             self.export_fmt = f;
                         }
@@ -2327,6 +2627,21 @@ impl GifForgeApp {
                                 self.export_open = false;
                             }
                             ui.checkbox(&mut self.gif_opts.noai_tag, "Add “noai” tag").on_hover_text("Writes a “noai, noimageai” comment into the file – an opt-out marker some sites and scrapers respect.");
+                        }
+                        ExportFormat::Webp => {
+                            let o = &mut self.webp_opts;
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(&mut o.lossless, false, "Lossy");
+                                ui.selectable_value(&mut o.lossless, true, "Lossless");
+                            });
+                            if !o.lossless {
+                                ui.add(egui::Slider::new(&mut o.quality, 0.0..=100.0).text("quality")).on_hover_text("75–90 looks like the original for most GIFs");
+                            }
+                            ui.add(egui::Slider::new(&mut o.method, 0..=6).text("effort")).on_hover_text("Higher = smaller file, slower");
+                        }
+                        ExportFormat::Avif => {
+                            ui.add(egui::Slider::new(&mut self.avif_quality, 0..=100).text("quality")).on_hover_text("50–70 is a good balance");
+                            hint(ui, "Encoding can take a while");
                         }
                         ExportFormat::Apng => {
                             ui.label("24-bit colour, full alpha");
@@ -2380,6 +2695,27 @@ impl GifForgeApp {
                         }
                     }
                 });
+                if self.export_fmt.can_target() {
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.target_on, "Fit under").on_hover_text("Finds the best quality that fits. Lowers quality first, then size.");
+                        ui.add_enabled_ui(self.target_on, |ui| {
+                            ui.add(egui::DragValue::new(&mut self.target_val).range(0.01..=10000.0).speed(0.1).max_decimals(2));
+                            ui.selectable_value(&mut self.target_mb, true, "MB");
+                            ui.selectable_value(&mut self.target_mb, false, "KB");
+                        });
+                    });
+                    if self.target_on {
+                        ui.horizontal_wrapped(|ui| {
+                            for (lbl, v, mb) in [("Discord 10 MB", 10.0, true), ("Slack 5 MB", 5.0, true), ("Emote 256 KB", 256.0, false)] {
+                                if ui.small_button(lbl).clicked() {
+                                    self.target_val = v;
+                                    self.target_mb = mb;
+                                }
+                            }
+                        });
+                    }
+                }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     go = primary(ui, &format!("Export {}…", self.export_fmt.label()));
@@ -2396,7 +2732,48 @@ impl GifForgeApp {
 
     fn do_export(&mut self, ctx: &egui::Context) {
         let name = self.base_name();
+        if self.target_on && self.export_fmt.can_target() {
+            let (ext, fmt) = match self.export_fmt {
+                ExportFormat::Gif => ("gif", crate::target::TargetFormat::Gif(self.gif_opts.clone())),
+                ExportFormat::Webp => ("webp", crate::target::TargetFormat::Webp(self.webp_opts)),
+                _ => ("avif", crate::target::TargetFormat::Avif(self.avif_quality)),
+            };
+            let max = (self.target_val as f64 * if self.target_mb { 1_000_000.0 } else { 1000.0 }) as u64;
+            if let Some(path) = rfd::FileDialog::new().add_filter(ext, &[ext]).set_file_name(format!("{name}.{ext}")).save_file() {
+                self.run_export(ctx, &format!("Fitting under {}", fmt_size(max)), move |a, p| {
+                    let fit = crate::target::fit(a, &fmt, max, p)?;
+                    std::fs::write(&path, &fit.bytes)?;
+                    let n = fit.bytes.len() as u64;
+                    if fit.reached {
+                        Ok(format!("Saved {} ({}, {})", path.display(), fmt_size(n), fit.settings))
+                    } else {
+                        Ok(format!("Couldn't reach target – smallest is {} ({}). Saved anyway.", fmt_size(n), fit.settings))
+                    }
+                });
+            }
+            return;
+        }
         match self.export_fmt {
+            ExportFormat::Webp => {
+                if let Some(path) = rfd::FileDialog::new().add_filter("WebP", &["webp"]).set_file_name(format!("{name}.webp")).save_file() {
+                    let o = self.webp_opts;
+                    self.run_export(ctx, "Save WebP", move |a, _| {
+                        let b = io::encode_webp(a, &o)?;
+                        std::fs::write(&path, &b)?;
+                        Ok(format!("Saved {} ({})", path.display(), fmt_size(b.len() as u64)))
+                    });
+                }
+            }
+            ExportFormat::Avif => {
+                if let Some(path) = rfd::FileDialog::new().add_filter("AVIF", &["avif"]).set_file_name(format!("{name}.avif")).save_file() {
+                    let q = self.avif_quality;
+                    self.run_export(ctx, "Save AVIF", move |a, _| {
+                        let b = io::encode_avif(a, q)?;
+                        std::fs::write(&path, &b)?;
+                        Ok(format!("Saved {} ({})", path.display(), fmt_size(b.len() as u64)))
+                    });
+                }
+            }
             ExportFormat::Gif => self.save_gif_dialog(ctx),
             ExportFormat::Apng => {
                 if let Some(path) = rfd::FileDialog::new().add_filter("PNG", &["png", "apng"]).set_file_name(format!("{name}.png")).save_file() {

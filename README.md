@@ -21,7 +21,7 @@ It covers the same toolset as the popular online GIF editors:
 | **AI shield** (live) | Subtle seeded perturbation (high-frequency pattern, colour noise, optional sub-pixel warp, optional per-frame variation) that makes frames worse AI-training data. Not a guarantee – far weaker than Glaze/Nightshade, and heavy compression removes part of it |
 | **Cut** (live) | Keep a range by frame number or by time |
 | **Frames** | Thumbnail grid: per-frame delay, skip/enable, duplicate, reorder, delete, range & every-N toggles, crossfade, first-frame background, add frames from files |
-| **Export** | One button (Ctrl+S / Ctrl+E): GIF, APNG, MP4 / WebM (VP9 with alpha) via ffmpeg, frames (PNG/GIF folder or ZIP), **sprite sheet + JSON + Godot 4 `SpriteFrames` (.tres)**. Optional “noai, noimageai” tag in GIF/APNG metadata |
+| **Export** | One button (Ctrl+S / Ctrl+E): GIF, **animated WebP** (lossy / lossless, built in), **animated AVIF** (via ffmpeg, keeps transparency), APNG, MP4 / WebM (VP9 with alpha) via ffmpeg, frames (PNG/GIF folder or ZIP), **sprite sheet + JSON + Godot 4 `SpriteFrames` (.tres)**. Optional “noai, noimageai” tag in GIF/APNG metadata |
 
 Inputs: animated GIF, APNG, animated WebP, any still image, or a set of images
 (dropped together or via *Open sequence…*) which become frames.
@@ -50,6 +50,39 @@ source frames directly; all live edits are re-applied on top immediately.
 
 Sliders stop at sensible limits, but you can type values beyond them
 (e.g. saturation 400 %).
+
+## Compression
+
+The GIF encoder is lossless unless you ask for lossy settings – every pixel
+decodes exactly as it was – and tries hard to be small:
+
+- an exact global colour table from the animation's most common colours;
+  frames that fit it don't repeat a local table
+- per frame, it trial-encodes several variants and keeps the smallest:
+  changed pixels only (rest transparent) vs. the whole changed rectangle,
+  global vs. a minimal local table, and a "wildcard" mode where unchanged
+  pixels may be written as transparent *or* their own colour, whichever
+  continues the current LZW string
+- transparent animations: every frame is trimmed to its visible area
+- identical consecutive frames are merged
+
+On real files that's 1–14 % smaller than before with identical pixels, and
+smaller than the source GIFs we tested. For much smaller files, export
+**WebP** (often 25–40 % smaller than the best GIF, even lossless) or **AVIF**
+(often 10–30× smaller for screen recordings, modern browsers only).
+
+**Fit under a size** (export window, GIF / WebP / AVIF): give a limit such as
+10 MB (Discord) or 256 KB (emotes) and GifForge searches for the best quality
+that fits – stronger lossy / fewer colours first, then smaller frames – and
+reports the settings it used.
+
+## Undo history
+
+Every change is undoable – frame edits, layer edits, compression settings,
+frame operations. ☰ in the toolbar opens the History list (e.g. "Effects:
+sepia", "Hide Watermark", "Crop"); click any entry to jump there, later steps
+stay available for redo until you make a new change. Slider drags are recorded
+as one step once you let go.
 
 ## Presets
 

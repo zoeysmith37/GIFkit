@@ -63,7 +63,19 @@ pub fn load_animation_bytes(bytes: &[u8]) -> Result<Animation> {
         image::ImageFormat::WebP => {
             let dec = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes))?;
             if dec.has_animation() {
-                frames_from_decoder(dec)?
+                // libwebp composites frames exactly (image's decoder can be off by one)
+                loop_count = webp_loop(bytes);
+                let d = webp_animation::Decoder::new(bytes).map_err(|e| anyhow::anyhow!("WebP: {e:?}"))?;
+                let (w, h) = d.dimensions();
+                let mut prev = 0i32;
+                let mut out = Vec::new();
+                for f in d {
+                    let img = RgbaImage::from_raw(w, h, f.data().to_vec()).context("WebP frame size")?;
+                    let d_ms = (f.timestamp() - prev).max(0);
+                    prev = f.timestamp();
+                    out.push(Frame::new(img, ((d_ms + 5) / 10).clamp(1, 65535) as u16));
+                }
+                out
             } else {
                 vec![Frame::new(image::load_from_memory(bytes)?.to_rgba8(), 10)]
             }
@@ -74,6 +86,13 @@ pub fn load_animation_bytes(bytes: &[u8]) -> Result<Animation> {
         bail!("File contains no frames");
     }
     Ok(Animation { frames, loop_count })
+}
+
+/// Loop count from a WebP ANIM chunk (`None` = forever).
+fn webp_loop(bytes: &[u8]) -> Option<u16> {
+    let i = bytes.windows(4).position(|w| w == b"ANIM")?;
+    let n = u16::from_le_bytes([*bytes.get(i + 12)?, *bytes.get(i + 13)?]);
+    (n != 0).then_some(n)
 }
 
 /// Load a still image (first frame only) for overlays / extra frames.
@@ -316,14 +335,80 @@ pub fn ffmpeg_available() -> bool {
 pub enum VideoFormat {
     Mp4,
     WebmAlpha,
+    /// Animated AVIF (AV1), keeps transparency
+    Avif,
+}
+
+/// Animated WebP settings.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct WebpOptions {
+    pub lossless: bool,
+    /// 0..=100 (lossy quality, or compression effort when lossless)
+    pub quality: f32,
+    /// 0 = fastest .. 6 = smallest
+    pub method: u8,
+}
+
+impl Default for WebpOptions {
+    fn default() -> Self {
+        Self { lossless: false, quality: 85.0, method: 4 }
+    }
+}
+
+/// Encode an animated WebP (libwebp). Delays are kept exactly.
+pub fn encode_webp(anim: &Animation, o: &WebpOptions) -> Result<Vec<u8>> {
+    use webp_animation::{AnimParams, Encoder, EncoderOptions, EncodingConfig, EncodingType};
+    let frames = anim.enabled_frames();
+    anyhow::ensure!(!frames.is_empty(), "No enabled frames");
+    let (w, h) = frames[0].image.dimensions();
+    let cfg = EncodingConfig {
+        encoding_type: if o.lossless { EncodingType::Lossless } else { EncodingType::new_lossy() },
+        quality: o.quality.clamp(0.0, 100.0),
+        method: o.method.min(6) as usize,
+    };
+    let opts = EncoderOptions {
+        anim_params: AnimParams { loop_count: anim.loop_count.map(|n| n as i32).unwrap_or(0) },
+        minimize_size: o.method >= 6,
+        // 0 would make every frame a key frame (no inter-frame compression)
+        kmin: 60,
+        kmax: 120,
+        allow_mixed: !o.lossless,
+        encoding_config: Some(cfg),
+        ..Default::default()
+    };
+    let mut enc = Encoder::new_with_options((w, h), opts).map_err(|e| anyhow::anyhow!("WebP: {e:?}"))?;
+    let mut t = 0i32;
+    for f in &frames {
+        enc.add_frame(f.image.as_raw(), t).map_err(|e| anyhow::anyhow!("WebP frame: {e:?}"))?;
+        t += crate::anim::effective_delay(f.delay_cs) as i32 * 10;
+    }
+    let data = enc.finalize(t).map_err(|e| anyhow::anyhow!("WebP: {e:?}"))?;
+    Ok(data.to_vec())
+}
+
+/// Encode an animated AVIF with ffmpeg; `quality` 0..=100.
+pub fn encode_avif(anim: &Animation, quality: u8) -> Result<Vec<u8>> {
+    let tmp = std::env::temp_dir().join(format!("gifforge_avif_{}_{}.avif", std::process::id(), quality));
+    export_video_q(anim, &tmp, VideoFormat::Avif, [0, 0, 0], Some(quality))?;
+    let b = std::fs::read(&tmp)?;
+    let _ = std::fs::remove_file(&tmp);
+    Ok(b)
 }
 
 /// Export to video via ffmpeg (must be on PATH). Uses the concat demuxer so
 /// per-frame delays are preserved exactly.
 pub fn export_video(anim: &Animation, path: &Path, fmt: VideoFormat, bg: [u8; 3]) -> Result<()> {
+    export_video_q(anim, path, fmt, bg, None)
+}
+
+/// [`export_video`] with an optional quality (0..=100) mapped to the codec's CRF.
+pub fn export_video_q(anim: &Animation, path: &Path, fmt: VideoFormat, bg: [u8; 3], quality: Option<u8>) -> Result<()> {
+    static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let frames = anim.enabled_frames();
     anyhow::ensure!(!frames.is_empty(), "No enabled frames");
-    let tmp = std::env::temp_dir().join(format!("gifforge_{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("gifforge_{}_{}", std::process::id(), RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    let has_alpha = frames.iter().any(|f| f.image.pixels().any(|p| p[3] < 255));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
     let mut list = String::new();
@@ -347,12 +432,32 @@ pub fn export_video(anim: &Animation, path: &Path, fmt: VideoFormat, bg: [u8; 3]
 
     let mut cmd = std::process::Command::new("ffmpeg");
     cmd.arg("-y").arg("-loglevel").arg("error").arg("-f").arg("concat").arg("-safe").arg("0").arg("-i").arg(&list_path);
+    // quality 0..100 -> CRF (lower = better)
+    let crf = |best: f32, worst: f32, default: u8| -> String {
+        match quality {
+            Some(q) => format!("{}", (worst + (best - worst) * q.min(100) as f32 / 100.0).round() as i32),
+            None => default.to_string(),
+        }
+    };
     match fmt {
         VideoFormat::Mp4 => {
-            cmd.args(["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2,fps=50", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-movflags", "+faststart"]);
+            cmd.args(["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2,fps=50", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", &crf(12.0, 40.0, 18), "-movflags", "+faststart"]);
         }
         VideoFormat::WebmAlpha => {
-            cmd.args(["-vf", "fps=50", "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-b:v", "0", "-crf", "30", "-auto-alt-ref", "0"]);
+            cmd.args(["-vf", "fps=50", "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-b:v", "0", "-crf", &crf(15.0, 55.0, 30), "-auto-alt-ref", "0"]);
+        }
+        VideoFormat::Avif => {
+            let q = crf(10.0, 55.0, 28);
+            if has_alpha {
+                // AVIF stores alpha as a second AV1 stream
+                cmd.args(["-filter_complex", "[0:v]fps=50,pad=ceil(iw/2)*2:ceil(ih/2)*2:color=black@0,format=rgba,split[c][a];[c]format=yuv420p[cc];[a]alphaextract,format=gray[al]", "-map", "[cc]", "-map", "[al]"]);
+            } else {
+                cmd.args(["-vf", "fps=50,pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p"]);
+            }
+            cmd.args(["-c:v", "libaom-av1", "-crf", &q, "-b:v", "0", "-cpu-used", "6", "-row-mt", "1", "-still-picture", "0", "-f", "avif"]);
+            if anim.loop_count.is_none() {
+                cmd.args(["-loop", "0"]);
+            }
         }
     }
     cmd.arg(path);
