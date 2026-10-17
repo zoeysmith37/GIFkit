@@ -101,6 +101,31 @@ fn ladder(fmt: &TargetFormat) -> Vec<Rung> {
     v
 }
 
+/// Quality-only ladder (frame size fixed): every lossy / colour step at 100%.
+fn locked_ladder(fmt: &TargetFormat) -> Vec<Rung> {
+    let mut v = Vec::new();
+    match fmt {
+        TargetFormat::Gif(base) => {
+            v.push(Rung::Gif(base.clone(), 1.0));
+            for l in [20u16, 40, 60, 80, 100, 130, 160, 200] {
+                if l > base.lossy {
+                    v.push(Rung::Gif(GifOptions { lossy: l, ..base.clone() }, 1.0));
+                }
+            }
+            let top = base.lossy.max(200);
+            for c in [192u16, 128, 96, 64, 48, 32, 16] {
+                if c < base.colors {
+                    v.push(Rung::Gif(GifOptions { lossy: top, colors: c, ..base.clone() }, 1.0));
+                }
+            }
+        }
+        _ => {
+            v = ladder(fmt).into_iter().filter(|r| r.scale() >= 0.999).collect();
+        }
+    }
+    v
+}
+
 /// Scale every frame (Lanczos-ish triangle filter, alpha kept).
 pub fn scaled(anim: &Animation, s: f32) -> Animation {
     if s >= 0.999 {
@@ -145,13 +170,17 @@ fn make_fit(rungs: &[Rung], i: usize, bytes: Vec<u8>, reached: bool) -> Fit {
 /// Find the highest-quality settings whose output is at most `max_bytes`.
 /// Binary search over a quality ladder (sizes are close to monotonic).
 pub fn fit(anim: &Animation, fmt: &TargetFormat, max_bytes: u64, trials: &AtomicUsize) -> Result<Fit> {
-    fit_with(fmt, max_bytes, trials, |s| scaled(anim, s))
+    fit_with(fmt, max_bytes, true, trials, |s| scaled(anim, s))
 }
 
 /// [`fit`] where `render(scale)` produces the frames at a given scale – lets the
 /// app render through its real resize step so results match the preview.
-pub fn fit_with(fmt: &TargetFormat, max_bytes: u64, trials: &AtomicUsize, render: impl Fn(f32) -> Animation) -> Result<Fit> {
-    let rungs = ladder(fmt);
+/// With `allow_scale` false, only compression settings change, never the frame size.
+pub fn fit_with(fmt: &TargetFormat, max_bytes: u64, allow_scale: bool, trials: &AtomicUsize, render: impl Fn(f32) -> Animation) -> Result<Fit> {
+    let mut rungs = ladder(fmt);
+    if !allow_scale {
+        rungs = locked_ladder(fmt);
+    }
     let mut scaled_cache: HashMap<u32, Arc<Animation>> = HashMap::new();
     let mut results: HashMap<usize, Vec<u8>> = HashMap::new();
     let mut eval = |i: usize| -> Result<usize> {

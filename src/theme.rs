@@ -70,9 +70,76 @@ pub const LIGHT: Palette = Palette {
 
 static IS_DARK: AtomicBool = AtomicBool::new(true);
 
+/// (dark, light) palettes with the system accent colour applied.
+fn palettes() -> &'static (Palette, Palette) {
+    static P: std::sync::OnceLock<(Palette, Palette)> = std::sync::OnceLock::new();
+    P.get_or_init(|| match system_accent() {
+        Some(a) => (with_accent(DARK, a, true), with_accent(LIGHT, a, false)),
+        None => (DARK, LIGHT),
+    })
+}
+
+fn lerp(a: Color32, b: Color32, t: f32) -> Color32 {
+    let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
+}
+
+/// Re-derive the accent-dependent colours (same mixes as the Breeze defaults).
+fn with_accent(mut p: Palette, a: Color32, dark: bool) -> Palette {
+    p.highlight = a;
+    if dark {
+        p.highlight_soft = lerp(p.view, a, 0.25);
+    } else {
+        p.highlight_soft = lerp(Color32::WHITE, a, 0.22);
+        p.button_hover = lerp(Color32::WHITE, a, 0.12);
+    }
+    p
+}
+
+fn parse_kde_color(v: &str) -> Option<Color32> {
+    let v = v.trim();
+    if let Some(hex) = v.strip_prefix('#') {
+        let n = u32::from_str_radix(hex.get(..6)?, 16).ok()?;
+        return Some(Color32::from_rgb((n >> 16) as u8, (n >> 8) as u8, n as u8));
+    }
+    let c: Vec<u8> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+    (c.len() >= 3).then(|| Color32::from_rgb(c[0], c[1], c[2]))
+}
+
+/// KDE Plasma's accent colour from kdeglobals (custom accent first, then the
+/// colour scheme's selection colour). `GIFFORGE_ACCENT=r,g,b` overrides;
+/// `GIFFORGE_ACCENT=default` keeps Breeze blue. None elsewhere.
+fn system_accent() -> Option<Color32> {
+    if let Ok(v) = std::env::var("GIFFORGE_ACCENT") {
+        return parse_kde_color(&v);
+    }
+    if !cfg!(all(unix, not(target_os = "macos"))) {
+        return None;
+    }
+    let base = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+    let text = std::fs::read_to_string(base.join("kdeglobals")).ok()?;
+    let mut section = String::new();
+    let (mut accent, mut selection) = (None, None);
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            section = line.to_string();
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else { continue };
+        match (section.as_str(), k.trim()) {
+            ("[General]", "AccentColor") => accent = parse_kde_color(v),
+            ("[Colors:Selection]", "BackgroundNormal") => selection = parse_kde_color(v),
+            _ => {}
+        }
+    }
+    accent.or(selection)
+}
+
 /// Palette of the theme currently in use (set every frame by the app).
 pub fn p() -> &'static Palette {
-    if IS_DARK.load(Ordering::Relaxed) { &DARK } else { &LIGHT }
+    let (d, l) = palettes();
+    if IS_DARK.load(Ordering::Relaxed) { d } else { l }
 }
 
 pub fn set_current(ctx: &egui::Context) {
@@ -163,8 +230,9 @@ pub fn install(ctx: &egui::Context) {
     fonts.families.insert(FontFamily::Name("gf-mono-bold".into()), vec!["dejavu-mono".into(), "dejavu".into(), "noto".into()]);
     ctx.set_fonts(fonts);
 
-    ctx.set_visuals_of(Theme::Dark, visuals(&DARK, true));
-    ctx.set_visuals_of(Theme::Light, visuals(&LIGHT, false));
+    let (d, l) = palettes();
+    ctx.set_visuals_of(Theme::Dark, visuals(d, true));
+    ctx.set_visuals_of(Theme::Light, visuals(l, false));
     ctx.all_styles_mut(|s| {
         s.spacing.item_spacing = Vec2::new(6.0, 6.0);
         s.spacing.button_padding = Vec2::new(10.0, 4.0);

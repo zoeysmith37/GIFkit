@@ -576,8 +576,14 @@ pub struct GifForgeApp {
     last_tick: Option<f64>,
     resize_by_pct: bool,
     about_open: bool,
+    /// layer being renamed (id, text) and whether its field still needs focus
+    renaming: Option<(u64, String)>,
+    rename_fresh: bool,
+    /// frame edits that keep a row in the layer panel while switched off
+    edit_rows_shown: std::collections::HashSet<Tool>,
     /// (settings before, settings after) the last "Find settings"
     fit_record: Option<(CompState, CompState)>,
+    fit_keep_size: bool,
     about_icon: Option<TextureHandle>,
 }
 
@@ -726,7 +732,9 @@ fn describe_edit(os: &Stack, og: &GifOptions, ns: &Stack, ng: &GifOptions) -> St
     if added.is_empty() {
         for l in &ns.layers {
             if let Some(o) = old.get(&l.id) {
-                if o.visible != l.visible {
+                if o.label != l.label {
+                    parts.push(format!("Rename to {}", short(l)));
+                } else if o.visible != l.visible {
                     parts.push(format!("{} {}", if l.visible { "Show" } else { "Hide" }, short(l)));
                 } else if stack::layer_signature(o) != stack::layer_signature(l) {
                     let what = changed_fields(&o.kind, &l.kind);
@@ -1041,7 +1049,11 @@ impl GifForgeApp {
             last_tick: None,
             resize_by_pct: true,
             about_open: false,
+            renaming: None,
+            rename_fresh: false,
+            edit_rows_shown: Default::default(),
             fit_record: None,
+            fit_keep_size: theme::get_setting("fit_keep_size").as_deref() == Some("1"),
             about_icon: None,
         };
         // scan system fonts in the background
@@ -1317,28 +1329,29 @@ impl GifForgeApp {
         CompState { gif: self.gif_opts.clone(), webp: self.webp_opts, avif: self.avif_quality, resize: (t.resize_on, t.rs_w, t.rs_h, t.rs_pct.to_bits()) }
     }
 
-    fn set_comp_state(&mut self, c: &CompState) {
-        self.gif_opts = c.gif.clone();
-        self.webp_opts = c.webp;
-        self.avif_quality = c.avif;
-        let t = &mut self.stack.transform;
-        (t.resize_on, t.rs_w, t.rs_h) = (c.resize.0, c.resize.1, c.resize.2);
-        t.rs_pct = f32::from_bits(c.resize.3);
-    }
-
     /// If the current settings are exactly what the last "Find settings"
     /// produced, go back to what they were before it (so a new search can
     /// go up as well as down).
     fn undo_last_fit(&mut self) -> bool {
-        if let Some((before, after)) = self.fit_record.clone() {
-            if self.comp_state() == after {
-                self.set_comp_state(&before);
-                self.fit_record = None;
-                return true;
-            }
+        let Some((before, after)) = self.fit_record.take() else { return false };
+        let cur = self.comp_state();
+        let mut undone = false;
+        // the size Find chose is undone even if compression was tweaked since,
+        // so a new search can make the image bigger again
+        if cur.resize == after.resize {
+            let t = &mut self.stack.transform;
+            (t.resize_on, t.rs_w, t.rs_h) = (before.resize.0, before.resize.1, before.resize.2);
+            t.rs_pct = f32::from_bits(before.resize.3);
+            undone = true;
         }
-        self.fit_record = None;
-        false
+        // compression settings only if they are still exactly what Find set
+        if (&cur.gif, &cur.webp, cur.avif) == (&after.gif, &after.webp, after.avif) {
+            self.gif_opts = before.gif;
+            self.webp_opts = before.webp;
+            self.avif_quality = before.avif;
+            undone = true;
+        }
+        undone
     }
 
     fn target_bytes(&self) -> u64 {
@@ -1346,7 +1359,8 @@ impl GifForgeApp {
     }
 
     fn live_sig(&self) -> u64 {
-        hash_parts(&[self.stack.signature(), hash_str(&format!("{:?}", self.gif_opts))])
+        let labels: Vec<&Option<String>> = self.stack.layers.iter().map(|l| &l.label).collect();
+        hash_parts(&[self.stack.signature(), hash_str(&format!("{:?}{:?}{:?}{labels:?}", self.gif_opts, self.webp_opts, self.avif_quality))])
     }
 
     /// Turn a pending (not yet recorded) live edit into an undo entry now.
@@ -2584,6 +2598,9 @@ impl GifForgeApp {
         let mut remove: Option<usize> = None;
         let mut drop_to: Option<(usize, usize)> = None;
         let mut to_frames = false;
+        let mut rename_done: Option<Option<(usize, String)>> = None;
+        let mut edit_toggle: Option<Tool> = None;
+        let mut edit_remove: Option<Tool> = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             let mut rows: Vec<(usize, Rect)> = Vec::new();
@@ -2596,7 +2613,7 @@ impl GifForgeApp {
                 rows.push((li, r));
                 let selected = self.sel.get(kind_key(kind)) == Some(&id) && self.tool == kind_tool(kind);
                 let dragging_me = self.layer_drag == Some(id);
-                let painter = ui.painter();
+                let painter = ui.painter().clone();
                 if selected {
                     painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 2.0, pal.highlight_soft);
                 } else if resp.hovered() {
@@ -2618,9 +2635,29 @@ impl GifForgeApp {
                 job.wrap = egui::text::TextWrapping { max_width: name_w, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
                 let galley = ui.painter().layout_job(job);
                 let gy = r.center().y - galley.size().y / 2.0;
-                painter.galley(pos2(r.left() + 52.0, gy), galley, pal.fg);
-                // delete (on hover)
-                if resp.hovered() || selected {
+                let renaming = self.renaming.as_ref().map(|(rid, _)| *rid == id).unwrap_or(false);
+                if !renaming {
+                    painter.galley(pos2(r.left() + 52.0, gy), galley, pal.fg);
+                } else if let Some((_, buf)) = &mut self.renaming {
+                    let name_r = Rect::from_min_size(pos2(r.left() + 48.0, r.top() + 4.0), vec2(name_w + 4.0, r.height() - 8.0));
+                    let te = ui.put(name_r, egui::TextEdit::singleline(buf).font(egui::FontId::proportional(13.0)).margin(vec2(4.0, 2.0)));
+                    if self.rename_fresh {
+                        te.request_focus();
+                        self.rename_fresh = false;
+                    }
+                    let (enter, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+                    if esc {
+                        rename_done = Some(None);
+                    } else if te.lost_focus() || enter {
+                        rename_done = Some(Some((li, buf.clone())));
+                    }
+                }
+                if resp.double_clicked() && !eye.hovered() {
+                    self.renaming = Some((id, name.clone()));
+                    self.rename_fresh = true;
+                }
+                // delete (pointer anywhere over the row – the ✕ itself takes the hover)
+                if ui.rect_contains_pointer(r) || selected {
                     let del_r = Rect::from_center_size(pos2(r.right() - 14.0, r.center().y), vec2(20.0, 20.0));
                     let del = ui.interact(del_r, egui::Id::unique(("layer-del", id)), Sense::click()).on_hover_text("Delete layer");
                     painter.text(del_r.center(), egui::Align2::CENTER_CENTER, "✕", egui::FontId::proportional(11.5), if del.hovered() { pal.negative } else { pal.fg_muted });
@@ -2640,9 +2677,9 @@ impl GifForgeApp {
             }
             // base frames row
             // active frame edits, each opening its own tool, then the frames themselves
-            let mut edit_rows: Vec<(Tool, String)> = self.frame_edit_rows();
-            edit_rows.push((Tool::Frames, "Frames".to_string()));
-            for (t, label) in edit_rows {
+            let mut edit_rows: Vec<(Tool, String, Option<bool>)> = self.frame_edit_rows().into_iter().map(|(t, l, on)| (t, l, Some(on))).collect();
+            edit_rows.push((Tool::Frames, "Frames".to_string(), None));
+            for (t, label, enabled) in edit_rows {
                 let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h - 4.0), Sense::click());
                 let painter = ui.painter();
                 let sel = self.tool == t;
@@ -2651,14 +2688,34 @@ impl GifForgeApp {
                 } else if resp.hovered() {
                     painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 2.0, mix(pal.view, pal.highlight_soft, 0.45));
                 }
-                let col = if t == Tool::Frames { pal.fg_muted } else { pal.fg };
+                let on = enabled.unwrap_or(true);
+                let col = if t == Tool::Frames || !on { pal.fg_muted } else { pal.fg };
+                let mut eye_hit = false;
+                if let Some(on) = enabled {
+                    let eye_r = Rect::from_center_size(pos2(r.left() + 16.0, r.center().y), vec2(22.0, 22.0));
+                    let eye = ui.interact(eye_r, egui::Id::unique(("edit-eye", t)), Sense::click()).on_hover_text("Turn this edit on / off");
+                    painter.text(eye_r.center(), egui::Align2::CENTER_CENTER, if on { "◉" } else { "○" }, egui::FontId::proportional(13.0), if on { pal.highlight } else { pal.fg_muted });
+                    if eye.clicked() {
+                        edit_toggle = Some(t);
+                    }
+                    eye_hit = eye.hovered();
+                    if ui.rect_contains_pointer(r) || sel {
+                        let del_r = Rect::from_center_size(pos2(r.right() - 14.0, r.center().y), vec2(20.0, 20.0));
+                        let del = ui.interact(del_r, egui::Id::unique(("edit-del", t)), Sense::click()).on_hover_text("Remove this edit");
+                        painter.text(del_r.center(), egui::Align2::CENTER_CENTER, "✕", egui::FontId::proportional(11.5), if del.hovered() { pal.negative } else { pal.fg_muted });
+                        if del.clicked() {
+                            edit_remove = Some(t);
+                        }
+                        eye_hit |= del.hovered();
+                    }
+                }
                 painter.text(pos2(r.left() + 38.0, r.center().y), egui::Align2::CENTER_CENTER, t.icon(), egui::FontId::proportional(13.0), pal.fg_muted);
                 let mut job = egui::text::LayoutJob::simple_singleline(label, egui::FontId::proportional(12.5), col);
-                job.wrap = egui::text::TextWrapping { max_width: (r.width() - 60.0).max(10.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+                job.wrap = egui::text::TextWrapping { max_width: (r.width() - 80.0).max(10.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
                 let galley = ui.painter().layout_job(job);
                 painter.galley(pos2(r.left() + 52.0, r.center().y - galley.size().y / 2.0), galley, col);
                 let tip = if t == Tool::Frames { "Source frames" } else { "Frame edit – click to adjust" };
-                if resp.on_hover_text(tip).clicked() {
+                if resp.on_hover_text(tip).clicked() && !eye_hit {
                     if t == Tool::Frames {
                         to_frames = true;
                     } else {
@@ -2716,6 +2773,30 @@ impl GifForgeApp {
                 self.stack.layers.insert(pos.min(self.stack.layers.len()), l);
             }
         }
+        if let Some(done) = rename_done {
+            if let Some((li, text)) = done {
+                if let Some(l) = self.stack.layers.get_mut(li) {
+                    let t = text.trim().to_string();
+                    l.label = if t.is_empty() { None } else { Some(t) };
+                }
+            }
+            self.renaming = None;
+        }
+        if let Some(t) = edit_toggle {
+            let tr = &mut self.stack.transform;
+            match t {
+                Tool::Cut => tr.cut_on = !tr.cut_on,
+                Tool::Speed => tr.speed_on = !tr.speed_on,
+                Tool::Reverse => tr.play_on = !tr.play_on,
+                Tool::Crop => tr.crop_on = !tr.crop_on,
+                Tool::Resize => tr.resize_on = !tr.resize_on,
+                Tool::Rotate => tr.rot_on = !tr.rot_on,
+                _ => {}
+            }
+        }
+        if let Some(t) = edit_remove {
+            self.reset_frame_edit(t);
+        }
         if let Some(i) = remove {
             self.snapshot(&format!("del{now}"), now);
             self.stack.layers.remove(i);
@@ -2725,25 +2806,93 @@ impl GifForgeApp {
         }
     }
 
-    /// One (tool, label) per active frame edit, in pipeline order.
-    fn frame_edit_rows(&self) -> Vec<(Tool, String)> {
-        let t = &self.stack.transform;
-        let mut v = Vec::new();
-        if t.cut_on {
-            if let Some(b) = &self.base {
-                let (s, e) = t.cut_range(b);
-                v.push((Tool::Cut, format!("Cut · frames {}–{}", s + 1, e + 1)));
+    /// Is a frame edit switched on?
+    fn edit_enabled(&self, t: Tool) -> bool {
+        let tr = &self.stack.transform;
+        match t {
+            Tool::Cut => tr.cut_on,
+            Tool::Speed => tr.speed_on,
+            Tool::Reverse => tr.play_on && (tr.reverse || tr.boomerang || tr.set_loop),
+            Tool::Crop => tr.crop_on,
+            Tool::Resize => tr.resize_on,
+            Tool::Rotate => tr.rotates(),
+            _ => false,
+        }
+    }
+
+    /// Set a frame edit back to its defaults and drop its row.
+    fn reset_frame_edit(&mut self, t: Tool) {
+        let dur = self.base.as_ref().map(|a| a.duration_secs()).unwrap_or(1.0);
+        let tr = &mut self.stack.transform;
+        match t {
+            Tool::Cut => {
+                tr.cut_on = false;
+                tr.cut_start = 1;
+                tr.cut_end = 0;
+                tr.cut_t0 = 0.0;
+                tr.cut_t1 = dur;
+            }
+            Tool::Speed => {
+                tr.speed_on = false;
+                tr.speed_mode = SpeedMode::Percent;
+                tr.speed_val = 100.0;
+            }
+            Tool::Reverse => {
+                tr.reverse = false;
+                tr.boomerang = false;
+                tr.set_loop = false;
+                tr.play_on = true;
+            }
+            Tool::Crop => tr.crop_on = false,
+            Tool::Resize => {
+                tr.resize_on = false;
+                tr.rs_w = 0;
+                tr.rs_h = 0;
+                tr.rs_pct = 0.0;
+            }
+            Tool::Rotate => {
+                tr.rot_on = false;
+                tr.flip_h = false;
+                tr.flip_v = false;
+                tr.rot = 0;
+                tr.rot_any = false;
+            }
+            _ => {}
+        }
+        self.edit_rows_shown.remove(&t);
+        self.modified = true;
+    }
+
+    /// One (tool, label, enabled) per frame edit that is on – or was on and
+    /// is now switched off – in pipeline order.
+    fn frame_edit_rows(&mut self) -> Vec<(Tool, String, bool)> {
+        for t in [Tool::Cut, Tool::Speed, Tool::Reverse, Tool::Crop, Tool::Resize, Tool::Rotate] {
+            if self.edit_enabled(t) {
+                self.edit_rows_shown.insert(t);
             }
         }
-        if t.speed_on {
+        let t = &self.stack.transform;
+        let shown = |x: Tool| self.edit_rows_shown.contains(&x);
+        let mut v = Vec::new();
+        if shown(Tool::Cut) {
+            let what = match &self.base {
+                Some(b) => {
+                    let (s, e) = t.cut_range(b);
+                    format!("frames {}–{}", s + 1, e + 1)
+                }
+                None => String::new(),
+            };
+            v.push((Tool::Cut, format!("Cut · {what}"), t.cut_on));
+        }
+        if shown(Tool::Speed) {
             let what = match t.speed_mode {
                 SpeedMode::Percent => format!("{:.0}%", t.speed_val),
                 SpeedMode::DelayAll => format!("{:.0} cs", t.speed_val),
                 SpeedMode::Fps => format!("{:.1} fps", t.speed_val),
             };
-            v.push((Tool::Speed, format!("Speed · {what}")));
+            v.push((Tool::Speed, format!("Speed · {what}"), t.speed_on));
         }
-        if t.reverse || t.boomerang || t.set_loop {
+        if shown(Tool::Reverse) && (t.reverse || t.boomerang || t.set_loop) {
             let mut p = Vec::new();
             if t.reverse {
                 p.push("reverse");
@@ -2754,25 +2903,25 @@ impl GifForgeApp {
             if t.set_loop {
                 p.push("loop");
             }
-            v.push((Tool::Reverse, format!("Playback · {}", p.join(", "))));
+            v.push((Tool::Reverse, format!("Playback · {}", p.join(", ")), t.play_on));
         }
-        if t.crop_on {
-            v.push((Tool::Crop, format!("Crop · {}×{}", t.crop[2], t.crop[3])));
+        if shown(Tool::Crop) {
+            v.push((Tool::Crop, format!("Crop · {}×{}", t.crop[2], t.crop[3]), t.crop_on));
         }
-        if t.resize_on {
+        if shown(Tool::Resize) {
             let what = if t.rs_pct > 0.0 {
                 format!("{}%", (t.rs_pct * 10.0).round() / 10.0)
             } else {
                 match (t.rs_w, t.rs_h) {
-                    (0, 0) => "off".into(),
+                    (0, 0) => "unchanged".into(),
                     (w, 0) => format!("{w} px wide"),
                     (0, h) => format!("{h} px tall"),
                     (w, h) => format!("{w}×{h}"),
                 }
             };
-            v.push((Tool::Resize, format!("Resize · {what}")));
+            v.push((Tool::Resize, format!("Resize · {what}"), t.resize_on));
         }
-        if t.rotates() {
+        if shown(Tool::Rotate) {
             let mut p = Vec::new();
             if t.flip_h || t.flip_v {
                 p.push("flip".to_string());
@@ -2782,7 +2931,7 @@ impl GifForgeApp {
             } else if t.rot != 0 {
                 p.push(format!("{}°", t.rot));
             }
-            v.push((Tool::Rotate, format!("Rotate · {}", p.join(", "))));
+            v.push((Tool::Rotate, format!("Rotate · {}", p.join(", ")), t.rot_on));
         }
         v
     }
@@ -4491,6 +4640,9 @@ impl GifForgeApp {
             });
         });
         ui.horizontal(|ui| {
+            if ui.checkbox(&mut self.fit_keep_size, "Keep size").on_hover_text("Find settings only changes compression, never shrinks the frames").changed() {
+                theme::set_setting("fit_keep_size", if self.fit_keep_size { "1" } else { "0" });
+            }
             reset = ui.add_enabled(idle, egui::Button::new("Reset compression")).on_hover_text("Back to lossless defaults; also undoes a downscale made by Find").clicked();
         });
         if reset {
@@ -4509,13 +4661,14 @@ impl GifForgeApp {
                 ExportFormat::Avif => crate::target::TargetFormat::Avif(self.avif_quality),
                 _ => crate::target::TargetFormat::Gif(self.gif_opts.clone()),
             };
+            let allow_scale = !self.fit_keep_size;
             if let Some(base) = self.base.clone() {
                 let stack = self.stack.clone();
                 let fonts = self.fonts.clone();
                 let total = self.plan.len();
                 self.spawn(ctx, &format!("Finding settings under {}", fmt_size(max)), total, move |p| {
                     // render each scale through the real Resize step so sizes match the preview
-                    JobOutput::Fit(crate::target::fit_with(&tf, max, p, |sc| {
+                    JobOutput::Fit(crate::target::fit_with(&tf, max, allow_scale, p, |sc| {
                         let mut st = stack.clone();
                         apply_fit_scale(&mut st.transform, sc);
                         st.flatten(&base, &fonts, None)
@@ -5567,6 +5720,23 @@ fn apply_aspect(fixed: Pos2, mut pt: Pos2, aspect: Option<f32>) -> Pos2 {
     pt
 }
 
+/// Scale the box from `fixed` to `pt` (already at the right aspect) down
+/// uniformly until it fits inside the bounds.
+fn fit_aspect_in_bounds(fixed: Pos2, pt: Pos2, b: (f32, f32)) -> Pos2 {
+    let fixed = clamp_pt(fixed, b);
+    let (dx, dy) = (pt.x - fixed.x, pt.y - fixed.y);
+    let room_x = if dx >= 0.0 { b.0 - fixed.x } else { fixed.x };
+    let room_y = if dy >= 0.0 { b.1 - fixed.y } else { fixed.y };
+    let mut k: f32 = 1.0;
+    if dx.abs() > room_x {
+        k = k.min(room_x / dx.abs());
+    }
+    if dy.abs() > room_y {
+        k = k.min(room_y / dy.abs());
+    }
+    pos2(fixed.x + dx * k.max(0.0), fixed.y + dy * k.max(0.0))
+}
+
 fn clamp_pt(pt: Pos2, b: (f32, f32)) -> Pos2 {
     pos2(pt.x.clamp(0.0, b.0), pt.y.clamp(0.0, b.1))
 }
@@ -5577,7 +5747,8 @@ fn clamp_pt(pt: Pos2, b: (f32, f32)) -> Pos2 {
 fn rect_tool(drag: &mut Option<DragMode>, started: bool, dragged: bool, stopped: bool, resp: &egui::Response, m: &Mapper, r: &mut [f32; 4], bounds: (f32, f32), aspect: Option<f32>, allow_new: bool) {
     let clampb = |pt: Pos2| if allow_new { clamp_pt(pt, bounds) } else { pt };
     if started {
-        if let Some(sp) = resp.interact_pointer_pos() {
+        // where the button went down, not where the pointer is once egui decides it's a drag
+        if let Some(sp) = resp.ctx.input(|i| i.pointer.press_origin()).or_else(|| resp.interact_pointer_pos()) {
             let ip = m.to_img(sp);
             let has = r[2] > 0.0 && r[3] > 0.0;
             *drag = if let Some(opp) = has.then(|| hit_corner(m, r, sp)).flatten() {
@@ -5596,10 +5767,26 @@ fn rect_tool(drag: &mut Option<DragMode>, started: bool, dragged: bool, stopped:
             let ip = m.to_img(sp);
             match d {
                 DragMode::New(a) | DragMode::Corner(a) => {
-                    let b = clampb(apply_aspect(a, clampb(ip), aspect));
+                    let b = match aspect {
+                        // keep the ratio exact: shrink along the diagonal instead of clamping each axis
+                        Some(_) if allow_new => fit_aspect_in_bounds(a, apply_aspect(a, ip, aspect), bounds),
+                        _ => clampb(apply_aspect(a, clampb(ip), aspect)),
+                    };
                     let mn = pos2(a.x.min(b.x).round(), a.y.min(b.y).round());
                     let mx = pos2(a.x.max(b.x).round(), a.y.max(b.y).round());
-                    *r = [mn.x, mn.y, (mx.x - mn.x).max(1.0), (mx.y - mn.y).max(1.0)];
+                    let (mut w, mut h) = ((mx.x - mn.x).max(1.0), (mx.y - mn.y).max(1.0));
+                    if let Some(ar) = aspect {
+                        // whole pixels at the exact ratio, never past the edge
+                        h = (w / ar).round().max(1.0);
+                        while allow_new && w > 1.0 && (mn.y + h > bounds.1 || mn.x + w > bounds.0) {
+                            w -= 1.0;
+                            h = (w / ar).round().max(1.0);
+                        }
+                    }
+                    // keep the fixed corner where it is when the size was adjusted
+                    let x = if b.x < a.x { (a.x.round() - w).max(0.0) } else { mn.x };
+                    let y = if b.y < a.y { (a.y.round() - h).max(0.0) } else { mn.y };
+                    *r = [x, y, w, h];
                 }
                 DragMode::Move(off) => {
                     let (mut nx, mut ny) = ((ip.x - off.x).round(), (ip.y - off.y).round());

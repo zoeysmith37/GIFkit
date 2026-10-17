@@ -47,6 +47,8 @@ pub struct Transform {
     pub speed_val: f32,
     pub reverse: bool,
     pub boomerang: bool,
+    /// master switch for reverse / boomerang / loop
+    pub play_on: bool,
     pub set_loop: bool,
     pub loop_count: u16,
     // geometry
@@ -86,6 +88,7 @@ impl Default for Transform {
             reverse: false,
             boomerang: false,
             set_loop: false,
+            play_on: true,
             loop_count: 0,
             crop_on: false,
             crop: [0, 0, 0, 0],
@@ -126,7 +129,7 @@ impl Transform {
     }
 
     pub fn is_identity(&self) -> bool {
-        self.geometry_identity() && !self.cut_on && !(self.speed_on && !(self.speed_mode == SpeedMode::Percent && self.speed_val == 100.0)) && !self.reverse && !self.boomerang && !self.set_loop
+        self.geometry_identity() && !self.cut_on && !(self.speed_on && !(self.speed_mode == SpeedMode::Percent && self.speed_val == 100.0)) && !(self.play_on && (self.reverse || self.boomerang || self.set_loop))
     }
 
     pub fn rotates(&self) -> bool {
@@ -303,6 +306,8 @@ pub struct Layer {
     pub id: u64,
     pub visible: bool,
     pub kind: LayerKind,
+    /// user-chosen name (None = automatic)
+    pub label: Option<String>,
 }
 
 impl Layer {
@@ -352,6 +357,9 @@ impl Layer {
     }
 
     pub fn name(&self) -> String {
+        if let Some(l) = self.label.as_ref().filter(|l| !l.trim().is_empty()) {
+            return l.clone();
+        }
         match &self.kind {
             LayerKind::Effects(_) => "Effects".into(),
             LayerKind::Text(t) => t.text.lines().next().unwrap_or("").to_string(),
@@ -418,7 +426,7 @@ impl Stack {
     pub fn push(&mut self, kind: LayerKind) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
-        self.layers.push(Layer { id, visible: true, kind });
+        self.layers.push(Layer { id, visible: true, kind, label: None });
         id
     }
 
@@ -452,7 +460,7 @@ impl Stack {
     pub fn plan_signature(&self) -> u64 {
         let t = &self.transform;
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (t.cut_on, t.cut_by_time, t.cut_start, t.cut_end, t.cut_t0.to_bits(), t.cut_t1.to_bits(), t.speed_on, format!("{:?}", t.speed_mode), t.speed_val.to_bits(), t.reverse, t.boomerang).hash(&mut h);
+        (t.cut_on, t.cut_by_time, t.cut_start, t.cut_end, t.cut_t0.to_bits(), t.cut_t1.to_bits(), t.speed_on, format!("{:?}", t.speed_mode), t.speed_val.to_bits(), t.play_on && t.reverse, t.play_on && t.boomerang).hash(&mut h);
         h.finish()
     }
 
@@ -463,10 +471,10 @@ impl Stack {
         let t = &self.transform;
         let (s, e) = t.cut_range(base);
         let mut idx: Vec<usize> = (s..=e).collect();
-        if t.reverse {
+        if t.play_on && t.reverse {
             idx.reverse();
         }
-        if t.boomerang && idx.len() > 2 {
+        if t.play_on && t.boomerang && idx.len() > 2 {
             let back: Vec<usize> = idx[1..idx.len() - 1].iter().rev().copied().collect();
             idx.extend(back);
         }
@@ -480,7 +488,7 @@ impl Stack {
 
     pub fn loop_count(&self, base: &Animation) -> Option<u16> {
         let t = &self.transform;
-        if t.set_loop {
+        if t.play_on && t.set_loop {
             if t.loop_count == 0 { None } else { Some(t.loop_count) }
         } else {
             base.loop_count
