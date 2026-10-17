@@ -147,6 +147,16 @@ fn kind_tool(k: Kind) -> Tool {
     }
 }
 
+/// Compression settings + the resize part of the frame edits: what "Find
+/// settings" changes, so it can be undone before searching again.
+#[derive(Clone, PartialEq, Debug)]
+struct CompState {
+    gif: GifOptions,
+    webp: io::WebpOptions,
+    avif: u8,
+    resize: (bool, u32, u32, u32), // on, w, h, pct bits
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ExportFormat {
     Gif,
@@ -487,6 +497,9 @@ pub struct GifForgeApp {
     comp_tex: TexCache,
     orig_tex: TexCache,
     cmp_tex: TexCache,
+    crop_tex: TexCache,
+    crop_prep: Option<(u64, Arc<stack::Prepared>)>,
+    crop_live: bool,
     checker_tex: Option<TextureHandle>,
     comp_key: u64,
     comp_key_since: f64,
@@ -562,6 +575,10 @@ pub struct GifForgeApp {
     last_comp: Option<(usize, TextureHandle)>,
     last_tick: Option<f64>,
     resize_by_pct: bool,
+    about_open: bool,
+    /// (settings before, settings after) the last "Find settings"
+    fit_record: Option<(CompState, CompState)>,
+    about_icon: Option<TextureHandle>,
 }
 
 fn hash_str(s: &str) -> u64 {
@@ -590,18 +607,44 @@ fn to_color_image(img: &RgbaImage) -> egui::ColorImage {
     egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw())
 }
 
+/// Shrink the output by `scale` through the Resize frame edit (as "Find
+/// settings" does), keeping any resize already set.
+fn apply_fit_scale(t: &mut Transform, scale: f32) {
+    if scale >= 0.999 {
+        return;
+    }
+    if t.resize_on && t.rs_pct > 0.0 {
+        t.rs_pct *= scale;
+    } else if t.resize_on && (t.rs_w > 0 || t.rs_h > 0) {
+        t.rs_w = (t.rs_w as f32 * scale).round() as u32;
+        t.rs_h = (t.rs_h as f32 * scale).round() as u32;
+    } else {
+        t.rs_w = 0;
+        t.rs_h = 0;
+        t.rs_pct = (scale * 1000.0).round() / 10.0;
+    }
+    t.resize_on = true;
+}
+
 /// Quick targets, with a little headroom under each service's limit.
 const TARGET_PRESETS: [(&str, f32, bool); 3] = [("Discord 10 MB", 9.5, true), ("X 15 MB", 14.0, true), ("Emote 256 KB", 250.0, false)];
 
 /// Open a folder in the system file manager.
 fn open_in_file_manager(dir: &std::path::Path) {
+    open_external(&dir.to_string_lossy());
+}
+
+const REPO_URL: &str = "https://github.com/zoeysmith37/gifforge";
+
+/// Open a URL or path with the system's default handler.
+fn open_external(target: &str) {
     #[cfg(target_os = "windows")]
-    let cmd = "explorer";
+    let r = std::process::Command::new("explorer").arg(target).spawn();
     #[cfg(target_os = "macos")]
-    let cmd = "open";
+    let r = std::process::Command::new("open").arg(target).spawn();
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    let cmd = "xdg-open";
-    let _ = std::process::Command::new(cmd).arg(dir).spawn();
+    let r = std::process::Command::new("xdg-open").arg(target).spawn();
+    let _ = r;
 }
 
 /// History label for a structural edit key like "delay3" or "dup12 4.5".
@@ -926,6 +969,9 @@ impl GifForgeApp {
             comp_tex: TexCache::default(),
             orig_tex: TexCache::default(),
             cmp_tex: TexCache::default(),
+            crop_tex: TexCache::default(),
+            crop_prep: None,
+            crop_live: true,
             checker_tex: None,
             comp_key: 0,
             comp_key_since: 0.0,
@@ -994,6 +1040,9 @@ impl GifForgeApp {
             last_comp: None,
             last_tick: None,
             resize_by_pct: true,
+            about_open: false,
+            fit_record: None,
+            about_icon: None,
         };
         // scan system fonts in the background
         {
@@ -1154,6 +1203,7 @@ impl GifForgeApp {
             }
             JobOutput::Info(Ok(s)) => self.info(s),
             JobOutput::Fit(Ok(fit)) => {
+                let before = self.comp_state();
                 let (scale, n, reached, desc) = (fit.scale, fit.bytes.len() as u64, fit.reached, fit.settings.clone());
                 if let Some(o) = fit.gif {
                     self.gif_opts = o;
@@ -1164,20 +1214,8 @@ impl GifForgeApp {
                 if let Some(q) = fit.avif {
                     self.avif_quality = q;
                 }
-                if scale < 0.999 {
-                    let t = &mut self.stack.transform;
-                    if t.resize_on && t.rs_pct > 0.0 {
-                        t.rs_pct *= scale;
-                    } else if t.resize_on && (t.rs_w > 0 || t.rs_h > 0) {
-                        t.rs_w = (t.rs_w as f32 * scale).round() as u32;
-                        t.rs_h = (t.rs_h as f32 * scale).round() as u32;
-                    } else {
-                        t.rs_w = 0;
-                        t.rs_h = 0;
-                        t.rs_pct = (scale * 1000.0).round() / 10.0;
-                    }
-                    t.resize_on = true;
-                }
+                apply_fit_scale(&mut self.stack.transform, scale);
+                self.fit_record = Some((before, self.comp_state()));
                 if reached {
                     self.info(format!("Fits: {} with {desc}", fmt_size(n)));
                 } else {
@@ -1274,6 +1312,35 @@ impl GifForgeApp {
     }
 
     /// Target size in bytes (binary units, matching how sizes are shown).
+    fn comp_state(&self) -> CompState {
+        let t = &self.stack.transform;
+        CompState { gif: self.gif_opts.clone(), webp: self.webp_opts, avif: self.avif_quality, resize: (t.resize_on, t.rs_w, t.rs_h, t.rs_pct.to_bits()) }
+    }
+
+    fn set_comp_state(&mut self, c: &CompState) {
+        self.gif_opts = c.gif.clone();
+        self.webp_opts = c.webp;
+        self.avif_quality = c.avif;
+        let t = &mut self.stack.transform;
+        (t.resize_on, t.rs_w, t.rs_h) = (c.resize.0, c.resize.1, c.resize.2);
+        t.rs_pct = f32::from_bits(c.resize.3);
+    }
+
+    /// If the current settings are exactly what the last "Find settings"
+    /// produced, go back to what they were before it (so a new search can
+    /// go up as well as down).
+    fn undo_last_fit(&mut self) -> bool {
+        if let Some((before, after)) = self.fit_record.clone() {
+            if self.comp_state() == after {
+                self.set_comp_state(&before);
+                self.fit_record = None;
+                return true;
+            }
+        }
+        self.fit_record = None;
+        false
+    }
+
     fn target_bytes(&self) -> u64 {
         (self.target_val as f64 * if self.target_mb { 1_048_576.0 } else { 1024.0 }) as u64
     }
@@ -1335,6 +1402,68 @@ impl GifForgeApp {
             for _ in 0..steps {
                 self.do_redo();
             }
+        }
+    }
+
+    fn about_window(&mut self, ctx: &egui::Context) {
+        if !self.about_open {
+            return;
+        }
+        let pal = *p();
+        if self.about_icon.is_none() {
+            if let Ok(img) = image::load_from_memory(include_bytes!("../assets/icon/gifforge-128.png")) {
+                self.about_icon = Some(ctx.load_texture("about-icon", to_color_image(&img.to_rgba8()), TextureOptions::LINEAR));
+            }
+        }
+        let mut open = true;
+        egui::Window::new(RichText::new("About").font(theme::medium(15.0)))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, -30.0))
+            .show(ctx, |ui| {
+                ui.set_width(340.0);
+                ui.horizontal(|ui| {
+                    if let Some(t) = &self.about_icon {
+                        ui.add(egui::Image::new(t).fit_to_exact_size(vec2(72.0, 72.0)));
+                    }
+                    ui.vertical(|ui| {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("GifForge").font(theme::medium(22.0)).color(pal.fg));
+                        ui.label(RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).color(pal.fg));
+                        let commit = env!("GIFFORGE_COMMIT");
+                        let built = if commit.is_empty() { format!("Built {}", env!("GIFFORGE_BUILD_DATE")) } else { format!("Built {} · {commit}", env!("GIFFORGE_BUILD_DATE")) };
+                        hint(ui, &built);
+                    });
+                });
+                ui.add_space(8.0);
+                ui.label("A GIF editor and optimiser that runs on your own machine.");
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.link("GitHub").clicked() {
+                        open_external(REPO_URL);
+                    }
+                    ui.label("·");
+                    if ui.link("Releases").clicked() {
+                        open_external(&format!("{REPO_URL}/releases"));
+                    }
+                    ui.label("·");
+                    if ui.link("Report a problem").clicked() {
+                        open_external(&format!("{REPO_URL}/issues"));
+                    }
+                });
+                ui.add_space(8.0);
+                ui.separator();
+                ui.label(RichText::new("Credits").font(theme::medium(13.5)));
+                hint(ui, "Made by zoeysmith37");
+                hint(ui, "Built with Rust, egui, image, gif, libwebp and rayon");
+                hint(ui, "Video and AVIF via ffmpeg (optional)");
+                hint(ui, "Fonts: Noto Sans (OFL), DejaVu");
+                ui.add_space(4.0);
+                hint(ui, "Licensed under Apache 2.0");
+            });
+        if !open {
+            self.about_open = false;
         }
     }
 
@@ -1605,6 +1734,7 @@ impl GifForgeApp {
             self.export_open = false;
             self.presets_open = false;
             self.font_picker_open = false;
+            self.about_open = false;
         }
         if typing {
             return;
@@ -1809,6 +1939,41 @@ impl GifForgeApp {
         let prep = self.prepared()?;
         let base = self.base.as_ref()?;
         Some(self.stack.render_frame(base, &self.plan, &self.plan_times, i, &self.fonts, &prep))
+    }
+
+    /// Frame `i` with effects and layers but without crop / resize / rotate,
+    /// so the crop tool can show the whole frame (outside the crop dimmed).
+    fn crop_texture(&mut self, ctx: &egui::Context, i: usize) -> Option<TextureHandle> {
+        let base = self.base.as_ref()?;
+        let mut st = self.stack.clone();
+        st.transform.crop_on = false;
+        st.transform.resize_on = false;
+        st.transform.rot_on = false;
+        if !st.needs_render() {
+            return None;
+        }
+        let key = hash_parts(&[st.signature(), self.version, self.timing_rev, self.pixelated as u64, 0xC20F]);
+        if let Some(t) = self.crop_tex.get(key, i) {
+            return Some(t);
+        }
+        let prep = match &self.crop_prep {
+            Some((k, p)) if *k == key => p.clone(),
+            _ => {
+                let p = Arc::new(st.prepare(base, &self.fonts));
+                self.crop_prep = Some((key, p.clone()));
+                p
+            }
+        };
+        if i >= self.plan.len() {
+            return None;
+        }
+        let img = st.render_frame(base, &self.plan, &self.plan_times, i, &self.fonts, &prep);
+        // effects that change the frame size (borders, polaroid) can't line up with crop coordinates
+        if img.dimensions() != (base.width(), base.height()) {
+            return None;
+        }
+        let o = self.tex_opts();
+        Some(self.crop_tex.put(ctx, i, &img, o, "crop"))
     }
 
     /// Texture of output frame `i` with all live edits applied.
@@ -2136,6 +2301,7 @@ impl eframe::App for GifForgeApp {
 
         self.export_window(&ctx);
         self.history_window(&ctx);
+        self.about_window(&ctx);
         self.track_live_edits(&ctx, now);
         self.presets_window(&ctx);
         clear_group_command(&ctx);
@@ -2206,7 +2372,10 @@ impl GifForgeApp {
                     self.export_open = true;
                 }
                 let before = self.theme;
-                egui::ComboBox::from_id_salt("theme").width(36.0).selected_text("◐").show_ui(ui, |ui| {
+                let mut about = false;
+                ui.menu_button(RichText::new("⋮").size(17.0), |ui| {
+                    ui.set_min_width(190.0);
+                    ui.label(RichText::new("Theme").size(11.5).color(pal.fg_muted));
                     for t in [ThemeChoice::System, ThemeChoice::Dark, ThemeChoice::Light] {
                         ui.selectable_value(&mut self.theme, t, t.label());
                     }
@@ -2217,7 +2386,28 @@ impl GifForgeApp {
                             theme::set_setting("wayland", if native { "native" } else { "xwayland" });
                         }
                     }
+                    ui.separator();
+                    if ui.button("GitHub page").clicked() {
+                        open_external(REPO_URL);
+                        ui.close();
+                    }
+                    if ui.button("Check for updates").on_hover_text("Opens the Releases page").clicked() {
+                        open_external(&format!("{REPO_URL}/releases"));
+                        ui.close();
+                    }
+                    if ui.button("Report a problem").clicked() {
+                        open_external(&format!("{REPO_URL}/issues"));
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("About GifForge").clicked() {
+                        about = true;
+                        ui.close();
+                    }
                 });
+                if about {
+                    self.about_open = true;
+                }
                 if before != self.theme {
                     self.theme.apply(ctx);
                     theme::save_theme_choice(self.theme);
@@ -2449,20 +2639,33 @@ impl GifForgeApp {
                 }
             }
             // base frames row
-            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
-            let painter = ui.painter();
-            if resp.hovered() {
-                painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 2.0, mix(pal.view, pal.highlight_soft, 0.45));
-            }
-            painter.text(pos2(r.left() + 38.0, r.center().y), egui::Align2::CENTER_CENTER, "▤", egui::FontId::proportional(14.0), pal.fg_muted);
-            let edits = self.frame_edit_summary();
-            let label = if edits.is_empty() { "Frames".to_string() } else { format!("Frames · {edits}") };
-            let mut job = egui::text::LayoutJob::simple_singleline(label, egui::FontId::proportional(13.0), pal.fg_muted);
-            job.wrap = egui::text::TextWrapping { max_width: (r.width() - 60.0).max(10.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
-            let galley = ui.painter().layout_job(job);
-            painter.galley(pos2(r.left() + 52.0, r.center().y - galley.size().y / 2.0), galley, pal.fg_muted);
-            if resp.on_hover_text("Source frames and frame edits").clicked() {
-                to_frames = true;
+            // active frame edits, each opening its own tool, then the frames themselves
+            let mut edit_rows: Vec<(Tool, String)> = self.frame_edit_rows();
+            edit_rows.push((Tool::Frames, "Frames".to_string()));
+            for (t, label) in edit_rows {
+                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h - 4.0), Sense::click());
+                let painter = ui.painter();
+                let sel = self.tool == t;
+                if sel {
+                    painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 2.0, pal.highlight_soft);
+                } else if resp.hovered() {
+                    painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 2.0, mix(pal.view, pal.highlight_soft, 0.45));
+                }
+                let col = if t == Tool::Frames { pal.fg_muted } else { pal.fg };
+                painter.text(pos2(r.left() + 38.0, r.center().y), egui::Align2::CENTER_CENTER, t.icon(), egui::FontId::proportional(13.0), pal.fg_muted);
+                let mut job = egui::text::LayoutJob::simple_singleline(label, egui::FontId::proportional(12.5), col);
+                job.wrap = egui::text::TextWrapping { max_width: (r.width() - 60.0).max(10.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+                let galley = ui.painter().layout_job(job);
+                painter.galley(pos2(r.left() + 52.0, r.center().y - galley.size().y / 2.0), galley, col);
+                let tip = if t == Tool::Frames { "Source frames" } else { "Frame edit – click to adjust" };
+                if resp.on_hover_text(tip).clicked() {
+                    if t == Tool::Frames {
+                        to_frames = true;
+                    } else {
+                        self.tool = t;
+                        self.drag = None;
+                    }
+                }
             }
             // drag-to-reorder: insertion line + drop
             if let Some(did) = self.layer_drag {
@@ -2522,34 +2725,66 @@ impl GifForgeApp {
         }
     }
 
-    fn frame_edit_summary(&self) -> String {
+    /// One (tool, label) per active frame edit, in pipeline order.
+    fn frame_edit_rows(&self) -> Vec<(Tool, String)> {
         let t = &self.stack.transform;
         let mut v = Vec::new();
         if t.cut_on {
-            v.push("cut");
-        }
-        if t.crop_on {
-            v.push("crop");
-        }
-        if t.resize_on {
-            v.push("resize");
-        }
-        if t.rotates() {
-            v.push("rotate");
+            if let Some(b) = &self.base {
+                let (s, e) = t.cut_range(b);
+                v.push((Tool::Cut, format!("Cut · frames {}–{}", s + 1, e + 1)));
+            }
         }
         if t.speed_on {
-            v.push("speed");
+            let what = match t.speed_mode {
+                SpeedMode::Percent => format!("{:.0}%", t.speed_val),
+                SpeedMode::DelayAll => format!("{:.0} cs", t.speed_val),
+                SpeedMode::Fps => format!("{:.1} fps", t.speed_val),
+            };
+            v.push((Tool::Speed, format!("Speed · {what}")));
         }
-        if t.reverse {
-            v.push("reverse");
+        if t.reverse || t.boomerang || t.set_loop {
+            let mut p = Vec::new();
+            if t.reverse {
+                p.push("reverse");
+            }
+            if t.boomerang {
+                p.push("boomerang");
+            }
+            if t.set_loop {
+                p.push("loop");
+            }
+            v.push((Tool::Reverse, format!("Playback · {}", p.join(", "))));
         }
-        if t.boomerang {
-            v.push("boomerang");
+        if t.crop_on {
+            v.push((Tool::Crop, format!("Crop · {}×{}", t.crop[2], t.crop[3])));
         }
-        if t.set_loop {
-            v.push("loop");
+        if t.resize_on {
+            let what = if t.rs_pct > 0.0 {
+                format!("{}%", (t.rs_pct * 10.0).round() / 10.0)
+            } else {
+                match (t.rs_w, t.rs_h) {
+                    (0, 0) => "off".into(),
+                    (w, 0) => format!("{w} px wide"),
+                    (0, h) => format!("{h} px tall"),
+                    (w, h) => format!("{w}×{h}"),
+                }
+            };
+            v.push((Tool::Resize, format!("Resize · {what}")));
         }
-        v.join(", ")
+        if t.rotates() {
+            let mut p = Vec::new();
+            if t.flip_h || t.flip_v {
+                p.push("flip".to_string());
+            }
+            if t.rot_any && t.rot_deg != 0.0 {
+                p.push(format!("{:.0}°", t.rot_deg));
+            } else if t.rot != 0 {
+                p.push(format!("{}°", t.rot));
+            }
+            v.push((Tool::Rotate, format!("Rotate · {}", p.join(", "))));
+        }
+        v
     }
 
     /// "+" menu / sidebar shortcut for creating a layer of a kind.
@@ -3342,6 +3577,8 @@ impl GifForgeApp {
     fn source_view_inner(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, rect: Rect, src: ViewSource, vi: usize, show_label: bool) {
         let t = self.play_time();
         let crop_mode = self.tool == Tool::Crop;
+        // there is no compressed result of the uncropped frame: crop on the live view
+        let src = if crop_mode && src == ViewSource::Compressed { ViewSource::Edit } else { src };
         match src {
             ViewSource::Edit => {
                 let (tex, size) = if crop_mode {
@@ -3351,14 +3588,15 @@ impl GifForgeApp {
                     }
                     let s = self.plan.get(self.cur).map(|f| f.src).unwrap_or(0);
                     let (w, h) = self.dims();
-                    (self.base_texture(ctx, s), vec2(w as f32, h as f32))
+                    let live = if self.crop_live { self.crop_texture(ctx, self.cur) } else { None };
+                    (live.or_else(|| self.base_texture(ctx, s)), vec2(w as f32, h as f32))
                 } else {
                     let tex = self.composite_texture(ctx, self.cur);
                     let size = tex.as_ref().map(|t| t.size_vec2()).unwrap_or(vec2(self.out_size.0, self.out_size.1));
                     self.out_size = (size.x, size.y);
                     (tex, size)
                 };
-                let label = crop_mode.then(|| ("Full frame (before edits)".to_string(), Color32::WHITE));
+                let label = crop_mode.then(|| (if self.crop_live { "Full frame · with edits".to_string() } else { "Full frame · original".to_string() }, Color32::WHITE));
                 let _ = show_label;
                 let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, label, None, false);
                 let space = if crop_mode { Space::Source } else { Space::Output };
@@ -3977,6 +4215,11 @@ impl GifForgeApp {
     fn ui_crop(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.transform_header(ui, ctx, |t| &mut t.crop_on, |_| {});
         let (w, h) = self.dims();
+        ui.horizontal(|ui| {
+            ui.label("Show");
+            ui.selectable_value(&mut self.crop_live, true, "With edits").on_hover_text("Effects and layers, whole frame");
+            ui.selectable_value(&mut self.crop_live, false, "Original").on_hover_text("The source frames only");
+        });
         hint(ui, "Drag on the image");
         let tr = &mut self.stack.transform;
         let before = tr.crop;
@@ -4228,6 +4471,7 @@ impl GifForgeApp {
             }
         });
         let mut find = false;
+        let mut reset = false;
         let idle = !self.busy();
         group(ui, "Target size", |ui| {
             ui.horizontal(|ui| {
@@ -4246,7 +4490,19 @@ impl GifForgeApp {
                 }
             });
         });
+        ui.horizontal(|ui| {
+            reset = ui.add_enabled(idle, egui::Button::new("Reset compression")).on_hover_text("Back to lossless defaults; also undoes a downscale made by Find").clicked();
+        });
+        if reset {
+            self.undo_last_fit();
+            self.gif_opts = GifOptions { noai_tag: self.gif_opts.noai_tag, ..GifOptions::default() };
+            self.webp_opts = io::WebpOptions::default();
+            self.avif_quality = 60;
+            self.info("Compression reset");
+        }
         if find {
+            // start from the settings before the previous search, not its result
+            self.undo_last_fit();
             let max = self.target_bytes();
             let tf = match self.export_fmt {
                 ExportFormat::Webp => crate::target::TargetFormat::Webp(self.webp_opts),
@@ -4258,8 +4514,12 @@ impl GifForgeApp {
                 let fonts = self.fonts.clone();
                 let total = self.plan.len();
                 self.spawn(ctx, &format!("Finding settings under {}", fmt_size(max)), total, move |p| {
-                    let out = stack.flatten(&base, &fonts, Some(p));
-                    JobOutput::Fit(crate::target::fit(&out, &tf, max, p))
+                    // render each scale through the real Resize step so sizes match the preview
+                    JobOutput::Fit(crate::target::fit_with(&tf, max, p, |sc| {
+                        let mut st = stack.clone();
+                        apply_fit_scale(&mut st.transform, sc);
+                        st.flatten(&base, &fonts, None)
+                    }))
                 });
             }
         }

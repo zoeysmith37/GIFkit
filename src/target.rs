@@ -145,6 +145,12 @@ fn make_fit(rungs: &[Rung], i: usize, bytes: Vec<u8>, reached: bool) -> Fit {
 /// Find the highest-quality settings whose output is at most `max_bytes`.
 /// Binary search over a quality ladder (sizes are close to monotonic).
 pub fn fit(anim: &Animation, fmt: &TargetFormat, max_bytes: u64, trials: &AtomicUsize) -> Result<Fit> {
+    fit_with(fmt, max_bytes, trials, |s| scaled(anim, s))
+}
+
+/// [`fit`] where `render(scale)` produces the frames at a given scale – lets the
+/// app render through its real resize step so results match the preview.
+pub fn fit_with(fmt: &TargetFormat, max_bytes: u64, trials: &AtomicUsize, render: impl Fn(f32) -> Animation) -> Result<Fit> {
     let rungs = ladder(fmt);
     let mut scaled_cache: HashMap<u32, Arc<Animation>> = HashMap::new();
     let mut results: HashMap<usize, Vec<u8>> = HashMap::new();
@@ -154,7 +160,7 @@ pub fn fit(anim: &Animation, fmt: &TargetFormat, max_bytes: u64, trials: &Atomic
         }
         let r = &rungs[i];
         let key = (r.scale() * 1000.0) as u32;
-        let a = scaled_cache.entry(key).or_insert_with(|| Arc::new(scaled(anim, r.scale()))).clone();
+        let a = scaled_cache.entry(key).or_insert_with(|| Arc::new(render(r.scale()))).clone();
         let b = match r {
             Rung::Gif(o, _) => encode_gif(&a, o, None)?,
             Rung::Webp(o, _) => encode_webp(&a, o)?,

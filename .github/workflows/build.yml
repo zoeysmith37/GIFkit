@@ -47,6 +47,8 @@ jobs:
           mkdir -p dist/gifforge-${{ matrix.name }}
           cp target/release/gifforge README.md dist/gifforge-${{ matrix.name }}/
           cp assets/*.txt dist/gifforge-${{ matrix.name }}/
+          cp assets/linux/gifforge.desktop assets/linux/install.sh assets/icon/gifforge.svg dist/gifforge-${{ matrix.name }}/
+          cp assets/icon/gifforge-256.png dist/gifforge-${{ matrix.name }}/gifforge.png
           tar -C dist -czf gifforge-${{ matrix.name }}.tar.gz gifforge-${{ matrix.name }}
 
       # ---------------------------------------------------------------- Windows
@@ -72,6 +74,7 @@ jobs:
           lipo -create -output $APP/Contents/MacOS/gifforge \
             target/aarch64-apple-darwin/release/gifforge \
             target/x86_64-apple-darwin/release/gifforge
+          cp assets/icon/gifforge.icns $APP/Contents/Resources/gifforge.icns
           VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           cat > $APP/Contents/Info.plist <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
@@ -81,6 +84,7 @@ jobs:
             <key>CFBundleDisplayName</key><string>GifForge</string>
             <key>CFBundleIdentifier</key><string>io.github.zoeysmith37.gifforge</string>
             <key>CFBundleExecutable</key><string>gifforge</string>
+            <key>CFBundleIconFile</key><string>gifforge</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>${VERSION}</string>
             <key>CFBundleVersion</key><string>${VERSION}</string>
