@@ -124,18 +124,22 @@ pub struct Fit {
     pub bytes: Vec<u8>,
     pub settings: String,
     pub reached: bool,
-    /// GIF settings and frame scale that produced it (GIF targets only)
+    /// settings and frame scale that produced it
     pub gif: Option<GifOptions>,
+    pub webp: Option<WebpOptions>,
+    pub avif: Option<u8>,
     pub scale: f32,
 }
 
 fn make_fit(rungs: &[Rung], i: usize, bytes: Vec<u8>, reached: bool) -> Fit {
     let r = &rungs[i];
-    let gif = match r {
-        Rung::Gif(o, _) => Some(o.clone()),
-        _ => None,
-    };
-    Fit { bytes, settings: r.describe(), reached, gif, scale: r.scale() }
+    let (mut gif, mut webp, mut avif) = (None, None, None);
+    match r {
+        Rung::Gif(o, _) => gif = Some(o.clone()),
+        Rung::Webp(o, _) => webp = Some(*o),
+        Rung::Avif(q, _) => avif = Some(*q),
+    }
+    Fit { bytes, settings: r.describe(), reached, gif, webp, avif, scale: r.scale() }
 }
 
 /// Find the highest-quality settings whose output is at most `max_bytes`.

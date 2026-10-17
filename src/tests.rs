@@ -737,3 +737,32 @@ fn video_import_if_ffmpeg() {
     assert!((dur - a.duration_secs()).abs() < 0.25, "{dur} vs {}", a.duration_secs());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn preview_every_format() {
+    use io::PreviewFormat as P;
+    let a = synth(true);
+    let mut fmts = vec![P::Gif(GifOptions::default()), P::Webp(io::WebpOptions::default()), P::Apng];
+    if io::ffmpeg_available() {
+        fmts.push(P::Avif(60));
+        fmts.push(P::Video(io::VideoFormat::Mp4, [255, 255, 255]));
+        fmts.push(P::Video(io::VideoFormat::WebmAlpha, [0, 0, 0]));
+    }
+    for f in fmts {
+        let (dec, bytes) = io::encode_preview(&a, &f).unwrap_or_else(|e| panic!("{f:?}: {e:#}"));
+        assert!(!bytes.is_empty());
+        assert_eq!((dec.width(), dec.height()), (a.width(), a.height()), "{f:?}");
+        assert!((dec.duration_secs() - a.duration_secs()).abs() < 0.2, "{f:?}: {} vs {}", dec.duration_secs(), a.duration_secs());
+    }
+}
+
+#[test]
+#[ignore]
+fn preview_alpha_probe() {
+    use io::PreviewFormat as P;
+    let a = synth(true);
+    for f in [P::Avif(60), P::Video(io::VideoFormat::WebmAlpha, [0, 0, 0]), P::Webp(io::WebpOptions::default())] {
+        let (dec, _) = io::encode_preview(&a, &f).unwrap();
+        eprintln!("{f:?}: corner alpha {} square {:?}", dec.frames[0].image.get_pixel(90, 2)[3], dec.frames[0].image.get_pixel(5, 30));
+    }
+}

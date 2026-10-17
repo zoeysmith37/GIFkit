@@ -201,8 +201,8 @@ enum JobOutput {
     Loaded(anyhow::Result<(Animation, Option<PathBuf>, Option<u64>)>),
     Info(anyhow::Result<String>),
     Overlay(anyhow::Result<OverlaySource>),
-    /// target-size search: (settings, frame scale, bytes, reached, description)
-    Fit(anyhow::Result<(GifOptions, f32, u64, bool, String)>),
+    /// target-size search result to apply
+    Fit(anyhow::Result<crate::target::Fit>),
 }
 
 struct Job {
@@ -1153,8 +1153,17 @@ impl GifForgeApp {
                 }
             }
             JobOutput::Info(Ok(s)) => self.info(s),
-            JobOutput::Fit(Ok((opts, scale, n, reached, desc))) => {
-                self.gif_opts = opts;
+            JobOutput::Fit(Ok(fit)) => {
+                let (scale, n, reached, desc) = (fit.scale, fit.bytes.len() as u64, fit.reached, fit.settings.clone());
+                if let Some(o) = fit.gif {
+                    self.gif_opts = o;
+                }
+                if let Some(o) = fit.webp {
+                    self.webp_opts = o;
+                }
+                if let Some(q) = fit.avif {
+                    self.avif_quality = q;
+                }
                 if scale < 0.999 {
                     let t = &mut self.stack.transform;
                     if t.resize_on && t.rs_pct > 0.0 {
@@ -1924,11 +1933,26 @@ impl GifForgeApp {
     // ------------------------------------------------------------ compare / compressed output
 
     fn cmp_key(&self) -> u64 {
-        hash_parts(&[self.stack.signature(), self.version, self.timing_rev, hash_str(&format!("{:?}", self.gif_opts)), self.stack.plan_signature()])
+        hash_parts(&[self.stack.signature(), self.version, self.timing_rev, hash_str(&format!("{:?}", self.preview_format())), self.stack.plan_signature()])
+    }
+
+    /// The output format the compressed preview shows (shared with Export).
+    fn preview_format(&self) -> Option<io::PreviewFormat> {
+        use io::PreviewFormat as P;
+        Some(match self.export_fmt {
+            ExportFormat::Gif => P::Gif(self.gif_opts.clone()),
+            ExportFormat::Webp => P::Webp(self.webp_opts),
+            ExportFormat::Avif if self.ffmpeg => P::Avif(self.avif_quality),
+            ExportFormat::Apng => P::Apng,
+            ExportFormat::Mp4 if self.ffmpeg => P::Video(VideoFormat::Mp4, self.video_bg),
+            ExportFormat::Webm if self.ffmpeg => P::Video(VideoFormat::WebmAlpha, [0, 0, 0]),
+            _ => return None,
+        })
     }
 
     fn wants_compressed(&self) -> bool {
-        (self.compare && (self.view_left == ViewSource::Compressed || self.view_right == ViewSource::Compressed)) || self.tool == Tool::Optimize
+        let shown = if self.compare { self.view_left == ViewSource::Compressed || self.view_right == ViewSource::Compressed } else { self.view_single == ViewSource::Compressed };
+        self.preview_format().is_some() && (shown || self.tool == Tool::Optimize)
     }
 
     fn manage_compare(&mut self, ctx: &egui::Context, now: f64) {
@@ -1974,7 +1998,7 @@ impl GifForgeApp {
         let base = self.base.clone().unwrap();
         let stack = self.stack.clone();
         let fonts = self.fonts.clone();
-        let opts = self.gif_opts.clone();
+        let Some(pf) = self.preview_format() else { return };
         let (tx, rx) = channel();
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
@@ -1982,9 +2006,8 @@ impl GifForgeApp {
                 let t0 = std::time::Instant::now();
                 let out = stack.flatten(&base, &fonts, None);
                 let t1 = t0.elapsed();
-                let bytes = crate::encode::encode_gif(&out, &opts, None)?;
+                let (anim, bytes) = io::encode_preview(&out, &pf)?;
                 let t2 = t0.elapsed();
-                let anim = io::decode_gif_bytes(&bytes)?;
                 if std::env::var_os("GIFFORGE_PERF").is_some() {
                     eprintln!("compress: flatten {:.1}s encode {:.1}s decode {:.1}s", t1.as_secs_f32(), (t2 - t1).as_secs_f32(), (t0.elapsed() - t2).as_secs_f32());
                 }
@@ -2819,6 +2842,26 @@ impl GifForgeApp {
             }
             return;
         }
+        // the preview already holds the encoded file: save it directly
+        if self.export_fmt != ExportFormat::Gif && self.preview_format().is_some() && !(self.export_fmt == ExportFormat::Apng && self.gif_opts.noai_tag) {
+            if let Some(c) = self.cmp.as_ref().filter(|c| c.key == self.cmp_key()) {
+                let ext = match self.export_fmt {
+                    ExportFormat::Webp => "webp",
+                    ExportFormat::Avif => "avif",
+                    ExportFormat::Apng => "png",
+                    ExportFormat::Mp4 => "mp4",
+                    _ => "webm",
+                };
+                let bytes = c.bytes.clone();
+                if let Some(path) = rfd::FileDialog::new().add_filter(ext, &[ext]).set_file_name(format!("{name}.{ext}")).save_file() {
+                    match std::fs::write(&path, &*bytes) {
+                        Ok(_) => self.info(format!("Saved {} ({})", path.display(), fmt_size(bytes.len() as u64))),
+                        Err(e) => self.error(e.to_string()),
+                    }
+                }
+                return;
+            }
+        }
         match self.export_fmt {
             ExportFormat::Webp => {
                 if let Some(path) = rfd::FileDialog::new().add_filter("WebP", &["webp"]).set_file_name(format!("{name}.webp")).save_file() {
@@ -3241,16 +3284,22 @@ impl GifForgeApp {
         match src {
             ViewSource::Original => self.file_size.map(fmt_size).unwrap_or_default(),
             ViewSource::Edit => String::new(),
-            ViewSource::Compressed => match &self.cmp {
-                Some(c) if c.key == self.cmp_key() => {
-                    let n = c.bytes.len() as u64;
-                    match self.file_size {
-                        Some(o) => format!("{} ({:+.0}%)", fmt_size(n), (n as f64 / o as f64 - 1.0) * 100.0),
-                        None => fmt_size(n),
-                    }
+            ViewSource::Compressed => {
+                let f = self.export_fmt.label();
+                if self.preview_format().is_none() {
+                    return format!("{f} · no preview");
                 }
-                _ => "…".into(),
-            },
+                match &self.cmp {
+                    Some(c) if c.key == self.cmp_key() => {
+                        let n = c.bytes.len() as u64;
+                        match self.file_size {
+                            Some(o) => format!("{f} · {} ({:+.0}%)", fmt_size(n), (n as f64 / o as f64 - 1.0) * 100.0),
+                            None => format!("{f} · {}", fmt_size(n)),
+                        }
+                    }
+                    _ => format!("{f} · …"),
+                }
+            }
         }
     }
 
@@ -3345,7 +3394,13 @@ impl GifForgeApp {
                     // compression pending / running: show the live preview with a warning
                     let tex = self.composite_texture(ctx, self.cur);
                     let size = tex.as_ref().map(|t| t.size_vec2()).unwrap_or(vec2(self.out_size.0, self.out_size.1));
-                    let badge = if encoding { "⚠ Compressing" } else { "⚠ Not compressed yet" };
+                    let badge = if self.preview_format().is_none() {
+                        if self.export_fmt.needs_ffmpeg() && !self.ffmpeg { "⚠ Needs ffmpeg to preview" } else { "Uncompressed output" }
+                    } else if encoding {
+                        "⚠ Compressing"
+                    } else {
+                        "⚠ Not compressed yet"
+                    };
                     let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, None, Some(badge.into()), encoding);
                     if !crop_mode {
                         self.canvas_interaction(ui, &resp, m, (size.x, size.y), Space::Output, vi);
@@ -4135,6 +4190,20 @@ impl GifForgeApp {
 
     fn ui_optimize(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let pal = *p();
+        group(ui, "Format", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                for f in [ExportFormat::Gif, ExportFormat::Webp, ExportFormat::Avif, ExportFormat::Apng, ExportFormat::Mp4, ExportFormat::Webm] {
+                    let en = !f.needs_ffmpeg() || self.ffmpeg;
+                    let r = ui.add_enabled(en, egui::Button::new(f.label()).selected(self.export_fmt == f));
+                    let r = if en { r.on_hover_text(f.tip()) } else { r.on_disabled_hover_text("Needs ffmpeg on PATH") };
+                    if r.clicked() {
+                        self.export_fmt = f;
+                    }
+                }
+            });
+            hint(ui, "Preview and Export use this format");
+        });
         let cur_key = self.cmp_key();
         let busy = self.cmp_job.is_some();
         group(ui, "Result", |ui| match &self.cmp {
@@ -4166,7 +4235,7 @@ impl GifForgeApp {
                 ui.add(egui::DragValue::new(&mut self.target_val).range(0.01..=10000.0).speed(0.1).max_decimals(2));
                 ui.selectable_value(&mut self.target_mb, true, "MiB");
                 ui.selectable_value(&mut self.target_mb, false, "KiB");
-                find = ui.add_enabled(idle, egui::Button::new("Find settings")).on_hover_text("Search for the best quality that fits and apply it. Lowers quality first, then size.").clicked();
+                find = ui.add_enabled(idle && self.export_fmt.can_target(), egui::Button::new("Find settings")).on_hover_text("Search for the best quality that fits and apply it. Lowers quality first, then size.").clicked();
             });
             ui.horizontal_wrapped(|ui| {
                 for (lbl, v, mb) in TARGET_PRESETS {
@@ -4179,15 +4248,60 @@ impl GifForgeApp {
         });
         if find {
             let max = self.target_bytes();
-            let base_opts = self.gif_opts.clone();
+            let tf = match self.export_fmt {
+                ExportFormat::Webp => crate::target::TargetFormat::Webp(self.webp_opts),
+                ExportFormat::Avif => crate::target::TargetFormat::Avif(self.avif_quality),
+                _ => crate::target::TargetFormat::Gif(self.gif_opts.clone()),
+            };
             if let Some(base) = self.base.clone() {
                 let stack = self.stack.clone();
                 let fonts = self.fonts.clone();
                 let total = self.plan.len();
                 self.spawn(ctx, &format!("Finding settings under {}", fmt_size(max)), total, move |p| {
                     let out = stack.flatten(&base, &fonts, Some(p));
-                    JobOutput::Fit(crate::target::fit(&out, &crate::target::TargetFormat::Gif(base_opts), max, p).map(|f| (f.gif.unwrap_or_default(), f.scale, f.bytes.len() as u64, f.reached, f.settings)))
+                    JobOutput::Fit(crate::target::fit(&out, &tf, max, p))
                 });
+            }
+        }
+        match self.export_fmt {
+            ExportFormat::Gif => {}
+            ExportFormat::Webp => {
+                let o = &mut self.webp_opts;
+                group(ui, "WebP", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut o.lossless, false, "Lossy");
+                        ui.selectable_value(&mut o.lossless, true, "Lossless");
+                    });
+                    if !o.lossless {
+                        ui.add(egui::Slider::new(&mut o.quality, 0.0..=100.0).text("quality")).on_hover_text("75–90 looks like the original for most GIFs");
+                    }
+                    ui.add(egui::Slider::new(&mut o.method, 0..=6).text("effort")).on_hover_text("Higher = smaller file, slower");
+                });
+                return;
+            }
+            ExportFormat::Avif => {
+                group(ui, "AVIF", |ui| {
+                    ui.add(egui::Slider::new(&mut self.avif_quality, 0..=100).text("quality")).on_hover_text("50–70 is a good balance");
+                    hint(ui, "Slow to encode – the preview takes a while");
+                });
+                return;
+            }
+            ExportFormat::Mp4 => {
+                group(ui, "MP4", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Background");
+                        ui.color_edit_button_srgb(&mut self.video_bg).on_hover_text("MP4 has no transparency; this fills it");
+                    });
+                });
+                return;
+            }
+            ExportFormat::Apng => {
+                hint(ui, "APNG is lossless – no settings");
+                return;
+            }
+            _ => {
+                hint(ui, "No compression settings for this format");
+                return;
             }
         }
         group(ui, "Presets", |ui| {

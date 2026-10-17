@@ -7,6 +7,7 @@ use image::{AnimationDecoder, RgbaImage};
 use std::fs::File;
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 fn delay_to_cs(d: image::Delay) -> u16 {
     let (n, dnm) = d.numer_denom_ms();
@@ -79,6 +80,17 @@ fn probe_fps(path: &Path) -> Option<f64> {
 /// GIF delays can represent exactly (50, 33.3, 25, 20 ... fps); large videos are
 /// scaled down to [`VIDEO_MAX_SIDE`].
 pub fn load_video(path: &Path) -> Result<Animation> {
+    load_video_opts(path, Some(VIDEO_MAX_SIDE), None)
+}
+
+/// [`load_video`] with an optional size cap and an exact output size to crop
+/// to (used to decode our own previews, which ffmpeg pads to even sizes).
+pub fn load_video_opts(path: &Path, max_side: Option<u32>, crop_to: Option<(u32, u32)>) -> Result<Animation> {
+    load_video_dec(path, max_side, crop_to, None)
+}
+
+/// `decoder` forces an ffmpeg decoder (e.g. libvpx-vp9, which keeps WebM alpha).
+fn load_video_dec(path: &Path, max_side: Option<u32>, crop_to: Option<(u32, u32)>, decoder: Option<&str>) -> Result<Animation> {
     anyhow::ensure!(ffmpeg_available(), "Opening videos needs ffmpeg installed and on PATH");
     let src_fps = probe_fps(path).unwrap_or(25.0);
     // GIF delays are whole 1/100 s: pick the fastest exact rate not above the source
@@ -88,12 +100,24 @@ pub fn load_video(path: &Path) -> Result<Animation> {
     let tmp = std::env::temp_dir().join(format!("gifforge_vid_{}_{}", std::process::id(), RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
-    let m = VIDEO_MAX_SIDE;
-    let vf = format!("fps={fps},scale='if(gt(iw,ih),min({m},iw),-2)':'if(gt(iw,ih),-2,min({m},ih))':flags=lanczos,format=rgba");
-    let out = std::process::Command::new("ffmpeg")
-        .args(["-v", "error", "-y", "-i"])
+    let mut vf = format!("fps={fps}");
+    if let Some(m) = max_side {
+        vf.push_str(&format!(",scale='if(gt(iw,ih),min({m},iw),-2)':'if(gt(iw,ih),-2,min({m},ih))':flags=lanczos"));
+    }
+    if let Some((w, h)) = crop_to {
+        vf.push_str(&format!(",crop={w}:{h}:0:0"));
+    }
+    vf.push_str(",format=rgba");
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.args(["-v", "error", "-y"]);
+    if let Some(d) = decoder {
+        cmd.args(["-c:v", d]);
+    }
+    let out = cmd
+        .arg("-i")
         .arg(path)
-        .args(["-an", "-vf", &vf, "-frames:v", &VIDEO_MAX_FRAMES.to_string()])
+        .args(["-an", "-vf", &vf])
+        .args(if max_side.is_some() { vec!["-frames:v".to_string(), VIDEO_MAX_FRAMES.to_string()] } else { vec![] })
         .arg(tmp.join("f%06d.png"))
         .output()
         .context("Failed to run ffmpeg")?;
@@ -452,6 +476,79 @@ pub fn encode_webp(anim: &Animation, o: &WebpOptions) -> Result<Vec<u8>> {
     }
     let data = enc.finalize(t).map_err(|e| anyhow::anyhow!("WebP: {e:?}"))?;
     Ok(data.to_vec())
+}
+
+/// What the "compressed" preview should encode to.
+#[derive(Clone, Debug)]
+pub enum PreviewFormat {
+    Gif(GifOptions),
+    Webp(WebpOptions),
+    Avif(u8),
+    /// lossless: the preview is the input itself, only the size is measured
+    Apng,
+    Video(VideoFormat, [u8; 3]),
+}
+
+/// Encode `anim` like the real export would, then decode the result so the
+/// preview shows exactly what the file will look like. Returns (decoded, bytes).
+pub fn encode_preview(anim: &Animation, f: &PreviewFormat) -> Result<(Animation, Vec<u8>)> {
+    let (w, h) = (anim.width(), anim.height());
+    match f {
+        PreviewFormat::Gif(o) => {
+            let b = encode_gif(anim, o, None)?;
+            Ok((decode_gif_bytes(&b)?, b))
+        }
+        PreviewFormat::Webp(o) => {
+            let b = encode_webp(anim, o)?;
+            Ok((load_animation_bytes(&b)?, b))
+        }
+        PreviewFormat::Apng => {
+            let b = encode_apng(anim, false)?;
+            let mut a = anim.clone();
+            a.frames.retain(|f| f.enabled);
+            Ok((a, b))
+        }
+        PreviewFormat::Avif(q) => {
+            let b = encode_avif(anim, *q)?;
+            let mut dec = decode_video_bytes(&b, "avif", (w, h))?;
+            // ffmpeg can't decode AVIF's alpha layer; it's stored near-losslessly,
+            // so show the source's transparency
+            if anim.frames.iter().any(|f| f.image.pixels().any(|p| p[3] < 255)) {
+                let mut src = anim.clone();
+                src.frames.retain(|f| f.enabled);
+                let mut t = 0.0f32;
+                for f in &mut dec.frames {
+                    let s = &src.frames[crate::stack::frame_at_time(&src, t + 0.001)].image;
+                    let img = Arc::make_mut(&mut f.image);
+                    for (p, q) in img.pixels_mut().zip(s.pixels()) {
+                        p[3] = q[3];
+                    }
+                    t += crate::anim::effective_delay(f.delay_cs) as f32 / 100.0;
+                }
+            }
+            Ok((dec, b))
+        }
+        PreviewFormat::Video(vf, bg) => {
+            static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let ext = if *vf == VideoFormat::Mp4 { "mp4" } else { "webm" };
+            let tmp = std::env::temp_dir().join(format!("gifforge_prev_{}_{}.{ext}", std::process::id(), RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+            export_video(anim, &tmp, *vf, *bg)?;
+            let b = std::fs::read(&tmp)?;
+            let dec = if *vf == VideoFormat::WebmAlpha { Some("libvpx-vp9") } else { None };
+            let a = load_video_dec(&tmp, None, Some((w, h)), dec);
+            let _ = std::fs::remove_file(&tmp);
+            Ok((a?, b))
+        }
+    }
+}
+
+fn decode_video_bytes(b: &[u8], ext: &str, size: (u32, u32)) -> Result<Animation> {
+    static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let tmp = std::env::temp_dir().join(format!("gifforge_dec_{}_{}.{ext}", std::process::id(), RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    std::fs::write(&tmp, b)?;
+    let a = load_video_opts(&tmp, None, Some(size));
+    let _ = std::fs::remove_file(&tmp);
+    a
 }
 
 /// Encode an animated AVIF with ffmpeg; `quality` 0..=100.
