@@ -14,7 +14,7 @@ A GIF editor and optimiser that runs on your own machine. Runs on Linux, Windows
 - Export with arbitrary file size target
 - Presets you can reuse
 
-## How small does it get?
+## Examples 
 
 Same 255-frame GIF with different export settings:
 
@@ -30,7 +30,7 @@ Quality comparison (frame 1, zoomed 2×):
   <img alt="Zoomed crops of the original, lossy GIF, WebP and AVIF" src="docs/img/quality-light.png">
 </picture>
 
-Download
+## Download
 
 Grab a build from [Releases](../../releases), or build it yourself with: 
 
