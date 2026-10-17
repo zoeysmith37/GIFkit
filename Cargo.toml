@@ -1,0 +1,31 @@
+[package]
+name = "gifforge"
+version = "0.1.0"
+edition = "2021"
+description = "Local, cross-platform animated GIF editor / optimiser"
+license = "Apache-2.0"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+image = { version = "0.25", default-features = false, features = ["gif", "png", "jpeg", "webp", "bmp", "rayon"] }
+gif = "0.14"
+png = "0.18"
+color_quant = "1.1"
+ab_glyph = "0.2"
+rayon = "1.10"
+rfd = "0.17"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+anyhow = "1"
+fontdb = "0.23"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+
+[profile.dev]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 3
