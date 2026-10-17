@@ -201,6 +201,8 @@ enum JobOutput {
     Loaded(anyhow::Result<(Animation, Option<PathBuf>, Option<u64>)>),
     Info(anyhow::Result<String>),
     Overlay(anyhow::Result<OverlaySource>),
+    /// target-size search: (settings, frame scale, bytes, reached, description)
+    Fit(anyhow::Result<(GifOptions, f32, u64, bool, String)>),
 }
 
 struct Job {
@@ -541,6 +543,7 @@ pub struct GifForgeApp {
     frames_zip: bool,
     presets_open: bool,
     presets: Vec<crate::presets::Preset>,
+    preset_problems: Vec<String>,
     preset_name: String,
     preset_inc: (bool, bool, bool),
     font_preview_queue: Vec<String>,
@@ -557,6 +560,8 @@ pub struct GifForgeApp {
     pending_sig: u64,
     commit_since: f64,
     last_comp: Option<(usize, TextureHandle)>,
+    last_tick: Option<f64>,
+    resize_by_pct: bool,
 }
 
 fn hash_str(s: &str) -> u64 {
@@ -583,6 +588,20 @@ fn fmt_size(b: u64) -> String {
 
 fn to_color_image(img: &RgbaImage) -> egui::ColorImage {
     egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw())
+}
+
+/// Quick targets, with a little headroom under each service's limit.
+const TARGET_PRESETS: [(&str, f32, bool); 3] = [("Discord 10 MB", 9.5, true), ("X 15 MB", 14.0, true), ("Emote 256 KB", 250.0, false)];
+
+/// Open a folder in the system file manager.
+fn open_in_file_manager(dir: &std::path::Path) {
+    #[cfg(target_os = "windows")]
+    let cmd = "explorer";
+    #[cfg(target_os = "macos")]
+    let cmd = "open";
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let cmd = "xdg-open";
+    let _ = std::process::Command::new(cmd).arg(dir).spawn();
 }
 
 /// History label for a structural edit key like "delay3" or "dup12 4.5".
@@ -957,7 +976,8 @@ impl GifForgeApp {
             frames_zip: false,
             presets_open: false,
             presets: Vec::new(),
-            preset_name: String::new(),
+            preset_problems: Vec::new(),
+            preset_name: std::env::var("GIFFORGE_PRESET_NAME").unwrap_or_default(),
             preset_inc: (true, true, true),
             font_preview_queue: Vec::new(),
             preview_fonts: HashMap::new(),
@@ -965,13 +985,15 @@ impl GifForgeApp {
             webp_opts: io::WebpOptions::default(),
             avif_quality: 60,
             target_on: false,
-            target_val: 8.0,
+            target_val: 9.5,
             target_mb: true,
             history_open: false,
             committed: None,
             commit_since: 0.0,
             pending_sig: 0,
             last_comp: None,
+            last_tick: None,
+            resize_by_pct: true,
         };
         // scan system fonts in the background
         {
@@ -1131,11 +1153,33 @@ impl GifForgeApp {
                 }
             }
             JobOutput::Info(Ok(s)) => self.info(s),
+            JobOutput::Fit(Ok((opts, scale, n, reached, desc))) => {
+                self.gif_opts = opts;
+                if scale < 0.999 {
+                    let t = &mut self.stack.transform;
+                    if t.resize_on && t.rs_pct > 0.0 {
+                        t.rs_pct *= scale;
+                    } else if t.resize_on && (t.rs_w > 0 || t.rs_h > 0) {
+                        t.rs_w = (t.rs_w as f32 * scale).round() as u32;
+                        t.rs_h = (t.rs_h as f32 * scale).round() as u32;
+                    } else {
+                        t.rs_w = 0;
+                        t.rs_h = 0;
+                        t.rs_pct = (scale * 1000.0).round() / 10.0;
+                    }
+                    t.resize_on = true;
+                }
+                if reached {
+                    self.info(format!("Fits: {} with {desc}", fmt_size(n)));
+                } else {
+                    self.error(format!("Can't reach the target – smallest is {} ({desc})", fmt_size(n)));
+                }
+            }
             JobOutput::Overlay(Ok(src)) => {
                 self.add_overlay(src);
                 self.info("Overlay added – drag it on the preview to position it");
             }
-            JobOutput::Anim(Err(e)) | JobOutput::Baked(Err(e)) | JobOutput::Loaded(Err(e)) | JobOutput::Info(Err(e)) | JobOutput::Overlay(Err(e)) => self.error(format!("{label} failed: {e:#}")),
+            JobOutput::Anim(Err(e)) | JobOutput::Baked(Err(e)) | JobOutput::Loaded(Err(e)) | JobOutput::Info(Err(e)) | JobOutput::Overlay(Err(e)) | JobOutput::Fit(Err(e)) => self.error(format!("{label} failed: {e:#}")),
         }
     }
 
@@ -1218,6 +1262,11 @@ impl GifForgeApp {
             self.after_base_change(false);
             self.info(format!("Redo: {label}"));
         }
+    }
+
+    /// Target size in bytes (binary units, matching how sizes are shown).
+    fn target_bytes(&self) -> u64 {
+        (self.target_val as f64 * if self.target_mb { 1_048_576.0 } else { 1024.0 }) as u64
     }
 
     fn live_sig(&self) -> u64 {
@@ -1418,7 +1467,7 @@ impl GifForgeApp {
 
     fn open_dialog(&mut self, ctx: &egui::Context) {
         if let Some(p) = rfd::FileDialog::new()
-            .add_filter("Animations & images", &["gif", "png", "apng", "webp", "jpg", "jpeg", "bmp"])
+            .add_filter("Animations, images & videos", &["gif", "png", "apng", "webp", "jpg", "jpeg", "bmp", "mp4", "m4v", "mov", "webm", "mkv", "avi", "wmv", "flv", "mpg", "mpeg", "ts", "ogv", "3gp"])
             .add_filter("All files", &["*"])
             .pick_file()
         {
@@ -1434,8 +1483,10 @@ impl GifForgeApp {
     }
 
     fn open_path(&mut self, p: PathBuf, ctx: &egui::Context) {
-        self.spawn(ctx, "Open", 1, move |_| {
-            let size = std::fs::metadata(&p).ok().map(|m| m.len());
+        let label = if io::is_video(&p) { "Importing video" } else { "Open" };
+        self.spawn(ctx, label, 1, move |_| {
+            // a video's size says nothing about GIF sizes, so don't compare against it
+            let size = if io::is_video(&p) { None } else { std::fs::metadata(&p).ok().map(|m| m.len()) };
             JobOutput::Loaded(io::load_animation(&p).map(|a| (a, Some(p.clone()), size)))
         });
     }
@@ -1649,9 +1700,18 @@ impl GifForgeApp {
 
     fn advance(&mut self, ctx: &egui::Context) {
         if !self.playing || self.plan.is_empty() || !self.plan.iter().any(|f| f.enabled) {
+            self.last_tick = None;
             return;
         }
-        let dt = ctx.input(|i| i.stable_dt).min(0.25) as f64;
+        // Real elapsed time. egui's stable_dt falls back to a fixed 1/60 s
+        // guess after delayed (non-immediate) repaints, which made playback
+        // crawl whenever the mouse was idle.
+        let now = ctx.input(|i| i.time);
+        let dt = match self.last_tick {
+            Some(t) => (now - t).clamp(0.0, 0.25),
+            None => 0.0,
+        };
+        self.last_tick = Some(now);
         self.elapsed += dt;
         let n = self.plan.len();
         if !self.plan[self.cur].enabled {
@@ -2107,7 +2167,7 @@ impl GifForgeApp {
             if pr.on_hover_text("Save and re-use edits").clicked() {
                 self.presets_open = !self.presets_open;
                 if self.presets_open {
-                    self.presets = crate::presets::list();
+                    { let (l, pr) = crate::presets::list_with_problems(); self.presets = l; self.preset_problems = pr; }
                 }
             }
 
@@ -2510,7 +2570,7 @@ impl GifForgeApp {
         let c = inner.center();
         ui.painter().text(c - vec2(0.0, 40.0), egui::Align2::CENTER_CENTER, "▤", egui::FontId::proportional(56.0), pal.fg_muted);
         ui.painter().text(c + vec2(0.0, 18.0), egui::Align2::CENTER_CENTER, "Drop a GIF here or click to open", theme::medium(19.0), pal.fg);
-        ui.painter().text(c + vec2(0.0, 46.0), egui::Align2::CENTER_CENTER, "GIF · APNG · WebP · image sequences", egui::FontId::proportional(13.5), pal.fg_muted);
+        ui.painter().text(c + vec2(0.0, 46.0), egui::Align2::CENTER_CENTER, if self.ffmpeg { "GIF · APNG · WebP · videos · image sequences" } else { "GIF · APNG · WebP · image sequences" }, egui::FontId::proportional(13.5), pal.fg_muted);
         if resp.clicked() && !self.busy() {
             self.open_dialog(ctx);
         }
@@ -2707,13 +2767,13 @@ impl GifForgeApp {
                         ui.checkbox(&mut self.target_on, "Fit under").on_hover_text("Finds the best quality that fits. Lowers quality first, then size.");
                         ui.add_enabled_ui(self.target_on, |ui| {
                             ui.add(egui::DragValue::new(&mut self.target_val).range(0.01..=10000.0).speed(0.1).max_decimals(2));
-                            ui.selectable_value(&mut self.target_mb, true, "MB");
-                            ui.selectable_value(&mut self.target_mb, false, "KB");
+                            ui.selectable_value(&mut self.target_mb, true, "MiB");
+                            ui.selectable_value(&mut self.target_mb, false, "KiB");
                         });
                     });
                     if self.target_on {
                         ui.horizontal_wrapped(|ui| {
-                            for (lbl, v, mb) in [("Discord 10 MB", 10.0, true), ("Slack 5 MB", 5.0, true), ("Emote 256 KB", 256.0, false)] {
+                            for (lbl, v, mb) in TARGET_PRESETS {
                                 if ui.small_button(lbl).clicked() {
                                     self.target_val = v;
                                     self.target_mb = mb;
@@ -2744,7 +2804,7 @@ impl GifForgeApp {
                 ExportFormat::Webp => ("webp", crate::target::TargetFormat::Webp(self.webp_opts)),
                 _ => ("avif", crate::target::TargetFormat::Avif(self.avif_quality)),
             };
-            let max = (self.target_val as f64 * if self.target_mb { 1_000_000.0 } else { 1000.0 }) as u64;
+            let max = self.target_bytes();
             if let Some(path) = rfd::FileDialog::new().add_filter(ext, &[ext]).set_file_name(format!("{name}.{ext}")).save_file() {
                 self.run_export(ctx, &format!("Fitting under {}", fmt_size(max)), move |a, p| {
                     let fit = crate::target::fit(a, &fmt, max, p)?;
@@ -2843,10 +2903,21 @@ impl GifForgeApp {
                     ui.checkbox(&mut self.preset_inc.1, "Layers");
                     ui.checkbox(&mut self.preset_inc.2, "Compression");
                 });
+                ui.horizontal(|ui| {
+                    if let Some(dir) = crate::presets::folder() {
+                        if ui.small_button("Open folder").on_hover_text(dir.display().to_string()).clicked() {
+                            let _ = std::fs::create_dir_all(&dir);
+                            open_in_file_manager(&dir);
+                        }
+                    }
+                });
                 ui.add_space(6.0);
                 ui.separator();
                 if self.presets.is_empty() {
                     hint(ui, "No presets yet");
+                }
+                if !self.preset_problems.is_empty() {
+                    ui.label(RichText::new(format!("⚠ {} problem(s) reading presets", self.preset_problems.len())).color(pal.neutral).size(12.0)).on_hover_text(self.preset_problems.join("\n"));
                 }
                 egui::ScrollArea::vertical().max_height(260.0).auto_shrink([false, true]).show(ui, |ui| {
                     for pr in &self.presets {
@@ -2880,11 +2951,11 @@ impl GifForgeApp {
                 }
                 Err(e) => self.error(format!("Could not save preset: {e:#}")),
             }
-            self.presets = crate::presets::list();
+            { let (l, pr) = crate::presets::list_with_problems(); self.presets = l; self.preset_problems = pr; }
         }
         if let Some(name) = delete {
             crate::presets::delete(&name);
-            self.presets = crate::presets::list();
+            { let (l, pr) = crate::presets::list_with_problems(); self.presets = l; self.preset_problems = pr; }
         }
         if let Some(pr) = apply {
             self.apply_preset(&pr, ctx);
@@ -3761,30 +3832,65 @@ impl GifForgeApp {
         let tr = &mut self.stack.transform;
         let (w, h) = if tr.crop_on && tr.crop[2] > 0 { (tr.crop[2], tr.crop[3]) } else { (bw, bh) };
         let before = (tr.rs_w, tr.rs_h, tr.rs_pct.to_bits(), tr.rs_mode, tr.rs_filter);
+        // follow the stored settings (undo, presets)
+        if tr.rs_pct == 0.0 && (tr.rs_w > 0 || tr.rs_h > 0) {
+            self.resize_by_pct = false;
+        } else if tr.rs_pct > 0.0 {
+            self.resize_by_pct = true;
+        }
+        let by_pct = &mut self.resize_by_pct;
         group(ui, "Size", |ui| {
-            egui::Grid::new("rs").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                ui.label("Width");
-                ui.add(egui::DragValue::new(&mut tr.rs_w).range(0..=16384).suffix(" px")).on_hover_text("0 = keep aspect");
-                ui.end_row();
-                ui.label("Height");
-                ui.add(egui::DragValue::new(&mut tr.rs_h).range(0..=16384).suffix(" px")).on_hover_text("0 = keep aspect");
-                ui.end_row();
-                ui.label("Scale");
-                ui.add(egui::DragValue::new(&mut tr.rs_pct).range(0.0..=6400.0).suffix(" %")).on_hover_text("Overrides width / height when set");
-                ui.end_row();
-            });
             ui.horizontal(|ui| {
-                for pc in [25.0, 50.0, 200.0, 400.0] {
-                    if ui.small_button(format!("{pc:.0}%")).clicked() {
-                        tr.rs_pct = pc;
+                if ui.selectable_label(!*by_pct, "Pixels").clicked() && *by_pct {
+                    *by_pct = false;
+                    if tr.rs_pct > 0.0 {
+                        // keep the current size when switching
+                        if let Some((tw, th)) = stack::resize_target(w, h, 0, 0, tr.rs_pct) {
+                            tr.rs_w = tw;
+                            tr.rs_h = th;
+                        }
+                        tr.rs_pct = 0.0;
                     }
                 }
+                if ui.selectable_label(*by_pct, "Percent").clicked() && !*by_pct {
+                    *by_pct = true;
+                    let cur = match stack::resize_target(w, h, tr.rs_w, tr.rs_h, 0.0) {
+                        Some((tw, _)) => tw as f32 / w.max(1) as f32 * 100.0,
+                        None => 100.0,
+                    };
+                    tr.rs_pct = (cur * 10.0).round() / 10.0;
+                }
+            });
+            ui.add_space(2.0);
+            if *by_pct {
+                let mut pct = if tr.rs_pct > 0.0 { tr.rs_pct } else { 100.0 };
+                let r1 = ui.add(egui::Slider::new(&mut pct, 1.0..=400.0).suffix(" %").max_decimals(1).clamping(egui::SliderClamping::Never).logarithmic(true))
+                    .on_hover_text("Drag, or type any value (e.g. 37.5 or 1200)");
+                if r1.changed() {
+                    tr.rs_pct = pct.clamp(0.1, 6400.0);
+                }
+                ui.horizontal_wrapped(|ui| {
+                    for pc in [10.0, 25.0, 33.3, 50.0, 75.0, 150.0, 200.0, 400.0] {
+                        if ui.small_button(format!("{pc}%")).clicked() {
+                            tr.rs_pct = pc;
+                        }
+                    }
+                });
+            } else {
+                tr.rs_pct = 0.0;
+                egui::Grid::new("rs").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                    ui.label("Width");
+                    ui.add(egui::DragValue::new(&mut tr.rs_w).range(0..=16384).suffix(" px")).on_hover_text("0 = keep aspect");
+                    ui.end_row();
+                    ui.label("Height");
+                    ui.add(egui::DragValue::new(&mut tr.rs_h).range(0..=16384).suffix(" px")).on_hover_text("0 = keep aspect");
+                    ui.end_row();
+                });
                 if ui.small_button("Clear").clicked() {
-                    tr.rs_pct = 0.0;
                     tr.rs_w = 0;
                     tr.rs_h = 0;
                 }
-            });
+            }
             match stack::resize_target(w, h, tr.rs_w, tr.rs_h, tr.rs_pct) {
                 Some((tw, th)) => hint(ui, &format!("{w}×{h} → {tw}×{th}")),
                 None => hint(ui, &format!("{w}×{h}")),
@@ -4052,6 +4158,38 @@ impl GifForgeApp {
                 });
             }
         });
+        let mut find = false;
+        let idle = !self.busy();
+        group(ui, "Target size", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Under");
+                ui.add(egui::DragValue::new(&mut self.target_val).range(0.01..=10000.0).speed(0.1).max_decimals(2));
+                ui.selectable_value(&mut self.target_mb, true, "MiB");
+                ui.selectable_value(&mut self.target_mb, false, "KiB");
+                find = ui.add_enabled(idle, egui::Button::new("Find settings")).on_hover_text("Search for the best quality that fits and apply it. Lowers quality first, then size.").clicked();
+            });
+            ui.horizontal_wrapped(|ui| {
+                for (lbl, v, mb) in TARGET_PRESETS {
+                    if ui.small_button(lbl).clicked() {
+                        self.target_val = v;
+                        self.target_mb = mb;
+                    }
+                }
+            });
+        });
+        if find {
+            let max = self.target_bytes();
+            let base_opts = self.gif_opts.clone();
+            if let Some(base) = self.base.clone() {
+                let stack = self.stack.clone();
+                let fonts = self.fonts.clone();
+                let total = self.plan.len();
+                self.spawn(ctx, &format!("Finding settings under {}", fmt_size(max)), total, move |p| {
+                    let out = stack.flatten(&base, &fonts, Some(p));
+                    JobOutput::Fit(crate::target::fit(&out, &crate::target::TargetFormat::Gif(base_opts), max, p).map(|f| (f.gif.unwrap_or_default(), f.scale, f.bytes.len() as u64, f.reached, f.settings)))
+                });
+            }
+        }
         group(ui, "Presets", |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Best").clicked() {

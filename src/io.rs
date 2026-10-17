@@ -39,8 +39,75 @@ fn read_gif_loop(bytes: &[u8]) -> Option<u16> {
 
 /// Load any supported file: animated GIF / APNG / WebP, or a still image (1 frame).
 pub fn load_animation(path: &Path) -> Result<Animation> {
+    if is_video(path) {
+        return load_video(path);
+    }
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     load_animation_bytes(&bytes)
+}
+
+/// Video file extensions opened through ffmpeg.
+pub const VIDEO_EXTS: &[&str] = &["mp4", "m4v", "mov", "webm", "mkv", "avi", "wmv", "flv", "mpg", "mpeg", "ts", "ogv", "3gp"];
+
+pub fn is_video(path: &Path) -> bool {
+    path.extension().map(|e| VIDEO_EXTS.contains(&e.to_string_lossy().to_lowercase().as_str())).unwrap_or(false)
+}
+
+/// Longest side and frame cap used when importing video (GIFs of full-HD
+/// video need gigabytes of memory and make huge files).
+pub const VIDEO_MAX_SIDE: u32 = 640;
+pub const VIDEO_MAX_FRAMES: usize = 1500;
+
+/// Source frame rate via ffprobe, if available.
+fn probe_fps(path: &Path) -> Option<f64> {
+    let out = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=avg_frame_rate,r_frame_rate", "-of", "default=nw=1:nk=1"])
+        .arg(path)
+        .output()
+        .ok()?;
+    let txt = String::from_utf8_lossy(&out.stdout);
+    txt.lines()
+        .filter_map(|l| {
+            let (a, b) = l.trim().split_once('/')?;
+            let (a, b): (f64, f64) = (a.parse().ok()?, b.parse().ok()?);
+            (b > 0.0 && a > 0.0).then(|| a / b)
+        })
+        .find(|f| *f > 0.5 && *f < 1000.0)
+}
+
+/// Import a video as frames (needs ffmpeg). Frame rate is snapped to a rate
+/// GIF delays can represent exactly (50, 33.3, 25, 20 ... fps); large videos are
+/// scaled down to [`VIDEO_MAX_SIDE`].
+pub fn load_video(path: &Path) -> Result<Animation> {
+    anyhow::ensure!(ffmpeg_available(), "Opening videos needs ffmpeg installed and on PATH");
+    let src_fps = probe_fps(path).unwrap_or(25.0);
+    // GIF delays are whole 1/100 s: pick the fastest exact rate not above the source
+    let delay_cs = [2u16, 3, 4, 5, 6, 8, 10].into_iter().find(|d| 100.0 / *d as f64 <= src_fps + 0.01).unwrap_or(10);
+    let fps = 100.0 / delay_cs as f64;
+    static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let tmp = std::env::temp_dir().join(format!("gifforge_vid_{}_{}", std::process::id(), RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp)?;
+    let m = VIDEO_MAX_SIDE;
+    let vf = format!("fps={fps},scale='if(gt(iw,ih),min({m},iw),-2)':'if(gt(iw,ih),-2,min({m},ih))':flags=lanczos,format=rgba");
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-i"])
+        .arg(path)
+        .args(["-an", "-vf", &vf, "-frames:v", &VIDEO_MAX_FRAMES.to_string()])
+        .arg(tmp.join("f%06d.png"))
+        .output()
+        .context("Failed to run ffmpeg")?;
+    if !out.status.success() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        bail!("ffmpeg could not read the video: {}", String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or(""));
+    }
+    let mut names: Vec<PathBuf> = std::fs::read_dir(&tmp)?.flatten().map(|e| e.path()).filter(|p| p.extension().map(|e| e == "png").unwrap_or(false)).collect();
+    names.sort();
+    use rayon::prelude::*;
+    let frames: Vec<Frame> = names.par_iter().map(|p| image::open(p).map(|i| Frame::new(i.to_rgba8(), delay_cs))).collect::<std::result::Result<_, _>>()?;
+    let _ = std::fs::remove_dir_all(&tmp);
+    anyhow::ensure!(!frames.is_empty(), "The video has no frames");
+    Ok(Animation { frames, loop_count: None })
 }
 
 pub fn load_animation_bytes(bytes: &[u8]) -> Result<Animation> {

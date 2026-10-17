@@ -47,21 +47,30 @@ fn ladder(fmt: &TargetFormat) -> Vec<Rung> {
     let mut v = Vec::new();
     match fmt {
         TargetFormat::Gif(base) => {
+            // Order is "how bad it looks": moderate lossy first, then smaller
+            // frames (looks far better than heavy lossy, especially on video),
+            // and only at the smallest sizes heavier lossy / fewer colours.
+            const SOFT: u16 = 80;
             v.push(Rung::Gif(base.clone(), 1.0));
-            for l in [20u16, 40, 60, 80, 100, 130, 160, 200] {
+            for l in [20u16, 40, 60, SOFT] {
                 if l > base.lossy {
                     v.push(Rung::Gif(GifOptions { lossy: l, ..base.clone() }, 1.0));
                 }
             }
-            let top = base.lossy.max(200);
-            for c in [192u16, 128, 96, 64, 48, 32] {
-                if c < base.colors {
-                    v.push(Rung::Gif(GifOptions { lossy: top, colors: c, ..base.clone() }, 1.0));
+            let soft = base.lossy.max(SOFT);
+            for s in SCALES {
+                v.push(Rung::Gif(GifOptions { lossy: soft, ..base.clone() }, s));
+            }
+            let last = *SCALES.last().unwrap();
+            for l in [120u16, 160, 200] {
+                if l > soft {
+                    v.push(Rung::Gif(GifOptions { lossy: l, ..base.clone() }, last));
                 }
             }
-            // smaller frames look better than very few colours
-            for s in SCALES {
-                v.push(Rung::Gif(GifOptions { lossy: base.lossy.max(80), colors: base.colors.min(256), ..base.clone() }, s));
+            for c in [128u16, 64, 32] {
+                if c < base.colors {
+                    v.push(Rung::Gif(GifOptions { lossy: soft.max(200), colors: c, ..base.clone() }, last));
+                }
             }
         }
         TargetFormat::Webp(base) => {
@@ -115,6 +124,18 @@ pub struct Fit {
     pub bytes: Vec<u8>,
     pub settings: String,
     pub reached: bool,
+    /// GIF settings and frame scale that produced it (GIF targets only)
+    pub gif: Option<GifOptions>,
+    pub scale: f32,
+}
+
+fn make_fit(rungs: &[Rung], i: usize, bytes: Vec<u8>, reached: bool) -> Fit {
+    let r = &rungs[i];
+    let gif = match r {
+        Rung::Gif(o, _) => Some(o.clone()),
+        _ => None,
+    };
+    Fit { bytes, settings: r.describe(), reached, gif, scale: r.scale() }
 }
 
 /// Find the highest-quality settings whose output is at most `max_bytes`.
@@ -143,12 +164,12 @@ pub fn fit(anim: &Animation, fmt: &TargetFormat, max_bytes: u64, trials: &Atomic
     let max = max_bytes as usize;
     if eval(0)? <= max {
         let b = results.remove(&0).unwrap();
-        return Ok(Fit { bytes: b, settings: rungs[0].describe(), reached: true });
+        return Ok(make_fit(&rungs, 0, b, true));
     }
     let last = rungs.len() - 1;
     if eval(last)? > max {
         let b = results.remove(&last).unwrap();
-        return Ok(Fit { bytes: b, settings: rungs[last].describe(), reached: false });
+        return Ok(make_fit(&rungs, last, b, false));
     }
     // invariant: lo too big, hi fits
     let (mut lo, mut hi) = (0usize, last);
@@ -161,5 +182,5 @@ pub fn fit(anim: &Animation, fmt: &TargetFormat, max_bytes: u64, trials: &Atomic
         }
     }
     let b = results.remove(&hi).unwrap();
-    Ok(Fit { bytes: b, settings: rungs[hi].describe(), reached: true })
+    Ok(make_fit(&rungs, hi, b, true))
 }

@@ -707,3 +707,33 @@ fn readme_encodes() {
     run("webp_q80.webp", &|| io::encode_webp(&a, &io::WebpOptions { lossless: false, quality: 80.0, method: 4 }).unwrap());
     run("avif_q60.avif", &|| io::encode_avif(&a, 60).unwrap());
 }
+
+#[test]
+#[ignore]
+fn parse_preset_file() {
+    let p = std::env::var("PRESET").unwrap();
+    let s = std::fs::read_to_string(p).unwrap();
+    let r: Result<crate::presets::Preset, _> = serde_json::from_str(&s);
+    if let Err(e) = &r {
+        panic!("parse error: {e}");
+    }
+}
+
+#[test]
+fn video_import_if_ffmpeg() {
+    if !io::ffmpeg_available() {
+        return;
+    }
+    // export a short clip, then import it again
+    let a = synth(false);
+    let dir = std::env::temp_dir().join(format!("gf_vid_test_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("clip.mp4");
+    io::export_video(&a, &p, io::VideoFormat::Mp4, [0, 0, 0]).unwrap();
+    let b = io::load_animation(&p).unwrap();
+    assert!(b.len() >= 8, "{} frames", b.len());
+    assert_eq!((b.width(), b.height()), (96, 64));
+    let dur = b.duration_secs();
+    assert!((dur - a.duration_secs()).abs() < 0.25, "{dur} vs {}", a.duration_secs());
+    let _ = std::fs::remove_dir_all(&dir);
+}

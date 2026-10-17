@@ -56,23 +56,95 @@ fn file_name(name: &str) -> String {
     format!("{}.json", safe.trim())
 }
 
-pub fn list() -> Vec<Preset> {
-    let Some(d) = dir() else { return Vec::new() };
-    let mut out: Vec<Preset> = std::fs::read_dir(d)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.path().extension().map(|x| x == "json").unwrap_or(false))
-        .filter_map(|e| serde_json::from_str::<Preset>(&std::fs::read_to_string(e.path()).ok()?).ok())
-        .collect();
+/// Folder presets are stored in.
+pub fn folder() -> Option<PathBuf> {
+    dir()
+}
+
+/// All saved presets, plus a note for each file (or part of one) that could
+/// not be read. Parsing is lenient: an unreadable layer or section is skipped
+/// rather than hiding the whole preset.
+pub fn list_with_problems() -> (Vec<Preset>, Vec<String>) {
+    let mut out = Vec::new();
+    let mut problems = Vec::new();
+    let Some(d) = dir() else { return (out, vec!["No config folder (HOME / APPDATA not set)".into()]) };
+    let Ok(rd) = std::fs::read_dir(&d) else { return (out, problems) };
+    for e in rd.flatten() {
+        let path = e.path();
+        if path.extension().map(|x| x != "json").unwrap_or(true) {
+            continue;
+        }
+        let fname = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(err) => {
+                problems.push(format!("{fname}: {err}"));
+                continue;
+            }
+        };
+        match parse_lenient(&text) {
+            Ok((mut p, skipped)) => {
+                if p.name.trim().is_empty() {
+                    p.name = fname.trim_end_matches(".json").to_string();
+                }
+                for s in skipped {
+                    problems.push(format!("{}: skipped {s}", p.name));
+                }
+                out.push(p);
+            }
+            Err(err) => problems.push(format!("{fname}: {err}")),
+        }
+    }
     out.sort_by_key(|p| p.name.to_lowercase());
-    out
+    (out, problems)
+}
+
+fn parse_lenient(text: &str) -> anyhow::Result<(Preset, Vec<String>)> {
+    use serde_json::Value;
+    let v: Value = serde_json::from_str(text)?;
+    let obj = v.as_object().ok_or_else(|| anyhow::anyhow!("not a preset"))?;
+    let mut skipped = Vec::new();
+    let mut p = Preset { name: obj.get("name").and_then(|x| x.as_str()).unwrap_or_default().to_string(), ..Default::default() };
+    if let Some(x) = obj.get("src_size") {
+        p.src_size = serde_json::from_value(x.clone()).unwrap_or_default();
+    }
+    if let Some(x) = obj.get("transform").filter(|x| !x.is_null()) {
+        match serde_json::from_value(x.clone()) {
+            Ok(t) => p.transform = Some(t),
+            Err(e) => skipped.push(format!("frame edits ({e})")),
+        }
+    }
+    if let Some(x) = obj.get("gif").filter(|x| !x.is_null()) {
+        match serde_json::from_value(x.clone()) {
+            Ok(g) => p.gif = Some(g),
+            Err(e) => skipped.push(format!("compression ({e})")),
+        }
+    }
+    if let Some(Value::Array(ls)) = obj.get("layers") {
+        let mut layers = Vec::new();
+        for (i, l) in ls.iter().enumerate() {
+            match serde_json::from_value::<PresetLayer>(l.clone()) {
+                Ok(l) => layers.push(l),
+                Err(e) => skipped.push(format!("layer {} ({e})", i + 1)),
+            }
+        }
+        p.layers = Some(layers);
+    }
+    Ok((p, skipped))
 }
 
 pub fn save(p: &Preset) -> anyhow::Result<()> {
     let d = dir().ok_or_else(|| anyhow::anyhow!("no config directory"))?;
     std::fs::create_dir_all(&d)?;
-    std::fs::write(d.join(file_name(&p.name)), serde_json::to_string_pretty(p)?)?;
+    let path = d.join(file_name(&p.name));
+    let text = serde_json::to_string_pretty(p)?;
+    // write-then-rename so a crash never leaves a half-written preset
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &text)?;
+    std::fs::rename(&tmp, &path)?;
+    // read it back, so a preset that can't be loaded is reported now, not next session
+    let (_, skipped) = parse_lenient(&text)?;
+    anyhow::ensure!(skipped.is_empty(), "saved, but parts can't be read back: {}", skipped.join("; "));
     Ok(())
 }
 
