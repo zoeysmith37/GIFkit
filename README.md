@@ -17,10 +17,11 @@ It covers the same toolset as the popular online GIF editors:
 | **Add text** (live) | Multiple annotations, drag to position, frame ranges, outline, opacity, alignment, load any .ttf/.otf |
 | **Censor** (live) | Any number of pixelate / blur / solid regions, each with a frame range |
 | **Add image** (live) | Any number of static or animated overlays, per-frame position/size; edits apply to all / following / this frame |
+| **Watermark** (live) | Text (any font) or a logo image; pinned to one of 9 anchor points with a margin, or tiled diagonally across the frame; size relative to the frame, opacity |
+| **AI shield** (live) | Subtle seeded perturbation (high-frequency pattern, colour noise, optional sub-pixel warp, optional per-frame variation) that makes frames worse AI-training data. Not a guarantee – far weaker than Glaze/Nightshade, and heavy compression removes part of it |
 | **Cut** (live) | Keep a range by frame number or by time |
-| **Split** | Frames to PNG/GIF files or a ZIP |
 | **Frames** | Thumbnail grid: per-frame delay, skip/enable, duplicate, reorder, delete, range & every-N toggles, crossfade, first-frame background, add frames from files |
-| **Save / Export** | GIF, APNG, MP4 / WebM (VP9 with alpha) via ffmpeg, **sprite sheet + JSON + Godot 4 `SpriteFrames` (.tres)** |
+| **Export** | One button (Ctrl+S / Ctrl+E): GIF, APNG, MP4 / WebM (VP9 with alpha) via ffmpeg, frames (PNG/GIF folder or ZIP), **sprite sheet + JSON + Godot 4 `SpriteFrames` (.tres)**. Optional “noai, noimageai” tag in GIF/APNG metadata |
 
 Inputs: animated GIF, APNG, animated WebP, any still image, or a set of images
 (dropped together or via *Open sequence…*) which become frames.
@@ -34,11 +35,11 @@ instantly while the animation plays:
    rotate / flip. Each tool has an *Enabled* switch, *Reset* and *Bake frame
    edits*. They sit underneath everything else, so effects and layers are
    applied on top of the cropped / resized / rotated result.
-2. **Layers** – effects, text, censor regions and images, in any number and any
-   order. The *Layer stack* in the sidebar lists them top → bottom; drag the ≡
-   handle (or use ▲▼) to reorder – e.g. put a caption above or below a colour
-   effect, or one image over another. Each layer has a visibility eye and
-   delete button; you can have several effects layers.
+2. **Layers** – effects, text, censor regions, images, watermarks and AI
+   shields, in any number and any order. The **Layers** panel on the right
+   (Photoshop-style) lists them top → bottom; drag a row to reorder, click the
+   eye to hide, hover for ✕ to delete, **+** to add, ⬇ to bake. Long names are
+   shortened.
 
 Saving / exporting applies everything. **Bake everything** (or *Bake frame
 edits*, which keeps layers live) writes edits into the frames permanently –
@@ -49,6 +50,23 @@ source frames directly; all live edits are re-applied on top immediately.
 
 Sliders stop at sensible limits, but you can type values beyond them
 (e.g. saturation 400 %).
+
+## Presets
+
+**Presets** (toolbar) saves the current frame edits, layers and/or compression
+settings under a name and re-applies them to any other file. Positions are
+scaled to the new frame size; fonts are matched by family; image layers reload
+their file. Presets are JSON files in the config folder
+(`~/.config/gifforge/presets` on Linux, `%APPDATA%\gifforge\presets` on Windows,
+`~/Library/Application Support/gifforge/presets` on macOS).
+
+## Layout
+
+- Left: tools (collapse to icons with «). Right: tool settings on top, layers
+  below (the Layers header collapses; the split is resizable).
+- Every settings section collapses; ⊟ / ⊞ in the panel header collapse or
+  expand them all.
+- Most help is in tooltips – hover a control.
 
 ## Layers stick to the content
 
@@ -66,8 +84,9 @@ aspect unless Shift is held; text corners scale the font size).
 ## Viewport
 
 - Default view is **split**: left = original file, right = live edit, compressed.
-  Each side can show the live edit, the original file or the compressed output.
-- **Each viewport has its own zoom and pan** (tick *Link views* to tie them).
+  Click the label in a view's top-left corner to switch it between *Original*,
+  *Live edit* and *Compressed*.
+- **Each viewport has its own zoom and pan** (⚭ links them).
   The zoom buttons act on the viewport you last used.
 - **Mouse wheel** zooms around the cursor; **middle- / right-drag** pans; left-drag
   pans in tools that don't draw on the image (Alt-drag pans anywhere). **F** /
@@ -81,10 +100,17 @@ aspect unless Shift is held; text corners scale the font size).
 
 ## Fonts
 
-The text font picker lists the built-in fonts plus every system font family
-(found via fontconfig on Linux, the system font folders on Windows/macOS), with
-search and per-family styles (weights / italics). *Load font file…* adds any
-.ttf/.otf/.ttc.
+The font picker (text and watermark layers) lists the built-in fonts plus every
+system font family (fontconfig folders on Linux, the system font folders on
+Windows/macOS), each **shown in its own typeface**, with search and per-family
+styles (weights / italics). *Load font file…* adds any .ttf/.otf/.ttc.
+
+## Performance
+
+Preview frames are pre-rendered in playback order on a background thread pool
+that is kept separate from the UI thread, compression previews run on the same
+background pool, and playback never "catches up" after a slow frame, so heavy
+effect combinations no longer cause stutter or speed bursts.
 
 ## Linux / Wayland
 
@@ -123,12 +149,24 @@ desktop portal (KDE/GNOME provide it). On Debian/Ubuntu, building may need
 
 **Video export** (optional) – install `ffmpeg` and make sure it is on your `PATH`.
 
-`.github/workflows/build.yml` builds Linux, Windows and macOS (Intel + Apple
-Silicon) binaries on GitHub Actions when you push a `v*` tag.
+### Release builds for every platform
+
+`.github/workflows/build.yml` runs the tests and builds on Linux, Windows and
+macOS for every push to `main`. Pushing a tag such as `v0.2.0` also creates a
+GitHub Release with:
+
+- `gifforge-linux-x86_64.tar.gz`
+- `gifforge-windows-x86_64.zip` (no console window)
+- `gifforge-macos-universal.zip` – a universal (Apple Silicon + Intel)
+  `GifForge.app`, ad-hoc signed. First launch: right-click → Open.
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
 
 ## Godot workflow
 
-*Split* or *Save / Export → Sprite sheet*: choose columns/padding, set the
+*Export → Sprite sheet*: choose columns/padding, set the
 `res://` folder the PNG will live in, export. Drop `name_sheet.png` and
 `name_sheet_frames.tres` into that folder and assign the `.tres` to an
 `AnimatedSprite2D`/`AnimatedSprite3D`. Variable per-frame delays are preserved
@@ -157,7 +195,3 @@ text/censor/overlay rendering and all exporters.
 - GIF delays are in 1/100 s; delays under 2 are shown/played as 10 (browser behaviour).
 
 Fonts: Noto Sans (SIL OFL, `assets/NOTO_OFL.txt`) and DejaVu (`assets/DEJAVU_LICENSE.txt`).
-
-## License
-
-Apache-2.0 – see [LICENSE](LICENSE). Bundled fonts keep their own licences (see `assets/`).

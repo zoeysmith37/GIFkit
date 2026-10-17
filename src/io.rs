@@ -123,7 +123,7 @@ pub fn save_gif(anim: &Animation, opt: &GifOptions, path: &Path, progress: Optio
     Ok(bytes.len() as u64)
 }
 
-pub fn encode_apng(anim: &Animation) -> Result<Vec<u8>> {
+pub fn encode_apng(anim: &Animation, noai: bool) -> Result<Vec<u8>> {
     let frames = anim.enabled_frames();
     anyhow::ensure!(!frames.is_empty(), "No enabled frames");
     let (w, h) = frames[0].image.dimensions();
@@ -133,6 +133,9 @@ pub fn encode_apng(anim: &Animation) -> Result<Vec<u8>> {
         enc.set_color(png::ColorType::Rgba);
         enc.set_depth(png::BitDepth::Eight);
         enc.set_compression(png::Compression::High);
+        if noai {
+            enc.add_text_chunk("Comment".into(), crate::encode::NOAI_COMMENT.into())?;
+        }
         enc.set_animated(frames.len() as u32, anim.loop_count.map(|n| n as u32).unwrap_or(0))?;
         let mut wr = enc.write_header()?;
         for f in &frames {
@@ -144,8 +147,8 @@ pub fn encode_apng(anim: &Animation) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-pub fn save_apng(anim: &Animation, path: &Path) -> Result<u64> {
-    let b = encode_apng(anim)?;
+pub fn save_apng(anim: &Animation, path: &Path, noai: bool) -> Result<u64> {
+    let b = encode_apng(anim, noai)?;
     std::fs::write(path, &b)?;
     Ok(b.len() as u64)
 }

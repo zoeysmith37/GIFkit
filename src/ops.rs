@@ -7,7 +7,7 @@ use image::{Rgba, RgbaImage};
 
 // ---------------------------------------------------------------- geometry
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ResizeFilter {
     Nearest,
     Bilinear,
@@ -35,7 +35,7 @@ impl ResizeFilter {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum AspectMode {
     Stretch,
     CenterCrop,

@@ -157,6 +157,10 @@ pub fn install(ctx: &egui::Context) {
     let mut medium = vec!["noto-medium".to_string(), "noto".to_string()];
     medium.extend(fonts.families[&FontFamily::Proportional].iter().skip(1).cloned());
     fonts.families.insert(FontFamily::Name("medium".into()), medium);
+    // built-in text fonts, so the font picker can show each in its own face
+    fonts.font_data.insert("dejavu-mono".into(), Arc::new(egui::FontData::from_static(crate::text::MONO_BOLD)));
+    fonts.families.insert(FontFamily::Name("gf-sans-bold".into()), vec!["dejavu".into(), "noto".into()]);
+    fonts.families.insert(FontFamily::Name("gf-mono-bold".into()), vec!["dejavu-mono".into(), "dejavu".into(), "noto".into()]);
     ctx.set_fonts(fonts);
 
     ctx.set_visuals_of(Theme::Dark, visuals(&DARK, true));
@@ -210,7 +214,7 @@ impl ThemeChoice {
     }
 }
 
-fn config_path() -> Option<std::path::PathBuf> {
+pub fn config_path() -> Option<std::path::PathBuf> {
     let base = if cfg!(target_os = "windows") {
         std::env::var_os("APPDATA").map(std::path::PathBuf::from)
     } else if cfg!(target_os = "macos") {

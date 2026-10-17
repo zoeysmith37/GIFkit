@@ -11,7 +11,7 @@
 //! Layer coordinates and frame ranges refer to the output (what you see).
 
 use crate::anim::{effective_delay, Animation, Frame};
-use crate::effects::{self, CensorSettings, EffectSettings};
+use crate::effects::{self, CensorSettings, EffectSettings, ShieldSettings, WatermarkSettings, WatermarkSprite};
 use crate::geo::{map_box, GeoMap, Obb};
 use crate::ops::{self, AspectMode, ResizeFilter};
 use crate::overlay::{OverlaySource, Placement};
@@ -24,14 +24,15 @@ use std::sync::Arc;
 
 // ---------------------------------------------------------------- transform
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum SpeedMode {
     Percent,
     DelayAll,
     Fps,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Transform {
     // timing
     pub cut_on: bool,
@@ -283,6 +284,8 @@ pub enum LayerKind {
     Text(Annotation),
     Censor(CensorSettings),
     Overlay(OverlayLayer),
+    Watermark(Box<WatermarkSettings>),
+    Shield(ShieldSettings),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -291,6 +294,8 @@ pub enum Kind {
     Text,
     Censor,
     Overlay,
+    Watermark,
+    Shield,
 }
 
 #[derive(Clone)]
@@ -307,6 +312,8 @@ impl Layer {
             LayerKind::Text(_) => Kind::Text,
             LayerKind::Censor(_) => Kind::Censor,
             LayerKind::Overlay(_) => Kind::Overlay,
+            LayerKind::Watermark(_) => Kind::Watermark,
+            LayerKind::Shield(_) => Kind::Shield,
         }
     }
     pub fn active(&self) -> bool {
@@ -316,12 +323,14 @@ impl Layer {
                 LayerKind::Text(t) => !t.text.is_empty(),
                 LayerKind::Censor(c) => c.w > 0 && c.h > 0,
                 LayerKind::Overlay(_) => true,
+                LayerKind::Watermark(w) => w.active(),
+                LayerKind::Shield(s) => s.strength > 0.0 && (s.pattern || s.noise || s.jitter),
             }
     }
     /// The layer's oriented box in source-frame space (for source frame `src`).
     pub fn source_box(&self, src: usize, fonts: &[FontEntry]) -> Option<Obb> {
         match &self.kind {
-            LayerKind::Effects(_) => None,
+            LayerKind::Effects(_) | LayerKind::Watermark(_) | LayerKind::Shield(_) => None,
             LayerKind::Text(t) => {
                 if t.text.is_empty() {
                     return None;
@@ -344,10 +353,12 @@ impl Layer {
 
     pub fn name(&self) -> String {
         match &self.kind {
-            LayerKind::Effects(_) => "✦ Effects".into(),
-            LayerKind::Text(t) => format!("T {}", t.text.lines().next().unwrap_or("")),
-            LayerKind::Censor(c) => format!("▦ Censor ({:?})", c.method),
-            LayerKind::Overlay(o) => format!("◩ {}", o.src.name),
+            LayerKind::Effects(_) => "Effects".into(),
+            LayerKind::Text(t) => t.text.lines().next().unwrap_or("").to_string(),
+            LayerKind::Censor(c) => format!("Censor · {:?}", c.method),
+            LayerKind::Overlay(o) => o.src.name.clone(),
+            LayerKind::Watermark(w) => if w.use_image { "Watermark · image".into() } else { format!("Watermark · {}", w.text) },
+            LayerKind::Shield(_) => "AI shield".into(),
         }
     }
 }
@@ -372,6 +383,21 @@ pub struct PlanFrame {
 pub struct Prepared {
     pub maps: Vec<GeoMap>,
     sprites: Vec<Option<(RgbaImage, i64, i64)>>,
+    watermarks: Vec<Option<WatermarkSprite>>,
+}
+
+/// Thread pool for background work (pre-rendering, compression, exports) so
+/// it never competes with preview rendering on the UI thread's pool.
+pub fn bg_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n.saturating_sub(1).max(1))
+            .thread_name(|i| format!("gifforge-bg-{i}"))
+            .build()
+            .expect("thread pool")
+    })
 }
 
 impl Stack {
@@ -409,6 +435,8 @@ impl Stack {
                 LayerKind::Text(t) => format!("{t:?}").hash(&mut h),
                 LayerKind::Censor(c) => format!("{c:?}").hash(&mut h),
                 LayerKind::Overlay(o) => (o.opacity.to_bits(), format!("{:?}", o.placements), Arc::as_ptr(&o.src) as usize).hash(&mut h),
+                LayerKind::Watermark(w) => (format!("{w:?}"), w.image.as_ref().map(|i| Arc::as_ptr(i) as usize)).hash(&mut h),
+                LayerKind::Shield(sh) => format!("{sh:?}").hash(&mut h),
             }
         }
         h.finish()
@@ -493,7 +521,16 @@ impl Stack {
                 _ => None,
             })
             .collect();
-        Prepared { maps, sprites }
+        let watermarks = self
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(li, l)| match &l.kind {
+                LayerKind::Watermark(w) if l.active() => w.sprite(fonts, maps[li].w, maps[li].h),
+                _ => None,
+            })
+            .collect();
+        Prepared { maps, sprites, watermarks }
     }
 
     /// The transformed frame before any layer (geometry only).
@@ -527,6 +564,12 @@ impl Stack {
                         crate::overlay::draw_in_obb(&mut img, frame, map_box(m, b, true), o.opacity / 100.0);
                     }
                 }
+                LayerKind::Watermark(w) => {
+                    if let Some(Some(sp)) = prep.watermarks.get(li) {
+                        effects::draw_watermark(&mut img, sp, w.opacity);
+                    }
+                }
+                LayerKind::Shield(sh) => img = effects::shield(&img, sh, src),
                 LayerKind::Text(t) => {
                     if let Some(Some((s, x, y))) = prep.sprites.get(li) {
                         if t.applies_to(src) {

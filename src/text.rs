@@ -5,7 +5,7 @@ use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use image::{Rgba, RgbaImage};
 
 pub static SANS_BOLD: &[u8] = include_bytes!("../assets/DejaVuSans-Bold.ttf");
-static MONO_BOLD: &[u8] = include_bytes!("../assets/DejaVuSansMono-Bold.ttf");
+pub static MONO_BOLD: &[u8] = include_bytes!("../assets/DejaVuSansMono-Bold.ttf");
 
 #[derive(Clone)]
 pub struct FontEntry {
@@ -28,14 +28,14 @@ pub fn load_font_file(path: &std::path::Path) -> anyhow::Result<FontEntry> {
     Ok(FontEntry { name, font })
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Align {
     Left,
     Center,
     Right,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Border {
     None,
     Light,
@@ -52,7 +52,8 @@ impl Border {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Annotation {
     pub text: String,
     pub font_idx: usize,

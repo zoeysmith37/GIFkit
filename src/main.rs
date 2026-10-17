@@ -9,6 +9,7 @@ mod io;
 mod lzw;
 mod ops;
 mod overlay;
+mod presets;
 mod stack;
 mod sysfonts;
 mod text;

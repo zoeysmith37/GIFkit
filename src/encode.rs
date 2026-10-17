@@ -15,7 +15,8 @@ use rayon::prelude::*;
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct GifOptions {
     /// Max colours per palette (2..=256).
     pub colors: u16,
@@ -35,6 +36,8 @@ pub struct GifOptions {
     pub alpha_threshold: u8,
     /// Always use the built-in LZW encoder (testing aid).
     pub force_custom_lzw: bool,
+    /// Write a "noai, noimageai" comment into the file.
+    pub noai_tag: bool,
 }
 
 impl Default for GifOptions {
@@ -49,9 +52,13 @@ impl Default for GifOptions {
             merge_duplicates: true,
             alpha_threshold: 128,
             force_custom_lzw: false,
+            noai_tag: false,
         }
     }
 }
+
+/// Marker text for "do not use for AI training" (DeviantArt / common opt-out convention).
+pub const NOAI_COMMENT: &str = "noai, noimageai - not licensed for AI/ML training";
 
 /// A frame ready for encoding, before quantisation.
 struct Prepared {
@@ -284,6 +291,9 @@ pub fn encode_gif(anim: &Animation, opt: &GifOptions, progress: Option<&AtomicUs
             None => gif::Repeat::Infinite,
             Some(n) => gif::Repeat::Finite(n.saturating_sub(1)),
         })?;
+        if opt.noai_tag {
+            enc.write_raw_extension(gif::AnyExtension(0xFE), &[NOAI_COMMENT.as_bytes()])?;
+        }
 
         // Source colour last painted at each pixel (RGB + "painted" flag), for differencing.
         // Comparing against the *source* (not the quantised output) avoids re-sending

@@ -4,7 +4,8 @@
 use crate::anim::Animation;
 use image::{imageops, RgbaImage};
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Placement {
     pub enabled: bool,
     pub x: i32,
@@ -18,6 +19,8 @@ pub struct Placement {
 #[derive(Clone)]
 pub struct OverlaySource {
     pub name: String,
+    /// where it was loaded from (for presets)
+    pub path: Option<std::path::PathBuf>,
     pub frames: Vec<RgbaImage>,
     pub delays: Vec<u16>,
 }

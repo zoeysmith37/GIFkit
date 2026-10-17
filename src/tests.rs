@@ -111,7 +111,7 @@ fn load_real_gif_if_present() {
 #[test]
 fn apng_roundtrip() {
     let a = synth(true);
-    let b = io::load_animation_bytes(&io::encode_apng(&a).unwrap()).unwrap();
+    let b = io::load_animation_bytes(&io::encode_apng(&a, true).unwrap()).unwrap();
     assert_eq!(b.len(), a.len());
     assert_eq!(max_diff(&a, &b), 0);
 }
@@ -193,7 +193,7 @@ fn text_and_censor_and_overlay() {
     let out = effects::censor_frame(&a.frames[0].image, 0, &c);
     assert_ne!(out.as_raw(), a.frames[0].image.as_raw());
 
-    let src = overlay::OverlaySource { name: "x".into(), frames: vec![RgbaImage::from_pixel(10, 10, Rgba([0, 255, 0, 255]))], delays: vec![10] };
+    let src = overlay::OverlaySource { name: "x".into(), path: None, frames: vec![RgbaImage::from_pixel(10, 10, Rgba([0, 255, 0, 255]))], delays: vec![10] };
     let pl = vec![overlay::Placement { enabled: true, x: 5, y: 5, w: 20, h: 20, angle: 0.0 }; a.len()];
     let o = overlay::apply(&a, &src, &pl, 1.0);
     assert_eq!(*o.frames[0].image.get_pixel(10, 10), Rgba([0, 255, 0, 255]));
@@ -383,4 +383,169 @@ fn pixelate_censor_on_real_gif() {
     let img = s.render_frame(&a, &plan, &times, 37, &fonts, &prep);
     let diff = img.pixels().zip(a.frames[37].image.pixels()).filter(|(x, y)| x != y).count();
     assert!(diff > 100, "pixelate changed only {diff} pixels");
+}
+
+#[test]
+#[ignore]
+fn bench_effects_per_frame() {
+    use crate::stack::{LayerKind, Stack};
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test.gif");
+    let a = io::load_animation(&p).unwrap();
+    let fonts = text::builtin_fonts();
+    macro_rules! each {
+        ($($f:ident),*) => {$(
+            let mut s = Stack::default();
+            s.push(LayerKind::Effects(Box::new(EffectSettings { $f: true, ..Default::default() })));
+            let plan = s.plan(&a);
+            let times = crate::stack::plan_times(&plan);
+            let prep = s.prepare(&a, &fonts);
+            let t = std::time::Instant::now();
+            for i in 0..10 { let _ = s.render_frame(&a, &plan, &times, i, &fonts, &prep); }
+            eprintln!("{:16} {:7.2} ms/frame", stringify!($f), t.elapsed().as_secs_f64() * 100.0);
+        )*};
+    }
+    each!(grayscale, tint, blur, sharpen, oil, emboss, noise, swirl, implode, wave, gotham, lomo, nashville, toaster, vignette, polaroid, frame_camera, frame_fuzzy, frame_rounded, rot_any, error_dither, ordered_dither, rc_white, counter);
+    let mut s = Stack::default();
+    s.push(LayerKind::Text(text::Annotation { text: "Hello".into(), ..Default::default() }));
+    let t = std::time::Instant::now();
+    for _ in 0..10 { let _ = s.prepare(&a, &fonts); }
+    eprintln!("prepare(text)    {:7.2} ms", t.elapsed().as_secs_f64() * 100.0);
+}
+
+
+#[test]
+fn watermark_single_and_tiled() {
+    let fonts = text::builtin_fonts();
+    let a = synth(false);
+    let (w, h) = (a.width() as f32, a.height() as f32);
+    let mut wm = effects::WatermarkSettings { text: "WM".into(), size: 20.0, opacity: 100.0, ..Default::default() };
+    let sp = wm.sprite(&fonts, w, h).expect("sprite");
+    match &sp {
+        effects::WatermarkSprite::Single(s, x, y) => {
+            // bottom-right anchor: sprite ends near the right / bottom edges
+            assert!(*x + s.width() as i64 <= w as i64 && *x + (s.width() as i64) > (w as i64) * 3 / 4);
+            assert!(*y + s.height() as i64 <= h as i64);
+        }
+        _ => panic!("expected single"),
+    }
+    let mut img = (*a.frames[0].image).clone();
+    effects::draw_watermark(&mut img, &sp, wm.opacity);
+    assert_ne!(img.as_raw(), a.frames[0].image.as_raw());
+    // top-left corner untouched by a bottom-right watermark
+    assert_eq!(img.get_pixel(1, 1), a.frames[0].image.get_pixel(1, 1));
+
+    wm.tiled = true;
+    let sp = wm.sprite(&fonts, w, h).unwrap();
+    let mut img = (*a.frames[0].image).clone();
+    effects::draw_watermark(&mut img, &sp, 100.0);
+    let changed = img.pixels().zip(a.frames[0].image.pixels()).filter(|(p, q)| p != q).count();
+    assert!(changed > (w * h) as usize / 20, "tiled watermark should cover the frame, changed {changed}");
+
+    // empty text = inactive
+    let none = effects::WatermarkSettings { text: "  ".into(), ..Default::default() };
+    assert!(none.sprite(&fonts, w, h).is_none());
+}
+
+#[test]
+fn shield_is_subtle_and_deterministic() {
+    let a = synth(false);
+    let s = effects::ShieldSettings { strength: 6.0, ..Default::default() };
+    let src = &a.frames[0].image;
+    let o1 = effects::shield(src, &s, 0);
+    let o2 = effects::shield(src, &s, 5);
+    assert_eq!(o1.as_raw(), o2.as_raw(), "same seed, static pattern");
+    let mut maxd = 0i32;
+    let mut changed = 0;
+    for (p, q) in o1.pixels().zip(src.pixels()) {
+        for c in 0..3 {
+            let d = (p[c] as i32 - q[c] as i32).abs();
+            maxd = maxd.max(d);
+            if d > 0 {
+                changed += 1;
+            }
+        }
+    }
+    assert!(changed > (src.width() * src.height()) as usize, "perturbs most pixels");
+    assert!(maxd <= 12, "stays subtle, max diff {maxd}");
+    let pf = effects::ShieldSettings { per_frame: true, ..s.clone() };
+    assert_ne!(effects::shield(src, &pf, 0).as_raw(), effects::shield(src, &pf, 1).as_raw());
+}
+
+#[test]
+fn watermark_and_shield_layers_render_in_stack() {
+    use crate::stack::{LayerKind, Stack};
+    let fonts = text::builtin_fonts();
+    let a = synth(false);
+    let mut st = Stack::default();
+    st.push(LayerKind::Shield(effects::ShieldSettings::default()));
+    st.push(LayerKind::Watermark(Box::new(effects::WatermarkSettings { opacity: 100.0, ..Default::default() })));
+    assert!(st.needs_render());
+    let out = st.flatten(&a, &fonts, None);
+    assert_eq!(out.len(), a.len());
+    assert_ne!(out.frames[0].image.as_raw(), a.frames[0].image.as_raw());
+}
+
+#[test]
+fn preset_roundtrip_json() {
+    use crate::presets::{Preset, PresetLayer};
+    let mut tr = crate::stack::Transform::default();
+    tr.speed_on = true;
+    tr.speed_val = 150.0;
+    let p = Preset {
+        name: "Test".into(),
+        src_size: (96, 64),
+        transform: Some(tr),
+        layers: Some(vec![
+            PresetLayer::Effects { visible: true, fx: EffectSettings { grayscale: true, ..Default::default() } },
+            PresetLayer::Watermark { visible: true, watermark: Default::default() },
+            PresetLayer::Shield { visible: false, shield: Default::default() },
+        ]),
+        gif: Some(GifOptions { lossy: 40, ..Default::default() }),
+    };
+    let j = serde_json::to_string(&p).unwrap();
+    let q: Preset = serde_json::from_str(&j).unwrap();
+    assert_eq!(q.name, "Test");
+    assert_eq!(q.transform.as_ref().unwrap().speed_val, 150.0);
+    assert_eq!(q.layers.as_ref().unwrap().len(), 3);
+    assert_eq!(q.gif.as_ref().unwrap().lossy, 40);
+    assert!(q.summary().contains("3 layers"));
+}
+
+#[test]
+fn noai_tag_written() {
+    let a = synth(false);
+    let opts = GifOptions { noai_tag: true, ..Default::default() };
+    let b = encode_gif(&a, &opts, None).unwrap();
+    let needle = b"noai";
+    assert!(b.windows(needle.len()).any(|w| w == needle));
+    let b = io::encode_apng(&a, true).unwrap();
+    assert!(b.windows(needle.len()).any(|w| w == needle));
+    assert_eq!(io::load_animation_bytes(&b).unwrap().len(), a.len());
+}
+
+/// Writes a sample preset into the config folder (used for UI screenshots).
+#[test]
+#[ignore]
+fn write_demo_preset() {
+    use crate::presets::{Preset, PresetLayer};
+    let mut tr = crate::stack::Transform::default();
+    tr.rot_on = true;
+    tr.flip_h = true;
+    let p = Preset {
+        name: "Sepia + watermark".into(),
+        src_size: (320, 240),
+        transform: Some(tr),
+        layers: Some(vec![
+            PresetLayer::Effects { visible: true, fx: EffectSettings { sepia: true, vignette: true, ..Default::default() } },
+            PresetLayer::Text { visible: true, text: crate::text::Annotation { text: "PRESET".into(), size: 30.0, x: 20, y: 20, ..Default::default() }, font: None },
+            PresetLayer::Watermark { visible: true, watermark: effects::WatermarkSettings { tiled: true, opacity: 30.0, ..Default::default() } },
+        ]),
+        gif: Some(GifOptions { lossy: 40, ..Default::default() }),
+    };
+    crate::presets::save(&p).unwrap();
+    let mut q = p.clone();
+    q.name = "Small & shielded".into();
+    q.transform = None;
+    q.layers = Some(vec![PresetLayer::Shield { visible: true, shield: Default::default() }]);
+    crate::presets::save(&q).unwrap();
 }

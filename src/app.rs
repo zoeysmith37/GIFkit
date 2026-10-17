@@ -1,7 +1,7 @@
 //! The egui application.
 
 use crate::anim::{effective_delay, Animation};
-use crate::effects::{CensorMethod, CensorSettings, EffectSettings};
+use crate::effects::{CensorMethod, CensorSettings, EffectSettings, ShieldSettings};
 use crate::geo::{map_box, source_angle, unmap_box, Affine, Obb};
 use crate::encode::GifOptions;
 use crate::io::{self, SheetOptions, SplitFormat, VideoFormat};
@@ -33,10 +33,10 @@ enum Tool {
     Text,
     Censor,
     AddImage,
+    Watermark,
+    Shield,
     Cut,
-    Split,
     Frames,
-    Export,
 }
 
 impl Tool {
@@ -45,6 +45,8 @@ impl Tool {
         Tool::Text,
         Tool::Censor,
         Tool::AddImage,
+        Tool::Watermark,
+        Tool::Shield,
         Tool::Resize,
         Tool::Crop,
         Tool::Rotate,
@@ -53,8 +55,6 @@ impl Tool {
         Tool::Cut,
         Tool::Frames,
         Tool::Optimize,
-        Tool::Split,
-        Tool::Export,
     ];
     fn label(self) -> &'static str {
         match self {
@@ -65,13 +65,13 @@ impl Tool {
             Tool::Speed => "Speed",
             Tool::Optimize => "Optimize",
             Tool::Effects => "Effects",
-            Tool::Text => "Add text",
+            Tool::Text => "Text",
             Tool::Censor => "Censor",
-            Tool::AddImage => "Add image",
+            Tool::AddImage => "Image",
+            Tool::Watermark => "Watermark",
+            Tool::Shield => "AI shield",
             Tool::Cut => "Cut",
-            Tool::Split => "Split",
             Tool::Frames => "Frames",
-            Tool::Export => "Save / Export",
         }
     }
     fn icon(self) -> &'static str {
@@ -86,28 +86,37 @@ impl Tool {
             Tool::Text => "T",
             Tool::Censor => "▦",
             Tool::AddImage => "◩",
+            Tool::Watermark => "©",
+            Tool::Shield => "◈",
             Tool::Cut => "✄",
-            Tool::Split => "⊞",
             Tool::Frames => "▤",
-            Tool::Export => "⬇",
         }
     }
-    fn title(self) -> &'static str {
+    fn tip(self) -> &'static str {
         match self {
             Tool::Resize => "Resize",
             Tool::Crop => "Crop",
             Tool::Rotate => "Rotate / flip",
-            Tool::Reverse => "Reverse / loop",
-            Tool::Speed => "Speed",
-            Tool::Optimize => "Optimize & compress",
-            Tool::Effects => "Effects",
+            Tool::Reverse => "Reverse / boomerang / loop",
+            Tool::Speed => "Playback speed",
+            Tool::Optimize => "Compression",
+            Tool::Effects => "Colour, filters, distortions",
             Tool::Text => "Text layers",
-            Tool::Censor => "Censor regions",
+            Tool::Censor => "Pixelate / blur regions",
             Tool::AddImage => "Image overlays",
-            Tool::Cut => "Cut",
-            Tool::Split => "Split into frames",
-            Tool::Frames => "Frame editor",
-            Tool::Export => "Save / convert",
+            Tool::Watermark => "Text or logo watermark",
+            Tool::Shield => "Anti-AI-training noise",
+            Tool::Cut => "Trim frames",
+            Tool::Frames => "Frame list, delays, skip",
+        }
+    }
+    fn title(self) -> &'static str {
+        match self {
+            Tool::Rotate => "Rotate / flip",
+            Tool::Reverse => "Reverse / loop",
+            Tool::Optimize => "Compression",
+            Tool::AddImage => "Image",
+            _ => self.label(),
         }
     }
     fn layer_kind(self) -> Option<Kind> {
@@ -116,11 +125,10 @@ impl Tool {
             Tool::Text => Some(Kind::Text),
             Tool::Censor => Some(Kind::Censor),
             Tool::AddImage => Some(Kind::Overlay),
+            Tool::Watermark => Some(Kind::Watermark),
+            Tool::Shield => Some(Kind::Shield),
             _ => None,
         }
-    }
-    fn is_transform_tool(self) -> bool {
-        matches!(self, Tool::Resize | Tool::Crop | Tool::Rotate | Tool::Reverse | Tool::Speed | Tool::Cut)
     }
     /// Tools that use left-drag on the canvas (otherwise left-drag pans).
     fn uses_canvas_drag(self) -> bool {
@@ -134,6 +142,35 @@ fn kind_tool(k: Kind) -> Tool {
         Kind::Text => Tool::Text,
         Kind::Censor => Tool::Censor,
         Kind::Overlay => Tool::AddImage,
+        Kind::Watermark => Tool::Watermark,
+        Kind::Shield => Tool::Shield,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExportFormat {
+    Gif,
+    Apng,
+    Mp4,
+    Webm,
+    Frames,
+    Sheet,
+}
+
+impl ExportFormat {
+    const ALL: [ExportFormat; 6] = [ExportFormat::Gif, ExportFormat::Apng, ExportFormat::Mp4, ExportFormat::Webm, ExportFormat::Frames, ExportFormat::Sheet];
+    fn label(self) -> &'static str {
+        match self {
+            ExportFormat::Gif => "GIF",
+            ExportFormat::Apng => "APNG",
+            ExportFormat::Mp4 => "MP4",
+            ExportFormat::Webm => "WebM",
+            ExportFormat::Frames => "Frames",
+            ExportFormat::Sheet => "Sprite sheet",
+        }
+    }
+    fn needs_ffmpeg(self) -> bool {
+        matches!(self, ExportFormat::Mp4 | ExportFormat::Webm)
     }
 }
 
@@ -291,11 +328,19 @@ enum ViewSource {
 }
 
 impl ViewSource {
+    const ALL: [ViewSource; 3] = [ViewSource::Original, ViewSource::Edit, ViewSource::Compressed];
+    fn tip(self) -> &'static str {
+        match self {
+            ViewSource::Edit => "All edits, before GIF compression",
+            ViewSource::Original => "The file as opened",
+            ViewSource::Compressed => "All edits, as the saved GIF will look",
+        }
+    }
     fn label(self) -> &'static str {
         match self {
             ViewSource::Edit => "Live edit",
-            ViewSource::Original => "Original file",
-            ViewSource::Compressed => "Live edit (compressed)",
+            ViewSource::Original => "Original",
+            ViewSource::Compressed => "Compressed",
         }
     }
 }
@@ -439,6 +484,7 @@ pub struct GifForgeApp {
     compare: bool,
     view_left: ViewSource,
     view_right: ViewSource,
+    view_single: ViewSource,
     cmp: Option<CmpResult>,
     cmp_job: Option<CmpJob>,
     cmp_key_seen: u64,
@@ -463,6 +509,22 @@ pub struct GifForgeApp {
     fr_crossfade_wrap: bool,
     fr_thumb: f32,
     video_bg: [u8; 3],
+
+    // layout
+    sidebar_compact: bool,
+    layers_collapsed: bool,
+    layer_drag: Option<u64>,
+    export_open: bool,
+    export_fmt: ExportFormat,
+    frames_zip: bool,
+    presets_open: bool,
+    presets: Vec<crate::presets::Preset>,
+    preset_name: String,
+    preset_inc: (bool, bool, bool),
+    font_preview_queue: Vec<String>,
+    preview_fonts: HashMap<String, bool>,
+    prep_cache: Option<(u64, Arc<stack::Prepared>)>,
+    last_comp: Option<(usize, TextureHandle)>,
 }
 
 fn hash_str(s: &str) -> u64 {
@@ -497,17 +559,71 @@ fn kind_key(k: Kind) -> &'static str {
         Kind::Text => "text",
         Kind::Censor => "censor",
         Kind::Overlay => "overlay",
+        Kind::Watermark => "watermark",
+        Kind::Shield => "shield",
     }
 }
 
 // ---------------------------------------------------------------- Breeze-ish widgets
 
-/// A Breeze group box: title above a framed area.
-fn group<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    let pal = p();
-    if !title.is_empty() {
+/// A collapsible Breeze group box: clickable title row above a framed area.
+fn group<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> Option<R> {
+    group_ex(ui, title, true, None, add)
+}
+
+const GROUP_CMD: &str = "gf_group_cmd";
+
+/// Collapse (false) or expand (true) every group on the next frame.
+fn set_all_groups(ctx: &egui::Context, open: bool) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::unique(GROUP_CMD), Some(open)));
+}
+
+fn clear_group_command(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.remove::<Option<bool>>(egui::Id::unique(GROUP_CMD)));
+}
+
+/// Collapsible group with a default state and an optional badge (e.g. number of active options).
+fn group_ex<R>(ui: &mut egui::Ui, title: &str, default_open: bool, badge: Option<String>, add: impl FnOnce(&mut egui::Ui) -> R) -> Option<R> {
+    let pal = *p();
+    if title.is_empty() {
+        let r = egui::Frame::new()
+            .fill(mix(pal.window, pal.view, 0.35))
+            .stroke(Stroke::new(1.0, pal.border))
+            .corner_radius(3.0)
+            .inner_margin(10.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                add(ui)
+            })
+            .inner;
+        ui.add_space(8.0);
+        return Some(r);
+    }
+    let id = ui.make_persistent_id(("grp", title));
+    let cmd: Option<bool> = ui.ctx().data(|d| d.get_temp::<Option<bool>>(egui::Id::unique(GROUP_CMD))).flatten();
+    let mut open: bool = ui.ctx().data_mut(|d| *d.get_persisted_mut_or(id, default_open));
+    if let Some(c) = cmd {
+        open = c;
+    }
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
+    let hovered = resp.hovered();
+    if resp.clicked() {
+        open = !open;
+    }
+    ui.ctx().data_mut(|d| d.insert_persisted(id, open));
+    let painter = ui.painter();
+    if hovered {
+        painter.rect_filled(rect, 3.0, mix(pal.window, pal.highlight, 0.12));
+    }
+    let arrow = if open { "▾" } else { "▸" };
+    painter.text(pos2(rect.left() + 4.0, rect.center().y), egui::Align2::LEFT_CENTER, arrow, egui::FontId::proportional(13.0), pal.fg_muted);
+    painter.text(pos2(rect.left() + 20.0, rect.center().y), egui::Align2::LEFT_CENTER, title, theme::medium(13.5), pal.fg);
+    if let Some(b) = badge {
+        painter.text(pos2(rect.right() - 6.0, rect.center().y), egui::Align2::RIGHT_CENTER, b, egui::FontId::proportional(11.0), pal.highlight);
+    }
+    if !open {
         ui.add_space(2.0);
-        ui.label(RichText::new(title).font(theme::medium(13.5)).color(pal.fg));
+        return None;
     }
     let r = egui::Frame::new()
         .fill(mix(pal.window, pal.view, 0.35))
@@ -520,7 +636,43 @@ fn group<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui) -> R
         })
         .inner;
     ui.add_space(8.0);
-    r
+    Some(r)
+}
+
+fn toolbar_sep(ui: &mut egui::Ui) {
+    ui.add_space(2.0);
+    ui.add(egui::Separator::default().vertical().spacing(8.0));
+    ui.add_space(2.0);
+}
+
+/// Square flat icon button.
+fn icon_button(ui: &mut egui::Ui, icon: &str, enabled: bool) -> egui::Response {
+    let pal = p();
+    ui.add_enabled(enabled, egui::Button::new(RichText::new(icon).size(15.0).color(if enabled { pal.fg } else { pal.fg_muted })).frame_when_inactive(false).min_size(vec2(28.0, 28.0)))
+}
+
+/// Flat icon toggle; returns true when clicked.
+fn toggle_icon(ui: &mut egui::Ui, icon: &str, on: bool, tip: &str) -> bool {
+    let pal = p();
+    ui.add(egui::Button::new(RichText::new(icon).size(15.0).color(if on { pal.fg } else { pal.fg_muted })).selected(on).frame_when_inactive(on).min_size(vec2(28.0, 28.0))).on_hover_text(tip).clicked()
+}
+
+/// One segment of a segmented control.
+fn segment(ui: &mut egui::Ui, text: &str, selected: bool, tip: &str) -> bool {
+    let pal = p();
+    ui.add(egui::Button::new(RichText::new(text).size(15.0).color(if selected { pal.fg } else { pal.fg_muted })).selected(selected).min_size(vec2(30.0, 26.0))).on_hover_text(tip).clicked()
+}
+
+/// Shorten to `max` characters with an ellipsis.
+fn elide(s: &str, max: usize) -> String {
+    let s = s.lines().next().unwrap_or("");
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
+        t.push('…');
+        t
+    }
 }
 
 /// Breeze "default" button.
@@ -639,6 +791,21 @@ impl GifForgeApp {
             fr_crossfade_wrap: true,
             fr_thumb: 96.0,
             video_bg: [255, 255, 255],
+            view_single: ViewSource::Edit,
+            sidebar_compact: theme::get_setting("sidebar_compact").as_deref() == Some("1"),
+            layers_collapsed: false,
+            layer_drag: None,
+            export_open: false,
+            export_fmt: ExportFormat::Gif,
+            frames_zip: false,
+            presets_open: false,
+            presets: Vec::new(),
+            preset_name: String::new(),
+            preset_inc: (true, true, true),
+            font_preview_queue: Vec::new(),
+            preview_fonts: HashMap::new(),
+            prep_cache: None,
+            last_comp: None,
         };
         // scan system fonts in the background
         {
@@ -687,7 +854,7 @@ impl GifForgeApp {
         let p2 = progress.clone();
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
-            let out = f(&p2);
+            let out = stack::bg_pool().install(|| f(&p2));
             let _ = tx.send(out);
             ctx2.request_repaint();
         });
@@ -781,10 +948,18 @@ impl GifForgeApp {
                 self.after_base_change(true);
                 let name = self.path.as_ref().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "sequence".into());
                 self.info(format!("Opened {name}"));
+                // scripting hook (screenshots): a typical layer stack
+                if std::env::var("GIFFORGE_DEMO").is_ok() {
+                    self.add_layer(LayerKind::Shield(ShieldSettings::default()));
+                    self.add_layer(LayerKind::Effects(Box::new(EffectSettings { saturation: 140.0, vignette: true, ..Default::default() })));
+                    self.add_layer(LayerKind::Censor(CensorSettings { x: 200, y: 140, w: 70, h: 60, angle: 12.0, ..Default::default() }));
+                    self.add_layer(LayerKind::Text(Annotation { text: "This caption is a really long line of text for testing".into(), size: 22.0, x: 20, y: 190, ..Default::default() }));
+                    self.add_layer(LayerKind::Watermark(Box::default()));
+                }
                 // scripting hook: GIFFORGE_OVERLAY=path adds an image layer on open
                 if let Ok(ov) = std::env::var("GIFFORGE_OVERLAY") {
                     if let Ok(a) = io::load_animation(std::path::Path::new(&ov)) {
-                        self.add_overlay(OverlaySource { name: ov.rsplit('/').next().unwrap_or("overlay").into(), delays: a.frames.iter().map(|f| f.delay_cs).collect(), frames: a.frames.iter().map(|f| (*f.image).clone()).collect() });
+                        self.add_overlay(OverlaySource { name: ov.rsplit('/').next().unwrap_or("overlay").into(), path: Some(PathBuf::from(&ov)), delays: a.frames.iter().map(|f| f.delay_cs).collect(), frames: a.frames.iter().map(|f| (*f.image).clone()).collect() });
                     }
                 }
             }
@@ -927,6 +1102,8 @@ impl GifForgeApp {
             LayerKind::Text(_) => Kind::Text,
             LayerKind::Censor(_) => Kind::Censor,
             LayerKind::Overlay(_) => Kind::Overlay,
+            LayerKind::Watermark(_) => Kind::Watermark,
+            LayerKind::Shield(_) => Kind::Shield,
         };
         let id = self.stack.push(kind);
         self.select(k, id);
@@ -1035,6 +1212,7 @@ impl GifForgeApp {
         self.spawn(ctx, "Load overlay", 1, move |_| {
             JobOutput::Overlay(io::load_animation(&p).map(|a| OverlaySource {
                 name: p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+                path: Some(p.clone()),
                 delays: a.frames.iter().map(|f| f.delay_cs).collect(),
                 frames: a.frames.iter().map(|f| (*f.image).clone()).collect(),
             }))
@@ -1051,7 +1229,7 @@ impl GifForgeApp {
                 cmd && !i.modifiers.shift && i.key_pressed(egui::Key::Z),
                 cmd && (i.key_pressed(egui::Key::Y) || (i.modifiers.shift && i.key_pressed(egui::Key::Z))),
                 cmd && i.key_pressed(egui::Key::O),
-                cmd && i.key_pressed(egui::Key::S),
+                cmd && (i.key_pressed(egui::Key::S) || i.key_pressed(egui::Key::E)),
                 i.key_pressed(egui::Key::Space),
                 i.key_pressed(egui::Key::ArrowLeft),
                 i.key_pressed(egui::Key::ArrowRight),
@@ -1068,8 +1246,13 @@ impl GifForgeApp {
         if open {
             self.open_dialog(ctx);
         }
-        if save {
-            self.save_gif_dialog(ctx);
+        if save && self.base.is_some() {
+            self.export_open = true;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.export_open = false;
+            self.presets_open = false;
+            self.font_picker_open = false;
         }
         if typing {
             return;
@@ -1182,18 +1365,17 @@ impl GifForgeApp {
         if !self.plan[self.cur].enabled {
             self.cur = self.next_enabled(self.cur);
         }
-        let mut guard = 0;
-        loop {
-            let d = effective_delay(self.plan[self.cur].delay) as f64 / 100.0;
-            if self.elapsed < d || guard > n {
-                let remain = (d - self.elapsed).max(0.005);
-                ctx.request_repaint_after(std::time::Duration::from_secs_f64(remain));
-                break;
-            }
-            self.elapsed -= d;
+        let _ = n;
+        // Advance at most one frame per repaint. After a slow frame we drop the
+        // backlog instead of racing through frames to catch up (no speed bursts).
+        let d = effective_delay(self.plan[self.cur].delay) as f64 / 100.0;
+        if self.elapsed >= d {
+            self.elapsed = (self.elapsed - d).min(d * 0.5);
             self.cur = self.next_enabled(self.cur);
-            guard += 1;
         }
+        let d = effective_delay(self.plan[self.cur].delay) as f64 / 100.0;
+        let remain = (d - self.elapsed).max(0.004);
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(remain));
     }
 
     fn next_enabled(&self, from: usize) -> usize {
@@ -1245,12 +1427,26 @@ impl GifForgeApp {
         hash_parts(&[self.stack.signature(), self.version, self.timing_rev, self.pixelated as u64, self.plan.len() as u64, self.stack.plan_signature()])
     }
 
-    fn render_composite(&self, i: usize) -> Option<RgbaImage> {
+    /// Layer geometry / sprites for the current stack, cached per composite key.
+    fn prepared(&mut self) -> Option<Arc<stack::Prepared>> {
+        let key = self.comp_key;
+        if let Some((k, p)) = &self.prep_cache {
+            if *k == key {
+                return Some(p.clone());
+            }
+        }
         let base = self.base.as_ref()?;
+        let p = Arc::new(self.stack.prepare(base, &self.fonts));
+        self.prep_cache = Some((key, p.clone()));
+        Some(p)
+    }
+
+    fn render_composite(&mut self, i: usize) -> Option<RgbaImage> {
         if i >= self.plan.len() {
             return None;
         }
-        let prep = self.stack.prepare(base, &self.fonts);
+        let prep = self.prepared()?;
+        let base = self.base.as_ref()?;
         Some(self.stack.render_frame(base, &self.plan, &self.plan_times, i, &self.fonts, &prep))
     }
 
@@ -1262,11 +1458,23 @@ impl GifForgeApp {
         }
         let key = self.comp_key;
         if let Some(t) = self.comp_tex.get(key, i) {
+            self.last_comp = Some((i, t.clone()));
             return Some(t);
+        }
+        // While playing and the background pre-render is filling the cache, keep
+        // showing the last frame instead of stalling the UI thread on a render.
+        if self.playing && self.prerender.as_ref().map(|p| p.key == key).unwrap_or(false) {
+            if let Some((li, t)) = &self.last_comp {
+                if *li != i || self.comp_tex.map.is_empty() {
+                    return Some(t.clone());
+                }
+            }
         }
         let img = self.render_composite(i)?;
         let o = self.tex_opts();
-        Some(self.comp_tex.put(ctx, i, &img, o, "comp"))
+        let t = self.comp_tex.put(ctx, i, &img, o, "comp");
+        self.last_comp = Some((i, t.clone()));
+        Some(t)
     }
 
     /// Track composite key changes; once stable, pre-render all frames in the background.
@@ -1323,21 +1531,37 @@ impl GifForgeApp {
             let plan = self.plan.clone();
             let times = self.plan_times.clone();
             let fonts = self.fonts.clone();
-            let missing: Vec<usize> = (0..plan.len()).filter(|i| !(self.comp_tex.key == key && self.comp_tex.map.contains_key(i))).collect();
+            // render in playback order, starting just after the frame on screen
+            let n = plan.len();
+            let start = self.cur + 1;
+            let missing: Vec<usize> = (0..n).map(|k| (start + k) % n).filter(|i| !(self.comp_tex.key == key && self.comp_tex.map.contains_key(i))).collect();
             let cancel = self.prerender_cancel.clone();
             let (tx, rx) = channel();
             let ctx2 = ctx.clone();
+            let prep = self.prepared();
             std::thread::spawn(move || {
-                use rayon::prelude::*;
-                let prep = stack.prepare(&base, &fonts);
-                missing.par_iter().for_each_with(tx, |tx, &i| {
-                    if cancel.load(Ordering::Relaxed) != key {
-                        return;
+                let pool = stack::bg_pool();
+                let prep = prep.unwrap_or_else(|| Arc::new(stack.prepare(&base, &fonts)));
+                let next = AtomicUsize::new(0);
+                pool.scope(|sc| {
+                    for _ in 0..pool.current_num_threads() {
+                        let tx = tx.clone();
+                        let (next, missing, stack, base, plan, times, fonts, prep, cancel, ctx2) = (&next, &missing, &stack, &base, &plan, &times, &fonts, &prep, &cancel, &ctx2);
+                        sc.spawn(move |_| loop {
+                            let j = next.fetch_add(1, Ordering::Relaxed);
+                            if j >= missing.len() || cancel.load(Ordering::Relaxed) != key {
+                                break;
+                            }
+                            let i = missing[j];
+                            let img = stack.render_frame(base, plan, times, i, fonts, prep);
+                            if tx.send((key, i, img)).is_err() {
+                                break;
+                            }
+                            ctx2.request_repaint();
+                        });
                     }
-                    let img = stack.render_frame(&base, &plan, &times, i, &fonts, &prep);
-                    let _ = tx.send((key, i, img));
-                    ctx2.request_repaint();
                 });
+                drop(tx);
             });
             self.prerender = Some(Prerender { key, rx });
         } else if self.prerender.is_none() && !stable && self.stack.needs_render() {
@@ -1402,12 +1626,12 @@ impl GifForgeApp {
         let (tx, rx) = channel();
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
-            let res = (|| {
+            let res = stack::bg_pool().install(|| {
                 let out = stack.flatten(&base, &fonts, None);
                 let bytes = crate::encode::encode_gif(&out, &opts, None)?;
                 let anim = io::decode_gif_bytes(&bytes)?;
                 Ok((anim, bytes))
-            })();
+            });
             let _ = tx.send(res);
             ctx2.request_repaint();
         });
@@ -1455,6 +1679,7 @@ impl GifForgeApp {
 impl eframe::App for GifForgeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let perf_t0 = std::time::Instant::now();
         theme::set_current(&ctx);
         let now = ctx.input(|i| i.time);
         self.poll_job(&ctx);
@@ -1464,43 +1689,57 @@ impl eframe::App for GifForgeApp {
         self.advance(&ctx);
         self.manage_prerender(&ctx, now);
         self.manage_compare(&ctx, now);
+        self.load_preview_fonts(&ctx);
         let pal = *p();
 
         egui::Panel::top("toolbar")
-            .frame(egui::Frame::new().fill(pal.header).inner_margin(egui::Margin { left: 8, right: 8, top: 4, bottom: 6 }))
+            .frame(egui::Frame::new().fill(pal.header).inner_margin(egui::Margin { left: 8, right: 8, top: 4, bottom: 4 }))
             .show(ui, |ui| self.toolbar(ui, &ctx));
 
-        egui::Panel::bottom("status").frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin::symmetric(10, 4))).show(ui, |ui| self.status_bar(ui));
+        egui::Panel::bottom("status").frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin::symmetric(10, 3))).show(ui, |ui| self.status_bar(ui));
 
+        let side_w = if self.sidebar_compact { 46.0 } else { 168.0 };
         egui::Panel::left("sidebar")
-            .resizable(true)
-            .default_size(196.0)
-            .size_range(160.0..=300.0)
-            .frame(egui::Frame::new().fill(pal.view).inner_margin(egui::Margin { left: 6, right: 6, top: 8, bottom: 6 }))
-            .show(ui, |ui| self.sidebar(ui, &ctx));
+            .resizable(false)
+            .exact_size(side_w)
+            .frame(egui::Frame::new().fill(pal.view).inner_margin(egui::Margin { left: 5, right: 5, top: 8, bottom: 6 }))
+            .show(ui, |ui| self.sidebar(ui));
 
         if self.base.is_some() {
-            egui::Panel::right("options")
+            egui::Panel::right("inspector")
                 .resizable(true)
-                .default_size(380.0)
-                .size_range(300.0..=640.0)
-                .frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin { left: 12, right: 10, top: 10, bottom: 8 }))
+                .default_size(350.0)
+                .size_range(290.0..=620.0)
+                .frame(egui::Frame::new().fill(pal.window))
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(self.tool.icon()).size(20.0).color(pal.highlight));
-                        ui.heading(self.tool.title());
-                        if self.tool.is_transform_tool() || self.tool.layer_kind().is_some() {
-                            ui.label(RichText::new("LIVE").size(10.5).strong().color(pal.positive));
-                        }
-                    });
-                    ui.add_space(6.0);
-                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                        ui.add_enabled_ui(!self.busy(), |ui| self.tool_panel(ui, &ctx));
+                    egui::Panel::bottom("layers_panel")
+                        .resizable(!self.layers_collapsed)
+                        .default_size(230.0)
+                        .size_range(if self.layers_collapsed { 34.0..=34.0 } else { 120.0..=700.0 })
+                        .frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin { left: 8, right: 8, top: 6, bottom: 6 }))
+                        .show(ui, |ui| self.layer_panel(ui, &ctx));
+                    egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin { left: 10, right: 8, top: 8, bottom: 4 })).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(self.tool.icon()).size(18.0).color(pal.highlight));
+                            ui.label(RichText::new(self.tool.title()).font(theme::medium(16.0)).color(pal.fg));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if small_flat(ui, "⊟", "Collapse all sections") {
+                                    set_all_groups(ui.ctx(), false);
+                                }
+                                if small_flat(ui, "⊞", "Expand all sections") {
+                                    set_all_groups(ui.ctx(), true);
+                                }
+                            });
+                        });
+                        ui.add_space(4.0);
+                        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                            ui.add_enabled_ui(!self.busy(), |ui| self.tool_panel(ui, &ctx));
+                        });
                     });
                 });
 
             egui::Panel::bottom("transport")
-                .frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin::symmetric(10, 6)))
+                .frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin::symmetric(8, 5)))
                 .show(ui, |ui| self.transport(ui));
         }
 
@@ -1514,15 +1753,23 @@ impl eframe::App for GifForgeApp {
             }
         });
 
+        self.export_window(&ctx);
+        self.presets_window(&ctx);
+        clear_group_command(&ctx);
+        if std::env::var_os("GIFFORGE_PERF").is_some() {
+            let ms = perf_t0.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("frame {:.1} ms cur={} prerender={}", ms, self.cur, self.prerender.is_some());
+        }
+
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             let r = ctx.content_rect();
             let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("gifforge_drop_overlay")));
             painter.rect_filled(r, 0.0, Color32::from_black_alpha(150));
             painter.rect_stroke(r.shrink(12.0), 6.0, Stroke::new(2.0, pal.highlight), egui::StrokeKind::Inside);
             let msg = match (self.base.is_some(), self.tool) {
-                (true, Tool::AddImage) => "Drop to add as an image overlay",
+                (true, Tool::AddImage) => "Drop to add image layer",
                 (true, Tool::Frames) => "Drop to append frames",
-                _ => "Drop to open (multiple files = image sequence)",
+                _ => "Drop to open",
             };
             painter.text(r.center(), egui::Align2::CENTER_CENTER, msg, theme::medium(22.0), Color32::WHITE);
         }
@@ -1535,55 +1782,49 @@ impl GifForgeApp {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             let idle = !self.busy();
-            if tool_button(ui, "⏏", "Open…", idle).on_hover_text("Ctrl+O").clicked() {
+            let has = self.base.is_some();
+            if tool_button(ui, "⏏", "Open", idle).on_hover_text("Open GIF, APNG, WebP or image (Ctrl+O)").clicked() {
                 self.open_dialog(ctx);
             }
-            if tool_button(ui, "⊞", "Open sequence…", idle).clicked() {
+            if tool_button(ui, "⊞", "Sequence", idle).on_hover_text("Build an animation from several images").clicked() {
                 self.open_sequence_dialog(ctx);
             }
-            let has = self.base.is_some();
-            if tool_button(ui, "⬇", "Save GIF…", idle && has).on_hover_text("Ctrl+S – applies all live edits and uses the Optimize settings").clicked() {
-                self.save_gif_dialog(ctx);
-            }
-            ui.add_space(6.0);
-            ui.separator();
-            ui.add_space(6.0);
-            if tool_button(ui, "↶", "Undo", idle && !self.undo.is_empty()).on_hover_text("Ctrl+Z").clicked() {
+            toolbar_sep(ui);
+            if icon_button(ui, "↶", idle && !self.undo.is_empty()).on_hover_text("Undo (Ctrl+Z)").clicked() {
                 self.do_undo();
             }
-            if tool_button(ui, "↷", "Redo", idle && !self.redo.is_empty()).on_hover_text("Ctrl+Y / Ctrl+Shift+Z").clicked() {
+            if icon_button(ui, "↷", idle && !self.redo.is_empty()).on_hover_text("Redo (Ctrl+Y)").clicked() {
                 self.do_redo();
             }
-            ui.add_space(6.0);
-            ui.separator();
-            ui.add_space(6.0);
-            let cmp_on = self.compare;
-            let r = ui.add_enabled(has, egui::Button::new(RichText::new("◫  Compare").color(if cmp_on { Color32::WHITE } else { pal.fg })).selected(cmp_on).frame_when_inactive(cmp_on).min_size(vec2(0.0, 30.0)));
-            if r.on_hover_text("Two synchronised viewports (C)").clicked() {
-                self.compare = !self.compare;
-            }
-            if self.compare {
-                ui.add_space(6.0);
-                for (id, side, val) in [("vl", "Left:", &mut self.view_left), ("vr", "Right:", &mut self.view_right)] {
-                    ui.label(RichText::new(side).size(12.0).color(pal.fg_muted));
-                    egui::ComboBox::from_id_salt(id).width(150.0).selected_text(val.label()).show_ui(ui, |ui| {
-                        for s in [ViewSource::Edit, ViewSource::Original, ViewSource::Compressed] {
-                            ui.selectable_value(val, s, s.label());
-                        }
-                    });
-                    ui.add_space(4.0);
+            toolbar_sep(ui);
+            let pr = ui.add_enabled(has, egui::Button::new(RichText::new("❖  Presets").color(if self.presets_open { Color32::WHITE } else { pal.fg })).selected(self.presets_open).frame_when_inactive(self.presets_open).min_size(vec2(0.0, 30.0)));
+            if pr.on_hover_text("Save and re-use edits").clicked() {
+                self.presets_open = !self.presets_open;
+                if self.presets_open {
+                    self.presets = crate::presets::list();
                 }
             }
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let export = ui
+                    .add_enabled(
+                        has && idle,
+                        egui::Button::new(RichText::new("⬇  Export").font(theme::medium(14.0)).color(Color32::WHITE)).fill(pal.highlight).stroke(Stroke::new(1.0, mix(pal.highlight, Color32::BLACK, 0.25))).min_size(vec2(96.0, 30.0)),
+                    )
+                    .on_hover_text("Save as GIF, APNG, video, frames or sprite sheet (Ctrl+S)");
+                if export.clicked() {
+                    self.export_open = true;
+                }
                 let before = self.theme;
-                egui::ComboBox::from_id_salt("theme").width(130.0).selected_text(format!("◐  {}", self.theme.label())).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("theme").width(36.0).selected_text("◐").show_ui(ui, |ui| {
                     for t in [ThemeChoice::System, ThemeChoice::Dark, ThemeChoice::Light] {
                         ui.selectable_value(&mut self.theme, t, t.label());
                     }
                     if cfg!(all(unix, not(target_os = "macos"))) {
                         ui.separator();
                         let mut native = theme::get_setting("wayland").as_deref() == Some("native");
-                        if ui.checkbox(&mut native, "Native Wayland (restart)").on_hover_text("Off (default): run through XWayland so drag-and-drop works.\nOn: native Wayland – sharper on fractional scaling, but no drag-and-drop (paste with Ctrl+V instead).").changed() {
+                        if ui.checkbox(&mut native, "Native Wayland").on_hover_text("Takes effect after restart. Off = XWayland, which supports drag-and-drop.").changed() {
                             theme::set_setting("wayland", if native { "native" } else { "xwayland" });
                         }
                     }
@@ -1592,93 +1833,89 @@ impl GifForgeApp {
                     self.theme.apply(ctx);
                     theme::save_theme_choice(self.theme);
                 }
+                // file info
+                if let Some(a) = &self.base {
+                    let m = |s: String| RichText::new(s).size(12.0).color(pal.fg_muted);
+                    let dur: f32 = self.plan.iter().filter(|f| f.enabled).map(|f| effective_delay(f.delay) as f32 / 100.0).sum();
+                    let (ow, oh) = self.out_size;
+                    ui.add_space(8.0);
+                    ui.label(m(format!("{}×{} · {} frames · {:.2}s", ow as u32, oh as u32, self.plan.len(), dur)));
+                    if let Some(s) = self.file_size {
+                        ui.label(m(fmt_size(s)));
+                    }
+                    let name = self.path.as_ref().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "untitled".into());
+                    let name = elide(&name, 28);
+                    ui.label(RichText::new(if self.modified { format!("{name} •") } else { name }).font(theme::medium(13.0)).color(pal.fg)).on_hover_text(if self.modified { "Unsaved changes" } else { "" });
+                    let _ = a;
+                }
             });
         });
-        if let Some(a) = &self.base {
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 12.0;
-                ui.add_space(6.0);
-                let name = self.path.as_ref().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "untitled".into());
-                ui.label(RichText::new(name).font(theme::medium(13.0)).color(pal.fg));
-                if self.modified {
-                    ui.label(RichText::new("● modified").size(12.0).color(pal.neutral));
-                }
-                let m = |s: String| RichText::new(s).size(12.0).color(pal.fg_muted);
-                if let Some(s) = self.file_size {
-                    ui.label(m(format!("File size: {}", fmt_size(s))));
-                }
-                let (ow, oh) = self.out_size;
-                if (ow as u32, oh as u32) != (a.width(), a.height()) {
-                    ui.label(m(format!("{}×{} → {}×{} px", a.width(), a.height(), ow as u32, oh as u32)));
-                } else {
-                    ui.label(m(format!("{}×{} px", a.width(), a.height())));
-                }
-                let dur: f32 = self.plan.iter().filter(|f| f.enabled).map(|f| effective_delay(f.delay) as f32 / 100.0).sum();
-                ui.label(m(format!("{} frames", self.plan.len())));
-                ui.label(m(format!("{dur:.2} s")));
-                ui.label(m(format!("loop {}", self.stack.loop_count(a).map(|n| format!("{n}×")).unwrap_or_else(|| "forever".into()))));
-                let edits = self.stack.layers.len() + (!self.stack.transform.is_identity()) as usize;
-                if edits > 0 {
-                    ui.label(RichText::new(format!("{edits} live edit{}", if edits == 1 { "" } else { "s" })).size(12.0).color(pal.highlight));
-                }
-            });
-        }
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let pal = *p();
         let r = ui.max_rect();
-        ui.painter().hline(r.x_range(), r.top() - 4.0, Stroke::new(1.0, pal.border));
+        ui.painter().hline(r.x_range(), r.top() - 3.0, Stroke::new(1.0, pal.border));
         ui.horizontal(|ui| {
             if let Some(job) = &self.job {
                 ui.spinner();
                 let done = job.progress.load(Ordering::Relaxed).min(job.total);
-                ui.label(format!("{}…", job.label));
+                ui.label(RichText::new(format!("{}…", job.label)).size(12.5));
                 if job.total > 1 {
-                    ui.add(egui::ProgressBar::new(done as f32 / job.total as f32).desired_width(220.0).desired_height(14.0).fill(pal.highlight));
+                    ui.add(egui::ProgressBar::new(done as f32 / job.total as f32).desired_width(200.0).desired_height(12.0).fill(pal.highlight));
                 }
             } else if let Some(s) = &self.status {
                 ui.label(RichText::new(&s.text).size(12.5).color(if s.error { pal.negative } else { pal.fg_muted }));
             } else {
-                ui.label(RichText::new("Ready – drop a GIF, APNG, WebP or images onto the window").size(12.5).color(pal.fg_muted));
+                ui.label(RichText::new("Ready").size(12.5).color(pal.fg_muted));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new("Wheel zoom · middle/right-drag pan · F fit · 1 = 100% · Space play · ←/→ step · C compare").size(11.5).color(pal.fg_muted));
+                ui.label(RichText::new("?").size(12.5).color(pal.fg_muted)).on_hover_text(
+                    "Mouse wheel: zoom\nMiddle/right drag: pan (Alt+drag in drawing tools)\nF: fit · 1: 100% · +/−: zoom\nSpace: play/pause · ←/→: step\nC: single/split view\nCtrl+S: export · Ctrl+Z/Y: undo/redo\nCtrl+V: open copied files",
+                );
             });
         });
     }
 
-    fn sidebar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn sidebar(&mut self, ui: &mut egui::Ui) {
         let pal = *p();
+        let compact = self.sidebar_compact;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
             let section = |ui: &mut egui::Ui, s: &str| {
-                ui.add_space(2.0);
-                ui.label(RichText::new(s).size(11.5).color(pal.fg_muted));
+                if compact {
+                    ui.add_space(4.0);
+                    let r = ui.available_rect_before_wrap();
+                    ui.painter().hline(r.x_range().shrink(6.0), r.top() + 2.0, Stroke::new(1.0, pal.border));
+                    ui.add_space(6.0);
+                } else {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(s.to_uppercase()).size(10.5).color(pal.fg_muted));
+                    ui.add_space(1.0);
+                }
             };
-            section(ui, "Layers");
             for (i, t) in Tool::ALL.iter().copied().enumerate() {
-                if i == 4 {
-                    ui.add_space(4.0);
-                    section(ui, "Frame edits");
+                match i {
+                    0 => section(ui, "Layers"),
+                    6 => section(ui, "Frame edits"),
+                    12 => section(ui, "Frames & output"),
+                    _ => {}
                 }
-                if i == 10 {
-                    ui.add_space(4.0);
-                    section(ui, "Frames & output");
-                }
-                self.sidebar_row(ui, t);
+                self.sidebar_row(ui, t, compact);
             }
-            if self.base.is_some() {
-                ui.add_space(10.0);
-                section(ui, "Layer stack (top → bottom)");
-                self.layer_list(ui, ctx);
+            ui.add_space(8.0);
+            let tip = if compact { "Expand sidebar" } else { "Collapse sidebar" };
+            if small_flat(ui, if compact { "»" } else { "«" }, tip) {
+                self.sidebar_compact = !compact;
+                theme::set_setting("sidebar_compact", if compact { "0" } else { "1" });
             }
         });
     }
 
-    fn sidebar_row(&mut self, ui: &mut egui::Ui, t: Tool) {
+    fn sidebar_row(&mut self, ui: &mut egui::Ui, t: Tool, compact: bool) {
         let pal = *p();
         let sel = self.tool == t;
-        let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
+        let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
         let painter = ui.painter();
         if sel {
             painter.rect_filled(r, 3.0, pal.highlight_soft);
@@ -1687,11 +1924,14 @@ impl GifForgeApp {
             painter.rect_filled(r, 3.0, mix(pal.view, pal.highlight_soft, 0.5));
         }
         let icon_col = if sel { pal.highlight } else { pal.fg };
-        painter.text(r.left_center() + vec2(18.0, 0.0), egui::Align2::CENTER_CENTER, t.icon(), egui::FontId::proportional(16.0), icon_col);
-        painter.text(r.left_center() + vec2(36.0, 0.0), egui::Align2::LEFT_CENTER, t.label(), egui::FontId::proportional(13.5), pal.fg);
+        let icon_x = if compact { r.center().x } else { r.left() + 16.0 };
+        painter.text(pos2(icon_x, r.center().y), egui::Align2::CENTER_CENTER, t.icon(), egui::FontId::proportional(15.0), icon_col);
+        if !compact {
+            painter.text(r.left_center() + vec2(32.0, 0.0), egui::Align2::LEFT_CENTER, t.label(), egui::FontId::proportional(13.5), pal.fg);
+        }
         let tr = &self.stack.transform;
         let badge: Option<String> = match t {
-            Tool::Effects | Tool::Text | Tool::Censor | Tool::AddImage => {
+            _ if t.layer_kind().is_some() => {
                 let n = self.stack.count(t.layer_kind().unwrap());
                 (n > 0).then(|| n.to_string())
             }
@@ -1704,98 +1944,179 @@ impl GifForgeApp {
             _ => None,
         };
         if let Some(b) = badge {
-            let c = r.right_center() - vec2(14.0, 0.0);
+            let c = if compact { r.right_top() + vec2(-7.0, 7.0) } else { r.right_center() - vec2(12.0, 0.0) };
             if b == "●" {
-                painter.circle_filled(c, 4.0, pal.positive);
+                painter.circle_filled(c, 3.5, pal.positive);
+            } else if compact {
+                painter.circle_filled(c, 3.5, pal.highlight);
             } else {
-                painter.circle_filled(c, 8.0, pal.highlight);
-                painter.text(c, egui::Align2::CENTER_CENTER, b, egui::FontId::proportional(10.5), Color32::WHITE);
+                painter.circle_filled(c, 7.5, pal.highlight);
+                painter.text(c, egui::Align2::CENTER_CENTER, b, egui::FontId::proportional(10.0), Color32::WHITE);
             }
         }
-        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        let resp = if compact { resp.on_hover_text(format!("{} – {}", t.label(), t.tip())) } else { resp.on_hover_text(t.tip()) };
+        if resp.clicked() {
             self.tool = t;
             self.drag = None;
         }
     }
 
-    fn layer_list(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    /// Photoshop-style layer list: top of the stack first, drag to reorder.
+    fn layer_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let pal = *p();
         let now = ctx.input(|i| i.time);
-        if self.stack.layers.is_empty() {
-            hint(ui, "No layers yet. Effects, text, censor regions and images appear here; drag ≡ to reorder.");
-        }
-        let n = self.stack.layers.len();
-        let mut goto: Option<(Kind, u64)> = None;
-        let mut remove: Option<usize> = None;
-        let mut mv: Option<(usize, usize)> = None; // (from, insert position)
-        let mut toggled = false;
-        for li in (0..n).rev() {
-            let (id, name, kind, mut visible) = {
-                let l = &self.stack.layers[li];
-                (l.id, l.name(), l.kind(), l.visible)
-            };
-            let selected = self.sel.get(kind_key(kind)) == Some(&id) && self.tool == kind_tool(kind);
-            let row = egui::Frame::new()
-                .fill(if selected { pal.highlight_soft } else { Color32::TRANSPARENT })
-                .stroke(Stroke::new(1.0, if selected { pal.highlight } else { Color32::TRANSPARENT }))
-                .corner_radius(3.0)
-                .inner_margin(egui::Margin::symmetric(2, 1))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 1.0;
-                        ui.dnd_drag_source(egui::Id::unique(("layer-drag", id)), li, |ui| {
-                            ui.label(RichText::new("≡").color(pal.fg_muted)).on_hover_cursor(egui::CursorIcon::Grab);
-                        });
-                        let eye = ui.add(egui::Button::new(RichText::new(if visible { "◉" } else { "○" }).color(if visible { pal.highlight } else { pal.fg_muted })).frame_when_inactive(false)).on_hover_text("Show / hide");
-                        if eye.clicked() {
-                            visible = !visible;
-                            toggled = true;
+        // header
+        ui.horizontal(|ui| {
+            let arrow = if self.layers_collapsed { "▸" } else { "▾" };
+            let h = ui.add(egui::Button::new(RichText::new(format!("{arrow}  Layers")).font(theme::medium(14.0)).color(pal.fg)).frame(false));
+            if h.clicked() {
+                self.layers_collapsed = !self.layers_collapsed;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.add_enabled_ui(!self.busy() && !self.stack.is_empty(), |ui| {
+                    if icon_button(ui, "⬇", true).on_hover_text("Bake all layers and frame edits into the frames").clicked() {
+                        self.bake(ctx, false);
+                    }
+                });
+                ui.menu_button(RichText::new("+").size(16.0).color(pal.fg), |ui| {
+                    for (t, label) in [(Tool::Effects, "Effects"), (Tool::Text, "Text"), (Tool::Censor, "Censor"), (Tool::AddImage, "Image…"), (Tool::Watermark, "Watermark"), (Tool::Shield, "AI shield")] {
+                        if ui.button(format!("{}  {label}", t.icon())).clicked() {
+                            self.new_layer_of(t, ctx);
                         }
-                        let w = (ui.available_width() - 60.0).max(30.0);
-                        ui.allocate_ui(vec2(w, 22.0), |ui| {
-                            let txt = RichText::new(&name).size(12.5).color(if visible { pal.fg } else { pal.fg_muted });
-                            if ui.add(egui::Label::new(txt).truncate().sense(Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                                goto = Some((kind, id));
-                            }
-                        });
-                        if small_flat(ui, "▲", "Move up") && li + 1 < n {
-                            mv = Some((li, li + 2));
-                        }
-                        if small_flat(ui, "▼", "Move down") && li > 0 {
-                            mv = Some((li, li - 1));
-                        }
-                        if small_flat(ui, "✕", "Delete layer") {
-                            remove = Some(li);
-                        }
-                    });
+                    }
                 })
-                .response;
-            // drop target
-            let resp = ui.interact(row.rect, egui::Id::unique(("layer-row", id)), Sense::hover());
-            if let Some(from) = resp.dnd_hover_payload::<usize>() {
-                if *from != li {
-                    let above = ui.input(|i| i.pointer.hover_pos()).map(|p| p.y < row.rect.center().y).unwrap_or(true);
-                    let y = if above { row.rect.top() } else { row.rect.bottom() };
-                    ui.painter().hline(row.rect.x_range(), y, Stroke::new(2.0, pal.highlight));
+                .response
+                .on_hover_text("Add layer");
+            });
+        });
+        if self.layers_collapsed {
+            return;
+        }
+        ui.add_space(2.0);
+        let rect = ui.available_rect_before_wrap();
+        ui.painter().rect_filled(rect, 3.0, pal.view);
+        ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
+        let n = self.stack.layers.len();
+        let row_h = 30.0;
+        let mut select: Option<(Kind, u64)> = None;
+        let mut toggle: Option<usize> = None;
+        let mut remove: Option<usize> = None;
+        let mut drop_to: Option<(usize, usize)> = None;
+        let mut to_frames = false;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let mut rows: Vec<(usize, Rect)> = Vec::new();
+            for li in (0..n).rev() {
+                let (id, name, kind, visible) = {
+                    let l = &self.stack.layers[li];
+                    (l.id, l.name(), l.kind(), l.visible)
+                };
+                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click_and_drag());
+                rows.push((li, r));
+                let selected = self.sel.get(kind_key(kind)) == Some(&id) && self.tool == kind_tool(kind);
+                let dragging_me = self.layer_drag == Some(id);
+                let painter = ui.painter();
+                if selected {
+                    painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 2.0, pal.highlight_soft);
+                } else if resp.hovered() {
+                    painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 2.0, mix(pal.view, pal.highlight_soft, 0.45));
+                }
+                painter.hline(r.x_range().shrink(4.0), r.bottom(), Stroke::new(1.0, mix(pal.view, pal.border, 0.5)));
+                // eye
+                let eye_r = Rect::from_center_size(pos2(r.left() + 16.0, r.center().y), vec2(22.0, 22.0));
+                let eye = ui.interact(eye_r, egui::Id::unique(("layer-eye", id)), Sense::click()).on_hover_text("Show / hide");
+                painter.text(eye_r.center(), egui::Align2::CENTER_CENTER, if visible { "◉" } else { "○" }, egui::FontId::proportional(14.0), if visible { pal.highlight } else { pal.fg_muted });
+                if eye.clicked() {
+                    toggle = Some(li);
+                }
+                // icon + name (elided)
+                painter.text(pos2(r.left() + 38.0, r.center().y), egui::Align2::CENTER_CENTER, kind_tool(kind).icon(), egui::FontId::proportional(14.0), if visible { pal.fg } else { pal.fg_muted });
+                let del_w = 22.0;
+                let name_w = (r.width() - 52.0 - del_w - 6.0).max(10.0);
+                let mut job = egui::text::LayoutJob::simple_singleline(elide(&name, 60), egui::FontId::proportional(13.0), if visible { pal.fg } else { pal.fg_muted });
+                job.wrap = egui::text::TextWrapping { max_width: name_w, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+                let galley = ui.painter().layout_job(job);
+                let gy = r.center().y - galley.size().y / 2.0;
+                painter.galley(pos2(r.left() + 52.0, gy), galley, pal.fg);
+                // delete (on hover)
+                if resp.hovered() || selected {
+                    let del_r = Rect::from_center_size(pos2(r.right() - 14.0, r.center().y), vec2(20.0, 20.0));
+                    let del = ui.interact(del_r, egui::Id::unique(("layer-del", id)), Sense::click()).on_hover_text("Delete layer");
+                    painter.text(del_r.center(), egui::Align2::CENTER_CENTER, "✕", egui::FontId::proportional(11.5), if del.hovered() { pal.negative } else { pal.fg_muted });
+                    if del.clicked() {
+                        remove = Some(li);
+                    }
+                }
+                if resp.clicked() && !eye.clicked() {
+                    select = Some((kind, id));
+                }
+                if resp.drag_started() {
+                    self.layer_drag = Some(id);
+                }
+                if dragging_me {
+                    painter.rect_stroke(r.shrink(1.0), 2.0, Stroke::new(1.0, pal.highlight), egui::StrokeKind::Inside);
                 }
             }
-            if let Some(from) = resp.dnd_release_payload::<usize>() {
-                let above = ui.input(|i| i.pointer.interact_pos()).map(|p| p.y < row.rect.center().y).unwrap_or(true);
-                // list is top-first: "above" in the list means higher in the stack
-                let pos = if above { li + 1 } else { li };
-                mv = Some((*from, pos));
+            // base frames row
+            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
+            let painter = ui.painter();
+            if resp.hovered() {
+                painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 2.0, mix(pal.view, pal.highlight_soft, 0.45));
             }
-            if toggled {
-                self.stack.layers[li].visible = visible;
-                toggled = false;
-                self.modified = true;
+            painter.text(pos2(r.left() + 38.0, r.center().y), egui::Align2::CENTER_CENTER, "▤", egui::FontId::proportional(14.0), pal.fg_muted);
+            let edits = self.frame_edit_summary();
+            let label = if edits.is_empty() { "Frames".to_string() } else { format!("Frames · {edits}") };
+            let mut job = egui::text::LayoutJob::simple_singleline(label, egui::FontId::proportional(13.0), pal.fg_muted);
+            job.wrap = egui::text::TextWrapping { max_width: (r.width() - 60.0).max(10.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+            let galley = ui.painter().layout_job(job);
+            painter.galley(pos2(r.left() + 52.0, r.center().y - galley.size().y / 2.0), galley, pal.fg_muted);
+            if resp.on_hover_text("Source frames and frame edits").clicked() {
+                to_frames = true;
             }
-        }
-        if let Some((k, id)) = goto {
+            // drag-to-reorder: insertion line + drop
+            if let Some(did) = self.layer_drag {
+                if let Some(pp) = ui.ctx().pointer_hover_pos().or_else(|| ui.ctx().pointer_interact_pos()) {
+                    if let Some(from) = self.stack.index_of(did) {
+                        // rows are top-first; compute stack insertion position
+                        let mut pos = 0usize; // stack index to insert at (0 = bottom)
+                        let mut line_y = rows.last().map(|r| r.1.bottom()).unwrap_or(pp.y);
+                        for (li, rr) in &rows {
+                            if pp.y < rr.center().y {
+                                pos = li + 1;
+                                line_y = rr.top();
+                                break;
+                            }
+                        }
+                        ui.painter().hline(rect.x_range().shrink(4.0), line_y, Stroke::new(2.0, pal.highlight));
+                        if ui.ctx().input(|i| i.pointer.any_released()) {
+                            drop_to = Some((from, pos));
+                        }
+                    }
+                }
+                if !ui.ctx().input(|i| i.pointer.any_down()) {
+                    self.layer_drag = None;
+                }
+            }
+            if n == 0 {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    hint(ui, "No layers – add one with +");
+                });
+            }
+        });
+        if let Some((k, id)) = select {
             self.tool = kind_tool(k);
             self.select(k, id);
         }
-        if let Some((from, pos)) = mv {
+        if let Some(li) = toggle {
+            self.stack.layers[li].visible = !self.stack.layers[li].visible;
+            self.modified = true;
+        }
+        if let Some((from, pos)) = drop_to {
+            self.layer_drag = None;
             if from < n && pos <= n && pos != from && pos != from + 1 {
                 self.snapshot(&format!("reorder{now}"), now);
                 let l = self.stack.layers.remove(from);
@@ -1807,14 +2128,68 @@ impl GifForgeApp {
             self.snapshot(&format!("del{now}"), now);
             self.stack.layers.remove(i);
         }
-        ui.add_space(6.0);
-        ui.add_enabled_ui(!self.busy(), |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("⬇  Bake everything").on_hover_text("Permanently apply all layers and frame edits to the frames (undoable)").clicked() {
-                    self.bake(ctx, false);
+        if to_frames {
+            self.tool = Tool::Frames;
+        }
+    }
+
+    fn frame_edit_summary(&self) -> String {
+        let t = &self.stack.transform;
+        let mut v = Vec::new();
+        if t.cut_on {
+            v.push("cut");
+        }
+        if t.crop_on {
+            v.push("crop");
+        }
+        if t.resize_on {
+            v.push("resize");
+        }
+        if t.rotates() {
+            v.push("rotate");
+        }
+        if t.speed_on {
+            v.push("speed");
+        }
+        if t.reverse {
+            v.push("reverse");
+        }
+        if t.boomerang {
+            v.push("boomerang");
+        }
+        if t.set_loop {
+            v.push("loop");
+        }
+        v.join(", ")
+    }
+
+    /// "+" menu / sidebar shortcut for creating a layer of a kind.
+    fn new_layer_of(&mut self, t: Tool, ctx: &egui::Context) {
+        let (w, h) = self.dims();
+        match t {
+            Tool::Effects => {
+                self.add_layer(LayerKind::Effects(Box::default()));
+            }
+            Tool::Text => {
+                self.add_layer(LayerKind::Text(Annotation { text: "Your text".into(), x: (w as i32 / 2 - 80).max(0), y: (h as i32 - 60).max(0), ..Default::default() }));
+            }
+            Tool::Censor => {
+                self.add_layer(LayerKind::Censor(CensorSettings { x: (w / 4) as i32, y: (h / 4) as i32, w: w / 2, h: h / 2, ..Default::default() }));
+            }
+            Tool::AddImage => {
+                if let Some(path) = rfd::FileDialog::new().add_filter("Images", &["png", "gif", "jpg", "jpeg", "webp", "bmp"]).pick_file() {
+                    self.load_overlay(path, ctx);
                 }
-            });
-        });
+            }
+            Tool::Watermark => {
+                self.add_layer(LayerKind::Watermark(Box::default()));
+            }
+            Tool::Shield => {
+                self.add_layer(LayerKind::Shield(ShieldSettings::default()));
+            }
+            _ => {}
+        }
+        self.tool = t;
     }
 
     fn empty_state(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1827,10 +2202,9 @@ impl GifForgeApp {
         let dash = egui::Shape::dashed_line(&[inner.left_top(), inner.right_top(), inner.right_bottom(), inner.left_bottom(), inner.left_top()], Stroke::new(1.5, stroke_col), 8.0, 6.0);
         ui.painter().extend(dash);
         let c = inner.center();
-        ui.painter().text(c - vec2(0.0, 48.0), egui::Align2::CENTER_CENTER, "▤", egui::FontId::proportional(56.0), pal.fg_muted);
-        ui.painter().text(c + vec2(0.0, 14.0), egui::Align2::CENTER_CENTER, "Drop a GIF, APNG or WebP here, or click to open", theme::medium(19.0), pal.fg);
-        ui.painter().text(c + vec2(0.0, 44.0), egui::Align2::CENTER_CENTER, "Drop several PNG/JPG files at once to build an animation from a sequence.", egui::FontId::proportional(13.5), pal.fg_muted);
-        ui.painter().text(c + vec2(0.0, 66.0), egui::Align2::CENTER_CENTER, "Everything runs locally.", egui::FontId::proportional(13.5), pal.fg_muted);
+        ui.painter().text(c - vec2(0.0, 40.0), egui::Align2::CENTER_CENTER, "▤", egui::FontId::proportional(56.0), pal.fg_muted);
+        ui.painter().text(c + vec2(0.0, 18.0), egui::Align2::CENTER_CENTER, "Drop a GIF here or click to open", theme::medium(19.0), pal.fg);
+        ui.painter().text(c + vec2(0.0, 46.0), egui::Align2::CENTER_CENTER, "GIF · APNG · WebP · image sequences", egui::FontId::proportional(13.5), pal.fg_muted);
         if resp.clicked() && !self.busy() {
             self.open_dialog(ctx);
         }
@@ -1839,51 +2213,472 @@ impl GifForgeApp {
     fn transport(&mut self, ui: &mut egui::Ui) {
         let pal = *p();
         let r = ui.max_rect();
-        ui.painter().hline(r.x_range(), r.top() - 6.0, Stroke::new(1.0, pal.border));
+        ui.painter().hline(r.x_range(), r.top() - 5.0, Stroke::new(1.0, pal.border));
         let n = self.plan.len();
         let (delay, enabled) = self.plan.get(self.cur).map(|f| (f.delay, f.enabled)).unwrap_or((0, true));
         ui.horizontal(|ui| {
-            if ui.button("|◀").on_hover_text("Previous frame (←)").clicked() {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if icon_button(ui, "|◀", true).on_hover_text("Previous frame (←)").clicked() {
                 self.step(-1);
             }
-            if ui.add(egui::Button::new(if self.playing { "❚❚  Pause" } else { "▶  Play" }).min_size(vec2(84.0, 0.0))).on_hover_text("Space").clicked() {
+            if ui.add(egui::Button::new(if self.playing { "❚❚" } else { "▶" }).min_size(vec2(34.0, 26.0))).on_hover_text("Play / pause (Space)").clicked() {
                 self.playing = !self.playing;
             }
-            if ui.button("▶|").on_hover_text("Next frame (→)").clicked() {
+            if icon_button(ui, "▶|", true).on_hover_text("Next frame (→)").clicked() {
                 self.step(1);
             }
+            ui.add_space(4.0);
+            let right_w = if self.compare { 430.0 } else { 400.0 };
+            ui.spacing_mut().slider_width = (ui.available_width() - right_w - 90.0).max(80.0);
             let mut f = self.cur + 1;
-            ui.spacing_mut().slider_width = (ui.available_width() - 560.0).max(100.0);
             if ui.add(egui::Slider::new(&mut f, 1..=n.max(1)).show_value(false)).changed() {
                 self.cur = f - 1;
                 self.playing = false;
                 self.elapsed = 0.0;
             }
-            ui.label(RichText::new(format!("{}/{} · {} cs{}", self.cur + 1, n, delay, if enabled { "" } else { " · skipped" })).size(12.5));
-            ui.separator();
-            if ui.button("−").on_hover_text("Zoom out (−)").clicked() {
-                self.zoom_to(self.cur_scale() / 1.25);
-            }
-            let mut pct = self.cur_scale() * 100.0;
-            if ui.add(egui::DragValue::new(&mut pct).range(2.0..=6400.0).speed(1.0).suffix("%").max_decimals(0)).on_hover_text("Zoom – or use the mouse wheel over the image").changed() {
-                self.zoom_to(pct / 100.0);
-            }
-            if ui.button("+").on_hover_text("Zoom in (+)").clicked() {
-                self.zoom_to(self.cur_scale() * 1.25);
-            }
-            if ui.add(egui::Button::new("Fit").selected(self.views[self.active()].zoom.is_none())).on_hover_text("F").clicked() {
-                self.zoom_fit();
-            }
-            if ui.button("1:1").on_hover_text("1").clicked() {
-                self.zoom_to(1.0);
-            }
-            if self.compare {
-                ui.checkbox(&mut self.link_views, "Link views").on_hover_text("Zoom and pan both viewports together. Off: each viewport has its own zoom/pan; the buttons act on the last one you used.");
-            }
-            ui.separator();
-            ui.checkbox(&mut self.checker, "Checker");
-            ui.checkbox(&mut self.pixelated, "Pixelated").on_hover_text("Nearest-neighbour preview scaling (good for pixel art)");
+            ui.label(RichText::new(format!("{}/{}", self.cur + 1, n)).size(12.5)).on_hover_text(format!("Delay {delay} cs{}", if enabled { "" } else { " · skipped" }));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                if toggle_icon(ui, "▩", self.pixelated, "Pixelated preview (nearest neighbour)") {
+                    self.pixelated = !self.pixelated;
+                }
+                if toggle_icon(ui, "▦", self.checker, "Checkerboard behind transparency") {
+                    self.checker = !self.checker;
+                }
+                toolbar_sep(ui);
+                if self.compare && toggle_icon(ui, "⚭", self.link_views, "Link zoom and pan of both views") {
+                    self.link_views = !self.link_views;
+                }
+                if icon_button(ui, "1:1", true).on_hover_text("Actual size (1)").clicked() {
+                    self.zoom_to(1.0);
+                }
+                if ui.add(egui::Button::new("Fit").selected(self.views[self.active()].zoom.is_none()).min_size(vec2(0.0, 24.0))).on_hover_text("Fit (F)").clicked() {
+                    self.zoom_fit();
+                }
+                if icon_button(ui, "+", true).on_hover_text("Zoom in").clicked() {
+                    self.zoom_to(self.cur_scale() * 1.25);
+                }
+                let mut pct = self.cur_scale() * 100.0;
+                if ui.add(egui::DragValue::new(&mut pct).range(2.0..=6400.0).speed(1.0).suffix("%").max_decimals(0)).on_hover_text("Zoom").changed() {
+                    self.zoom_to(pct / 100.0);
+                }
+                if icon_button(ui, "−", true).on_hover_text("Zoom out").clicked() {
+                    self.zoom_to(self.cur_scale() / 1.25);
+                }
+                toolbar_sep(ui);
+                // single / split segmented control
+                if segment(ui, "◫", self.compare, "Split view (C)") {
+                    self.compare = true;
+                }
+                if segment(ui, "▭", !self.compare, "Single view (C)") {
+                    self.compare = false;
+                }
+            });
         });
+    }
+
+    // ------------------------------------------------------------ export
+
+    fn export_window(&mut self, ctx: &egui::Context) {
+        if !self.export_open || self.base.is_none() {
+            return;
+        }
+        let pal = *p();
+        let mut open = true;
+        let mut go = false;
+        egui::Window::new(RichText::new("Export").font(theme::medium(15.0)))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(360.0)
+            .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, -40.0))
+            .show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                    for f in ExportFormat::ALL {
+                        let en = !f.needs_ffmpeg() || self.ffmpeg;
+                        let r = ui.add_enabled(en, egui::Button::new(f.label()).selected(self.export_fmt == f).min_size(vec2(0.0, 26.0)));
+                        let r = if en { r } else { r.on_disabled_hover_text("Needs ffmpeg on PATH") };
+                        if r.clicked() {
+                            self.export_fmt = f;
+                        }
+                    }
+                });
+                ui.add_space(8.0);
+                egui::Frame::new().fill(mix(pal.window, pal.view, 0.35)).stroke(Stroke::new(1.0, pal.border)).corner_radius(3.0).inner_margin(10.0).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    match self.export_fmt {
+                        ExportFormat::Gif => {
+                            let o = &self.gif_opts;
+                            ui.label(format!("{} colours{} · lossy {}", o.colors, if o.global_palette { " (global)" } else { "" }, o.lossy));
+                            if let Some(c) = &self.cmp {
+                                if c.key == self.cmp_key() {
+                                    let n = c.bytes.len() as u64;
+                                    let mut t = format!("Size: {}", fmt_size(n));
+                                    if let Some(orig) = self.file_size {
+                                        t.push_str(&format!(" ({:+.0}%)", (n as f64 / orig as f64 - 1.0) * 100.0));
+                                    }
+                                    ui.label(RichText::new(t).color(pal.positive));
+                                }
+                            }
+                            if ui.link("Compression settings…").clicked() {
+                                self.tool = Tool::Optimize;
+                                self.export_open = false;
+                            }
+                            ui.checkbox(&mut self.gif_opts.noai_tag, "Add “noai” tag").on_hover_text("Writes a “noai, noimageai” comment into the file – an opt-out marker some sites and scrapers respect.");
+                        }
+                        ExportFormat::Apng => {
+                            ui.label("24-bit colour, full alpha");
+                            ui.checkbox(&mut self.gif_opts.noai_tag, "Add “noai” tag");
+                        }
+                        ExportFormat::Mp4 => {
+                            ui.horizontal(|ui| {
+                                ui.label("Background");
+                                ui.color_edit_button_srgb(&mut self.video_bg).on_hover_text("Used behind transparent pixels");
+                            });
+                        }
+                        ExportFormat::Webm => {
+                            ui.label("VP9 with alpha");
+                        }
+                        ExportFormat::Frames => {
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(&mut self.split_fmt, SplitFormat::Png, "PNG");
+                                ui.selectable_value(&mut self.split_fmt, SplitFormat::Gif, "GIF");
+                                ui.separator();
+                                ui.selectable_value(&mut self.frames_zip, false, "Folder");
+                                ui.selectable_value(&mut self.frames_zip, true, "ZIP").on_hover_text("ZIP is always PNG");
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Prefix");
+                                ui.add(egui::TextEdit::singleline(&mut self.split_prefix).desired_width(140.0));
+                            });
+                        }
+                        ExportFormat::Sheet => {
+                            let n = self.plan.iter().filter(|f| f.enabled).count().max(1) as u32;
+                            let (fw, fh) = (self.out_size.0 as u32, self.out_size.1 as u32);
+                            let s = &mut self.sheet;
+                            ui.horizontal(|ui| {
+                                ui.label("Columns");
+                                ui.add(egui::DragValue::new(&mut s.columns).range(0..=n)).on_hover_text("0 = auto");
+                                ui.label("Padding");
+                                ui.add(egui::DragValue::new(&mut s.padding).range(0..=256).suffix(" px"));
+                            });
+                            let cols = if s.columns == 0 { (n as f32).sqrt().ceil() as u32 } else { s.columns.min(n) }.max(1);
+                            let rows = n.div_ceil(cols);
+                            hint(ui, &format!("{cols}×{rows} · {}×{} px", cols * fw + (cols - 1) * s.padding, rows * fh + (rows - 1) * s.padding));
+                            ui.checkbox(&mut s.write_json, "JSON metadata");
+                            ui.checkbox(&mut s.write_godot, "Godot SpriteFrames (.tres)").on_hover_text("Assign the .tres to an AnimatedSprite2D/3D. Frame delays are kept.");
+                            if s.write_godot {
+                                ui.horizontal(|ui| {
+                                    ui.label("res://");
+                                    ui.add(egui::TextEdit::singleline(&mut s.godot_res_dir).desired_width(140.0)).on_hover_text("Folder the PNG will live in inside your Godot project");
+                                    ui.label("Name");
+                                    ui.add(egui::TextEdit::singleline(&mut s.anim_name).desired_width(70.0));
+                                });
+                            }
+                        }
+                    }
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    go = primary(ui, &format!("Export {}…", self.export_fmt.label()));
+                });
+            });
+        if !open {
+            self.export_open = false;
+        }
+        if go {
+            self.export_open = false;
+            self.do_export(ctx);
+        }
+    }
+
+    fn do_export(&mut self, ctx: &egui::Context) {
+        let name = self.base_name();
+        match self.export_fmt {
+            ExportFormat::Gif => self.save_gif_dialog(ctx),
+            ExportFormat::Apng => {
+                if let Some(path) = rfd::FileDialog::new().add_filter("PNG", &["png", "apng"]).set_file_name(format!("{name}.png")).save_file() {
+                    let tag = self.gif_opts.noai_tag;
+                    self.run_export(ctx, "Save APNG", move |a, _| io::save_apng(a, &path, tag).map(|n| format!("Saved {} ({})", path.display(), fmt_size(n))));
+                }
+            }
+            ExportFormat::Mp4 | ExportFormat::Webm => {
+                let (fmt, ext) = if self.export_fmt == ExportFormat::Mp4 { (VideoFormat::Mp4, "mp4") } else { (VideoFormat::WebmAlpha, "webm") };
+                if let Some(path) = rfd::FileDialog::new().add_filter(ext, &[ext]).set_file_name(format!("{name}.{ext}")).save_file() {
+                    let bg = self.video_bg;
+                    self.run_export(ctx, "Export video", move |a, _| io::export_video(a, &path, fmt, bg).map(|_| format!("Saved {}", path.display())));
+                }
+            }
+            ExportFormat::Frames => {
+                let pre = self.split_prefix.clone();
+                if self.frames_zip {
+                    if let Some(path) = rfd::FileDialog::new().add_filter("ZIP", &["zip"]).set_file_name(format!("{name}_frames.zip")).save_file() {
+                        self.run_export(ctx, "ZIP frames", move |a, _| io::export_frames_zip(a, &path, &pre).map(|n| format!("Wrote {n} frames to {}", path.display())));
+                    }
+                } else if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    let fmt = self.split_fmt;
+                    self.run_export(ctx, "Split frames", move |a, _| io::export_frames_dir(a, &dir, &pre, fmt).map(|n| format!("Wrote {n} frames to {}", dir.display())));
+                }
+            }
+            ExportFormat::Sheet => {
+                if let Some(path) = rfd::FileDialog::new().add_filter("PNG", &["png"]).set_file_name(format!("{name}_sheet.png")).save_file() {
+                    let opts = self.sheet.clone();
+                    self.run_export(ctx, "Sprite sheet", move |a, _| io::export_spritesheet(a, &path, &opts).map(|s| format!("Wrote {s}")));
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ presets
+
+    fn presets_window(&mut self, ctx: &egui::Context) {
+        if !self.presets_open || self.base.is_none() {
+            return;
+        }
+        let pal = *p();
+        let mut open = true;
+        let mut apply: Option<crate::presets::Preset> = None;
+        let mut delete: Option<String> = None;
+        let mut save = false;
+        egui::Window::new(RichText::new("Presets").font(theme::medium(15.0)))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(320.0)
+            .default_pos(ctx.content_rect().left_top() + vec2(260.0, 70.0))
+            .show(ctx, |ui| {
+                ui.set_width(320.0);
+                ui.label(RichText::new("Save current").font(theme::medium(13.0)));
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.preset_name).hint_text("Name").desired_width(220.0));
+                    save = ui.add_enabled(!self.preset_name.trim().is_empty(), egui::Button::new("Save")).clicked();
+                });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.preset_inc.0, "Frame edits");
+                    ui.checkbox(&mut self.preset_inc.1, "Layers");
+                    ui.checkbox(&mut self.preset_inc.2, "Compression");
+                });
+                ui.add_space(6.0);
+                ui.separator();
+                if self.presets.is_empty() {
+                    hint(ui, "No presets yet");
+                }
+                egui::ScrollArea::vertical().max_height(260.0).auto_shrink([false, true]).show(ui, |ui| {
+                    for pr in &self.presets {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(elide(&pr.name, 30)).color(pal.fg));
+                                hint(ui, &pr.summary());
+                            });
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if small_flat(ui, "✕", "Delete preset") {
+                                    delete = Some(pr.name.clone());
+                                }
+                                if ui.button("Apply").clicked() {
+                                    apply = Some(pr.clone());
+                                }
+                            });
+                        });
+                        ui.add_space(2.0);
+                    }
+                });
+            });
+        if !open {
+            self.presets_open = false;
+        }
+        if save {
+            let pr = self.make_preset(self.preset_name.trim().to_string());
+            match crate::presets::save(&pr) {
+                Ok(_) => {
+                    self.info(format!("Saved preset “{}”", pr.name));
+                    self.preset_name.clear();
+                }
+                Err(e) => self.error(format!("Could not save preset: {e:#}")),
+            }
+            self.presets = crate::presets::list();
+        }
+        if let Some(name) = delete {
+            crate::presets::delete(&name);
+            self.presets = crate::presets::list();
+        }
+        if let Some(pr) = apply {
+            self.apply_preset(&pr, ctx);
+        }
+    }
+
+    fn font_key_of(&self, idx: usize) -> Option<(String, String)> {
+        if let Some(m) = self.font_meta.get(&idx) {
+            return Some(m.clone());
+        }
+        self.fonts.get(idx).map(|f| ("builtin".to_string(), f.name.clone()))
+    }
+
+    fn resolve_font(&mut self, key: &Option<(String, String)>) -> usize {
+        match key {
+            Some((fam, style)) if fam == "builtin" => self.fonts.iter().position(|f| &f.name == style).unwrap_or(0),
+            Some((fam, style)) => self.font_index_for(fam, style).unwrap_or(0),
+            None => 0,
+        }
+    }
+
+    fn make_preset(&self, name: String) -> crate::presets::Preset {
+        use crate::presets::{Preset, PresetLayer};
+        let (inc_t, inc_l, inc_g) = self.preset_inc;
+        let src = self.plan.get(self.cur).map(|f| f.src).unwrap_or(0);
+        let layers = inc_l.then(|| {
+            self.stack
+                .layers
+                .iter()
+                .filter_map(|l| {
+                    let visible = l.visible;
+                    Some(match &l.kind {
+                        LayerKind::Effects(fx) => PresetLayer::Effects { visible, fx: (**fx).clone() },
+                        LayerKind::Text(t) => PresetLayer::Text { visible, text: t.clone(), font: self.font_key_of(t.font_idx) },
+                        LayerKind::Censor(c) => PresetLayer::Censor { visible, censor: c.clone() },
+                        LayerKind::Overlay(o) => PresetLayer::Image { visible, path: o.src.path.clone()?, placement: o.placement(src), opacity: o.opacity },
+                        LayerKind::Watermark(w) => {
+                            let mut w = (**w).clone();
+                            w.font_key = self.font_key_of(w.font_idx);
+                            PresetLayer::Watermark { visible, watermark: w }
+                        }
+                        LayerKind::Shield(s) => PresetLayer::Shield { visible, shield: s.clone() },
+                    })
+                })
+                .collect()
+        });
+        Preset { name, src_size: self.dims(), transform: inc_t.then(|| self.stack.transform.clone()), layers, gif: inc_g.then(|| self.gif_opts.clone()) }
+    }
+
+    fn apply_preset(&mut self, pr: &crate::presets::Preset, ctx: &egui::Context) {
+        use crate::presets::PresetLayer;
+        let now = ctx.input(|i| i.time);
+        self.snapshot(&format!("preset{now}"), now);
+        let (w, h) = self.dims();
+        let (sw, sh) = (pr.src_size.0.max(1) as f32, pr.src_size.1.max(1) as f32);
+        let (fx, fy) = if pr.src_size.0 == 0 { (1.0, 1.0) } else { (w as f32 / sw, h as f32 / sh) };
+        let fs = fx.min(fy);
+        let sc = |v: i32, f: f32| (v as f32 * f).round() as i32;
+        if let Some(t) = &pr.transform {
+            let mut t = t.clone();
+            t.crop = [(t.crop[0] as f32 * fx) as u32, (t.crop[1] as f32 * fy) as u32, (t.crop[2] as f32 * fx) as u32, (t.crop[3] as f32 * fy) as u32];
+            self.stack.transform = t;
+        }
+        if let Some(g) = &pr.gif {
+            self.gif_opts = g.clone();
+        }
+        let mut missing = Vec::new();
+        if let Some(layers) = &pr.layers {
+            let n = self.base.as_ref().map(|b| b.len()).unwrap_or(1).max(1);
+            for l in layers {
+                let id = match l.clone() {
+                    PresetLayer::Effects { visible, fx: e } => (self.stack.push(LayerKind::Effects(Box::new(e))), visible),
+                    PresetLayer::Text { visible, mut text, font } => {
+                        text.x = sc(text.x, fx);
+                        text.y = sc(text.y, fy);
+                        text.size *= fs;
+                        text.font_idx = self.resolve_font(&font);
+                        (self.stack.push(LayerKind::Text(text)), visible)
+                    }
+                    PresetLayer::Censor { visible, mut censor } => {
+                        censor.x = sc(censor.x, fx);
+                        censor.y = sc(censor.y, fy);
+                        censor.w = (censor.w as f32 * fx) as u32;
+                        censor.h = (censor.h as f32 * fy) as u32;
+                        (self.stack.push(LayerKind::Censor(censor)), visible)
+                    }
+                    PresetLayer::Image { visible, path, mut placement, opacity } => match io::load_animation(&path) {
+                        Ok(a) => {
+                            placement.x = sc(placement.x, fx);
+                            placement.y = sc(placement.y, fy);
+                            placement.w = (placement.w as f32 * fs).max(1.0) as u32;
+                            placement.h = (placement.h as f32 * fs).max(1.0) as u32;
+                            let src = OverlaySource { name: path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(), path: Some(path.clone()), delays: a.frames.iter().map(|f| f.delay_cs).collect(), frames: a.frames.iter().map(|f| (*f.image).clone()).collect() };
+                            (self.stack.push(LayerKind::Overlay(OverlayLayer { src: Arc::new(src), placements: vec![placement; n], opacity })), visible)
+                        }
+                        Err(_) => {
+                            missing.push(path.display().to_string());
+                            continue;
+                        }
+                    },
+                    PresetLayer::Watermark { visible, mut watermark } => {
+                        watermark.font_idx = self.resolve_font(&watermark.font_key);
+                        if let Some(p) = &watermark.image_path {
+                            watermark.image = io::load_still(p).ok().map(Arc::new);
+                        }
+                        (self.stack.push(LayerKind::Watermark(Box::new(watermark))), visible)
+                    }
+                    PresetLayer::Shield { visible, shield } => (self.stack.push(LayerKind::Shield(shield)), visible),
+                };
+                if let Some(i) = self.stack.index_of(id.0) {
+                    self.stack.layers[i].visible = id.1;
+                }
+            }
+        }
+        self.modified = true;
+        self.refresh_plan();
+        if missing.is_empty() {
+            self.info(format!("Applied preset “{}”", pr.name));
+        } else {
+            self.error(format!("Applied “{}”; missing images: {}", pr.name, missing.join(", ")));
+        }
+    }
+
+    // ------------------------------------------------------------ font previews
+
+    /// Register system fonts with egui so the picker can show each name in its own face.
+    fn load_preview_fonts(&mut self, ctx: &egui::Context) {
+        if self.font_preview_queue.is_empty() {
+            return;
+        }
+        let batch: Vec<String> = self.font_preview_queue.drain(..).take(6).collect();
+        self.font_preview_queue.clear();
+        let faces: Vec<(String, crate::sysfonts::SysFace)> = {
+            let Ok(g) = self.sys_fonts.lock() else { return };
+            let Some(fams) = g.as_ref() else { return };
+            batch.iter().filter_map(|n| fams.iter().find(|f| &f.name == n).map(|f| (n.clone(), f.default_face().clone()))).collect()
+        };
+        for (name, face) in faces {
+            self.preview_fonts.insert(name.clone(), false);
+            let ok = std::fs::metadata(&face.path).map(|m| m.len() < 12_000_000).unwrap_or(false);
+            if !ok {
+                continue;
+            }
+            if let Ok(data) = std::fs::read(&face.path) {
+                let mut fd = egui::FontData::from_owned(data);
+                fd.index = face.index;
+                ctx.add_font(egui::epaint::text::FontInsert::new(
+                    &format!("sys:{name}"),
+                    fd,
+                    vec![
+                        egui::epaint::text::InsertFontFamily { family: egui::FontFamily::Name(format!("sys:{name}").into()), priority: egui::epaint::text::FontPriority::Highest },
+                    ],
+                ));
+                // fallback for glyphs the face lacks (symbol fonts, arrows)
+                ctx.add_font(egui::epaint::text::FontInsert::new(
+                    &format!("sys-fb:{name}"),
+                    egui::FontData::from_static(theme::NOTO_REGULAR),
+                    vec![egui::epaint::text::InsertFontFamily { family: egui::FontFamily::Name(format!("sys:{name}").into()), priority: egui::epaint::text::FontPriority::Lowest }],
+                ));
+                self.preview_fonts.insert(name, true);
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    /// FontId showing `family` in its own face (once loaded), else the UI font.
+    fn preview_font(&mut self, family: &str, size: f32) -> egui::FontId {
+        match self.preview_fonts.get(family) {
+            Some(true) => egui::FontId::new(size, egui::FontFamily::Name(format!("sys:{family}").into())),
+            Some(false) => egui::FontId::proportional(size),
+            None => {
+                if !self.font_preview_queue.iter().any(|f| f == family) {
+                    self.font_preview_queue.push(family.to_string());
+                }
+                egui::FontId::proportional(size)
+            }
+        }
     }
 
     // ------------------------------------------------------------ canvas
@@ -1943,7 +2738,7 @@ impl GifForgeApp {
             self.zoom_fit_v(vi);
         }
 
-        let mut y = rect.top() + 10.0;
+        let mut y = rect.top() + 46.0;
         for (text, col, warn) in [label.map(|(t, c)| (t, c, false)), badge.map(|t| (t, Color32::WHITE, true))].into_iter().flatten() {
             let galley = painter.layout_no_wrap(text, theme::medium(12.5), col);
             let pos = pos2(rect.left() + 10.0, y);
@@ -1983,6 +2778,65 @@ impl GifForgeApp {
     /// coordinates are known: live edit & compressed (output space) and the
     /// original file (source space, when its size matches the frames).
     fn source_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, rect: Rect, src: ViewSource, vi: usize, show_label: bool) {
+        self.source_view_inner(ui, ctx, rect, src, vi, show_label);
+        self.view_picker(ui, rect, src, vi);
+    }
+
+    /// Size note shown next to a view's source name.
+    fn view_info(&self, src: ViewSource) -> String {
+        match src {
+            ViewSource::Original => self.file_size.map(fmt_size).unwrap_or_default(),
+            ViewSource::Edit => String::new(),
+            ViewSource::Compressed => match &self.cmp {
+                Some(c) if c.key == self.cmp_key() => {
+                    let n = c.bytes.len() as u64;
+                    match self.file_size {
+                        Some(o) => format!("{} ({:+.0}%)", fmt_size(n), (n as f64 / o as f64 - 1.0) * 100.0),
+                        None => fmt_size(n),
+                    }
+                }
+                _ => "…".into(),
+            },
+        }
+    }
+
+    /// Source chooser floating in a viewport's top-left corner.
+    fn view_picker(&mut self, ui: &mut egui::Ui, rect: Rect, src: ViewSource, vi: usize) {
+        let pal = *p();
+        let info = self.view_info(src);
+        let text = if info.is_empty() { format!("{}  ▾", src.label()) } else { format!("{}  ·  {}  ▾", src.label(), info) };
+        let area = Rect::from_min_size(rect.min + vec2(10.0, 10.0), vec2((rect.width() - 20.0).max(40.0), 28.0));
+        let mut pick = None;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(area).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+            let r = ui.add(
+                egui::Button::new(RichText::new(text).font(theme::medium(12.5)).color(Color32::WHITE))
+                    .fill(Color32::from_black_alpha(170))
+                    .stroke(Stroke::new(1.0, Color32::from_white_alpha(30)))
+                    .corner_radius(4.0)
+                    .min_size(vec2(0.0, 26.0)),
+            );
+            let r = r.on_hover_text(src.tip());
+            egui::Popup::menu(&r).show(|ui| {
+                ui.set_min_width(170.0);
+                for s in ViewSource::ALL {
+                    let resp = ui.add(egui::Button::selectable(s == src, s.label())).on_hover_text(s.tip());
+                    if resp.clicked() {
+                        pick = Some(s);
+                    }
+                }
+            });
+        });
+        let _ = pal;
+        if let Some(s) = pick {
+            match vi {
+                1 => self.view_left = s,
+                2 => self.view_right = s,
+                _ => self.view_single = s,
+            }
+        }
+    }
+
+    fn source_view_inner(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, rect: Rect, src: ViewSource, vi: usize, show_label: bool) {
         let t = self.play_time();
         let crop_mode = self.tool == Tool::Crop;
         match src {
@@ -2001,13 +2855,8 @@ impl GifForgeApp {
                     self.out_size = (size.x, size.y);
                     (tex, size)
                 };
-                let label = if crop_mode {
-                    Some(("Crop: full frame before edits".to_string(), Color32::WHITE))
-                } else if show_label {
-                    Some(("Live edit · uncompressed".to_string(), Color32::WHITE))
-                } else {
-                    None
-                };
+                let label = crop_mode.then(|| ("Full frame (before edits)".to_string(), Color32::WHITE));
+                let _ = show_label;
                 let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, label, None, false);
                 let space = if crop_mode { Space::Source } else { Space::Output };
                 self.canvas_interaction(ui, &resp, m, (size.x, size.y), space, vi);
@@ -2018,9 +2867,8 @@ impl GifForgeApp {
                     let o = self.original.as_ref().unwrap();
                     (vec2(o.width() as f32, o.height() as f32), (o.width(), o.height()) == self.dims())
                 };
-                let label = format!("Original{}", self.file_size.map(|s| format!(" · {}", fmt_size(s))).unwrap_or_default());
                 let tex = self.orig_texture(ctx, i);
-                let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, Some((label, Color32::WHITE)), None, false);
+                let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, None, None, false);
                 if same {
                     self.canvas_interaction(ui, &resp, m, (size.x, size.y), Space::Source, vi);
                 }
@@ -2033,13 +2881,9 @@ impl GifForgeApp {
                         let c = self.cmp.as_ref().unwrap();
                         (stack::frame_at_time(&c.anim, t), vec2(c.anim.width() as f32, c.anim.height() as f32), c.bytes.len() as u64)
                     };
-                    let mut label = format!("Live edit · compressed · {}", fmt_size(n));
-                    if let Some(o) = self.file_size {
-                        let pct = (n as f64 / o as f64 - 1.0) * 100.0;
-                        label.push_str(&format!(" ({}{:.0}%)", if pct >= 0.0 { "+" } else { "" }, pct));
-                    }
+                    let _ = n;
                     let tex = self.cmp_texture(ctx, i);
-                    let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, Some((label, Color32::WHITE)), None, false);
+                    let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, None, None, false);
                     if !crop_mode {
                         self.canvas_interaction(ui, &resp, m, (size.x, size.y), Space::Output, vi);
                     }
@@ -2047,9 +2891,8 @@ impl GifForgeApp {
                     // compression pending / running: show the live preview with a warning
                     let tex = self.composite_texture(ctx, self.cur);
                     let size = tex.as_ref().map(|t| t.size_vec2()).unwrap_or(vec2(self.out_size.0, self.out_size.1));
-                    let label = self.cmp.as_ref().map(|c| format!("Live edit · compressed · last {}", fmt_size(c.bytes.len() as u64))).unwrap_or_else(|| "Live edit · compressed".into());
-                    let badge = if encoding { "⚠ Compressing… showing uncompressed preview" } else { "⚠ Waiting for edits to settle – uncompressed preview" };
-                    let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, Some((label, Color32::from_gray(200))), Some(badge.into()), encoding);
+                    let badge = if encoding { "⚠ Compressing" } else { "⚠ Not compressed yet" };
+                    let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, None, Some(badge.into()), encoding);
                     if !crop_mode {
                         self.canvas_interaction(ui, &resp, m, (size.x, size.y), Space::Output, vi);
                     }
@@ -2063,7 +2906,8 @@ impl GifForgeApp {
         let full = ui.available_rect_before_wrap();
         ui.allocate_rect(full, Sense::hover());
         if !self.compare {
-            self.source_view(ui, ctx, full, ViewSource::Edit, 0, false);
+            let s = self.view_single;
+            self.source_view(ui, ctx, full, s, 0, false);
             return;
         }
         let gap = 2.0;
@@ -2346,7 +3190,7 @@ impl GifForgeApp {
                     q.angle = b.angle;
                 }
             }
-            LayerKind::Effects(_) => {}
+            LayerKind::Effects(_) | LayerKind::Watermark(_) | LayerKind::Shield(_) => {}
         }
         self.modified = true;
     }
@@ -2361,10 +3205,10 @@ impl GifForgeApp {
         let (cs, ce) = self.base.as_ref().map(|b| self.stack.transform.cut_range(b)).unwrap_or((0, 0));
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("{n} source frames")).font(theme::medium(14.0)).color(pal.fg));
-            hint(ui, "Edits here happen underneath all live edits. Skipped frames are excluded from playback and export.");
+            ui.label(RichText::new("ℹ").color(pal.fg_muted)).on_hover_text("Changes here apply under all live edits. Skipped frames are left out of playback and export.");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add(egui::Slider::new(&mut self.fr_thumb, 56.0..=200.0).show_value(false));
-                ui.label("Thumbnail size");
+                ui.label("Size");
             });
         });
         ui.add_space(6.0);
@@ -2494,22 +3338,24 @@ impl GifForgeApp {
             Tool::Text => self.ui_text(ui, ctx),
             Tool::Censor => self.ui_censor(ui, ctx),
             Tool::AddImage => self.ui_add_image(ui, ctx),
+            Tool::Watermark => self.ui_watermark(ui, ctx),
+            Tool::Shield => self.ui_shield(ui, ctx),
             Tool::Cut => self.ui_cut(ui, ctx),
-            Tool::Split => self.ui_split(ui, ctx),
             Tool::Frames => self.ui_frames(ui, ctx),
-            Tool::Export => self.ui_export(ui, ctx),
         }
     }
 
-    /// Header for live frame-edit tools: enable switch, reset, bake.
+    /// Enable switch, reset and bake for live frame-edit tools.
     fn transform_header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, on: impl Fn(&mut Transform) -> &mut bool, reset: impl Fn(&mut Transform)) {
         let mut enabled = *on(&mut self.stack.transform);
         let mut do_reset = false;
         let mut do_bake = false;
         ui.horizontal(|ui| {
             ui.checkbox(&mut enabled, "Enabled");
-            do_reset = ui.button("Reset").clicked();
-            do_bake = ui.button("⬇ Bake frame edits").on_hover_text("Permanently apply crop/resize/rotate/speed/cut/reverse to the frames; layers stay live").clicked();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                do_bake = ui.button("⬇ Bake").on_hover_text("Apply frame edits to the frames permanently. Layers stay live.").clicked();
+                do_reset = ui.button("Reset").clicked();
+            });
         });
         *on(&mut self.stack.transform) = enabled;
         if do_reset {
@@ -2519,7 +3365,6 @@ impl GifForgeApp {
         if do_bake {
             self.bake(ctx, true);
         }
-        hint(ui, "Live: applied underneath your effects and layers as you change it.");
         ui.add_space(4.0);
     }
 
@@ -2534,18 +3379,15 @@ impl GifForgeApp {
         let (w, h) = if tr.crop_on && tr.crop[2] > 0 { (tr.crop[2], tr.crop[3]) } else { (bw, bh) };
         let before = (tr.rs_w, tr.rs_h, tr.rs_pct.to_bits(), tr.rs_mode, tr.rs_filter);
         group(ui, "Size", |ui| {
-            egui::Grid::new("rs").num_columns(3).spacing([8.0, 6.0]).show(ui, |ui| {
-                ui.label("↔ Width:");
-                ui.add(egui::DragValue::new(&mut tr.rs_w).range(0..=16384).suffix(" px"));
-                hint(ui, "0 = auto");
+            egui::Grid::new("rs").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label("Width");
+                ui.add(egui::DragValue::new(&mut tr.rs_w).range(0..=16384).suffix(" px")).on_hover_text("0 = keep aspect");
                 ui.end_row();
-                ui.label("↕ Height:");
-                ui.add(egui::DragValue::new(&mut tr.rs_h).range(0..=16384).suffix(" px"));
-                hint(ui, "0 = auto");
+                ui.label("Height");
+                ui.add(egui::DragValue::new(&mut tr.rs_h).range(0..=16384).suffix(" px")).on_hover_text("0 = keep aspect");
                 ui.end_row();
-                ui.label("Percentage:");
-                ui.add(egui::DragValue::new(&mut tr.rs_pct).range(0.0..=6400.0).suffix(" %"));
-                hint(ui, "overrides w/h");
+                ui.label("Scale");
+                ui.add(egui::DragValue::new(&mut tr.rs_pct).range(0.0..=6400.0).suffix(" %")).on_hover_text("Overrides width / height when set");
                 ui.end_row();
             });
             ui.horizontal(|ui| {
@@ -2560,78 +3402,81 @@ impl GifForgeApp {
                     tr.rs_h = 0;
                 }
             });
+            match stack::resize_target(w, h, tr.rs_w, tr.rs_h, tr.rs_pct) {
+                Some((tw, th)) => hint(ui, &format!("{w}×{h} → {tw}×{th}")),
+                None => hint(ui, &format!("{w}×{h}")),
+            }
         });
-        group(ui, "If the aspect ratio does not match", |ui| {
-            egui::ComboBox::from_id_salt("rsmode").selected_text(tr.rs_mode.label()).width(260.0).show_ui(ui, |ui| {
-                for m in AspectMode::ALL {
-                    ui.selectable_value(&mut tr.rs_mode, m, m.label());
-                }
-            });
-            ui.add_space(4.0);
-            ui.label("Resampling:");
-            egui::ComboBox::from_id_salt("rsfilt").selected_text(tr.rs_filter.label()).width(260.0).show_ui(ui, |ui| {
-                for f in ResizeFilter::ALL {
-                    ui.selectable_value(&mut tr.rs_filter, f, f.label());
-                }
+        group(ui, "Fit", |ui| {
+            egui::Grid::new("rsfit").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label("Aspect");
+                egui::ComboBox::from_id_salt("rsmode").selected_text(tr.rs_mode.label()).width(200.0).show_ui(ui, |ui| {
+                    for m in AspectMode::ALL {
+                        ui.selectable_value(&mut tr.rs_mode, m, m.label());
+                    }
+                });
+                ui.end_row();
+                ui.label("Filter");
+                egui::ComboBox::from_id_salt("rsfilt").selected_text(tr.rs_filter.label()).width(200.0).show_ui(ui, |ui| {
+                    for f in ResizeFilter::ALL {
+                        ui.selectable_value(&mut tr.rs_filter, f, f.label());
+                    }
+                });
+                ui.end_row();
             });
         });
         if before != (tr.rs_w, tr.rs_h, tr.rs_pct.to_bits(), tr.rs_mode, tr.rs_filter) {
             tr.resize_on = true;
         }
-        match stack::resize_target(w, h, tr.rs_w, tr.rs_h, tr.rs_pct) {
-            Some((tw, th)) => ui.label(format!("Result: {w}×{h} → {tw}×{th}")),
-            None => ui.label(RichText::new("Enter a width, height or percentage").color(p().fg_muted)),
-        };
-        hint(ui, "Layer positions are in output pixels and are not rescaled.");
     }
 
     fn ui_crop(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.transform_header(ui, ctx, |t| &mut t.crop_on, |_| {});
         let (w, h) = self.dims();
-        hint(ui, "Drag on the image to select the area. Drag inside to move it, corners to resize. Alt-drag or middle/right-drag pans.");
+        hint(ui, "Drag on the image");
         let tr = &mut self.stack.transform;
         let before = tr.crop;
-        group(ui, "Selection", |ui| {
+        group(ui, "Area", |ui| {
             let r = &mut tr.crop;
-            ui.horizontal(|ui| {
-                ui.label("Left:");
+            egui::Grid::new("crop").num_columns(4).spacing([8.0, 6.0]).show(ui, |ui| {
+                ui.label("X");
                 ui.add(egui::DragValue::new(&mut r[0]).range(0..=w.saturating_sub(1)));
-                ui.label("Top:");
+                ui.label("Y");
                 ui.add(egui::DragValue::new(&mut r[1]).range(0..=h.saturating_sub(1)));
-            });
-            ui.horizontal(|ui| {
-                ui.label("Width:");
+                ui.end_row();
+                ui.label("W");
                 ui.add(egui::DragValue::new(&mut r[2]).range(1..=w));
-                ui.label("Height:");
+                ui.label("H");
                 ui.add(egui::DragValue::new(&mut r[3]).range(1..=h));
+                ui.end_row();
             });
             r[2] = r[2].min(w.saturating_sub(r[0])).max(1);
             r[3] = r[3].min(h.saturating_sub(r[1])).max(1);
-            if ui.button("Select all").clicked() {
-                *r = [0, 0, w, h];
-            }
-        });
-        group(ui, "Lock aspect ratio", |ui| {
-            egui::ComboBox::from_id_salt("croplock").selected_text(self.crop_lock.label()).width(200.0).show_ui(ui, |ui| {
-                for l in AspectLock::ALL {
-                    ui.selectable_value(&mut self.crop_lock, l, l.label());
+            ui.horizontal(|ui| {
+                ui.label("Aspect");
+                egui::ComboBox::from_id_salt("croplock").selected_text(self.crop_lock.label()).width(130.0).show_ui(ui, |ui| {
+                    for l in AspectLock::ALL {
+                        ui.selectable_value(&mut self.crop_lock, l, l.label());
+                    }
+                });
+                if ui.button("All").on_hover_text("Select the whole frame").clicked() {
+                    *r = [0, 0, w, h];
                 }
             });
         });
         let mut detect = false;
         group(ui, "Auto-trim", |ui| {
-            hint(ui, "Find the smallest box containing all non-background pixels across every frame (great for sprite exports).");
             ui.horizontal(|ui| {
                 ui.label("Tolerance");
                 ui.add(egui::DragValue::new(&mut self.trim_tol).range(0..=255));
-                detect = ui.button("Detect").clicked();
+                detect = ui.button("Detect").on_hover_text("Fit the area to non-background pixels across all frames").clicked();
             });
         });
         if detect {
             if let Some(a) = &self.base {
                 match ops::auto_trim_rect(a, self.trim_tol) {
                     Some((x, y, w, h)) => self.stack.transform.crop = [x, y, w, h],
-                    None => self.error("Nothing to trim – every pixel is background"),
+                    None => self.error("Nothing to trim"),
                 }
             }
         }
@@ -2650,12 +3495,14 @@ impl GifForgeApp {
         let tr = &mut self.stack.transform;
         let before = format!("{} {} {} {} {} {} {} {:?}", tr.flip_v, tr.flip_h, tr.rot, tr.rot_any, tr.rot_deg, tr.rot_expand, tr.rot_bg_transparent, tr.rot_bg);
         group(ui, "Flip", |ui| {
-            ui.checkbox(&mut tr.flip_v, "↕ Flip vertically");
-            ui.checkbox(&mut tr.flip_h, "↔ Flip horizontally");
+            ui.horizontal(|ui| {
+                ui.toggle_value(&mut tr.flip_h, "↔ Horizontal");
+                ui.toggle_value(&mut tr.flip_v, "↕ Vertical");
+            });
         });
         group(ui, "Rotate", |ui| {
             ui.horizontal(|ui| {
-                for (deg, label) in [(0u16, "0°"), (90, "↻ 90°"), (180, "⟲ 180°"), (270, "↺ 270°")] {
+                for (deg, label) in [(0u16, "0°"), (90, "↻ 90°"), (180, "180°"), (270, "↺ 90°")] {
                     if ui.selectable_label(tr.rot == deg, label).clicked() {
                         tr.rot = deg;
                     }
@@ -2663,7 +3510,7 @@ impl GifForgeApp {
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.checkbox(&mut tr.rot_any, "Free rotation");
+                ui.checkbox(&mut tr.rot_any, "Free");
                 if ui.add(egui::DragValue::new(&mut tr.rot_deg).speed(0.5).suffix("°")).changed() {
                     tr.rot_any = true;
                 }
@@ -2671,9 +3518,9 @@ impl GifForgeApp {
             if ui.add(egui::Slider::new(&mut tr.rot_deg, -180.0..=180.0).show_value(false).clamping(egui::SliderClamping::Never)).changed() {
                 tr.rot_any = true;
             }
-            ui.checkbox(&mut tr.rot_expand, "Expand canvas to fit");
+            ui.checkbox(&mut tr.rot_expand, "Expand canvas");
             ui.horizontal(|ui| {
-                ui.checkbox(&mut tr.rot_bg_transparent, "Transparent background");
+                ui.checkbox(&mut tr.rot_bg_transparent, "Transparent fill");
                 if !tr.rot_bg_transparent {
                     ui.color_edit_button_srgb(&mut tr.rot_bg);
                 }
@@ -2688,27 +3535,15 @@ impl GifForgeApp {
         let tr = &mut self.stack.transform;
         group(ui, "Playback", |ui| {
             ui.checkbox(&mut tr.reverse, "⟲ Reverse");
-            ui.checkbox(&mut tr.boomerang, "⇄ Run to the end and back to the start (boomerang)");
-            ui.checkbox(&mut tr.set_loop, "Change the number of times to play (loop)");
-            if tr.set_loop {
-                ui.indent("loopn", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.add(egui::DragValue::new(&mut tr.loop_count).range(0..=65535));
-                        hint(ui, "times (0 = forever)");
-                    });
-                });
-            }
+            ui.checkbox(&mut tr.boomerang, "⇄ Boomerang").on_hover_text("Play forward, then backward");
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut tr.set_loop, "Loop count");
+                if tr.set_loop {
+                    ui.add(egui::DragValue::new(&mut tr.loop_count).range(0..=65535)).on_hover_text("0 = forever");
+                }
+            });
         });
-        group(ui, "Flip", |ui| {
-            if ui.checkbox(&mut tr.flip_v, "↕ Flip vertically").changed() {
-                tr.rot_on = true;
-            }
-            if ui.checkbox(&mut tr.flip_h, "↔ Flip horizontally").changed() {
-                tr.rot_on = true;
-            }
-        });
-        hint(ui, "Live. The seconds counter and fades are in Effects → Animation flow.");
-        if ui.button("⬇ Bake frame edits").clicked() {
+        if ui.button("⬇ Bake").on_hover_text("Apply frame edits to the frames permanently. Layers stay live.").clicked() {
             self.bake(ctx, true);
         }
     }
@@ -2718,23 +3553,23 @@ impl GifForgeApp {
             t.speed_mode = SpeedMode::Percent;
             t.speed_val = 100.0;
         });
-        let (avg_fps, n) = self.base.as_ref().map(|a| (a.enabled_count() as f32 / a.duration_secs().max(0.001), a.len())).unwrap_or((0.0, 0));
+        let avg_fps = self.base.as_ref().map(|a| a.enabled_count() as f32 / a.duration_secs().max(0.001)).unwrap_or(0.0);
         let tr = &mut self.stack.transform;
         let before = (tr.speed_mode, tr.speed_val.to_bits());
         group(ui, "Speed", |ui| {
             ui.horizontal(|ui| {
                 ui.add(egui::DragValue::new(&mut tr.speed_val).range(0.1..=100000.0).speed(1.0));
                 egui::ComboBox::from_id_salt("spmode")
-                    .width(210.0)
+                    .width(150.0)
                     .selected_text(match tr.speed_mode {
-                        SpeedMode::Percent => "% of original speed",
-                        SpeedMode::DelayAll => "delay for all frames (1/100 s)",
-                        SpeedMode::Fps => "frames per second (all frames)",
+                        SpeedMode::Percent => "% of original",
+                        SpeedMode::DelayAll => "cs per frame",
+                        SpeedMode::Fps => "fps",
                     })
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut tr.speed_mode, SpeedMode::Percent, "% of original speed");
-                        ui.selectable_value(&mut tr.speed_mode, SpeedMode::DelayAll, "delay for all frames (1/100 s)");
-                        ui.selectable_value(&mut tr.speed_mode, SpeedMode::Fps, "frames per second (all frames)");
+                        ui.selectable_value(&mut tr.speed_mode, SpeedMode::Percent, "% of original");
+                        ui.selectable_value(&mut tr.speed_mode, SpeedMode::DelayAll, "cs per frame").on_hover_text("Same delay for every frame, in 1/100 s");
+                        ui.selectable_value(&mut tr.speed_mode, SpeedMode::Fps, "fps").on_hover_text("Same rate for every frame");
                     });
             });
             if tr.speed_mode == SpeedMode::Percent {
@@ -2749,18 +3584,17 @@ impl GifForgeApp {
             } else {
                 let d = if tr.speed_mode == SpeedMode::Fps { (100.0 / tr.speed_val).round() } else { tr.speed_val };
                 if d < 2.0 {
-                    ui.label(RichText::new("⚠ Delays below 2 cs are played at 10 cs by most browsers.").color(p().neutral));
+                    ui.label(RichText::new("⚠ Too fast for browsers").color(p().neutral)).on_hover_text("Delays under 2 cs are played at 10 cs by most browsers.");
                 }
                 if tr.speed_mode == SpeedMode::Fps {
-                    hint(ui, &format!("GIF delays are in 1/100 s, so {:.1} fps becomes {} cs ({:.2} fps).", tr.speed_val, d.max(1.0), 100.0 / d.max(1.0)));
+                    hint(ui, &format!("= {} cs ({:.2} fps)", d.max(1.0), 100.0 / d.max(1.0)));
                 }
             }
-            hint(ui, &format!("Source: {n} frames, average {avg_fps:.1} fps."));
+            hint(ui, &format!("Source: {avg_fps:.1} fps"));
         });
         if before != (tr.speed_mode, tr.speed_val.to_bits()) {
             tr.speed_on = true;
         }
-        hint(ui, "Per-frame delays can be edited in the Frames tool.");
     }
 
     fn ui_cut(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -2772,33 +3606,30 @@ impl GifForgeApp {
         let src = self.plan.get(self.cur).map(|f| f.src + 1).unwrap_or(1);
         let tr = &mut self.stack.transform;
         let before = format!("{} {} {} {} {}", tr.cut_by_time, tr.cut_start, tr.cut_end, tr.cut_t0, tr.cut_t1);
-        ui.label(format!("Source: {n} frames, {dur:.2} seconds"));
-        group(ui, "Cutting options", |ui| {
-            egui::ComboBox::from_id_salt("cutmode").selected_text(if tr.cut_by_time { "Cut by time (seconds)" } else { "Cut by frame number" }).show_ui(ui, |ui| {
-                ui.selectable_value(&mut tr.cut_by_time, false, "Cut by frame number");
-                ui.selectable_value(&mut tr.cut_by_time, true, "Cut by time (seconds)");
+        group(ui, "Range", |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut tr.cut_by_time, false, "Frames");
+                ui.selectable_value(&mut tr.cut_by_time, true, "Seconds");
             });
             if tr.cut_by_time {
                 ui.horizontal(|ui| {
-                    ui.label("Start:");
                     ui.add(egui::DragValue::new(&mut tr.cut_t0).range(0.0..=dur).speed(0.01).suffix(" s"));
-                    ui.label("End:");
+                    ui.label("–");
                     ui.add(egui::DragValue::new(&mut tr.cut_t1).range(0.0..=dur).speed(0.01).suffix(" s"));
                 });
             } else {
                 let mut end = if tr.cut_end == 0 { n } else { tr.cut_end };
                 ui.horizontal(|ui| {
-                    ui.label("Start:");
                     ui.add(egui::DragValue::new(&mut tr.cut_start).range(1..=n));
-                    ui.label("End:");
+                    ui.label("–");
                     ui.add(egui::DragValue::new(&mut end).range(1..=n));
                 });
                 tr.cut_end = if end >= n { 0 } else { end };
                 ui.horizontal(|ui| {
-                    if ui.small_button("Start = current frame").clicked() {
+                    if ui.small_button("Start here").on_hover_text("Use the current frame").clicked() {
                         tr.cut_start = src;
                     }
-                    if ui.small_button("End = current frame").clicked() {
+                    if ui.small_button("End here").on_hover_text("Use the current frame").clicked() {
                         tr.cut_end = src;
                     }
                 });
@@ -2809,16 +3640,12 @@ impl GifForgeApp {
         }
         if let Some(b) = &self.base {
             let (s, e) = self.stack.transform.cut_range(b);
-            hint(ui, &format!("Keeps source frames {}–{} ({} frames).", s + 1, e + 1, e - s + 1));
+            hint(ui, &format!("Keeps {}–{} ({} frames)", s + 1, e + 1, e - s + 1));
         }
     }
 
     fn ui_optimize(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let pal = *p();
-        if ui.add(egui::Button::new(RichText::new("◫  Compare live edit vs compressed").color(if self.compare { Color32::WHITE } else { pal.fg })).selected(self.compare)).clicked() {
-            self.compare = !self.compare;
-        }
-        hint(ui, "The compressed result re-encodes automatically when anything changes. These settings are used whenever a GIF is saved.");
         let cur_key = self.cmp_key();
         let busy = self.cmp_job.is_some();
         group(ui, "Result", |ui| match &self.cmp {
@@ -2826,25 +3653,25 @@ impl GifForgeApp {
                 let n = c.bytes.len() as u64;
                 let stale = c.key != cur_key;
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("Compressed: {}", fmt_size(n))).font(theme::medium(15.0)).color(if stale { pal.fg_muted } else { pal.positive }));
+                    ui.label(RichText::new(fmt_size(n)).font(theme::medium(16.0)).color(if stale { pal.fg_muted } else { pal.positive }));
+                    if let Some(orig) = self.file_size {
+                        hint(ui, &format!("{:+.0}% vs original", (n as f64 / orig as f64 - 1.0) * 100.0));
+                    }
                     if stale || busy {
                         ui.spinner();
                     }
                 });
-                if let Some(orig) = self.file_size {
-                    hint(ui, &format!("{:.0}% of the original {}", n as f64 / orig as f64 * 100.0, fmt_size(orig)));
-                }
             }
             None => {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("Encoding…");
+                    hint(ui, "Encoding…");
                 });
             }
         });
         group(ui, "Presets", |ui| {
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Max quality").clicked() {
+                if ui.button("Best").clicked() {
                     self.gif_opts = GifOptions { quant_speed: 1, ..GifOptions::default() };
                 }
                 if ui.button("Balanced").clicked() {
@@ -2859,72 +3686,64 @@ impl GifForgeApp {
             });
         });
         let o = &mut self.gif_opts;
-        group(ui, "Lossy compression", |ui| {
-            ui.add(egui::Slider::new(&mut o.lossy, 0..=200).text("level").clamping(egui::SliderClamping::Never));
-            hint(ui, "Similar colours may merge inside the LZW stream and between frames. 30–80 is usually invisible on footage.");
+        group(ui, "Lossy", |ui| {
+            ui.add(egui::Slider::new(&mut o.lossy, 0..=200).text("level").clamping(egui::SliderClamping::Never)).on_hover_text("Lets similar colours merge. 30–80 is usually invisible.");
         });
         group(ui, "Colours", |ui| {
-            ui.add(egui::Slider::new(&mut o.colors, 2..=256).text("max colours"));
-            ui.checkbox(&mut o.global_palette, "Use one global palette for all frames");
-            ui.checkbox(&mut o.dither, "Dither (Floyd–Steinberg)");
+            ui.add(egui::Slider::new(&mut o.colors, 2..=256).text("max"));
+            ui.checkbox(&mut o.global_palette, "One palette for all frames").on_hover_text("Smaller files; can band on varied footage");
+            ui.checkbox(&mut o.dither, "Dither");
             ui.add(egui::Slider::new(&mut o.quant_speed, 1..=30).text("quantizer speed")).on_hover_text("1 = best palette, 30 = fastest");
         });
+        let drop_nth = &mut self.opt_drop_nth;
+        let mut drop_go = false;
         group(ui, "Frames", |ui| {
-            ui.checkbox(&mut o.frame_diff, "Store only changed pixels (frame differencing)");
-            ui.checkbox(&mut o.merge_duplicates, "Merge identical consecutive frames");
-            ui.add(egui::Slider::new(&mut o.alpha_threshold, 1..=255).text("alpha cut-off"));
-            hint(ui, "Animations with transparency automatically use \"don't stack frames\" disposal.");
-        });
-        group(ui, "Drop frames", |ui| {
+            ui.checkbox(&mut o.frame_diff, "Store only changed pixels");
+            ui.checkbox(&mut o.merge_duplicates, "Merge identical frames");
+            ui.add(egui::Slider::new(&mut o.alpha_threshold, 1..=255).text("alpha cut-off")).on_hover_text("Pixels below this opacity become transparent");
             ui.horizontal(|ui| {
                 ui.label("Drop every");
-                ui.add(egui::DragValue::new(&mut self.opt_drop_nth).range(0..=100));
+                ui.add(egui::DragValue::new(drop_nth).range(0..=100));
                 ui.label("th frame");
-                if ui.add_enabled(self.opt_drop_nth >= 2, egui::Button::new("Apply")).clicked() {
-                    let n = self.opt_drop_nth;
-                    self.run_anim(ctx, "Drop frames", move |a, _| Ok(ops::drop_every_nth(a, n)));
-                }
+                drop_go = ui.add_enabled(*drop_nth >= 2, egui::Button::new("Apply")).on_hover_text("Removes source frames; timing is kept").clicked();
             });
-            hint(ui, "Removes source frames (undoable); their time is given to the previous frame so speed is kept.");
         });
-        if primary(ui, "Save GIF…") {
-            self.save_gif_dialog(ctx);
+        if drop_go {
+            let n = self.opt_drop_nth;
+            self.run_anim(ctx, "Drop frames", move |a, _| Ok(ops::drop_every_nth(a, n)));
         }
     }
 
     fn ui_effects(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let pal = *p();
         let fx_layers: Vec<(usize, u64)> = self.stack.layers.iter().enumerate().filter(|(_, l)| l.kind() == Kind::Effects).map(|(i, l)| (i, l.id)).collect();
         let sel = self.sel_index(Kind::Effects);
-        ui.horizontal_wrapped(|ui| {
-            if fx_layers.len() > 1 {
+        if fx_layers.len() > 1 {
+            ui.horizontal_wrapped(|ui| {
                 for (n, (i, id)) in fx_layers.iter().enumerate() {
-                    if ui.selectable_label(Some(*i) == sel, format!("Effects #{}", n + 1)).clicked() {
+                    if ui.selectable_label(Some(*i) == sel, format!("Effects {}", n + 1)).clicked() {
                         self.select(Kind::Effects, *id);
                     }
                 }
-            }
-            if !fx_layers.is_empty() && ui.button("+ New effects layer").on_hover_text("Effects layers can sit above or below text/images – reorder in the layer stack").clicked() {
-                self.add_layer(LayerKind::Effects(Box::default()));
-            }
-        });
+            });
+        }
         let sel = self.sel_index(Kind::Effects);
         ui.horizontal(|ui| {
             if let Some(i) = sel {
-                ui.checkbox(&mut self.stack.layers[i].visible, "Layer visible");
+                ui.checkbox(&mut self.stack.layers[i].visible, "Visible");
             }
-            if ui.button("Reset").clicked() {
-                match sel {
-                    Some(i) => self.stack.layers[i].kind = LayerKind::Effects(Box::default()),
-                    None => self.fx_draft = EffectSettings::default(),
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if !fx_layers.is_empty() && ui.button("+ Layer").on_hover_text("Add another effects layer, e.g. one below your text and one above").clicked() {
+                    self.add_layer(LayerKind::Effects(Box::default()));
                 }
-            }
-            if ui.button("⬇ Bake everything").on_hover_text("Permanently apply all live edits to the frames").clicked() {
-                self.bake(ctx, false);
-            }
+                if ui.button("Reset").clicked() {
+                    match sel {
+                        Some(i) => self.stack.layers[i].kind = LayerKind::Effects(Box::default()),
+                        None => self.fx_draft = EffectSettings::default(),
+                    }
+                }
+            });
         });
-        hint(ui, "Every effect you tick is live and they all stack. Sliders stop at sensible limits – type a value to go beyond.");
-        let _ = pal;
+        let _ = ctx;
         let Stack { transform, layers, .. } = &mut self.stack;
         let fx: &mut EffectSettings = match sel {
             Some(i) => match &mut layers[i].kind {
@@ -2934,7 +3753,6 @@ impl GifForgeApp {
             None => &mut self.fx_draft,
         };
         effects_ui(ui, fx, transform);
-        // first change with no effects layer creates one
         if sel.is_none() && self.fx_draft != EffectSettings::default() {
             let fx = std::mem::take(&mut self.fx_draft);
             self.add_layer(LayerKind::Effects(Box::new(fx)));
@@ -2944,16 +3762,14 @@ impl GifForgeApp {
     /// Angle editor shared by text / censor / image layers.
     fn angle_row(ui: &mut egui::Ui, angle: &mut f32) {
         ui.horizontal(|ui| {
-            ui.label("Rotation:");
-            ui.add(egui::DragValue::new(angle).speed(0.5).suffix("°").max_decimals(1));
-            for (lbl, v) in [("0°", 0.0), ("-90°", -90.0), ("90°", 90.0), ("180°", 180.0)] {
+            ui.label("Angle");
+            ui.add(egui::DragValue::new(angle).speed(0.5).suffix("°").max_decimals(1)).on_hover_text("Or drag the round handle on the image (Shift snaps)");
+            for (lbl, v) in [("0", 0.0), ("−90", -90.0), ("90", 90.0), ("180", 180.0)] {
                 if ui.small_button(lbl).clicked() {
                     *angle = v;
                 }
             }
         });
-        ui.add(egui::Slider::new(angle, -180.0..=180.0).show_value(false).clamping(egui::SliderClamping::Never));
-        hint(ui, "Or drag the round handle above the box on the preview (Shift snaps to 15°).");
     }
 
     /// Load (or reuse) a system font face, returning its index in `self.fonts`.
@@ -2966,43 +3782,53 @@ impl GifForgeApp {
             let guard = self.sys_fonts.lock().ok()?;
             let fams = guard.as_ref()?;
             let f = fams.iter().find(|f| f.name == family)?;
-            f.faces.iter().find(|x| x.style == style).cloned()?
+            f.faces.iter().find(|x| x.style == style).or_else(|| Some(f.default_face())).cloned()?
         };
         match crate::sysfonts::load(&face) {
             Ok(font) => {
-                self.fonts.push(FontEntry { name: format!("{family} {style}"), font });
+                self.fonts.push(FontEntry { name: format!("{family} {}", face.style), font });
                 let i = self.fonts.len() - 1;
                 self.font_keys.insert(key, i);
-                self.font_meta.insert(i, (family.to_string(), style.to_string()));
+                self.font_meta.insert(i, (family.to_string(), face.style.clone()));
                 Some(i)
             }
             Err(e) => {
-                self.error(format!("Could not load font {family} {style}: {e:#}"));
+                self.error(format!("Could not load {family}: {e:#}"));
                 None
             }
         }
     }
 
-    /// Font chooser: searchable list of built-in + system font families, plus style.
+    fn builtin_preview_font(i: usize, size: f32) -> egui::FontId {
+        match i {
+            0 => egui::FontId::new(size, egui::FontFamily::Name("gf-sans-bold".into())),
+            1 => egui::FontId::new(size, egui::FontFamily::Name("gf-mono-bold".into())),
+            _ => theme::medium(size),
+        }
+    }
+
+    /// Font chooser with every name shown in its own typeface.
     fn font_picker(&mut self, ui: &mut egui::Ui, cur_idx: usize) -> Option<usize> {
         let pal = *p();
         let mut pick: Option<usize> = None;
         let mut pick_sys: Option<(String, String)> = None;
         let cur_name = self.fonts.get(cur_idx).map(|f| f.name.clone()).unwrap_or_default();
-        ui.horizontal(|ui| {
-            ui.label("Font:");
-            let r = ui.add(egui::Button::new(RichText::new(format!("{cur_name}  ▾")).color(pal.fg)).min_size(vec2(200.0, 0.0)));
-            if r.clicked() {
-                self.font_picker_open = !self.font_picker_open;
-            }
-        });
-        // style of the current family
+        let cur_font = match self.font_meta.get(&cur_idx).cloned() {
+            Some((fam, _)) => self.preview_font(&fam, 15.0),
+            None if cur_idx < self.builtin_font_count => Self::builtin_preview_font(cur_idx, 15.0),
+            None => egui::FontId::proportional(15.0),
+        };
+        let r = ui.add(egui::Button::new(RichText::new(format!("{}  ▾", elide(&cur_name, 30))).font(cur_font).color(pal.fg)).min_size(vec2(ui.available_width(), 30.0)));
+        if r.clicked() {
+            self.font_picker_open = !self.font_picker_open;
+            self.font_search.clear();
+        }
         if let Some((fam, style)) = self.font_meta.get(&cur_idx).cloned() {
             let styles: Vec<String> = self.sys_fonts.lock().ok().and_then(|g| g.as_ref().and_then(|v| v.iter().find(|f| f.name == fam).map(|f| f.faces.iter().map(|x| x.style.clone()).collect()))).unwrap_or_default();
             if styles.len() > 1 {
                 ui.horizontal(|ui| {
-                    ui.label("Style:");
-                    egui::ComboBox::from_id_salt("fontstyle").width(160.0).selected_text(&style).show_ui(ui, |ui| {
+                    ui.label("Style");
+                    egui::ComboBox::from_id_salt("fontstyle").width(150.0).selected_text(&style).show_ui(ui, |ui| {
                         for st in &styles {
                             if ui.selectable_label(*st == style, st).clicked() {
                                 pick_sys = Some((fam.clone(), st.clone()));
@@ -3013,52 +3839,56 @@ impl GifForgeApp {
             }
         }
         if self.font_picker_open {
+            let q = self.font_search.to_lowercase();
+            let fams: Option<Vec<String>> = self.sys_fonts.lock().ok().and_then(|g| g.as_ref().map(|v| v.iter().filter(|f| q.is_empty() || f.name.to_lowercase().contains(&q)).map(|f| f.name.clone()).collect()));
+            let cur_fam = self.font_meta.get(&cur_idx).map(|m| m.0.clone());
             egui::Frame::new().fill(pal.view).stroke(Stroke::new(1.0, pal.border)).corner_radius(3.0).inner_margin(6.0).show(ui, |ui| {
                 let r = ui.add(egui::TextEdit::singleline(&mut self.font_search).hint_text("Search fonts…").desired_width(f32::INFINITY));
                 if self.font_search.is_empty() && !r.has_focus() && !r.lost_focus() {
                     r.request_focus();
                 }
-                let q = self.font_search.to_lowercase();
-                egui::ScrollArea::vertical().max_height(240.0).auto_shrink([false, true]).show(ui, |ui| {
-                    ui.label(RichText::new("Built-in").size(11.5).color(pal.fg_muted));
-                    for i in 0..self.builtin_font_count.min(self.fonts.len()) {
-                        let n = self.fonts[i].name.clone();
-                        if (q.is_empty() || n.to_lowercase().contains(&q)) && ui.selectable_label(i == cur_idx, &n).clicked() {
-                            pick = Some(i);
-                        }
+                // built-in and file fonts
+                let extra: Vec<(usize, String)> = (0..self.fonts.len()).filter(|i| *i < self.builtin_font_count || !self.font_meta.contains_key(i)).map(|i| (i, self.fonts[i].name.clone())).filter(|(_, n)| q.is_empty() || n.to_lowercase().contains(&q)).collect();
+                for (i, n) in extra {
+                    let f = if i < self.builtin_font_count { Self::builtin_preview_font(i, 15.0) } else { egui::FontId::proportional(15.0) };
+                    if ui.add(egui::Button::selectable(i == cur_idx, RichText::new(n).font(f))).clicked() {
+                        pick = Some(i);
                     }
-                    let extra: Vec<(usize, String)> = (self.builtin_font_count..self.fonts.len()).filter(|i| !self.font_meta.contains_key(i)).map(|i| (i, self.fonts[i].name.clone())).collect();
-                    if !extra.is_empty() {
-                        ui.label(RichText::new("Loaded from file").size(11.5).color(pal.fg_muted));
-                        for (i, n) in extra {
-                            if (q.is_empty() || n.to_lowercase().contains(&q)) && ui.selectable_label(i == cur_idx, &n).clicked() {
-                                pick = Some(i);
-                            }
-                        }
+                }
+                ui.separator();
+                match fams {
+                    None => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            hint(ui, "Scanning fonts…");
+                        });
                     }
-                    let guard = self.sys_fonts.lock().ok();
-                    match guard.as_ref().and_then(|g| g.as_ref()) {
-                        None => {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label("Scanning system fonts…");
-                            });
-                        }
-                        Some(fams) => {
-                            ui.label(RichText::new(format!("System ({} families)", fams.len())).size(11.5).color(pal.fg_muted));
-                            let cur_fam = self.font_meta.get(&cur_idx).map(|m| m.0.clone());
-                            for f in fams.iter().filter(|f| q.is_empty() || f.name.to_lowercase().contains(&q)) {
-                                if ui.selectable_label(cur_fam.as_deref() == Some(f.name.as_str()), &f.name).clicked() {
-                                    pick_sys = Some((f.name.clone(), f.default_face().style.clone()));
+                    Some(fams) => {
+                        let row_h = 26.0;
+                        egui::ScrollArea::vertical().max_height(260.0).auto_shrink([false, true]).show_rows(ui, row_h, fams.len(), |ui, range| {
+                            ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                            ui.spacing_mut().item_spacing.y = 4.0;
+                            for fam in &fams[range] {
+                                let font = self.preview_font(fam, 15.0);
+                                let sel = cur_fam.as_deref() == Some(fam.as_str());
+                                let r = ui.add(egui::Button::selectable(sel, RichText::new(elide(fam, 34)).font(font)).min_size(vec2(0.0, row_h - 4.0)));
+                                if r.on_hover_text(fam).clicked() {
+                                    pick_sys = Some((fam.clone(), String::new()));
                                 }
                             }
-                        }
+                            });
+                        });
                     }
-                });
+                }
             });
         }
         if let Some((fam, st)) = pick_sys {
-            pick = self.font_index_for(&fam, &st);
+            let style = if st.is_empty() {
+                self.sys_fonts.lock().ok().and_then(|g| g.as_ref().and_then(|v| v.iter().find(|f| f.name == fam).map(|f| f.default_face().style.clone()))).unwrap_or_default()
+            } else {
+                st
+            };
+            pick = self.font_index_for(&fam, &style);
         }
         if pick.is_some() {
             self.font_picker_open = false;
@@ -3066,69 +3896,72 @@ impl GifForgeApp {
         pick
     }
 
-    fn ui_text(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
-        hint(ui, "Text layers are live and stick to the content: crops, resizes and rotations carry them along. Drag to move, corners to scale, the round handle to rotate.");
-        let sel = self.sel_index(Kind::Text);
-        ui.horizontal(|ui| {
-            if ui.button("+ Add text").clicked() {
-                let (w, h) = self.dims();
-                self.add_layer(LayerKind::Text(Annotation { text: "Your text".into(), x: (w as i32 / 2 - 80).max(0), y: (h as i32 - 60).max(0), ..Default::default() }));
-            }
-            if ui.add_enabled(sel.is_some(), egui::Button::new("✕ Remove")).clicked() {
-                self.stack.layers.remove(sel.unwrap());
-            }
-            if ui.button("Load font file…").on_hover_text("Load a .ttf / .otf font file").clicked() {
-                if let Some(path) = rfd::FileDialog::new().add_filter("Fonts", &["ttf", "otf", "ttc"]).pick_file() {
-                    match text::load_font_file(&path) {
-                        Ok(f) => {
-                            self.fonts.push(f);
-                            let fi = self.fonts.len() - 1;
-                            if let Some(i) = self.sel_index(Kind::Text) {
-                                if let LayerKind::Text(a) = &mut self.stack.layers[i].kind {
-                                    a.font_idx = fi;
-                                }
-                            }
-                        }
-                        Err(e) => self.error(format!("{e:#}")),
+    /// Layer chips for a kind (when there is more than one) + add/remove row.
+    fn layer_chooser(&mut self, ui: &mut egui::Ui, kind: Kind, add_label: &str, mut add: impl FnMut(&mut Self)) -> Option<usize> {
+        let items: Vec<(usize, u64, String)> = self.stack.layers.iter().enumerate().filter(|(_, l)| l.kind() == kind).map(|(i, l)| (i, l.id, elide(&l.name(), 16))).collect();
+        let sel = self.sel_index(kind);
+        ui.horizontal_wrapped(|ui| {
+            if items.len() > 1 {
+                for (i, id, name) in &items {
+                    if ui.selectable_label(Some(*i) == sel, name).clicked() {
+                        self.select(kind, *id);
                     }
                 }
             }
         });
-        let texts: Vec<(usize, u64, String)> = self
-            .stack
-            .layers
-            .iter()
-            .enumerate()
-            .filter_map(|(i, l)| match &l.kind {
-                LayerKind::Text(a) => Some((i, l.id, a.text.lines().next().unwrap_or("").chars().take(14).collect())),
-                _ => None,
-            })
-            .collect();
-        if texts.is_empty() {
-            hint(ui, "No text yet – click \"+ Add text\".");
-            return;
-        }
-        let sel = self.sel_index(Kind::Text);
-        ui.horizontal_wrapped(|ui| {
-            for (i, id, name) in &texts {
-                if ui.selectable_label(Some(*i) == sel, format!("T {name}")).clicked() {
-                    self.select(Kind::Text, *id);
-                }
+        ui.horizontal(|ui| {
+            if ui.button(add_label).clicked() {
+                add(self);
+            }
+            if let Some(i) = self.sel_index(kind) {
+                ui.checkbox(&mut self.stack.layers[i].visible, "Visible");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if small_flat(ui, "✕", "Delete layer") {
+                        self.stack.layers.remove(i);
+                    }
+                });
             }
         });
-        let Some(sel) = self.sel_index(Kind::Text) else { return };
+        if items.is_empty() {
+            return None;
+        }
+        self.sel_index(kind)
+    }
+
+    fn ui_text(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+        let Some(sel) = self.layer_chooser(ui, Kind::Text, "+ Text", |s| {
+            let (w, h) = s.dims();
+            s.add_layer(LayerKind::Text(Annotation { text: "Your text".into(), x: (w as i32 / 2 - 80).max(0), y: (h as i32 - 60).max(0), ..Default::default() }));
+        }) else {
+            hint(ui, "Add text, then drag it on the image");
+            return;
+        };
         let n = self.base.as_ref().map(|b| b.len()).unwrap_or(1).max(1);
-        // font picker first (needs &mut self)
+        if let LayerKind::Text(a) = &mut self.stack.layers[sel].kind {
+            ui.add(egui::TextEdit::multiline(&mut a.text).desired_rows(2).desired_width(f32::INFINITY));
+        }
         let cur_font = match &self.stack.layers[sel].kind {
             LayerKind::Text(a) => a.font_idx,
             _ => 0,
         };
         let mut picked = None;
+        let mut load_file = false;
         group(ui, "Font", |ui| {
             picked = self.font_picker(ui, cur_font);
+            load_file = ui.small_button("Load font file…").clicked();
         });
+        if load_file {
+            if let Some(path) = rfd::FileDialog::new().add_filter("Fonts", &["ttf", "otf", "ttc"]).pick_file() {
+                match text::load_font_file(&path) {
+                    Ok(f) => {
+                        self.fonts.push(f);
+                        picked = Some(self.fonts.len() - 1);
+                    }
+                    Err(e) => self.error(format!("{e:#}")),
+                }
+            }
+        }
         if let (Some(fi), LayerKind::Text(a)) = (picked, &mut self.stack.layers[sel].kind) {
-            // keep the text centred when its box size changes
             let (w0, h0) = text::measure(&self.fonts, a);
             let (cx, cy) = (a.x as f32 + w0 as f32 / 2.0, a.y as f32 + h0 as f32 / 2.0);
             a.font_idx = fi;
@@ -3136,50 +3969,16 @@ impl GifForgeApp {
             a.x = (cx - w1 as f32 / 2.0).round() as i32;
             a.y = (cy - h1 as f32 / 2.0).round() as i32;
         }
-        let layer = &mut self.stack.layers[sel];
-        let visible = &mut layer.visible;
-        let LayerKind::Text(a) = &mut layer.kind else { return };
-        group(ui, "Text", |ui| {
-            ui.add(egui::TextEdit::multiline(&mut a.text).desired_rows(2).desired_width(f32::INFINITY));
-            ui.checkbox(visible, "Visible");
-            egui::Grid::new("txtgrid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                ui.label("Size / colour:");
+        let LayerKind::Text(a) = &mut self.stack.layers[sel].kind else { return };
+        group(ui, "Style", |ui| {
+            egui::Grid::new("txtgrid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label("Size");
                 ui.horizontal(|ui| {
                     ui.add(egui::DragValue::new(&mut a.size).range(4.0..=4000.0).suffix(" px"));
                     ui.color_edit_button_srgba_unmultiplied(&mut a.color);
                 });
                 ui.end_row();
-                ui.label("Source frames:");
-                ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut a.from).range(1..=n));
-                    ui.label("–");
-                    let mut to = if a.to == 0 { n } else { a.to };
-                    if ui.add(egui::DragValue::new(&mut to).range(1..=n)).changed() {
-                        a.to = if to >= n { 0 } else { to };
-                    }
-                    if a.to == 0 {
-                        hint(ui, "(end)");
-                    }
-                });
-                ui.end_row();
-                ui.label("Align:");
-                ui.horizontal(|ui| {
-                    egui::ComboBox::from_id_salt("align").width(80.0).selected_text(format!("{:?}", a.align)).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut a.align, Align::Left, "Left");
-                        ui.selectable_value(&mut a.align, Align::Center, "Center");
-                        ui.selectable_value(&mut a.align, Align::Right, "Right");
-                    });
-                    ui.label("Opacity:");
-                    ui.add(egui::DragValue::new(&mut a.opacity).range(0..=100).suffix("%"));
-                });
-                ui.end_row();
-                ui.label("Position:");
-                ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut a.x).prefix("x "));
-                    ui.add(egui::DragValue::new(&mut a.y).prefix("y "));
-                });
-                ui.end_row();
-                ui.label("Outline:");
+                ui.label("Outline");
                 ui.horizontal(|ui| {
                     egui::ComboBox::from_id_salt("border").width(80.0).selected_text(format!("{:?}", a.border)).show_ui(ui, |ui| {
                         ui.selectable_value(&mut a.border, Border::None, "None");
@@ -3189,8 +3988,18 @@ impl GifForgeApp {
                     ui.color_edit_button_srgba_unmultiplied(&mut a.border_color);
                 });
                 ui.end_row();
-                ui.label("Preset:");
-                egui::ComboBox::from_id_salt("cpreset").width(150.0).selected_text("Choose…").show_ui(ui, |ui| {
+                ui.label("Align");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut a.align, Align::Left, "L");
+                    ui.selectable_value(&mut a.align, Align::Center, "C");
+                    ui.selectable_value(&mut a.align, Align::Right, "R");
+                });
+                ui.end_row();
+                ui.label("Opacity");
+                ui.add(egui::DragValue::new(&mut a.opacity).range(0..=100).suffix("%"));
+                ui.end_row();
+                ui.label("Colours");
+                egui::ComboBox::from_id_salt("cpreset").width(140.0).selected_text("Preset…").show_ui(ui, |ui| {
                     let presets: [(&str, [u8; 4], [u8; 4]); 5] = [
                         ("White / black", [255, 255, 255, 255], [0, 0, 0, 255]),
                         ("Black / white", [0, 0, 0, 255], [255, 255, 255, 255]),
@@ -3207,173 +4016,120 @@ impl GifForgeApp {
                 });
                 ui.end_row();
             });
-            ui.add_space(4.0);
-            Self::angle_row(ui, &mut a.angle);
         });
-        hint(ui, "Position, size and frame numbers refer to the source frames, so the text follows crops, resizes, rotations, cuts and reversal.");
+        group(ui, "Placement", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("X");
+                ui.add(egui::DragValue::new(&mut a.x));
+                ui.label("Y");
+                ui.add(egui::DragValue::new(&mut a.y));
+            });
+            Self::angle_row(ui, &mut a.angle);
+            frames_row(ui, &mut a.from, &mut a.to, n);
+        });
     }
 
     fn ui_censor(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
         let (w, h) = self.dims();
         let n = self.base.as_ref().map(|b| b.len()).unwrap_or(1).max(1);
-        hint(ui, "Censor regions are live and stick to the content. Drag on the image to draw a new region; drag inside to move, corners to resize, the round handle to rotate.");
-        let sel = self.sel_index(Kind::Censor);
-        ui.horizontal(|ui| {
-            if ui.button("+ Add region").clicked() {
-                self.add_layer(LayerKind::Censor(CensorSettings { x: (w / 4) as i32, y: (h / 4) as i32, w: w / 2, h: h / 2, ..Default::default() }));
-            }
-            if ui.add_enabled(sel.is_some(), egui::Button::new("✕ Remove")).clicked() {
-                self.stack.layers.remove(sel.unwrap());
-            }
-        });
-        let regions: Vec<(usize, u64)> = self.stack.layers.iter().enumerate().filter(|(_, l)| l.kind() == Kind::Censor).map(|(i, l)| (i, l.id)).collect();
-        if regions.is_empty() {
-            hint(ui, "No regions yet – drag on the image or click \"+ Add region\".");
+        let Some(sel) = self.layer_chooser(ui, Kind::Censor, "+ Region", |s| {
+            s.add_layer(LayerKind::Censor(CensorSettings { x: (w / 4) as i32, y: (h / 4) as i32, w: w / 2, h: h / 2, ..Default::default() }));
+        }) else {
+            hint(ui, "Drag on the image to draw a region");
             return;
-        }
-        let sel = self.sel_index(Kind::Censor);
-        ui.horizontal_wrapped(|ui| {
-            for (k, (i, id)) in regions.iter().enumerate() {
-                if ui.selectable_label(Some(*i) == sel, format!("Region #{}", k + 1)).clicked() {
-                    self.select(Kind::Censor, *id);
-                }
-            }
-        });
-        let Some(sel) = self.sel_index(Kind::Censor) else { return };
-        let layer = &mut self.stack.layers[sel];
-        let visible = &mut layer.visible;
-        let LayerKind::Censor(c) = &mut layer.kind else { return };
-        group(ui, "Area (source-frame pixels)", |ui| {
-            ui.checkbox(visible, "Visible");
-            ui.horizontal(|ui| {
-                ui.label("Left:");
-                ui.add(egui::DragValue::new(&mut c.x));
-                ui.label("Top:");
-                ui.add(egui::DragValue::new(&mut c.y));
-            });
-            ui.horizontal(|ui| {
-                ui.label("Width:");
-                ui.add(egui::DragValue::new(&mut c.w).range(0..=w * 4));
-                ui.label("Height:");
-                ui.add(egui::DragValue::new(&mut c.h).range(0..=h * 4));
-            });
-            Self::angle_row(ui, &mut c.angle);
-        });
+        };
+        let LayerKind::Censor(c) = &mut self.stack.layers[sel].kind else { return };
         group(ui, "Method", |ui| {
-            egui::ComboBox::from_id_salt("cm").selected_text(format!("{:?}", c.method)).show_ui(ui, |ui| {
+            ui.horizontal(|ui| {
                 ui.selectable_value(&mut c.method, CensorMethod::Pixelate, "Pixelate");
                 ui.selectable_value(&mut c.method, CensorMethod::Blur, "Blur");
-                ui.selectable_value(&mut c.method, CensorMethod::Solid, "Solid colour");
+                ui.selectable_value(&mut c.method, CensorMethod::Solid, "Solid");
             });
             match c.method {
                 CensorMethod::Pixelate => {
                     ui.horizontal(|ui| {
-                        ui.label("Square size:");
+                        ui.label("Block");
                         ui.add(egui::DragValue::new(&mut c.square).range(2..=1000).suffix(" px"));
                     });
                 }
                 CensorMethod::Blur => {
-                    ui.add(soft_slider(&mut c.sigma, 1.0..=40.0, "blur radius"));
+                    ui.add(soft_slider(&mut c.sigma, 1.0..=40.0, "radius"));
                 }
                 CensorMethod::Solid => {
                     ui.horizontal(|ui| {
-                        ui.label("Colour:");
+                        ui.label("Colour");
                         ui.color_edit_button_srgb(&mut c.color);
                     });
                 }
             }
         });
-        group(ui, "Source frames", |ui| {
-            ui.horizontal(|ui| {
-                ui.add(egui::DragValue::new(&mut c.from).range(1..=n));
-                ui.label("–");
-                let mut to = if c.to == 0 { n } else { c.to };
-                if ui.add(egui::DragValue::new(&mut to).range(1..=n)).changed() {
-                    c.to = if to >= n { 0 } else { to };
-                }
+        group(ui, "Placement", |ui| {
+            egui::Grid::new("cens").num_columns(4).spacing([8.0, 6.0]).show(ui, |ui| {
+                ui.label("X");
+                ui.add(egui::DragValue::new(&mut c.x));
+                ui.label("Y");
+                ui.add(egui::DragValue::new(&mut c.y));
+                ui.end_row();
+                ui.label("W");
+                ui.add(egui::DragValue::new(&mut c.w).range(0..=w * 4));
+                ui.label("H");
+                ui.add(egui::DragValue::new(&mut c.h).range(0..=h * 4));
+                ui.end_row();
             });
+            Self::angle_row(ui, &mut c.angle);
+            frames_row(ui, &mut c.from, &mut c.to, n);
         });
     }
 
     fn ui_add_image(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        hint(ui, "Image overlays are live and stick to the content. PNG/GIF/JPG/WebP – animated overlays loop. Drag to move, corners to resize (Shift = free aspect), round handle to rotate.");
-        let sel = self.sel_index(Kind::Overlay);
-        ui.horizontal(|ui| {
-            if ui.button("+ Add image…").clicked() {
-                if let Some(path) = rfd::FileDialog::new().add_filter("Images", &["png", "gif", "jpg", "jpeg", "webp", "bmp"]).pick_file() {
-                    self.load_overlay(path, ctx);
-                }
+        let Some(sel) = self.layer_chooser(ui, Kind::Overlay, "+ Image…", |s| {
+            if let Some(path) = rfd::FileDialog::new().add_filter("Images", &["png", "gif", "jpg", "jpeg", "webp", "bmp"]).pick_file() {
+                s.load_overlay(path, ctx);
             }
-            if ui.add_enabled(sel.is_some(), egui::Button::new("✕ Remove")).clicked() {
-                self.stack.layers.remove(sel.unwrap());
-            }
-        });
-        let items: Vec<(usize, u64, String)> = self
-            .stack
-            .layers
-            .iter()
-            .enumerate()
-            .filter_map(|(i, l)| match &l.kind {
-                LayerKind::Overlay(o) => Some((i, l.id, o.src.name.clone())),
-                _ => None,
-            })
-            .collect();
-        if items.is_empty() {
+        }) else {
+            hint(ui, "PNG, GIF, JPG or WebP – or drop a file");
             return;
-        }
-        let sel = self.sel_index(Kind::Overlay);
-        ui.horizontal_wrapped(|ui| {
-            for (i, id, name) in &items {
-                if ui.selectable_label(Some(*i) == sel, name).clicked() {
-                    self.select(Kind::Overlay, *id);
-                }
-            }
-        });
-        let Some(sel) = self.sel_index(Kind::Overlay) else { return };
+        };
         let (aw, ah) = self.dims();
         let src_idx = self.plan.get(self.cur).map(|f| f.src).unwrap_or(0);
-        ui.horizontal(|ui| {
-            ui.label("Edits affect:");
-            egui::ComboBox::from_id_salt("pscope").width(190.0).selected_text(self.place_scope.label()).show_ui(ui, |ui| {
-                for s in [PlaceScope::All, PlaceScope::Following, PlaceScope::This] {
-                    ui.selectable_value(&mut self.place_scope, s, s.label());
-                }
-            });
-        });
-        let scope = self.place_scope;
-        let layer = &mut self.stack.layers[sel];
-        let visible = &mut layer.visible;
-        let LayerKind::Overlay(o) = &mut layer.kind else { return };
+        let scope_before = self.place_scope;
+        let mut scope = scope_before;
+        let LayerKind::Overlay(o) = &mut self.stack.layers[sel].kind else { return };
         let native = o.src.native_size();
         let nframes = o.src.frames.len();
-        group(ui, "Layer", |ui| {
-            hint(ui, &format!("{}×{} px, {} frame{}", native.0, native.1, nframes, if nframes == 1 { "" } else { "s" }));
-            ui.checkbox(visible, "Visible");
+        group(ui, "Image", |ui| {
+            hint(ui, &format!("{}×{} · {} frame{}", native.0, native.1, nframes, if nframes == 1 { "" } else { "s" }));
             ui.add(egui::Slider::new(&mut o.opacity, 0.0..=100.0).text("opacity %"));
         });
         if o.placements.is_empty() {
             return;
         }
         let cur = src_idx.min(o.placements.len() - 1);
-        group(ui, &format!("Placement on source frame #{}", cur + 1), |ui| {
+        group(ui, "Placement", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Edits apply to");
+                egui::ComboBox::from_id_salt("pscope").width(150.0).selected_text(scope.label()).show_ui(ui, |ui| {
+                    for s in [PlaceScope::All, PlaceScope::Following, PlaceScope::This] {
+                        ui.selectable_value(&mut scope, s, s.label());
+                    }
+                });
+            });
             let mut pl = o.placements[cur];
-            let mut dont = !pl.enabled;
-            ui.checkbox(&mut dont, "Don't add image to this frame");
-            pl.enabled = !dont;
-            ui.horizontal(|ui| {
-                ui.label("Left:");
+            egui::Grid::new("ovl").num_columns(4).spacing([8.0, 6.0]).show(ui, |ui| {
+                ui.label("X");
                 ui.add(egui::DragValue::new(&mut pl.x));
-                ui.label("Top:");
+                ui.label("Y");
                 ui.add(egui::DragValue::new(&mut pl.y));
-            });
-            ui.horizontal(|ui| {
-                ui.label("Width:");
+                ui.end_row();
+                ui.label("W");
                 ui.add(egui::DragValue::new(&mut pl.w).range(1..=16384));
-                ui.label("Height:");
+                ui.label("H");
                 ui.add(egui::DragValue::new(&mut pl.h).range(1..=16384));
+                ui.end_row();
             });
+            Self::angle_row(ui, &mut pl.angle);
             ui.horizontal_wrapped(|ui| {
-                if ui.small_button("Native size").clicked() {
+                if ui.small_button("Native").on_hover_text("Original image size").clicked() {
                     pl.w = native.0;
                     pl.h = native.1;
                 }
@@ -3381,14 +4137,16 @@ impl GifForgeApp {
                     pl.x = (aw as i32 - pl.w as i32) / 2;
                     pl.y = (ah as i32 - pl.h as i32) / 2;
                 }
-                if ui.small_button("Fill frame").clicked() {
+                if ui.small_button("Fill").on_hover_text("Cover the whole frame").clicked() {
                     pl.x = 0;
                     pl.y = 0;
                     pl.w = aw;
                     pl.h = ah;
                 }
             });
-            Self::angle_row(ui, &mut pl.angle);
+            let mut hidden = !pl.enabled;
+            ui.checkbox(&mut hidden, format!("Hide on frame {}", cur + 1));
+            pl.enabled = !hidden;
             if pl != o.placements[cur] {
                 let n = o.placements.len();
                 let enabled_changed = pl.enabled != o.placements[cur].enabled;
@@ -3403,108 +4161,137 @@ impl GifForgeApp {
                     o.placements[cur].enabled = pl.enabled;
                 }
             }
-            ui.horizontal(|ui| {
-                if ui.button("Copy to all frames").clicked() {
-                    let pl = o.placements[cur];
-                    for q in &mut o.placements {
-                        *q = pl;
-                    }
+            if ui.small_button("Show on all frames").clicked() {
+                for q in &mut o.placements {
+                    q.enabled = true;
                 }
-                if ui.button("Enable on all").clicked() {
-                    for q in &mut o.placements {
-                        q.enabled = true;
-                    }
-                }
-            });
-        });
-        hint(ui, "Positions are in source-frame pixels, so the image follows crops, resizes and rotations.");
-    }
-
-    fn ui_split(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        hint(ui, "Exports include all live edits.");
-        group(ui, "Individual frames", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Output format:");
-                egui::ComboBox::from_id_salt("splitfmt")
-                    .selected_text(match self.split_fmt {
-                        SplitFormat::Png => "PNG (full detail, alpha)",
-                        SplitFormat::Gif => "GIF, full details in every frame",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.split_fmt, SplitFormat::Png, "PNG (full detail, alpha)");
-                        ui.selectable_value(&mut self.split_fmt, SplitFormat::Gif, "GIF, full details in every frame");
-                    });
-            });
-            ui.horizontal(|ui| {
-                ui.label("File prefix:");
-                ui.text_edit_singleline(&mut self.split_prefix);
-            });
-            ui.horizontal(|ui| {
-                if primary(ui, "Split to folder…") {
-                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                        let (pre, fmt) = (self.split_prefix.clone(), self.split_fmt);
-                        self.run_export(ctx, "Split frames", move |a, _| io::export_frames_dir(a, &dir, &pre, fmt).map(|n| format!("Wrote {n} frames to {}", dir.display())));
-                    }
-                }
-                if ui.button("ZIP of PNGs…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().add_filter("ZIP", &["zip"]).set_file_name(format!("{}_frames.zip", self.base_name())).save_file() {
-                        let pre = self.split_prefix.clone();
-                        self.run_export(ctx, "ZIP frames", move |a, _| io::export_frames_zip(a, &path, &pre).map(|n| format!("Wrote {n} frames to {}", path.display())));
-                    }
-                }
-            });
-        });
-        self.sheet_group(ui, ctx);
-    }
-
-    fn sheet_group(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let n = self.plan.iter().filter(|f| f.enabled).count().max(1) as u32;
-        let (fw, fh) = (self.out_size.0 as u32, self.out_size.1 as u32);
-        let base_name = self.base_name();
-        let mut export = false;
-        group(ui, "Sprite sheet / game engine", |ui| {
-            let s = &mut self.sheet;
-            ui.horizontal(|ui| {
-                ui.label("Columns:");
-                ui.add(egui::DragValue::new(&mut s.columns).range(0..=n));
-                hint(ui, "(0 = auto)");
-                ui.label("Padding:");
-                ui.add(egui::DragValue::new(&mut s.padding).range(0..=256).suffix(" px"));
-            });
-            let cols = if s.columns == 0 { (n as f32).sqrt().ceil() as u32 } else { s.columns.min(n) }.max(1);
-            let rows = n.div_ceil(cols);
-            hint(ui, &format!("Sheet: {cols}×{rows} cells, {}×{} px", cols * fw + (cols - 1) * s.padding, rows * fh + (rows - 1) * s.padding));
-            ui.checkbox(&mut s.write_json, "Write JSON metadata (frame rects + durations)");
-            ui.checkbox(&mut s.write_godot, "Write Godot 4 SpriteFrames (.tres)");
-            if s.write_godot {
-                ui.indent("godot", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("res:// folder:");
-                        ui.text_edit_singleline(&mut s.godot_res_dir);
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Animation name:");
-                        ui.text_edit_singleline(&mut s.anim_name);
-                    });
-                    hint(ui, "Put the PNG and .tres in that folder and assign the .tres to an AnimatedSprite2D/3D. Per-frame delays are preserved.");
-                });
             }
-            export = primary(ui, "Export sprite sheet…");
         });
-        if export {
-            if let Some(path) = rfd::FileDialog::new().add_filter("PNG", &["png"]).set_file_name(format!("{base_name}_sheet.png")).save_file() {
-                let opts = self.sheet.clone();
-                self.run_export(ctx, "Sprite sheet", move |a, _| io::export_spritesheet(a, &path, &opts).map(|s| format!("Wrote {s}")));
+        self.place_scope = scope;
+    }
+
+    fn ui_watermark(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+        let Some(sel) = self.layer_chooser(ui, Kind::Watermark, "+ Watermark", |s| {
+            s.add_layer(LayerKind::Watermark(Box::default()));
+        }) else {
+            hint(ui, "Text or logo, pinned to the frame");
+            return;
+        };
+        let (cur_font, use_image) = match &self.stack.layers[sel].kind {
+            LayerKind::Watermark(w) => (w.font_idx, w.use_image),
+            _ => return,
+        };
+        let mut picked = None;
+        let mut browse = false;
+        if let LayerKind::Watermark(w) = &mut self.stack.layers[sel].kind {
+            group(ui, "Content", |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut w.use_image, false, "Text");
+                    ui.selectable_value(&mut w.use_image, true, "Image");
+                });
+                if w.use_image {
+                    ui.horizontal(|ui| {
+                        browse = ui.button("Choose image…").clicked();
+                        if let Some(p) = &w.image_path {
+                            hint(ui, &elide(&p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(), 24));
+                        }
+                    });
+                } else {
+                    ui.add(egui::TextEdit::singleline(&mut w.text).desired_width(f32::INFINITY));
+                    ui.horizontal(|ui| {
+                        ui.color_edit_button_srgba_unmultiplied(&mut w.color);
+                        ui.checkbox(&mut w.outline, "Outline");
+                    });
+                }
+            });
+        }
+        if !use_image {
+            group(ui, "Font", |ui| {
+                picked = self.font_picker(ui, cur_font);
+            });
+        }
+        if browse {
+            if let Some(path) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif", "bmp"]).pick_file() {
+                match io::load_still(&path) {
+                    Ok(img) => {
+                        if let LayerKind::Watermark(w) = &mut self.stack.layers[sel].kind {
+                            w.image = Some(Arc::new(img));
+                            w.image_path = Some(path);
+                        }
+                    }
+                    Err(e) => self.error(format!("{e:#}")),
+                }
             }
         }
+        let LayerKind::Watermark(w) = &mut self.stack.layers[sel].kind else { return };
+        if let Some(fi) = picked {
+            w.font_idx = fi;
+        }
+        group(ui, "Placement", |ui| {
+            ui.add(soft_slider(&mut w.size, 1.0..=40.0, "size %")).on_hover_text("Relative to the frame's shorter side");
+            ui.add(egui::Slider::new(&mut w.opacity, 0.0..=100.0).text("opacity %"));
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut w.tiled, false, "Single");
+                ui.selectable_value(&mut w.tiled, true, "Tiled");
+            });
+            if w.tiled {
+                ui.add(egui::Slider::new(&mut w.angle, -90.0..=90.0).text("angle °"));
+                ui.add(soft_slider(&mut w.spacing, 0.8..=4.0, "spacing"));
+            } else {
+                ui.horizontal(|ui| {
+                    egui::Grid::new("anchor").spacing([2.0, 2.0]).show(ui, |ui| {
+                        for row in crate::effects::Anchor::GRID {
+                            for a in row {
+                                let sel = w.anchor == a;
+                                if ui.add(egui::Button::new(if sel { "●" } else { "·" }).selected(sel).min_size(vec2(24.0, 22.0))).clicked() {
+                                    w.anchor = a;
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.vertical(|ui| {
+                        ui.label("Margin");
+                        ui.add(egui::DragValue::new(&mut w.margin).range(0.0..=40.0).speed(0.1).suffix(" %"));
+                    });
+                });
+            }
+        });
+    }
+
+    fn ui_shield(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+        let Some(sel) = self.layer_chooser(ui, Kind::Shield, "+ AI shield", |s| {
+            s.add_layer(LayerKind::Shield(ShieldSettings::default()));
+        }) else {
+            hint(ui, "Perturbation noise against AI training");
+            return;
+        };
+        ui.label(RichText::new("ℹ What this does").size(12.0).color(p().fg_muted)).on_hover_text(
+            "Adds subtle, structured noise that makes frames less clean as AI training data and can confuse some image models.\n\nIt is not a guarantee: it is far weaker than tools like Glaze or Nightshade, and strong GIF compression removes part of it. Pair it with the “noai” tag on export.",
+        );
+        let LayerKind::Shield(s) = &mut self.stack.layers[sel].kind else { return };
+        group(ui, "Perturbation", |ui| {
+            ui.add(soft_slider(&mut s.strength, 0.0..=20.0, "strength")).on_hover_text("Colour levels; 4–8 is hard to see");
+            ui.checkbox(&mut s.pattern, "High-frequency pattern");
+            ui.checkbox(&mut s.noise, "Colour noise");
+            ui.checkbox(&mut s.jitter, "Sub-pixel jitter").on_hover_text("Tiny geometric warp");
+            ui.checkbox(&mut s.per_frame, "Vary every frame").on_hover_text("Stronger, but makes GIFs much larger");
+            ui.horizontal(|ui| {
+                ui.label("Seed");
+                ui.add(egui::DragValue::new(&mut s.seed));
+                if ui.small_button("Randomise").clicked() {
+                    s.seed = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(1) % 1_000_000) as u32;
+                }
+            });
+        });
     }
 
     fn ui_frames(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let pal = *p();
         let n = self.base.as_ref().map(|a| a.len()).unwrap_or(1);
         let now = ctx.input(|i| i.time);
-        hint(ui, "Frame edits change the source frames directly (undoable); all live edits are re-applied on top instantly.");
-        if ui.button("+ Add frames from files…").clicked() {
+        if ui.button("+ Add frames…").on_hover_text("Append images as frames").clicked() {
             if let Some(mut ps) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "bmp"]).pick_files() {
                 ps.sort();
                 let d = self.fr_delay;
@@ -3516,28 +4303,27 @@ impl GifForgeApp {
         }
         ui.add_space(4.0);
         let mut range_act: Option<(bool, bool)> = None;
-        group(ui, "Toggle a range of frames", |ui| {
+        group(ui, "Skip / enable", |ui| {
             ui.horizontal(|ui| {
-                ui.label("From:");
+                ui.label("Frames");
                 ui.add(egui::DragValue::new(&mut self.fr_from).range(1..=n));
-                ui.label("To:");
+                ui.label("–");
                 ui.add(egui::DragValue::new(&mut self.fr_to).range(1..=n));
-            });
-            ui.horizontal(|ui| {
-                if tinted(ui, "Skip range", pal.negative) {
+                if tinted(ui, "Skip", pal.negative) {
                     range_act = Some((false, false));
                 }
-                if tinted(ui, "Enable range", pal.highlight) {
+                if tinted(ui, "Enable", pal.highlight) {
                     range_act = Some((false, true));
                 }
             });
             ui.horizontal(|ui| {
-                ui.label("Every:");
+                ui.label("Every");
                 ui.add(egui::DragValue::new(&mut self.fr_every).range(2..=1000));
-                if tinted(ui, "Skip every N-th", pal.negative) {
+                ui.label("th");
+                if tinted(ui, "Skip", pal.negative) {
                     range_act = Some((true, false));
                 }
-                if tinted(ui, "Enable every N-th", pal.highlight) {
+                if tinted(ui, "Enable", pal.highlight) {
                     range_act = Some((true, true));
                 }
             });
@@ -3554,12 +4340,11 @@ impl GifForgeApp {
             }
             self.timing_rev += 1;
         }
-        group(ui, "GIF options", |ui| {
+        group(ui, "Timing", |ui| {
             ui.horizontal(|ui| {
-                ui.label("Delay time:");
-                ui.add(egui::DragValue::new(&mut self.fr_delay).range(1..=65535).suffix(" cs"));
-                ui.label(RichText::new(format!("({:.2} FPS)", 100.0 / self.fr_delay.max(1) as f32)).strong());
-                if ui.button("Set for all").clicked() {
+                ui.label("Delay");
+                ui.add(egui::DragValue::new(&mut self.fr_delay).range(1..=65535).suffix(" cs")).on_hover_text(format!("{:.2} fps", 100.0 / self.fr_delay.max(1) as f32));
+                if ui.button("Set all").clicked() {
                     let d = self.fr_delay;
                     self.run_anim(ctx, "Set delays", move |a, _| Ok(ops::set_all_delays(a, d)));
                 }
@@ -3568,38 +4353,33 @@ impl GifForgeApp {
             let mut count = self.base.as_ref().and_then(|a| a.loop_count).unwrap_or(1);
             let mut changed = false;
             ui.horizontal(|ui| {
-                ui.label("Loop count:");
+                ui.label("Loop");
                 changed |= ui.checkbox(&mut forever, "forever").changed();
                 if !forever {
-                    changed |= ui.add(egui::DragValue::new(&mut count).range(1..=65535).suffix(" plays")).changed();
+                    changed |= ui.add(egui::DragValue::new(&mut count).range(1..=65535).suffix("×")).changed();
                 }
             });
             if changed {
                 self.snapshot("loop", now);
                 self.base.as_mut().unwrap().loop_count = if forever { None } else { Some(count.max(1)) };
             }
-            ui.checkbox(&mut self.gif_opts.global_palette, "Use global colormap");
-            hint(ui, "Use the same set of colours for all frames to reduce file size.");
         });
-        group(ui, "Effects", |ui| {
+        group(ui, "Blend", |ui| {
             ui.horizontal(|ui| {
-                ui.label("Crossfade:");
-                ui.add(egui::DragValue::new(&mut self.fr_crossfade).range(1..=30));
-                ui.label("in-between frames");
+                ui.label("Crossfade");
+                ui.add(egui::DragValue::new(&mut self.fr_crossfade).range(1..=30)).on_hover_text("In-between frames");
+                ui.checkbox(&mut self.fr_crossfade_wrap, "loop").on_hover_text("Also blend last → first");
+                if ui.button("Apply").clicked() {
+                    let (s, w) = (self.fr_crossfade, self.fr_crossfade_wrap);
+                    self.run_anim(ctx, "Crossfade", move |a, _| Ok(ops::crossfade(a, s, w)));
+                }
             });
-            ui.checkbox(&mut self.fr_crossfade_wrap, "Also blend last → first (seamless loop)");
-            if ui.button("Crossfade frames").clicked() {
-                let (s, w) = (self.fr_crossfade, self.fr_crossfade_wrap);
-                self.run_anim(ctx, "Crossfade", move |a, _| Ok(ops::crossfade(a, s, w)));
-            }
-            ui.separator();
-            if ui.button("Use the first frame as background").on_hover_text("Composite every frame over frame 1").clicked() {
+            if ui.button("First frame as background").on_hover_text("Composite every frame over frame 1").clicked() {
                 self.run_anim(ctx, "First frame as background", move |a, _| Ok(ops::first_frame_as_background(a)));
             }
-            hint(ui, "Transparent animations are exported with \"don't stack frames\" disposal automatically.");
         });
         let skipped = self.base.as_ref().map(|a| a.len() - a.enabled_count()).unwrap_or(0);
-        if skipped > 0 && tinted(ui, &format!("Remove {skipped} skipped frame(s) permanently"), pal.negative) {
+        if skipped > 0 && tinted(ui, &format!("Delete {skipped} skipped"), pal.negative) {
             self.run_anim(ctx, "Remove skipped", move |a, _| {
                 let mut a = a.clone();
                 a.frames.retain(|f| f.enabled);
@@ -3607,91 +4387,38 @@ impl GifForgeApp {
             });
         }
     }
+}
 
-    fn ui_export(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let pal = *p();
-        hint(ui, "Everything is exported with all live edits applied.");
-        let summary = {
-            let o = &self.gif_opts;
-            format!("{} colours{}, lossy {}, {}", o.colors, if o.global_palette { " (global)" } else { "" }, o.lossy, if o.frame_diff { "frame differencing on" } else { "full frames" })
-        };
-        let mut save_gif = false;
-        let mut goto_opt = false;
-        group(ui, "GIF", |ui| {
-            hint(ui, &summary);
-            ui.horizontal(|ui| {
-                save_gif = primary(ui, "Save GIF…");
-                goto_opt = ui.button("Optimize settings…").clicked();
-            });
-        });
-        if save_gif {
-            self.save_gif_dialog(ctx);
+/// Source-frame range editor (1-based, `to` 0 = end).
+fn frames_row(ui: &mut egui::Ui, from: &mut usize, to: &mut usize, n: usize) {
+    ui.horizontal(|ui| {
+        ui.label("Frames");
+        ui.add(egui::DragValue::new(from).range(1..=n));
+        ui.label("–");
+        let mut t = if *to == 0 { n } else { *to };
+        if ui.add(egui::DragValue::new(&mut t).range(1..=n)).changed() {
+            *to = if t >= n { 0 } else { t };
         }
-        if goto_opt {
-            self.tool = Tool::Optimize;
-        }
-        let mut save_apng = false;
-        group(ui, "Animated PNG (APNG)", |ui| {
-            hint(ui, "Full 24-bit colour with 8-bit alpha. Supported by all modern browsers.");
-            save_apng = ui.button("Save APNG…").clicked();
-        });
-        if save_apng {
-            if let Some(path) = rfd::FileDialog::new().add_filter("PNG", &["png", "apng"]).set_file_name(format!("{}.png", self.base_name())).save_file() {
-                self.run_export(ctx, "Save APNG", move |a, _| io::save_apng(a, &path).map(|n| format!("Saved {} ({})", path.display(), fmt_size(n))));
-            }
-        }
-        let mut video: Option<(VideoFormat, &'static str)> = None;
-        let ffmpeg = self.ffmpeg;
-        let mut recheck = false;
-        group(ui, "Video", |ui| {
-            if !ffmpeg {
-                ui.label(RichText::new("ffmpeg was not found on PATH – install it to enable MP4/WebM export.").color(pal.neutral));
-                recheck = ui.small_button("Check again").clicked();
-                return;
-            }
-            ui.horizontal(|ui| {
-                ui.label("MP4 background (for transparency):");
-                ui.color_edit_button_srgb(&mut self.video_bg);
-            });
-            ui.horizontal(|ui| {
-                if ui.button("To MP4 (H.264)…").clicked() {
-                    video = Some((VideoFormat::Mp4, "mp4"));
-                }
-                if ui.button("To WebM (VP9 + alpha)…").clicked() {
-                    video = Some((VideoFormat::WebmAlpha, "webm"));
-                }
-            });
-        });
-        if recheck {
-            self.ffmpeg = io::ffmpeg_available();
-        }
-        if let Some((fmt, ext)) = video {
-            if let Some(path) = rfd::FileDialog::new().add_filter(ext, &[ext]).set_file_name(format!("{}.{ext}", self.base_name())).save_file() {
-                let bg = self.video_bg;
-                self.run_export(ctx, "Export video", move |a, _| io::export_video(a, &path, fmt, bg).map(|_| format!("Saved {}", path.display())));
-            }
-        }
-        let mut goto_split = false;
-        group(ui, "Frames", |ui| {
-            goto_split = ui.button("PNG frames / ZIP…").clicked();
-        });
-        if goto_split {
-            self.tool = Tool::Split;
-        }
-        self.sheet_group(ui, ctx);
-    }
+    });
 }
 
 // ================================================================ effects panel
 
+fn on(b: &[bool]) -> Option<String> {
+    let n = b.iter().filter(|x| **x).count();
+    (n > 0).then(|| n.to_string())
+}
+
 fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
-    group(ui, "Colorize", |ui| {
+    let d = EffectSettings::default();
+    let colour_changed = fx.hue != d.hue || fx.saturation != d.saturation || fx.lightness != d.lightness || fx.brightness != d.brightness || fx.contrast != d.contrast;
+    group_ex(ui, "Colour", true, colour_changed.then(|| "●".to_string()), |ui| {
         ui.add(soft_slider(&mut fx.hue, 0.0..=200.0, "Hue"));
         ui.add(soft_slider(&mut fx.saturation, 0.0..=200.0, "Saturation"));
         ui.add(soft_slider(&mut fx.lightness, 0.0..=200.0, "Lightness"));
         ui.add(soft_slider(&mut fx.brightness, -100.0..=100.0, "Brightness"));
         ui.add(soft_slider(&mut fx.contrast, -100.0..=100.0, "Contrast"));
-        if ui.small_button("Reset colour").clicked() {
+        if ui.small_button("Reset").clicked() {
             fx.hue = 100.0;
             fx.saturation = 100.0;
             fx.lightness = 100.0;
@@ -3699,11 +4426,13 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
             fx.contrast = 0.0;
         }
     });
-    group(ui, "Color presets", |ui| {
-        ui.checkbox(&mut fx.grayscale, "Grayscale");
-        ui.checkbox(&mut fx.sepia, "Sepia");
-        ui.checkbox(&mut fx.monochrome, "Monochrome");
-        ui.checkbox(&mut fx.negative, "Negative (invert colors)");
+    group_ex(ui, "Looks", true, on(&[fx.grayscale, fx.sepia, fx.monochrome, fx.negative, fx.tint, fx.change_bg]), |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.toggle_value(&mut fx.grayscale, "Grayscale");
+            ui.toggle_value(&mut fx.sepia, "Sepia");
+            ui.toggle_value(&mut fx.monochrome, "Mono");
+            ui.toggle_value(&mut fx.negative, "Invert");
+        });
         ui.horizontal(|ui| {
             ui.checkbox(&mut fx.tint, "Tint");
             if fx.tint {
@@ -3712,75 +4441,63 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
             }
         });
         ui.horizontal(|ui| {
-            ui.checkbox(&mut fx.change_bg, "Change background color");
+            ui.checkbox(&mut fx.change_bg, "Background");
             if fx.change_bg {
-                ui.color_edit_button_srgb(&mut fx.bg_color);
+                ui.color_edit_button_srgb(&mut fx.bg_color).on_hover_text("Fills transparent areas");
             }
         });
     });
-    group(ui, "Transformations", |ui| {
-        ui.checkbox(&mut fx.flip_v, "↕ Flip vertically");
-        ui.checkbox(&mut fx.flip_h, "↔ Flip horizontally");
-        ui.checkbox(&mut fx.rot90, "↻ Rotate 90°");
-        ui.checkbox(&mut fx.rot270, "↺ Rotate 270°");
+    group_ex(ui, "Transparency", false, on(&[fx.rc_white, fx.rc_black, fx.rc_custom]), |ui| {
         ui.horizontal(|ui| {
-            ui.checkbox(&mut fx.rot_any, "Rotate by");
-            ui.add(egui::DragValue::new(&mut fx.rot_deg).speed(0.5).suffix("°"));
+            ui.label("Remove");
+            ui.toggle_value(&mut fx.rc_white, "White");
+            ui.toggle_value(&mut fx.rc_black, "Black");
+            ui.toggle_value(&mut fx.rc_custom, "Colour");
+            if fx.rc_custom {
+                ui.color_edit_button_srgb(&mut fx.rc_color);
+            }
         });
-    });
-    group(ui, "Animation flow", |ui| {
-        ui.checkbox(&mut tr.reverse, "⟲ Reverse");
-        ui.checkbox(&mut tr.set_loop, "Change the number of times to play (loop)");
-        if tr.set_loop {
-            ui.indent("fxloop", |ui| {
-                ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut tr.loop_count).range(0..=65535));
-                    hint(ui, "(0 = forever)");
-                });
-            });
-        }
-        ui.checkbox(&mut tr.boomerang, "⇄ Run to the end and reverse back to the start");
-        ui.checkbox(&mut fx.counter, "◷ Add seconds counter");
-        ui.checkbox(&mut fx.fade_in, "Fade in");
-        ui.checkbox(&mut fx.fade_out, "Fade out");
-        if fx.fade_in || fx.fade_out {
-            ui.indent("fade", |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("over");
-                    ui.add(egui::DragValue::new(&mut fx.fade_frames).range(1..=10000));
-                    ui.label("frames");
-                });
-                ui.checkbox(&mut fx.fade_to_transparent, "Fade to transparency (instead of black)");
-            });
-        }
-        hint(ui, "Reverse, boomerang and loop apply to the whole animation (shared with the Reverse tool).");
-    });
-    group(ui, "Replace color with transparency", |ui| {
-        ui.checkbox(&mut fx.rc_white, "□ White");
-        ui.checkbox(&mut fx.rc_black, "■ Black");
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut fx.rc_custom, "Custom");
+        if fx.rc_custom {
             let mut hex = format!("#{:02x}{:02x}{:02x}", fx.rc_color[0], fx.rc_color[1], fx.rc_color[2]);
-            if ui.add(egui::TextEdit::singleline(&mut hex).desired_width(70.0)).changed() {
+            if ui.add(egui::TextEdit::singleline(&mut hex).desired_width(80.0)).changed() {
                 if let Some(c) = parse_hex(&hex) {
                     fx.rc_color = c;
                 }
             }
-            ui.color_edit_button_srgb(&mut fx.rc_color);
-        });
+        }
         if fx.rc_white || fx.rc_black || fx.rc_custom {
-            ui.add(soft_slider(&mut fx.rc_fuzz, 0.0..=60.0, "Fuzz %"));
-            hint(ui, "How similar colours can be to count as equal – useful when the background has subtle variations.");
+            ui.add(soft_slider(&mut fx.rc_fuzz, 0.0..=60.0, "fuzz %")).on_hover_text("How close a colour must be to count");
             ui.horizontal(|ui| {
-                ui.checkbox(&mut fx.rc_clean_edges, "Clean up edges");
+                ui.checkbox(&mut fx.rc_clean_edges, "Clean edges");
                 if fx.rc_clean_edges {
                     ui.add(egui::DragValue::new(&mut fx.rc_edge_px).range(1..=50).suffix(" px"));
                 }
             });
         }
     });
-    group(ui, "Blurring and sharpening", |ui| {
-        ui.checkbox(&mut fx.blur, "Gaussian blur");
+    group_ex(ui, "Animation", false, on(&[tr.reverse, tr.boomerang, tr.set_loop, fx.counter, fx.fade_in, fx.fade_out]), |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.toggle_value(&mut tr.reverse, "Reverse");
+            ui.toggle_value(&mut tr.boomerang, "Boomerang");
+            ui.toggle_value(&mut fx.counter, "Timer").on_hover_text("Seconds counter");
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut tr.set_loop, "Loop count");
+            if tr.set_loop {
+                ui.add(egui::DragValue::new(&mut tr.loop_count).range(0..=65535)).on_hover_text("0 = forever");
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.toggle_value(&mut fx.fade_in, "Fade in");
+            ui.toggle_value(&mut fx.fade_out, "Fade out");
+            if fx.fade_in || fx.fade_out {
+                ui.add(egui::DragValue::new(&mut fx.fade_frames).range(1..=10000).suffix(" fr"));
+                ui.checkbox(&mut fx.fade_to_transparent, "to clear");
+            }
+        });
+    });
+    group_ex(ui, "Blur & sharpen", false, on(&[fx.blur, fx.sharpen]), |ui| {
+        ui.checkbox(&mut fx.blur, "Blur");
         if fx.blur {
             ui.add(soft_slider(&mut fx.blur_sigma, 0.3..=20.0, "σ"));
         }
@@ -3789,69 +4506,87 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
             ui.add(soft_slider(&mut fx.sharpen_sigma, 0.3..=10.0, "σ"));
         }
     });
-    group(ui, "Dithering and patterns", |ui| {
-        ui.checkbox(&mut fx.ordered_dither, "Ordered dithering (Bayer)");
-        ui.checkbox(&mut fx.error_dither, "Error diffusion (Floyd–Steinberg)");
+    group_ex(ui, "Dither", false, on(&[fx.ordered_dither, fx.error_dither]), |ui| {
+        ui.horizontal(|ui| {
+            ui.toggle_value(&mut fx.ordered_dither, "Ordered");
+            ui.toggle_value(&mut fx.error_dither, "Diffusion");
+        });
         if fx.ordered_dither || fx.error_dither {
-            ui.add(egui::Slider::new(&mut fx.dither_levels, 2..=16).text("levels / channel").clamping(egui::SliderClamping::Never));
+            ui.add(egui::Slider::new(&mut fx.dither_levels, 2..=16).text("levels").clamping(egui::SliderClamping::Never));
         }
     });
-    group(ui, "Artistic", |ui| {
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut fx.oil, "Oil paint");
-            if fx.oil {
-                ui.add(egui::DragValue::new(&mut fx.oil_radius).range(1..=32).prefix("r "));
-            }
+    group_ex(ui, "Artistic", false, on(&[fx.oil, fx.emboss, fx.posterize, fx.solarize, fx.noise]), |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.toggle_value(&mut fx.oil, "Oil paint");
+            ui.toggle_value(&mut fx.emboss, "Emboss");
+            ui.toggle_value(&mut fx.posterize, "Posterize");
+            ui.toggle_value(&mut fx.solarize, "Solarize");
+            ui.toggle_value(&mut fx.noise, "Noise");
         });
-        ui.checkbox(&mut fx.emboss, "Emboss");
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut fx.posterize, "Posterize");
-            if fx.posterize {
-                ui.add(egui::DragValue::new(&mut fx.posterize_levels).range(2..=255).suffix(" levels"));
-            }
-        });
-        ui.checkbox(&mut fx.solarize, "Solarize");
-        ui.checkbox(&mut fx.noise, "Add noise");
+        if fx.oil {
+            ui.add(egui::Slider::new(&mut fx.oil_radius, 1..=8).text("oil radius").clamping(egui::SliderClamping::Never));
+        }
+        if fx.posterize {
+            ui.add(egui::Slider::new(&mut fx.posterize_levels, 2..=16).text("levels").clamping(egui::SliderClamping::Never));
+        }
         if fx.noise {
-            ui.add(soft_slider(&mut fx.noise_amount, 1.0..=128.0, "amount"));
+            ui.add(soft_slider(&mut fx.noise_amount, 1.0..=128.0, "noise"));
         }
     });
-    group(ui, "Distortions", |ui| {
-        ui.checkbox(&mut fx.swirl, "Swirl");
+    group_ex(ui, "Distort", false, on(&[fx.swirl, fx.implode, fx.wave]), |ui| {
+        ui.horizontal(|ui| {
+            ui.toggle_value(&mut fx.swirl, "Swirl");
+            ui.toggle_value(&mut fx.implode, "Implode");
+            ui.toggle_value(&mut fx.wave, "Wave");
+        });
         if fx.swirl {
-            ui.add(soft_slider(&mut fx.swirl_deg, -720.0..=720.0, "°"));
+            ui.add(soft_slider(&mut fx.swirl_deg, -720.0..=720.0, "swirl °"));
         }
-        ui.checkbox(&mut fx.implode, "Implode");
         if fx.implode {
-            ui.add(soft_slider(&mut fx.implode_amount, -2.0..=2.0, "amount"));
+            ui.add(soft_slider(&mut fx.implode_amount, -2.0..=2.0, "implode"));
         }
-        ui.checkbox(&mut fx.wave, "Wave");
         if fx.wave {
             ui.add(soft_slider(&mut fx.wave_amp, 1.0..=100.0, "amplitude"));
             ui.add(soft_slider(&mut fx.wave_len, 4.0..=500.0, "wavelength"));
         }
     });
-    group(ui, "Filters", |ui| {
-        ui.checkbox(&mut fx.gotham, "Gotham");
-        ui.checkbox(&mut fx.lomo, "Lomo");
-        ui.checkbox(&mut fx.nashville, "Nashville");
-        ui.checkbox(&mut fx.toaster, "Toaster");
-        ui.checkbox(&mut fx.vignette, "Vignette");
-        ui.checkbox(&mut fx.polaroid, "Polaroid");
+    group_ex(ui, "Filters", false, on(&[fx.gotham, fx.lomo, fx.nashville, fx.toaster, fx.vignette, fx.polaroid]), |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.toggle_value(&mut fx.gotham, "Gotham");
+            ui.toggle_value(&mut fx.lomo, "Lomo");
+            ui.toggle_value(&mut fx.nashville, "Nashville");
+            ui.toggle_value(&mut fx.toaster, "Toaster");
+            ui.toggle_value(&mut fx.vignette, "Vignette");
+            ui.toggle_value(&mut fx.polaroid, "Polaroid");
+        });
     });
-    group(ui, "Frames", |ui| {
-        ui.checkbox(&mut fx.frame_camera, "Camera");
-        ui.checkbox(&mut fx.frame_fuzzy, "Fuzzy");
-        ui.checkbox(&mut fx.frame_rounded, "Rounded corners");
+    group_ex(ui, "Frame", false, on(&[fx.frame_camera, fx.frame_fuzzy, fx.frame_rounded, fx.frame_border]), |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.toggle_value(&mut fx.frame_camera, "Camera");
+            ui.toggle_value(&mut fx.frame_fuzzy, "Fuzzy");
+            ui.toggle_value(&mut fx.frame_rounded, "Rounded");
+            ui.toggle_value(&mut fx.frame_border, "Border");
+        });
         if fx.frame_rounded {
             ui.add(soft_slider(&mut fx.rounded_radius, 1.0..=200.0, "radius px"));
         }
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut fx.frame_border, "Solid border");
-            if fx.frame_border {
+        if fx.frame_border {
+            ui.horizontal(|ui| {
                 ui.add(egui::DragValue::new(&mut fx.border_px).range(1..=2000).suffix(" px"));
                 ui.color_edit_button_srgb(&mut fx.border_color);
-            }
+            });
+        }
+    });
+    group_ex(ui, "Transform", false, on(&[fx.flip_v, fx.flip_h, fx.rot90, fx.rot270, fx.rot_any]), |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.toggle_value(&mut fx.flip_h, "↔ Flip");
+            ui.toggle_value(&mut fx.flip_v, "↕ Flip");
+            ui.toggle_value(&mut fx.rot90, "↻ 90°");
+            ui.toggle_value(&mut fx.rot270, "↺ 90°");
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut fx.rot_any, "Rotate");
+            ui.add(egui::DragValue::new(&mut fx.rot_deg).speed(0.5).suffix("°"));
         });
     });
 }

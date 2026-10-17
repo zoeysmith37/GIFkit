@@ -7,7 +7,8 @@ use crate::text::FontEntry;
 use image::{imageops, Rgba, RgbaImage};
 use rayon::prelude::*;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct EffectSettings {
     // Colorize (100 = unchanged)
     pub hue: f32,
@@ -563,7 +564,7 @@ pub fn error_diffusion(img: &mut RgbaImage, levels: u8) {
     }
 }
 
-fn warp(img: &RgbaImage, clamp: bool, f: impl Fn(f32, f32) -> (f32, f32) + Sync) -> RgbaImage {
+pub(crate) fn warp(img: &RgbaImage, clamp: bool, f: impl Fn(f32, f32) -> (f32, f32) + Sync) -> RgbaImage {
     let w = img.width();
     let mut out = img.clone();
     out.par_chunks_mut(4).enumerate().for_each(|(i, o)| {
@@ -985,14 +986,15 @@ pub fn normalize_sizes(a: &mut Animation) {
 
 // ------------------------------------------------------------- censor
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum CensorMethod {
     Pixelate,
     Blur,
     Solid,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct CensorSettings {
     /// top-left of the unrotated box (source-frame pixels)
     pub x: i32,
@@ -1113,4 +1115,251 @@ fn censor_rect(img: &RgbaImage, x: i32, y: i32, w: u32, h: u32, c: &CensorSettin
         }
     }
     out
+}
+
+// ------------------------------------------------------------- watermark
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum Anchor {
+    TopLeft,
+    Top,
+    TopRight,
+    Left,
+    Center,
+    Right,
+    BottomLeft,
+    Bottom,
+    BottomRight,
+}
+
+impl Anchor {
+    pub const GRID: [[Anchor; 3]; 3] = [
+        [Anchor::TopLeft, Anchor::Top, Anchor::TopRight],
+        [Anchor::Left, Anchor::Center, Anchor::Right],
+        [Anchor::BottomLeft, Anchor::Bottom, Anchor::BottomRight],
+    ];
+    /// (fx, fy) in 0..=1
+    fn frac(self) -> (f32, f32) {
+        match self {
+            Anchor::TopLeft => (0.0, 0.0),
+            Anchor::Top => (0.5, 0.0),
+            Anchor::TopRight => (1.0, 0.0),
+            Anchor::Left => (0.0, 0.5),
+            Anchor::Center => (0.5, 0.5),
+            Anchor::Right => (1.0, 0.5),
+            Anchor::BottomLeft => (0.0, 1.0),
+            Anchor::Bottom => (0.5, 1.0),
+            Anchor::BottomRight => (1.0, 1.0),
+        }
+    }
+}
+
+/// A watermark anchored to the output frame (text or image, single or tiled).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct WatermarkSettings {
+    pub text: String,
+    pub font_idx: usize,
+    /// (family, style) for presets
+    pub font_key: Option<(String, String)>,
+    pub use_image: bool,
+    pub image_path: Option<std::path::PathBuf>,
+    #[serde(skip)]
+    pub image: Option<std::sync::Arc<RgbaImage>>,
+    /// text height / image width as % of the frame's shorter side
+    pub size: f32,
+    pub color: [u8; 4],
+    pub outline: bool,
+    /// 0..=100
+    pub opacity: f32,
+    pub anchor: Anchor,
+    /// % of the shorter side
+    pub margin: f32,
+    pub tiled: bool,
+    pub angle: f32,
+    /// gap between tiles, as a multiple of the tile size
+    pub spacing: f32,
+}
+
+impl PartialEq for WatermarkSettings {
+    fn eq(&self, o: &Self) -> bool {
+        format!("{self:?}") == format!("{o:?}")
+    }
+}
+
+impl Default for WatermarkSettings {
+    fn default() -> Self {
+        Self {
+            text: "© your name".into(),
+            font_idx: 0,
+            font_key: None,
+            use_image: false,
+            image_path: None,
+            image: None,
+            size: 6.0,
+            color: [255, 255, 255, 255],
+            outline: true,
+            opacity: 60.0,
+            anchor: Anchor::BottomRight,
+            margin: 3.0,
+            tiled: false,
+            angle: -30.0,
+            spacing: 1.2,
+        }
+    }
+}
+
+/// Pre-rendered watermark for a frame size.
+pub enum WatermarkSprite {
+    Single(RgbaImage, i64, i64),
+    Tiled(RgbaImage, f32, f32),
+}
+
+impl WatermarkSettings {
+    pub fn active(&self) -> bool {
+        if self.use_image { self.image.is_some() } else { !self.text.trim().is_empty() }
+    }
+
+    pub fn sprite(&self, fonts: &[crate::text::FontEntry], w: f32, h: f32) -> Option<WatermarkSprite> {
+        if !self.active() {
+            return None;
+        }
+        let short = w.min(h).max(1.0);
+        let px = (self.size / 100.0 * short).clamp(4.0, 4000.0);
+        let mut sp = if self.use_image {
+            let img = self.image.as_ref()?;
+            let s = px / img.width().max(1) as f32;
+            let nw = (img.width() as f32 * s).round().max(1.0) as u32;
+            let nh = (img.height() as f32 * s).round().max(1.0) as u32;
+            imageops::resize(&**img, nw, nh, imageops::FilterType::Triangle)
+        } else {
+            let a = crate::text::Annotation {
+                text: self.text.clone(),
+                font_idx: self.font_idx.min(fonts.len().saturating_sub(1)),
+                size: px,
+                color: self.color,
+                border: if self.outline { crate::text::Border::Light } else { crate::text::Border::None },
+                border_color: [0, 0, 0, (self.color[3] as f32 * 0.8) as u8],
+                ..Default::default()
+            };
+            crate::text::render_sprite(fonts, &a)
+        };
+        if self.tiled {
+            if self.angle % 360.0 != 0.0 {
+                sp = crate::ops::rotate_any_image(&sp, self.angle, Rgba([0, 0, 0, 0]), true);
+            }
+            let sx = sp.width() as f32 * self.spacing.max(0.5);
+            let sy = sp.height() as f32 * self.spacing.max(0.5) * 1.6;
+            return Some(WatermarkSprite::Tiled(sp, sx, sy));
+        }
+        let m = self.margin / 100.0 * short;
+        let (fx, fy) = self.anchor.frac();
+        let x = m + (w - 2.0 * m - sp.width() as f32) * fx;
+        let y = m + (h - 2.0 * m - sp.height() as f32) * fy;
+        Some(WatermarkSprite::Single(sp, x.round() as i64, y.round() as i64))
+    }
+}
+
+pub fn draw_watermark(img: &mut RgbaImage, sp: &WatermarkSprite, opacity: f32) {
+    let o = (opacity / 100.0).clamp(0.0, 1.0);
+    match sp {
+        WatermarkSprite::Single(s, x, y) => crate::ops::overlay_with_opacity(img, s, *x, *y, o),
+        WatermarkSprite::Tiled(s, sx, sy) => {
+            let (w, h) = (img.width() as f32, img.height() as f32);
+            let mut row = 0;
+            let mut y = -(s.height() as f32);
+            while y < h {
+                let off = if row % 2 == 1 { sx / 2.0 } else { 0.0 };
+                let mut x = -(s.width() as f32) + off;
+                while x < w {
+                    crate::ops::overlay_with_opacity(img, s, x.round() as i64, y.round() as i64, o);
+                    x += sx;
+                }
+                y += sy;
+                row += 1;
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------- AI shield
+
+/// Perturbation that makes frames less useful as clean AI training data.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ShieldSettings {
+    /// amplitude in colour levels (0..255)
+    pub strength: f32,
+    /// structured high-frequency pattern
+    pub pattern: bool,
+    /// per-pixel chroma noise
+    pub noise: bool,
+    /// sub-pixel geometric jitter
+    pub jitter: bool,
+    /// change the perturbation every frame (hurts GIF compression)
+    pub per_frame: bool,
+    pub seed: u32,
+}
+
+impl Default for ShieldSettings {
+    fn default() -> Self {
+        Self { strength: 6.0, pattern: true, noise: true, jitter: false, per_frame: false, seed: 1337 }
+    }
+}
+
+#[inline]
+fn hash3(x: u32, y: u32, z: u32) -> u32 {
+    let mut h = x.wrapping_mul(0x8da6b343) ^ y.wrapping_mul(0xd8163841) ^ z.wrapping_mul(0xcb1ab31f);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0x5bd1e995);
+    h ^ (h >> 15)
+}
+
+pub fn shield(src: &RgbaImage, s: &ShieldSettings, frame: usize) -> RgbaImage {
+    let z = if s.per_frame { s.seed.wrapping_add(frame as u32 * 7919) } else { s.seed };
+    let mut img = if s.jitter {
+        let zz = z;
+        warp(src, true, move |x, y| {
+            let a = ((x * 0.37 + y * 0.11 + (zz % 97) as f32).sin() + (y * 0.29 - x * 0.07).cos()) * 0.25;
+            let b = ((y * 0.41 - x * 0.13 + (zz % 89) as f32).sin() + (x * 0.23 + y * 0.05).cos()) * 0.25;
+            (x + a, y + b)
+        })
+    } else {
+        src.clone()
+    };
+    // a few high-frequency gratings with seeded orientations / phases per channel
+    let mut waves = [[0f32; 4]; 9];
+    for (k, w) in waves.iter_mut().enumerate() {
+        let r = hash3(z, k as u32, 99);
+        let ang = (r % 3600) as f32 / 3600.0 * std::f32::consts::TAU;
+        let period = 2.2 + ((r >> 12) % 100) as f32 / 40.0; // 2.2–4.7 px
+        let f = std::f32::consts::TAU / period;
+        *w = [ang.cos() * f, ang.sin() * f, ((r >> 20) % 628) as f32 / 100.0, 0.0];
+    }
+    let amp = s.strength.max(0.0);
+    let w = img.width();
+    img.par_chunks_mut(4).enumerate().for_each(|(i, p)| {
+        if p[3] < 8 {
+            return;
+        }
+        let x = (i as u32 % w) as f32;
+        let y = (i as u32 / w) as f32;
+        for c in 0..3 {
+            let mut d = 0.0;
+            if s.pattern {
+                let mut v = 0.0;
+                for k in 0..3 {
+                    let wv = waves[c * 3 + k];
+                    v += (wv[0] * x + wv[1] * y + wv[2]).sin();
+                }
+                d += v / 3.0 * 0.8;
+            }
+            if s.noise {
+                let r = hash3(i as u32, c as u32, z);
+                d += ((r & 0xffff) as f32 / 32767.5 - 1.0) * 0.6;
+            }
+            p[c] = c8(p[c] as f32 + d * amp);
+        }
+    });
+    img
 }
