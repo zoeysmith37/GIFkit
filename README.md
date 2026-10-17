@@ -40,6 +40,8 @@ cargo run --release -- path/to/anim.gif
 
 Linux dependecies are `libxkbcommon-dev` and `libgl1-mesa-dev`. MP4, WebM and AVIF export need `ffmpeg` on PATH.
 
+Windows and MacOS versions are untested, use at your own peril (it should be fine). 
+
 ## License
 
 Apache 2.0 (see LICENSE). Bundled fonts: Noto Sans (OFL) and DejaVu.
