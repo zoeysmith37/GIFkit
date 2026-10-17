@@ -686,3 +686,24 @@ fn encode_timing() {
         eprintln!("lossy {}: {} bytes in {:.2}s", o.lossy, b.len(), t.elapsed().as_secs_f32());
     }
 }
+
+/// Writes README comparison encodes of $PROBE into $DUMP.
+#[test]
+#[ignore]
+fn readme_encodes() {
+    let path = std::env::var("PROBE").unwrap();
+    let d = std::env::var("DUMP").unwrap();
+    let a = io::load_animation(std::path::Path::new(&path)).unwrap();
+    let run = |name: &str, f: &dyn Fn() -> Vec<u8>| {
+        let t = std::time::Instant::now();
+        let b = f();
+        std::fs::write(format!("{d}/{name}"), &b).unwrap();
+        eprintln!("{name}\t{}\t{:.1}s", b.len(), t.elapsed().as_secs_f32());
+    };
+    run("gif_lossless.gif", &|| encode_gif(&a, &GifOptions::default(), None).unwrap());
+    run("gif_lossy60.gif", &|| encode_gif(&a, &GifOptions { lossy: 60, ..Default::default() }, None).unwrap());
+    run("gif_lossy120.gif", &|| encode_gif(&a, &GifOptions { lossy: 120, ..Default::default() }, None).unwrap());
+    run("webp_lossless.webp", &|| io::encode_webp(&a, &io::WebpOptions { lossless: true, quality: 75.0, method: 4 }).unwrap());
+    run("webp_q80.webp", &|| io::encode_webp(&a, &io::WebpOptions { lossless: false, quality: 80.0, method: 4 }).unwrap());
+    run("avif_q60.avif", &|| io::encode_avif(&a, 60).unwrap());
+}

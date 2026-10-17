@@ -1919,9 +1919,15 @@ impl GifForgeApp {
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
             let res = stack::bg_pool().install(|| {
+                let t0 = std::time::Instant::now();
                 let out = stack.flatten(&base, &fonts, None);
+                let t1 = t0.elapsed();
                 let bytes = crate::encode::encode_gif(&out, &opts, None)?;
+                let t2 = t0.elapsed();
                 let anim = io::decode_gif_bytes(&bytes)?;
+                if std::env::var_os("GIFFORGE_PERF").is_some() {
+                    eprintln!("compress: flatten {:.1}s encode {:.1}s decode {:.1}s", t1.as_secs_f32(), (t2 - t1).as_secs_f32(), (t0.elapsed() - t2).as_secs_f32());
+                }
                 Ok((anim, bytes))
             });
             let _ = tx.send(res);

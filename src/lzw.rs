@@ -79,10 +79,52 @@ pub fn encode_ex(indices: &[u8], alt: Option<&[u8]>, palette: &[u8], transparent
         }
     }
 
-    // trie: child[node*256 + byte] = code (0 = none); kids[node] = list of child bytes
-    let mut child = vec![0u16; 4096 * 256];
-    let mut kids: Vec<Vec<u8>> = vec![Vec::new(); 4096];
-    let mut used_nodes: Vec<u16> = Vec::new();
+    // trie: child[node*256 + byte] = code (0 = none); kids[node] = list of child bytes.
+    // Reused per thread (cleared on exit) - the encoder runs many trials per frame.
+    TRIE.with(|t| {
+        let mut t = t.borrow_mut();
+        let Trie { child, kids, used_nodes } = &mut *t;
+        let r = encode_inner(indices, alt, palette, transparent, lossy, &allowed, child, kids, used_nodes, &mut chosen, bw, min_code_size, clear, eoi);
+        // leave the trie empty for the next call
+        for &n in used_nodes.iter() {
+            for &k in &kids[n as usize] {
+                child[n as usize * 256 + k as usize] = 0;
+            }
+            kids[n as usize].clear();
+        }
+        used_nodes.clear();
+        (r, chosen)
+    })
+}
+
+struct Trie {
+    child: Vec<u16>,
+    kids: Vec<Vec<u8>>,
+    used_nodes: Vec<u16>,
+}
+
+thread_local! {
+    static TRIE: std::cell::RefCell<Trie> = std::cell::RefCell::new(Trie { child: vec![0u16; 4096 * 256], kids: vec![Vec::new(); 4096], used_nodes: Vec::new() });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_inner(
+    indices: &[u8],
+    alt: Option<&[u8]>,
+    palette: &[u8],
+    transparent: Option<u8>,
+    lossy: bool,
+    allowed: &[bool],
+    child: &mut [u16],
+    kids: &mut [Vec<u8>],
+    used_nodes: &mut Vec<u16>,
+    chosen: &mut [u8],
+    mut bw: BitWriter,
+    min_code_size: u32,
+    clear: u16,
+    eoi: u16,
+) -> Vec<u8> {
+    let _ = transparent;
 
     let mut code_size = min_code_size + 1;
     let mut next: u16 = eoi + 1;
@@ -145,7 +187,7 @@ pub fn encode_ex(indices: &[u8], alt: Option<&[u8]>, palette: &[u8], transparent
         } else {
             // table full: reset
             bw.put(clear, code_size);
-            for &n in &used_nodes {
+            for &n in used_nodes.iter() {
                 for &k in &kids[n as usize] {
                     child[n as usize * 256 + k as usize] = 0;
                 }
@@ -161,5 +203,5 @@ pub fn encode_ex(indices: &[u8], alt: Option<&[u8]>, palette: &[u8], transparent
     bw.put(cur, code_size);
     bw.put(eoi, code_size);
     bw.flush();
-    (bw.out, chosen)
+    bw.out
 }

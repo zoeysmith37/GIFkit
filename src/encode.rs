@@ -91,6 +91,20 @@ struct Palette {
     nq: Option<NeuQuant>,
     rgb: Vec<u8>, // 3 * n
     transparent: Option<u8>,
+    /// exact colour -> index (exact palettes)
+    lut: std::collections::HashMap<u32, u8>,
+}
+
+fn key(r: u8, g: u8, b: u8) -> u32 {
+    u32::from_le_bytes([r, g, b, 0])
+}
+
+fn make_lut(rgb: &[u8], opaque: usize) -> std::collections::HashMap<u32, u8> {
+    let mut m = std::collections::HashMap::with_capacity(opaque);
+    for i in (0..opaque).rev() {
+        m.insert(key(rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2]), i as u8);
+    }
+    m
 }
 
 impl Palette {
@@ -133,8 +147,9 @@ impl Palette {
             transparent = Some((rgb.len() / 3) as u8);
             rgb.extend_from_slice(&[0, 0, 0]);
         }
-        // GIF palettes must be a power of two in size; the encoder pads, but keep it tidy.
-        Palette { nq, rgb, transparent }
+        let opaque = rgb.len() / 3 - transparent.map(|_| 1).unwrap_or(0);
+        let lut = if nq.is_none() { make_lut(&rgb, opaque) } else { Default::default() };
+        Palette { nq, rgb, transparent, lut }
     }
 
     fn len(&self) -> usize {
@@ -149,6 +164,8 @@ impl Palette {
     fn index_of(&self, r: u8, g: u8, b: u8) -> u8 {
         if let Some(nq) = &self.nq {
             nq.index_of(&[r, g, b, 255]) as u8
+        } else if let Some(i) = self.lut.get(&key(r, g, b)) {
+            *i
         } else {
             // exact / nearest search over small palette
             let mut best = 0usize;
@@ -280,7 +297,9 @@ impl Palette {
             transparent = Some((rgb.len() / 3) as u8);
             rgb.extend_from_slice(&[0, 0, 0]);
         }
-        Palette { nq: None, rgb, transparent }
+        let opaque = rgb.len() / 3 - transparent.map(|_| 1).unwrap_or(0);
+        let lut = make_lut(&rgb, opaque);
+        Palette { nq: None, rgb, transparent, lut }
     }
 
     /// True if every colour in `set` is an exact entry of this palette.
@@ -288,8 +307,7 @@ impl Palette {
         if self.nq.is_some() {
             return false;
         }
-        let mine: std::collections::HashSet<[u8; 3]> = (0..self.opaque_len()).map(|i| self.color(i as u8)).collect();
-        set.iter().all(|c| mine.contains(c))
+        set.iter().all(|c| self.lut.contains_key(&key(c[0], c[1], c[2])))
     }
 }
 
@@ -297,6 +315,7 @@ impl Palette {
 fn local_table_bytes(pal: &Palette) -> usize {
     3 * pal.len().max(2).next_power_of_two()
 }
+
 
 /// One way of writing a frame, with its encoded size.
 struct Candidate<'a> {
@@ -480,8 +499,9 @@ pub fn encode_gif(anim: &Animation, opt: &GifOptions, progress: Option<&AtomicUs
                 let exact_fits = set.len() <= cap;
                 let fits_global = global.as_ref().map(|g| (g.transparent.is_some() || !uses_t) && (forced_global || g.contains_all(&set))).unwrap_or(false);
                 let global_wild = global.as_ref().map(|g| g.transparent.is_some()).unwrap_or(false);
-                // the unmasked variant is only worth it when it stays lossless-cheap
-                if !masked && !exact_fits && !fits_global {
+                // whole-rectangle and wildcard variants only ever win with the
+                // global table (measured), so they skip local-table trials
+                if !masked && !fits_global {
                     continue;
                 }
                 if fits_global {
@@ -491,7 +511,7 @@ pub fn encode_gif(anim: &Animation, opt: &GifOptions, progress: Option<&AtomicUs
                         plans.push((true, false, None, true));
                     }
                 }
-                if !forced_global {
+                if !forced_global && masked {
                     let pal = if exact_fits {
                         let mut v: Vec<[u8; 3]> = set.into_iter().collect();
                         v.sort();
@@ -501,12 +521,8 @@ pub fn encode_gif(anim: &Animation, opt: &GifOptions, progress: Option<&AtomicUs
                     } else {
                         Palette::build(&samples, opt.colors, true, opt.quant_speed)
                     };
-                    let exact = pal.nq.is_none() && pal.transparent.is_some();
                     locals.push((masked, pal));
                     plans.push((masked, true, Some(locals.len() - 1), false));
-                    if !masked && exact {
-                        plans.push((true, true, Some(locals.len() - 1), true));
-                    }
                 }
             }
             if plans.is_empty() {
