@@ -44,4 +44,4 @@ Linux needs `libxkbcommon-dev` and `libgl1-mesa-dev` to build. MP4, WebM and AVI
 
 ## License
 
-MIT. Bundled fonts: Noto Sans (OFL) and DejaVu.
+Apache 2.0 (see LICENSE). Bundled fonts: Noto Sans (OFL) and DejaVu.

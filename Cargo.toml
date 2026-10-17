@@ -3,7 +3,7 @@ name = "gifforge"
 version = "0.1.0"
 edition = "2021"
 description = "Local, cross-platform animated GIF editor / optimiser"
-license = "MIT"
+license = "Apache-2.0"
 
 [dependencies]
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
