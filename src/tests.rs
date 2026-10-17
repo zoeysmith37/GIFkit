@@ -212,7 +212,9 @@ fn exports() {
     let tres = std::fs::read_to_string(dir.join("sheet_frames.tres")).unwrap();
     assert!(tres.contains("SpriteFrames") && tres.contains("AtlasTexture_11"));
     let sheet = image::open(dir.join("sheet.png")).unwrap();
-    assert_eq!(sheet.width(), 96 * 4);
+    assert!(sheet.width().is_power_of_two() && sheet.height().is_power_of_two());
+    io::export_spritesheet(&a, &dir.join("sheet2.png"), &io::SheetOptions { pow2: false, ..Default::default() }).unwrap();
+    assert_eq!(image::open(dir.join("sheet2.png")).unwrap().width(), 96 * 4);
     if io::ffmpeg_available() {
         io::export_video(&synth(false), &dir.join("v.mp4"), io::VideoFormat::Mp4, [255, 255, 255]).unwrap();
         assert!(std::fs::metadata(dir.join("v.mp4")).unwrap().len() > 0);
@@ -765,4 +767,47 @@ fn preview_alpha_probe() {
         let (dec, _) = io::encode_preview(&a, &f).unwrap();
         eprintln!("{f:?}: corner alpha {} square {:?}", dec.frames[0].image.get_pixel(90, 2)[3], dec.frames[0].image.get_pixel(5, 30));
     }
+}
+
+#[test]
+fn sheet_pow2_and_indexed_png() {
+    let a = synth(true);
+    // 12 frames of 96x64
+    let mut o = io::SheetOptions { pow2: true, ..Default::default() };
+    let (cols, rows, w, h, cw, ch) = io::sheet_layout(12, 96, 64, &o);
+    assert!(cw.is_power_of_two() && ch.is_power_of_two(), "{cw}x{ch}");
+    assert!(cols * rows >= 12 && w <= cw && h <= ch);
+    // smallest pow2 area among all column counts
+    for c in 1..=12u32 {
+        let r = 12u32.div_ceil(c);
+        let area = (c * 96).next_power_of_two() as u64 * (r * 64).next_power_of_two() as u64;
+        assert!(area >= cw as u64 * ch as u64);
+    }
+    let (sheet, rects, _, _) = io::render_spritesheet(&a, &o).unwrap();
+    assert_eq!(sheet.dimensions(), (cw, ch));
+    assert_eq!(rects.len(), 12);
+    // indexed PNG: exact when colours fit, transparency kept, smaller than full colour
+    o.png.colors = 256;
+    let full = io::encode_png(&sheet, &io::PngOptions { colors: 0 }).unwrap();
+    let pal = io::encode_png(&sheet, &o.png).unwrap();
+    let back = image::load_from_memory(&pal).unwrap().to_rgba8();
+    assert_eq!(back.dimensions(), sheet.dimensions());
+    for (p, q) in back.pixels().zip(sheet.pixels()) {
+        if q[3] == 0 {
+            assert_eq!(p[3], 0);
+        } else {
+            assert_eq!(p, q);
+        }
+    }
+    assert!(pal.len() < full.len(), "{} vs {}", pal.len(), full.len());
+    // quantised path (too many colours) still decodes
+    let grad = RgbaImage::from_fn(64, 64, |x, y| Rgba([(x * 4) as u8, (y * 4) as u8, ((x + y) * 2) as u8, 255]));
+    let q = io::encode_png(&grad, &io::PngOptions { colors: 16 }).unwrap();
+    assert_eq!(image::load_from_memory(&q).unwrap().to_rgba8().dimensions(), (64, 64));
+    // previews
+    let (dec, _) = io::encode_preview(&a, &io::PreviewFormat::Sheet(o.clone())).unwrap();
+    assert_eq!((dec.width(), dec.height()), (cw, ch));
+    let (dec, bytes) = io::encode_preview(&a, &io::PreviewFormat::Frames(io::SplitFormat::Png, io::PngOptions { colors: 64 }, GifOptions::default())).unwrap();
+    assert_eq!(dec.len(), a.len());
+    assert!(!bytes.is_empty());
 }

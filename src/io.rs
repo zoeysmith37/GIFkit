@@ -263,39 +263,139 @@ pub fn save_apng(anim: &Animation, path: &Path, noai: bool) -> Result<u64> {
     Ok(b.len() as u64)
 }
 
-fn png_bytes(img: &RgbaImage) -> Result<Vec<u8>> {
-    let mut v = Vec::new();
-    img.write_to(&mut Cursor::new(&mut v), image::ImageFormat::Png)?;
-    Ok(v)
+/// PNG output settings (frames and sprite sheets).
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct PngOptions {
+    /// 0 = full colour; 2..=256 = indexed palette PNG (exact when the image
+    /// has that few colours, quantised otherwise)
+    pub colors: u16,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+impl Default for PngOptions {
+    fn default() -> Self {
+        Self { colors: 0 }
+    }
+}
+
+/// Encode a PNG: full colour (max compression) or indexed with a palette.
+pub fn encode_png(img: &RgbaImage, o: &PngOptions) -> Result<Vec<u8>> {
+    let (w, h) = img.dimensions();
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_compression(png::Compression::High);
+        if o.colors == 0 {
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header()?.write_image_data(img.as_raw())?;
+        } else {
+            let n = o.colors.clamp(2, 256) as usize;
+            // exact palette when the image fits, otherwise NeuQuant (RGBA aware)
+            let mut exact: std::collections::HashMap<[u8; 4], u8> = std::collections::HashMap::new();
+            let mut fits = true;
+            for p in img.pixels() {
+                let k = if p[3] == 0 { [0, 0, 0, 0] } else { p.0 };
+                if !exact.contains_key(&k) {
+                    if exact.len() >= n {
+                        fits = false;
+                        break;
+                    }
+                    let i = exact.len() as u8;
+                    exact.insert(k, i);
+                }
+            }
+            let (palette, indices): (Vec<[u8; 4]>, Vec<u8>) = if fits {
+                let mut pal = vec![[0u8; 4]; exact.len()];
+                for (c, i) in &exact {
+                    pal[*i as usize] = *c;
+                }
+                let idx = img.pixels().map(|p| exact[&if p[3] == 0 { [0, 0, 0, 0] } else { p.0 }]).collect();
+                (pal, idx)
+            } else {
+                let nq = color_quant::NeuQuant::new(10, n, img.as_raw());
+                let pal: Vec<[u8; 4]> = nq.color_map_rgba().chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
+                let idx = img.pixels().map(|p| nq.index_of(&p.0) as u8).collect();
+                (pal, idx)
+            };
+            let depth = match palette.len() {
+                0..=2 => png::BitDepth::One,
+                3..=4 => png::BitDepth::Two,
+                5..=16 => png::BitDepth::Four,
+                _ => png::BitDepth::Eight,
+            };
+            let bits = match depth {
+                png::BitDepth::One => 1,
+                png::BitDepth::Two => 2,
+                png::BitDepth::Four => 4,
+                _ => 8,
+            };
+            enc.set_color(png::ColorType::Indexed);
+            enc.set_depth(depth);
+            enc.set_palette(palette.iter().flat_map(|c| [c[0], c[1], c[2]]).collect::<Vec<u8>>());
+            if palette.iter().any(|c| c[3] < 255) {
+                enc.set_trns(palette.iter().map(|c| c[3]).collect::<Vec<u8>>());
+            }
+            // pack rows at the chosen bit depth
+            let per_byte = 8 / bits;
+            let row_bytes = (w as usize).div_ceil(per_byte);
+            let mut data = vec![0u8; row_bytes * h as usize];
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    let v = indices[y * w as usize + x];
+                    let bi = y * row_bytes + x / per_byte;
+                    let shift = 8 - bits * (x % per_byte + 1);
+                    data[bi] |= v << shift;
+                }
+            }
+            enc.write_header()?.write_image_data(&data)?;
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum SplitFormat {
     Png,
     Gif,
 }
 
+/// One frame encoded as it would be written by the frames export.
+pub fn encode_frame_file(f: &Frame, fmt: SplitFormat, png: &PngOptions, gif: &GifOptions) -> Result<Vec<u8>> {
+    match fmt {
+        SplitFormat::Png => encode_png(&f.image, png),
+        SplitFormat::Gif => {
+            let single = Animation { frames: vec![Frame { enabled: true, ..f.clone() }], loop_count: None };
+            encode_gif(&single, &GifOptions { frame_diff: false, merge_duplicates: false, ..gif.clone() }, None)
+        }
+    }
+}
+
 /// Write every enabled frame as an individual file into `dir`.
+#[allow(dead_code)]
 pub fn export_frames_dir(anim: &Animation, dir: &Path, prefix: &str, fmt: SplitFormat) -> Result<usize> {
+    export_frames_dir_opts(anim, dir, prefix, fmt, &PngOptions::default(), &GifOptions::default())
+}
+
+pub fn export_frames_dir_opts(anim: &Animation, dir: &Path, prefix: &str, fmt: SplitFormat, png: &PngOptions, gif: &GifOptions) -> Result<usize> {
     std::fs::create_dir_all(dir)?;
     let frames = anim.enabled_frames();
     let digits = frames.len().to_string().len().max(3);
     for (i, f) in frames.iter().enumerate() {
         let name = format!("{prefix}_{:0width$}", i + 1, width = digits);
-        match fmt {
-            SplitFormat::Png => f.image.save(dir.join(format!("{name}.png")))?,
-            SplitFormat::Gif => {
-                let single = Animation { frames: vec![f.clone()], loop_count: None };
-                let b = encode_gif(&single, &GifOptions { frame_diff: false, ..Default::default() }, None)?;
-                std::fs::write(dir.join(format!("{name}.gif")), b)?;
-            }
-        }
+        let ext = if fmt == SplitFormat::Png { "png" } else { "gif" };
+        std::fs::write(dir.join(format!("{name}.{ext}")), encode_frame_file(f, fmt, png, gif)?)?;
     }
     Ok(frames.len())
 }
 
 /// Write every enabled frame as PNG into a ZIP archive.
+#[allow(dead_code)]
 pub fn export_frames_zip(anim: &Animation, path: &Path, prefix: &str) -> Result<usize> {
+    export_frames_zip_opts(anim, path, prefix, &PngOptions::default())
+}
+
+pub fn export_frames_zip_opts(anim: &Animation, path: &Path, prefix: &str, png: &PngOptions) -> Result<usize> {
     let frames = anim.enabled_frames();
     let file = File::create(path)?;
     let mut zip = zip::ZipWriter::new(file);
@@ -303,13 +403,14 @@ pub fn export_frames_zip(anim: &Animation, path: &Path, prefix: &str) -> Result<
     let digits = frames.len().to_string().len().max(3);
     for (i, f) in frames.iter().enumerate() {
         zip.start_file(format!("{prefix}_{:0width$}.png", i + 1, width = digits), opts)?;
-        zip.write_all(&png_bytes(&f.image)?)?;
+        zip.write_all(&encode_png(&f.image, png)?)?;
     }
     zip.finish()?;
     Ok(frames.len())
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SheetOptions {
     /// 0 = automatic (roughly square sheet).
     pub columns: u32,
@@ -319,12 +420,58 @@ pub struct SheetOptions {
     /// res:// directory that the sheet will live in inside the Godot project.
     pub godot_res_dir: String,
     pub anim_name: String,
+    /// pad the sheet to power-of-two width and height (and pick the column
+    /// count that needs the smallest such canvas when columns is automatic)
+    pub pow2: bool,
+    pub png: PngOptions,
 }
 
 impl Default for SheetOptions {
     fn default() -> Self {
-        Self { columns: 0, padding: 0, write_json: true, write_godot: true, godot_res_dir: "res://".into(), anim_name: "default".into() }
+        Self { columns: 0, padding: 0, write_json: true, write_godot: true, godot_res_dir: "res://".into(), anim_name: "default".into(), pow2: true, png: PngOptions::default() }
     }
+}
+
+/// Sheet layout: (columns, rows, used width, used height, canvas width, canvas height).
+pub fn sheet_layout(n: u32, fw: u32, fh: u32, opt: &SheetOptions) -> (u32, u32, u32, u32, u32, u32) {
+    let n = n.max(1);
+    let p = opt.padding;
+    let size = |cols: u32| {
+        let rows = n.div_ceil(cols);
+        let w = cols * fw + (cols - 1) * p;
+        let h = rows * fh + (rows - 1) * p;
+        let (cw, ch) = if opt.pow2 { (w.next_power_of_two(), h.next_power_of_two()) } else { (w, h) };
+        (cols, rows, w, h, cw, ch)
+    };
+    if opt.columns > 0 {
+        return size(opt.columns.min(n));
+    }
+    if !opt.pow2 {
+        return size(((n as f32).sqrt().ceil() as u32).max(1));
+    }
+    // smallest power-of-two area, then the squarest
+    (1..=n)
+        .map(size)
+        .min_by_key(|&(_, _, w, h, cw, ch)| ((cw as u64) * (ch as u64), cw.max(ch), (w as i64 - h as i64).unsigned_abs()))
+        .unwrap()
+}
+
+/// Build the sheet image and the top-left of every frame.
+pub fn render_spritesheet(anim: &Animation, opt: &SheetOptions) -> Result<(RgbaImage, Vec<(u32, u32)>, u32, u32)> {
+    let frames = anim.enabled_frames();
+    anyhow::ensure!(!frames.is_empty(), "No enabled frames");
+    let (fw, fh) = frames[0].image.dimensions();
+    let (cols, rows, _, _, cw, ch) = sheet_layout(frames.len() as u32, fw, fh, opt);
+    let p = opt.padding;
+    let mut sheet = RgbaImage::new(cw, ch);
+    let mut rects = Vec::new();
+    for (i, f) in frames.iter().enumerate() {
+        let x = (i as u32 % cols) * (fw + p);
+        let y = (i as u32 / cols) * (fh + p);
+        image::imageops::replace(&mut sheet, &*f.image, x as i64, y as i64);
+        rects.push((x, y));
+    }
+    Ok((sheet, rects, cols, rows))
 }
 
 fn gcd(a: u32, b: u32) -> u32 {
@@ -336,23 +483,9 @@ pub fn export_spritesheet(anim: &Animation, png_path: &Path, opt: &SheetOptions)
     let frames = anim.enabled_frames();
     anyhow::ensure!(!frames.is_empty(), "No enabled frames");
     let (fw, fh) = frames[0].image.dimensions();
-    let n = frames.len() as u32;
-    let cols = if opt.columns == 0 { (n as f32).sqrt().ceil() as u32 } else { opt.columns.min(n) }.max(1);
-    let rows = n.div_ceil(cols);
     let p = opt.padding;
-    let sw = cols * fw + (cols - 1) * p;
-    let sh = rows * fh + (rows - 1) * p;
-    let mut sheet = RgbaImage::new(sw, sh);
-    let mut rects = Vec::new();
-    for (i, f) in frames.iter().enumerate() {
-        let c = i as u32 % cols;
-        let r = i as u32 / cols;
-        let x = c * (fw + p);
-        let y = r * (fh + p);
-        image::imageops::replace(&mut sheet, &*f.image, x as i64, y as i64);
-        rects.push((x, y));
-    }
-    sheet.save(png_path)?;
+    let (sheet, rects, cols, rows) = render_spritesheet(anim, opt)?;
+    std::fs::write(png_path, encode_png(&sheet, &opt.png)?)?;
     let stem = png_path.file_stem().and_then(|s| s.to_str()).unwrap_or("sheet").to_string();
     let file_name = png_path.file_name().and_then(|s| s.to_str()).unwrap_or("sheet.png").to_string();
     let mut written = vec![file_name.clone()];
@@ -487,6 +620,10 @@ pub enum PreviewFormat {
     /// lossless: the preview is the input itself, only the size is measured
     Apng,
     Video(VideoFormat, [u8; 3]),
+    /// one file per frame
+    Frames(SplitFormat, PngOptions, GifOptions),
+    /// the sprite sheet image itself
+    Sheet(SheetOptions),
 }
 
 /// Encode `anim` like the real export would, then decode the result so the
@@ -507,6 +644,25 @@ pub fn encode_preview(anim: &Animation, f: &PreviewFormat) -> Result<(Animation,
             let mut a = anim.clone();
             a.frames.retain(|f| f.enabled);
             Ok((a, b))
+        }
+        PreviewFormat::Frames(fmt, png, gif) => {
+            use rayon::prelude::*;
+            let frames = anim.enabled_frames();
+            let files: Vec<Vec<u8>> = frames.par_iter().map(|f| encode_frame_file(f, *fmt, png, gif)).collect::<Result<_>>()?;
+            let decoded: Vec<Frame> = files
+                .par_iter()
+                .zip(frames.par_iter())
+                .map(|(b, f)| Ok(Frame { image: Arc::new(image::load_from_memory(b)?.to_rgba8()), delay_cs: f.delay_cs, enabled: true }))
+                .collect::<Result<_>>()?;
+            // the size shown is the total of all files
+            let total: Vec<u8> = files.concat();
+            Ok((Animation { frames: decoded, loop_count: anim.loop_count }, total))
+        }
+        PreviewFormat::Sheet(opt) => {
+            let (sheet, _, _, _) = render_spritesheet(anim, opt)?;
+            let b = encode_png(&sheet, &opt.png)?;
+            let img = image::load_from_memory(&b)?.to_rgba8();
+            Ok((Animation { frames: vec![Frame::new(img, 100)], loop_count: None }, b))
         }
         PreviewFormat::Avif(q) => {
             let b = encode_avif(anim, *q)?;

@@ -224,6 +224,8 @@ struct Job {
 
 struct CmpResult {
     key: u64,
+    /// the preview is a sprite sheet (one big image, not frames)
+    sheet: bool,
     anim: Animation,
     bytes: Arc<Vec<u8>>,
     gen: u64,
@@ -231,6 +233,7 @@ struct CmpResult {
 
 struct CmpJob {
     key: u64,
+    sheet: bool,
     rx: Receiver<anyhow::Result<(Animation, Vec<u8>)>>,
 }
 
@@ -587,6 +590,7 @@ pub struct GifForgeApp {
     /// (settings before, settings after) the last "Find settings"
     fit_record: Option<(CompState, CompState)>,
     fit_keep_size: bool,
+    frames_png: io::PngOptions,
     about_icon: Option<TextureHandle>,
 }
 
@@ -1149,6 +1153,7 @@ impl GifForgeApp {
             edit_labels: HashMap::new(),
             edit_renaming: None,
             fit_record: None,
+            frames_png: io::PngOptions::default(),
             fit_keep_size: theme::get_setting("fit_keep_size").as_deref() == Some("1"),
             about_icon: None,
         };
@@ -1513,6 +1518,80 @@ impl GifForgeApp {
         } else {
             for _ in 0..steps {
                 self.do_redo();
+            }
+        }
+    }
+
+    /// PNG colour control shared by frames and sprite sheets.
+    fn png_colours_ui(ui: &mut egui::Ui, o: &mut io::PngOptions) {
+        ui.horizontal(|ui| {
+            ui.label("Colours");
+            let mut indexed = o.colors > 0;
+            if seg(ui, &mut indexed, false, "Full").on_hover_text("Every colour kept").changed() {
+                o.colors = 0;
+            }
+            if seg(ui, &mut indexed, true, "Palette").on_hover_text("Indexed PNG. Much smaller. Exact when the image has this few colours.").changed() {
+                o.colors = 256;
+            }
+            if o.colors > 0 {
+                ui.add(egui::DragValue::new(&mut o.colors).range(2..=256)).on_hover_text("Palette size");
+            }
+        });
+    }
+
+    /// Frames export settings (Optimize panel and Export window).
+    fn frames_settings_ui(&mut self, ui: &mut egui::Ui, with_files: bool) {
+        ui.horizontal(|ui| {
+            seg(ui, &mut self.split_fmt, SplitFormat::Png, "PNG");
+            ui.add_enabled_ui(!self.frames_zip, |ui| seg(ui, &mut self.split_fmt, SplitFormat::Gif, "GIF"));
+            if with_files {
+                ui.separator();
+                seg(ui, &mut self.frames_zip, false, "Folder");
+                seg(ui, &mut self.frames_zip, true, "ZIP").on_hover_text("ZIP files always contain PNGs");
+            }
+        });
+        if self.split_fmt == SplitFormat::Png || self.frames_zip {
+            Self::png_colours_ui(ui, &mut self.frames_png);
+        } else {
+            ui.add(egui::Slider::new(&mut self.gif_opts.colors, 2..=256).text("colours"));
+            ui.checkbox(&mut self.gif_opts.dither, "Dither");
+        }
+        if with_files {
+            ui.horizontal(|ui| {
+                ui.label("Prefix");
+                ui.add(egui::TextEdit::singleline(&mut self.split_prefix).desired_width(140.0));
+            });
+        }
+    }
+
+    /// Sprite sheet settings (Optimize panel and Export window).
+    fn sheet_settings_ui(&mut self, ui: &mut egui::Ui, with_files: bool) {
+        let n = self.plan.iter().filter(|f| f.enabled).count().max(1) as u32;
+        let (fw, fh) = (self.out_size.0 as u32, self.out_size.1 as u32);
+        let s = &mut self.sheet;
+        egui::Grid::new(("sheetgrid", with_files)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+            ui.label("Columns");
+            ui.add(egui::DragValue::new(&mut s.columns).range(0..=n)).on_hover_text("0 picks the layout automatically");
+            ui.end_row();
+            ui.label("Padding");
+            ui.add(egui::DragValue::new(&mut s.padding).range(0..=256).suffix(" px"));
+            ui.end_row();
+        });
+        ui.checkbox(&mut s.pow2, "Power-of-two size").on_hover_text("Pads the sheet to sizes like 512, 1024 or 2048 as most game engines expect. Automatic columns then pick the smallest such sheet.");
+        Self::png_colours_ui(ui, &mut s.png);
+        let (cols, rows, w, h, cw, ch) = io::sheet_layout(n, fw, fh, s);
+        let used = if (cw, ch) != (w, h) { format!(" ({w}×{h} used)") } else { String::new() };
+        hint(ui, &format!("{cols}×{rows} frames · {cw}×{ch} px{used}"));
+        if with_files {
+            ui.checkbox(&mut s.write_json, "JSON metadata");
+            ui.checkbox(&mut s.write_godot, "Godot SpriteFrames (.tres)").on_hover_text("Assign the .tres to an AnimatedSprite2D/3D. Frame delays are kept.");
+            if s.write_godot {
+                ui.horizontal(|ui| {
+                    ui.label("res://");
+                    ui.add(egui::TextEdit::singleline(&mut s.godot_res_dir).desired_width(140.0)).on_hover_text("Where the PNG will sit in your Godot project");
+                    ui.label("Name");
+                    ui.add(egui::TextEdit::singleline(&mut s.anim_name).desired_width(70.0));
+                });
             }
         }
     }
@@ -2223,12 +2302,18 @@ impl GifForgeApp {
             ExportFormat::Apng => P::Apng,
             ExportFormat::Mp4 if self.ffmpeg => P::Video(VideoFormat::Mp4, self.video_bg),
             ExportFormat::Webm if self.ffmpeg => P::Video(VideoFormat::WebmAlpha, [0, 0, 0]),
+            ExportFormat::Frames => {
+                let fmt = if self.frames_zip { SplitFormat::Png } else { self.split_fmt };
+                P::Frames(fmt, self.frames_png, self.gif_opts.clone())
+            }
+            ExportFormat::Sheet => P::Sheet(self.sheet.clone()),
             _ => return None,
         })
     }
 
     fn wants_compressed(&self) -> bool {
-        let shown = if self.compare { self.view_left == ViewSource::Compressed || self.view_right == ViewSource::Compressed } else { self.view_single == ViewSource::Compressed };
+        let single = !self.compare || self.tool == Tool::Frames;
+        let shown = if single { self.view_single == ViewSource::Compressed } else { self.view_left == ViewSource::Compressed || self.view_right == ViewSource::Compressed };
         self.preview_format().is_some() && (shown || self.tool == Tool::Optimize)
     }
 
@@ -2236,12 +2321,12 @@ impl GifForgeApp {
         if let Some(j) = &self.cmp_job {
             match j.rx.try_recv() {
                 Ok(res) => {
-                    let key = j.key;
+                    let (key, sheet) = (j.key, j.sheet);
                     self.cmp_job = None;
                     match res {
                         Ok((anim, bytes)) => {
                             self.cmp_gen += 1;
-                            self.cmp = Some(CmpResult { key, anim, bytes: Arc::new(bytes), gen: self.cmp_gen });
+                            self.cmp = Some(CmpResult { key, sheet, anim, bytes: Arc::new(bytes), gen: self.cmp_gen });
                         }
                         Err(e) => self.error(format!("Compression preview failed: {e:#}")),
                     }
@@ -2276,6 +2361,7 @@ impl GifForgeApp {
         let stack = self.stack.clone();
         let fonts = self.fonts.clone();
         let Some(pf) = self.preview_format() else { return };
+        let is_sheet = matches!(pf, io::PreviewFormat::Sheet(_));
         let (tx, rx) = channel();
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
@@ -2293,7 +2379,7 @@ impl GifForgeApp {
             let _ = tx.send(res);
             ctx2.request_repaint();
         });
-        self.cmp_job = Some(CmpJob { key, rx });
+        self.cmp_job = Some(CmpJob { key, sheet: is_sheet, rx });
     }
 
     fn orig_texture(&mut self, ctx: &egui::Context, i: usize) -> Option<TextureHandle> {
@@ -2406,6 +2492,18 @@ impl eframe::App for GifForgeApp {
             if self.base.is_none() {
                 self.empty_state(ui, &ctx);
             } else if self.tool == Tool::Frames {
+                // live preview beside the frame grid, so frame edits can be watched as they play
+                egui::Panel::right("frames_preview")
+                    .resizable(true)
+                    .default_size(380.0)
+                    .size_range(220.0..=900.0)
+                    .frame(egui::Frame::new().fill(pal.canvas))
+                    .show(ui, |ui| {
+                        let r = ui.available_rect_before_wrap();
+                        ui.allocate_rect(r, Sense::hover());
+                        let src = self.view_single;
+                        self.source_view(ui, &ctx, r, src, 0, false);
+                    });
                 egui::Frame::new().inner_margin(10.0).show(ui, |ui| self.frames_grid(ui, &ctx));
             } else {
                 self.canvas(ui, &ctx);
@@ -3276,41 +3374,10 @@ impl GifForgeApp {
                             ui.label("VP9 with alpha");
                         }
                         ExportFormat::Frames => {
-                            ui.horizontal(|ui| {
-                                seg(ui, &mut self.split_fmt, SplitFormat::Png, "PNG");
-                                seg(ui, &mut self.split_fmt, SplitFormat::Gif, "GIF");
-                                ui.separator();
-                                seg(ui, &mut self.frames_zip, false, "Folder");
-                                seg(ui, &mut self.frames_zip, true, "ZIP").on_hover_text("ZIP files always contain PNGs");
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Prefix");
-                                ui.add(egui::TextEdit::singleline(&mut self.split_prefix).desired_width(140.0));
-                            });
+                            self.frames_settings_ui(ui, true);
                         }
                         ExportFormat::Sheet => {
-                            let n = self.plan.iter().filter(|f| f.enabled).count().max(1) as u32;
-                            let (fw, fh) = (self.out_size.0 as u32, self.out_size.1 as u32);
-                            let s = &mut self.sheet;
-                            ui.horizontal(|ui| {
-                                ui.label("Columns");
-                                ui.add(egui::DragValue::new(&mut s.columns).range(0..=n)).on_hover_text("0 picks a layout automatically");
-                                ui.label("Padding");
-                                ui.add(egui::DragValue::new(&mut s.padding).range(0..=256).suffix(" px"));
-                            });
-                            let cols = if s.columns == 0 { (n as f32).sqrt().ceil() as u32 } else { s.columns.min(n) }.max(1);
-                            let rows = n.div_ceil(cols);
-                            hint(ui, &format!("{cols}×{rows} · {}×{} px", cols * fw + (cols - 1) * s.padding, rows * fh + (rows - 1) * s.padding));
-                            ui.checkbox(&mut s.write_json, "JSON metadata");
-                            ui.checkbox(&mut s.write_godot, "Godot SpriteFrames (.tres)").on_hover_text("Assign the .tres to an AnimatedSprite2D/3D. Frame delays are kept.");
-                            if s.write_godot {
-                                ui.horizontal(|ui| {
-                                    ui.label("res://");
-                                    ui.add(egui::TextEdit::singleline(&mut s.godot_res_dir).desired_width(140.0)).on_hover_text("Where the PNG will sit in your Godot project");
-                                    ui.label("Name");
-                                    ui.add(egui::TextEdit::singleline(&mut s.anim_name).desired_width(70.0));
-                                });
-                            }
+                            self.sheet_settings_ui(ui, true);
                         }
                     }
                 });
@@ -3373,7 +3440,7 @@ impl GifForgeApp {
             return;
         }
         // the preview already holds the encoded file: save it directly
-        if self.export_fmt != ExportFormat::Gif && self.preview_format().is_some() && !(self.export_fmt == ExportFormat::Apng && self.gif_opts.noai_tag) {
+        if !matches!(self.export_fmt, ExportFormat::Gif | ExportFormat::Frames | ExportFormat::Sheet) && self.preview_format().is_some() && !(self.export_fmt == ExportFormat::Apng && self.gif_opts.noai_tag) {
             if let Some(c) = self.cmp.as_ref().filter(|c| c.key == self.cmp_key()) {
                 let ext = match self.export_fmt {
                     ExportFormat::Webp => "webp",
@@ -3431,11 +3498,12 @@ impl GifForgeApp {
                 let pre = self.split_prefix.clone();
                 if self.frames_zip {
                     if let Some(path) = rfd::FileDialog::new().add_filter("ZIP", &["zip"]).set_file_name(format!("{name}_frames.zip")).save_file() {
-                        self.run_export(ctx, "ZIP frames", move |a, _| io::export_frames_zip(a, &path, &pre).map(|n| format!("Wrote {n} frames to {}", path.display())));
+                        let png = self.frames_png;
+                        self.run_export(ctx, "ZIP frames", move |a, _| io::export_frames_zip_opts(a, &path, &pre, &png).map(|n| format!("Wrote {n} frames to {}", path.display())));
                     }
                 } else if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                    let fmt = self.split_fmt;
-                    self.run_export(ctx, "Split frames", move |a, _| io::export_frames_dir(a, &dir, &pre, fmt).map(|n| format!("Wrote {n} frames to {}", dir.display())));
+                    let (fmt, png, gif) = (self.split_fmt, self.frames_png, self.gif_opts.clone());
+                    self.run_export(ctx, "Split frames", move |a, _| io::export_frames_dir_opts(a, &dir, &pre, fmt, &png, &gif).map(|n| format!("Wrote {n} frames to {}", dir.display())));
                 }
             }
             ExportFormat::Sheet => {
@@ -3820,6 +3888,10 @@ impl GifForgeApp {
                     return format!("{f} · no preview");
                 }
                 match &self.cmp {
+                    Some(c) if c.key == self.cmp_key() && c.sheet => {
+                        let (w, h) = (c.anim.width(), c.anim.height());
+                        format!("{f} · {w}×{h} · {}", fmt_size(c.bytes.len() as u64))
+                    }
                     Some(c) if c.key == self.cmp_key() => {
                         let n = c.bytes.len() as u64;
                         match self.file_size {
@@ -3918,9 +3990,11 @@ impl GifForgeApp {
                         (stack::frame_at_time(&c.anim, t), vec2(c.anim.width() as f32, c.anim.height() as f32), c.bytes.len() as u64)
                     };
                     let _ = n;
+                    let sheet = self.cmp.as_ref().map(|c| c.sheet).unwrap_or(false);
                     let tex = self.cmp_texture(ctx, i);
                     let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, None, None, false);
-                    if !crop_mode {
+                    // a sprite sheet doesn't share the frame's coordinates: no editing handles
+                    if !crop_mode && !sheet {
                         self.canvas_interaction(ui, &resp, m, (size.x, size.y), Space::Output, vi);
                     }
                 } else {
@@ -4740,7 +4814,7 @@ impl GifForgeApp {
         group(ui, "Format", |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
-                for f in [ExportFormat::Gif, ExportFormat::Webp, ExportFormat::Avif, ExportFormat::Apng, ExportFormat::Mp4, ExportFormat::Webm] {
+                for f in ExportFormat::ALL {
                     let en = !f.needs_ffmpeg() || self.ffmpeg;
                     let r = ui.add_enabled(en, egui::Button::new(f.label()).selected(self.export_fmt == f));
                     let r = if en { r.on_hover_text(f.tip()) } else { r.on_disabled_hover_text("Needs ffmpeg on PATH") };
@@ -4865,6 +4939,15 @@ impl GifForgeApp {
             }
             ExportFormat::Apng => {
                 hint(ui, "APNG is lossless and has no settings");
+                return;
+            }
+            ExportFormat::Frames => {
+                group(ui, "Frames", |ui| self.frames_settings_ui(ui, false));
+                return;
+            }
+            ExportFormat::Sheet => {
+                group(ui, "Sprite sheet", |ui| self.sheet_settings_ui(ui, false));
+                hint(ui, "The compressed view shows the whole sheet");
                 return;
             }
             _ => {
