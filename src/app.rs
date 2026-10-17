@@ -8,7 +8,7 @@ use crate::io::{self, SheetOptions, SplitFormat, VideoFormat};
 use crate::ops::{self, AspectMode, ResizeFilter};
 use crate::overlay::{OverlaySource, Placement};
 use crate::stack::{self, Kind, LayerKind, OverlayLayer, PlanFrame, SpeedMode, Stack, Transform};
-use crate::text::{self, Align, Annotation, Border, FontEntry};
+use crate::text::{self, Align, Annotation, FontEntry};
 use crate::theme::{self, mix, p, ThemeChoice};
 use eframe::egui::{self, pos2, vec2, Color32, PointerButton, Pos2, Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions, Vec2};
 use image::RgbaImage;
@@ -96,18 +96,18 @@ impl Tool {
         match self {
             Tool::Resize => "Resize",
             Tool::Crop => "Crop",
-            Tool::Rotate => "Rotate / flip",
-            Tool::Reverse => "Reverse / boomerang / loop",
+            Tool::Rotate => "Rotate or flip",
+            Tool::Reverse => "Reverse, boomerang and loop",
             Tool::Speed => "Playback speed",
             Tool::Optimize => "Compression",
-            Tool::Effects => "Colour, filters, distortions",
+            Tool::Effects => "Colour, filters and distortions",
             Tool::Text => "Text layers",
-            Tool::Censor => "Pixelate / blur regions",
+            Tool::Censor => "Pixelate or blur part of the frame",
             Tool::AddImage => "Image overlays",
             Tool::Watermark => "Text or logo watermark",
-            Tool::Shield => "Anti-AI-training noise",
-            Tool::Cut => "Trim frames",
-            Tool::Frames => "Frame list, delays, skip",
+            Tool::Shield => "Noise that discourages AI training",
+            Tool::Cut => "Keep a range of frames",
+            Tool::Frames => "Edit, reorder and time single frames",
         }
     }
     fn title(self) -> &'static str {
@@ -192,10 +192,10 @@ impl ExportFormat {
     fn tip(self) -> &'static str {
         match self {
             ExportFormat::Gif => "Plays everywhere",
-            ExportFormat::Webp => "Usually 30–70% smaller than GIF. Browsers, Discord, most apps",
-            ExportFormat::Avif => "Smallest files. Modern browsers only",
-            ExportFormat::Apng => "Lossless, full colour + alpha. Browsers",
-            ExportFormat::Mp4 => "Video, no transparency",
+            ExportFormat::Webp => "Often 30 to 70% smaller than GIF. Works in browsers and most apps.",
+            ExportFormat::Avif => "Smallest files. Needs a modern browser.",
+            ExportFormat::Apng => "Lossless with full colour and transparency",
+            ExportFormat::Mp4 => "Video without transparency",
             ExportFormat::Webm => "Video with transparency",
             ExportFormat::Frames => "One image per frame",
             ExportFormat::Sheet => "Sprite sheet for game engines",
@@ -365,9 +365,9 @@ impl ViewSource {
     const ALL: [ViewSource; 3] = [ViewSource::Original, ViewSource::Edit, ViewSource::Compressed];
     fn tip(self) -> &'static str {
         match self {
-            ViewSource::Edit => "All edits, before GIF compression",
+            ViewSource::Edit => "All edits before compression",
             ViewSource::Original => "The file as opened",
-            ViewSource::Compressed => "All edits, as the saved GIF will look",
+            ViewSource::Compressed => "All edits as the saved file will look",
         }
     }
     fn label(self) -> &'static str {
@@ -581,6 +581,9 @@ pub struct GifForgeApp {
     rename_fresh: bool,
     /// frame edits that keep a row in the layer panel while switched off
     edit_rows_shown: std::collections::HashSet<Tool>,
+    /// custom names for frame-edit rows
+    edit_labels: HashMap<Tool, String>,
+    edit_renaming: Option<(Tool, String)>,
     /// (settings before, settings after) the last "Find settings"
     fit_record: Option<(CompState, CompState)>,
     fit_keep_size: bool,
@@ -634,6 +637,57 @@ fn apply_fit_scale(t: &mut Transform, scale: f32) {
 
 /// Quick targets, with a little headroom under each service's limit.
 const TARGET_PRESETS: [(&str, f32, bool); 3] = [("Discord 10 MB", 9.5, true), ("X 15 MB", 14.0, true), ("Emote 256 KB", 250.0, false)];
+
+/// Draw a tool's icon. A few are vector drawings because no bundled font has a
+/// clear glyph for them; the rest use the tool's text glyph.
+fn paint_tool_icon(painter: &egui::Painter, t: Tool, c: Pos2, size: f32, col: Color32) {
+    let s = size / 15.0; // designed at 15 px
+    let stroke = Stroke::new((1.6 * s).max(1.2), col);
+    match t {
+        Tool::Shield => {
+            // "no AI" sign: circle with a slash over the letters AI
+            let r = 7.0 * s;
+            painter.text(c + vec2(0.0, 0.3 * s), egui::Align2::CENTER_CENTER, "AI", egui::FontId::new(8.6 * s, egui::FontFamily::Name("gf-sans-bold".into())), col);
+            painter.circle_stroke(c, r, stroke);
+            let d = r * std::f32::consts::FRAC_1_SQRT_2;
+            painter.line_segment([c + vec2(-d, -d), c + vec2(d, d)], stroke);
+        }
+        Tool::Crop => {
+            // two interlocking corner brackets
+            let a = 6.5 * s;
+            let b = 3.5 * s;
+            painter.line_segment([c + vec2(-b, -a - 1.5 * s), c + vec2(-b, b)], stroke);
+            painter.line_segment([c + vec2(-b, b), c + vec2(a + 1.5 * s, b)], stroke);
+            painter.line_segment([c + vec2(-a - 1.5 * s, -b), c + vec2(b, -b)], stroke);
+            painter.line_segment([c + vec2(b, -b), c + vec2(b, a + 1.5 * s)], stroke);
+        }
+        _ => {
+            painter.text(c, egui::Align2::CENTER_CENTER, t.icon(), egui::FontId::proportional(size), col);
+        }
+    }
+}
+
+/// Clock with a counter-clockwise arrow: the usual "history" symbol.
+fn paint_history_icon(painter: &egui::Painter, c: Pos2, size: f32, col: Color32) {
+    let s = size / 15.0;
+    let stroke = Stroke::new((1.6 * s).max(1.2), col);
+    let r = 6.5 * s;
+    // open circle (gap at the upper left where the arrow head sits)
+    let n = 28;
+    let (a0, a1) = (-2.4f32, 2.9f32);
+    let pts: Vec<Pos2> = (0..=n).map(|i| {
+        let a = a0 + (a1 - a0) * i as f32 / n as f32;
+        c + vec2(a.cos(), a.sin()) * r
+    }).collect();
+    painter.add(egui::Shape::line(pts, stroke));
+    // arrow head at the start of the arc
+    let tip = c + vec2(a0.cos(), a0.sin()) * r;
+    painter.line_segment([tip, tip + vec2(-0.6, 3.4) * s], stroke);
+    painter.line_segment([tip, tip + vec2(3.4, 0.6) * s], stroke);
+    // hands
+    painter.line_segment([c, c + vec2(0.0, -3.8 * s)], stroke);
+    painter.line_segment([c, c + vec2(2.8 * s, 1.6 * s)], stroke);
+}
 
 /// Open a folder in the system file manager.
 fn open_in_file_manager(dir: &std::path::Path) {
@@ -872,6 +926,16 @@ fn toolbar_sep(ui: &mut egui::Ui) {
     ui.add_space(2.0);
 }
 
+/// Height of toolbar / transport controls.
+const TOOLBAR_H: f32 = 28.0;
+/// Height of quick-pick chips (preset rows).
+const CHIP_H: f32 = 22.0;
+
+/// Small quick-pick button (preset rows): same height and padding everywhere.
+fn chip(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::Response {
+    ui.add(egui::Button::new(text.into()).wrap_mode(egui::TextWrapMode::Extend).min_size(vec2(28.0, CHIP_H)))
+}
+
 /// Square flat icon button.
 fn icon_button(ui: &mut egui::Ui, icon: &str, enabled: bool) -> egui::Response {
     let pal = p();
@@ -887,7 +951,7 @@ fn toggle_icon(ui: &mut egui::Ui, icon: &str, on: bool, tip: &str) -> bool {
 /// One segment of a segmented control.
 fn segment(ui: &mut egui::Ui, text: &str, selected: bool, tip: &str) -> bool {
     let pal = p();
-    ui.add(egui::Button::new(RichText::new(text).size(15.0).color(if selected { pal.fg } else { pal.fg_muted })).selected(selected).min_size(vec2(30.0, 26.0))).on_hover_text(tip).clicked()
+    ui.add(egui::Button::new(RichText::new(text).size(15.0).color(if selected { pal.fg } else { pal.fg_muted })).selected(selected).min_size(vec2(30.0, TOOLBAR_H))).on_hover_text(tip).clicked()
 }
 
 /// Shorten to `max` characters with an ellipsis.
@@ -926,7 +990,7 @@ fn soft_slider<'a>(v: &'a mut f32, r: std::ops::RangeInclusive<f32>, text: &str)
 fn tool_button(ui: &mut egui::Ui, icon: &str, text: &str, enabled: bool) -> egui::Response {
     let pal = p();
     let txt = RichText::new(format!("{icon}  {text}")).color(if enabled { pal.fg } else { pal.fg_muted });
-    ui.add_enabled(enabled, egui::Button::new(txt).frame_when_inactive(false).min_size(vec2(0.0, 30.0)))
+    ui.add_enabled(enabled, egui::Button::new(txt).frame_when_inactive(false).min_size(vec2(0.0, TOOLBAR_H)))
 }
 
 fn small_flat(ui: &mut egui::Ui, text: &str, tip: &str) -> bool {
@@ -1052,6 +1116,8 @@ impl GifForgeApp {
             renaming: None,
             rename_fresh: false,
             edit_rows_shown: Default::default(),
+            edit_labels: HashMap::new(),
+            edit_renaming: None,
             fit_record: None,
             fit_keep_size: theme::get_setting("fit_keep_size").as_deref() == Some("1"),
             about_icon: None,
@@ -1190,6 +1256,8 @@ impl GifForgeApp {
                 self.orig_gen += 1;
                 self.base = Some(a);
                 self.stack = Stack::default();
+                self.edit_labels.clear();
+                self.edit_rows_shown.clear();
                 self.sel.clear();
                 self.cur = 0;
                 self.elapsed = 0.0;
@@ -1472,7 +1540,7 @@ impl GifForgeApp {
                 hint(ui, "Made by zoeysmith37");
                 hint(ui, "Built with Rust, egui, image, gif, libwebp and rayon");
                 hint(ui, "Video and AVIF via ffmpeg (optional)");
-                hint(ui, "Fonts: Noto Sans (OFL), DejaVu");
+                hint(ui, "Fonts: Noto Sans (OFL) and DejaVu");
                 ui.add_space(4.0);
                 hint(ui, "Licensed under Apache 2.0");
             });
@@ -2280,7 +2348,8 @@ impl eframe::App for GifForgeApp {
                         .show(ui, |ui| self.layer_panel(ui, &ctx));
                     egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin { left: 10, right: 8, top: 8, bottom: 4 })).show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(self.tool.icon()).size(18.0).color(pal.highlight));
+                            let (ir, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
+                            paint_tool_icon(ui.painter(), self.tool, ir.center(), 18.0, pal.highlight);
                             ui.label(RichText::new(self.tool.title()).font(theme::medium(16.0)).color(pal.fg));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if small_flat(ui, "⊟", "Collapse all sections") {
@@ -2346,10 +2415,10 @@ impl GifForgeApp {
             ui.spacing_mut().item_spacing.x = 2.0;
             let idle = !self.busy();
             let has = self.base.is_some();
-            if tool_button(ui, "⏏", "Open", idle).on_hover_text("Open GIF, APNG, WebP or image (Ctrl+O)").clicked() {
+            if tool_button(ui, "⏏", "Open", idle).on_hover_text("Open a GIF, image or video (Ctrl+O)").clicked() {
                 self.open_dialog(ctx);
             }
-            if tool_button(ui, "⊞", "Sequence", idle).on_hover_text("Build an animation from several images").clicked() {
+            if tool_button(ui, "⊞", "Sequence", idle).on_hover_text("Make an animation from a set of images").clicked() {
                 self.open_sequence_dialog(ctx);
             }
             toolbar_sep(ui);
@@ -2362,12 +2431,14 @@ impl GifForgeApp {
             if icon_button(ui, "↷", idle && !self.redo.is_empty()).on_hover_text(redo_tip).clicked() {
                 self.do_redo();
             }
-            if toggle_icon(ui, "☰", self.history_open, "History") {
+            let hr = ui.add(egui::Button::new("").selected(self.history_open).frame_when_inactive(self.history_open).min_size(vec2(28.0, 28.0))).on_hover_text("History");
+            paint_history_icon(ui.painter(), hr.rect.center(), 15.0, if self.history_open { pal.fg } else if hr.hovered() { pal.fg } else { pal.fg_muted });
+            if hr.clicked() {
                 self.history_open = !self.history_open;
             }
             toolbar_sep(ui);
-            let pr = ui.add_enabled(has, egui::Button::new(RichText::new("❖  Presets").color(if self.presets_open { Color32::WHITE } else { pal.fg })).selected(self.presets_open).frame_when_inactive(self.presets_open).min_size(vec2(0.0, 30.0)));
-            if pr.on_hover_text("Save and re-use edits").clicked() {
+            let pr = ui.add_enabled(has, egui::Button::new(RichText::new("❖  Presets").color(if self.presets_open { Color32::WHITE } else { pal.fg })).selected(self.presets_open).frame_when_inactive(self.presets_open).min_size(vec2(0.0, TOOLBAR_H)));
+            if pr.on_hover_text("Save edits to reuse on other files").clicked() {
                 self.presets_open = !self.presets_open;
                 if self.presets_open {
                     { let (l, pr) = crate::presets::list_with_problems(); self.presets = l; self.preset_problems = pr; }
@@ -2379,15 +2450,16 @@ impl GifForgeApp {
                 let export = ui
                     .add_enabled(
                         has && idle,
-                        egui::Button::new(RichText::new("⬇  Export").font(theme::medium(14.0)).color(Color32::WHITE)).fill(pal.highlight).stroke(Stroke::new(1.0, mix(pal.highlight, Color32::BLACK, 0.25))).min_size(vec2(96.0, 30.0)),
+                        egui::Button::new(RichText::new("⬇  Export").font(theme::medium(14.0)).color(Color32::WHITE)).fill(pal.highlight).stroke(Stroke::new(1.0, mix(pal.highlight, Color32::BLACK, 0.25))).min_size(vec2(96.0, TOOLBAR_H)),
                     )
-                    .on_hover_text("Save as GIF, APNG, video, frames or sprite sheet (Ctrl+S)");
+                    .on_hover_text("Save the result (Ctrl+S)");
                 if export.clicked() {
                     self.export_open = true;
                 }
                 let before = self.theme;
                 let mut about = false;
-                ui.menu_button(RichText::new("⋮").size(17.0), |ui| {
+                let mr = icon_button(ui, "⋮", true).on_hover_text("Theme, links and About");
+                egui::Popup::menu(&mr).show(|ui| {
                     ui.set_min_width(190.0);
                     ui.label(RichText::new("Theme").size(11.5).color(pal.fg_muted));
                     for t in [ThemeChoice::System, ThemeChoice::Dark, ThemeChoice::Light] {
@@ -2396,7 +2468,7 @@ impl GifForgeApp {
                     if cfg!(all(unix, not(target_os = "macos"))) {
                         ui.separator();
                         let mut native = theme::get_setting("wayland").as_deref() == Some("native");
-                        if ui.checkbox(&mut native, "Native Wayland").on_hover_text("Takes effect after restart. Off = XWayland, which supports drag-and-drop.").changed() {
+                        if ui.checkbox(&mut native, "Native Wayland").on_hover_text("Applies after a restart. When off the app runs through XWayland so drag and drop works.").changed() {
                             theme::set_setting("wayland", if native { "native" } else { "xwayland" });
                         }
                     }
@@ -2464,7 +2536,7 @@ impl GifForgeApp {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(RichText::new("?").size(12.5).color(pal.fg_muted)).on_hover_text(
-                    "Mouse wheel: zoom\nMiddle/right drag: pan (Alt+drag in drawing tools)\nF: fit · 1: 100% · +/−: zoom\nSpace: play/pause · ←/→: step\nC: single/split view\nCtrl+S: export · Ctrl+Z/Y: undo/redo\nCtrl+V: open copied files",
+                    "Mouse wheel zooms. Middle or right drag pans.\nAlt+drag pans in drawing tools.\nShift+drag moves in straight lines.\nF fits the view. 1 shows actual size.\nSpace plays or pauses. ← and → step.\nC switches single and split view.\nCtrl+S exports. Ctrl+Z and Ctrl+Y undo and redo.\nCtrl+V opens copied files.",
                 );
             });
         });
@@ -2518,7 +2590,7 @@ impl GifForgeApp {
         }
         let icon_col = if sel { pal.highlight } else { pal.fg };
         let icon_x = if compact { r.center().x } else { r.left() + 16.0 };
-        painter.text(pos2(icon_x, r.center().y), egui::Align2::CENTER_CENTER, t.icon(), egui::FontId::proportional(15.0), icon_col);
+        paint_tool_icon(painter, t, pos2(icon_x, r.center().y), 15.0, icon_col);
         if !compact {
             painter.text(r.left_center() + vec2(32.0, 0.0), egui::Align2::LEFT_CENTER, t.label(), egui::FontId::proportional(13.5), pal.fg);
         }
@@ -2569,13 +2641,15 @@ impl GifForgeApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 ui.add_enabled_ui(!self.busy() && !self.stack.is_empty(), |ui| {
-                    if icon_button(ui, "⬇", true).on_hover_text("Bake all layers and frame edits into the frames").clicked() {
+                    if icon_button(ui, "⬇", true).on_hover_text("Make all layers and frame edits permanent").clicked() {
                         self.bake(ctx, false);
                     }
                 });
                 ui.menu_button(RichText::new("+").size(16.0).color(pal.fg), |ui| {
                     for (t, label) in [(Tool::Effects, "Effects"), (Tool::Text, "Text"), (Tool::Censor, "Censor"), (Tool::AddImage, "Image…"), (Tool::Watermark, "Watermark"), (Tool::Shield, "AI shield")] {
-                        if ui.button(format!("{}  {label}", t.icon())).clicked() {
+                        let b = ui.add(egui::Button::new(format!("      {label}")).min_size(vec2(150.0, 0.0)));
+                        paint_tool_icon(ui.painter(), t, pos2(b.rect.left() + 16.0, b.rect.center().y), 13.0, pal.fg);
+                        if b.clicked() {
                             self.new_layer_of(t, ctx);
                         }
                     }
@@ -2599,6 +2673,7 @@ impl GifForgeApp {
         let mut drop_to: Option<(usize, usize)> = None;
         let mut to_frames = false;
         let mut rename_done: Option<Option<(usize, String)>> = None;
+        let mut edit_rename_done: Option<Option<(Tool, String)>> = None;
         let mut edit_toggle: Option<Tool> = None;
         let mut edit_remove: Option<Tool> = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -2628,7 +2703,7 @@ impl GifForgeApp {
                     toggle = Some(li);
                 }
                 // icon + name (elided)
-                painter.text(pos2(r.left() + 38.0, r.center().y), egui::Align2::CENTER_CENTER, kind_tool(kind).icon(), egui::FontId::proportional(14.0), if visible { pal.fg } else { pal.fg_muted });
+                paint_tool_icon(&painter, kind_tool(kind), pos2(r.left() + 38.0, r.center().y), 14.0, if visible { pal.fg } else { pal.fg_muted });
                 let del_w = 22.0;
                 let name_w = (r.width() - 52.0 - del_w - 6.0).max(10.0);
                 let mut job = egui::text::LayoutJob::simple_singleline(elide(&name, 60), egui::FontId::proportional(13.0), if visible { pal.fg } else { pal.fg_muted });
@@ -2652,6 +2727,7 @@ impl GifForgeApp {
                         rename_done = Some(Some((li, buf.clone())));
                     }
                 }
+                let resp = resp.on_hover_text("Click to edit. Double-click to rename. Drag to reorder.");
                 if resp.double_clicked() && !eye.hovered() {
                     self.renaming = Some((id, name.clone()));
                     self.rename_fresh = true;
@@ -2693,7 +2769,7 @@ impl GifForgeApp {
                 let mut eye_hit = false;
                 if let Some(on) = enabled {
                     let eye_r = Rect::from_center_size(pos2(r.left() + 16.0, r.center().y), vec2(22.0, 22.0));
-                    let eye = ui.interact(eye_r, egui::Id::unique(("edit-eye", t)), Sense::click()).on_hover_text("Turn this edit on / off");
+                    let eye = ui.interact(eye_r, egui::Id::unique(("edit-eye", t)), Sense::click()).on_hover_text("Turn this edit on or off");
                     painter.text(eye_r.center(), egui::Align2::CENTER_CENTER, if on { "◉" } else { "○" }, egui::FontId::proportional(13.0), if on { pal.highlight } else { pal.fg_muted });
                     if eye.clicked() {
                         edit_toggle = Some(t);
@@ -2709,12 +2785,40 @@ impl GifForgeApp {
                         eye_hit |= del.hovered();
                     }
                 }
-                painter.text(pos2(r.left() + 38.0, r.center().y), egui::Align2::CENTER_CENTER, t.icon(), egui::FontId::proportional(13.0), pal.fg_muted);
-                let mut job = egui::text::LayoutJob::simple_singleline(label, egui::FontId::proportional(12.5), col);
-                job.wrap = egui::text::TextWrapping { max_width: (r.width() - 80.0).max(10.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
-                let galley = ui.painter().layout_job(job);
-                painter.galley(pos2(r.left() + 52.0, r.center().y - galley.size().y / 2.0), galley, col);
-                let tip = if t == Tool::Frames { "Source frames" } else { "Frame edit – click to adjust" };
+                paint_tool_icon(&painter, t, pos2(r.left() + 38.0, r.center().y), 13.0, pal.fg_muted);
+                let custom = self.edit_labels.get(&t).cloned();
+                let shown = custom.clone().unwrap_or_else(|| label.clone());
+                let editing = self.edit_renaming.as_ref().map(|(et, _)| *et == t).unwrap_or(false);
+                if !editing {
+                    let mut job = egui::text::LayoutJob::simple_singleline(shown, egui::FontId::proportional(12.5), col);
+                    job.wrap = egui::text::TextWrapping { max_width: (r.width() - 80.0).max(10.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+                    let galley = ui.painter().layout_job(job);
+                    painter.galley(pos2(r.left() + 52.0, r.center().y - galley.size().y / 2.0), galley, col);
+                } else if let Some((_, buf)) = &mut self.edit_renaming {
+                    let name_r = Rect::from_min_size(pos2(r.left() + 48.0, r.top() + 3.0), vec2((r.width() - 80.0).max(40.0), r.height() - 6.0));
+                    let te = ui.put(name_r, egui::TextEdit::singleline(buf).font(egui::FontId::proportional(12.5)).margin(vec2(4.0, 1.0)));
+                    if self.rename_fresh {
+                        te.request_focus();
+                        self.rename_fresh = false;
+                    }
+                    let (enter, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+                    if esc {
+                        edit_rename_done = Some(None);
+                    } else if te.lost_focus() || enter {
+                        edit_rename_done = Some(Some((t, buf.clone())));
+                    }
+                }
+                if t != Tool::Frames && resp.double_clicked() && !eye_hit {
+                    self.edit_renaming = Some((t, custom.clone().unwrap_or_else(|| t.label().to_string())));
+                    self.rename_fresh = true;
+                }
+                let tip = if t == Tool::Frames {
+                    "Source frames".to_string()
+                } else if custom.is_some() {
+                    format!("{label}\nDouble-click to rename")
+                } else {
+                    "Click to adjust. Double-click to rename.".to_string()
+                };
                 if resp.on_hover_text(tip).clicked() && !eye_hit {
                     if t == Tool::Frames {
                         to_frames = true;
@@ -2752,7 +2856,7 @@ impl GifForgeApp {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
-                    hint(ui, "No layers – add one with +");
+                    hint(ui, "No layers yet. Add one with +");
                 });
             }
         });
@@ -2781,6 +2885,17 @@ impl GifForgeApp {
                 }
             }
             self.renaming = None;
+        }
+        if let Some(done) = edit_rename_done {
+            if let Some((t, text)) = done {
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    self.edit_labels.remove(&t);
+                } else {
+                    self.edit_labels.insert(t, text);
+                }
+            }
+            self.edit_renaming = None;
         }
         if let Some(t) = edit_toggle {
             let tr = &mut self.stack.transform;
@@ -2860,6 +2975,7 @@ impl GifForgeApp {
             _ => {}
         }
         self.edit_rows_shown.remove(&t);
+        self.edit_labels.remove(&t);
         self.modified = true;
     }
 
@@ -3099,7 +3215,7 @@ impl GifForgeApp {
                                 self.tool = Tool::Optimize;
                                 self.export_open = false;
                             }
-                            ui.checkbox(&mut self.gif_opts.noai_tag, "Add “noai” tag").on_hover_text("Writes a “noai, noimageai” comment into the file – an opt-out marker some sites and scrapers respect.");
+                            ui.checkbox(&mut self.gif_opts.noai_tag, "Add “noai” tag").on_hover_text("Adds a “noai, noimageai” note to the file. Some sites and scrapers respect it.");
                         }
                         ExportFormat::Webp => {
                             let o = &mut self.webp_opts;
@@ -3110,7 +3226,7 @@ impl GifForgeApp {
                             if !o.lossless {
                                 ui.add(egui::Slider::new(&mut o.quality, 0.0..=100.0).text("quality")).on_hover_text("75–90 looks like the original for most GIFs");
                             }
-                            ui.add(egui::Slider::new(&mut o.method, 0..=6).text("effort")).on_hover_text("Higher = smaller file, slower");
+                            ui.add(egui::Slider::new(&mut o.method, 0..=6).text("effort")).on_hover_text("Higher makes smaller files but takes longer");
                         }
                         ExportFormat::Avif => {
                             ui.add(egui::Slider::new(&mut self.avif_quality, 0..=100).text("quality")).on_hover_text("50–70 is a good balance");
@@ -3123,7 +3239,7 @@ impl GifForgeApp {
                         ExportFormat::Mp4 => {
                             ui.horizontal(|ui| {
                                 ui.label("Background");
-                                ui.color_edit_button_srgb(&mut self.video_bg).on_hover_text("Used behind transparent pixels");
+                                ui.color_edit_button_srgb(&mut self.video_bg).on_hover_text("Fills transparent areas");
                             });
                         }
                         ExportFormat::Webm => {
@@ -3135,7 +3251,7 @@ impl GifForgeApp {
                                 ui.selectable_value(&mut self.split_fmt, SplitFormat::Gif, "GIF");
                                 ui.separator();
                                 ui.selectable_value(&mut self.frames_zip, false, "Folder");
-                                ui.selectable_value(&mut self.frames_zip, true, "ZIP").on_hover_text("ZIP is always PNG");
+                                ui.selectable_value(&mut self.frames_zip, true, "ZIP").on_hover_text("ZIP files always contain PNGs");
                             });
                             ui.horizontal(|ui| {
                                 ui.label("Prefix");
@@ -3148,7 +3264,7 @@ impl GifForgeApp {
                             let s = &mut self.sheet;
                             ui.horizontal(|ui| {
                                 ui.label("Columns");
-                                ui.add(egui::DragValue::new(&mut s.columns).range(0..=n)).on_hover_text("0 = auto");
+                                ui.add(egui::DragValue::new(&mut s.columns).range(0..=n)).on_hover_text("0 picks a layout automatically");
                                 ui.label("Padding");
                                 ui.add(egui::DragValue::new(&mut s.padding).range(0..=256).suffix(" px"));
                             });
@@ -3160,7 +3276,7 @@ impl GifForgeApp {
                             if s.write_godot {
                                 ui.horizontal(|ui| {
                                     ui.label("res://");
-                                    ui.add(egui::TextEdit::singleline(&mut s.godot_res_dir).desired_width(140.0)).on_hover_text("Folder the PNG will live in inside your Godot project");
+                                    ui.add(egui::TextEdit::singleline(&mut s.godot_res_dir).desired_width(140.0)).on_hover_text("Where the PNG will sit in your Godot project");
                                     ui.label("Name");
                                     ui.add(egui::TextEdit::singleline(&mut s.anim_name).desired_width(70.0));
                                 });
@@ -3171,7 +3287,7 @@ impl GifForgeApp {
                 if self.export_fmt.can_target() {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        ui.checkbox(&mut self.target_on, "Fit under").on_hover_text("Finds the best quality that fits. Lowers quality first, then size.");
+                        ui.checkbox(&mut self.target_on, "Fit under").on_hover_text("Finds the best quality that fits. Quality drops first and size only if needed.");
                         ui.add_enabled_ui(self.target_on, |ui| {
                             ui.add(egui::DragValue::new(&mut self.target_val).range(0.01..=10000.0).speed(0.1).max_decimals(2));
                             ui.selectable_value(&mut self.target_mb, true, "MiB");
@@ -3181,7 +3297,7 @@ impl GifForgeApp {
                     if self.target_on {
                         ui.horizontal_wrapped(|ui| {
                             for (lbl, v, mb) in TARGET_PRESETS {
-                                if ui.small_button(lbl).clicked() {
+                                if chip(ui, lbl).clicked() {
                                     self.target_val = v;
                                     self.target_mb = mb;
                                 }
@@ -3332,7 +3448,7 @@ impl GifForgeApp {
                 });
                 ui.horizontal(|ui| {
                     if let Some(dir) = crate::presets::folder() {
-                        if ui.small_button("Open folder").on_hover_text(dir.display().to_string()).clicked() {
+                        if chip(ui, "Open folder").on_hover_text(dir.display().to_string()).clicked() {
                             let _ = std::fs::create_dir_all(&dir);
                             open_in_file_manager(&dir);
                         }
@@ -3938,7 +4054,16 @@ impl GifForgeApp {
                     let readable = self.stack.layers[li].readable();
                     match d {
                         BoxDrag::Move { start, src, .. } => {
-                            let (dx, dy) = mp.inverse().apply_vec(pi.x - start.x, pi.y - start.y);
+                            let (mut ox, mut oy) = (pi.x - start.x, pi.y - start.y);
+                            // Shift: move along the nearest horizontal, vertical or 45° line (as seen on screen)
+                            if ui.input(|i| i.modifiers.shift) && (ox != 0.0 || oy != 0.0) {
+                                let step = std::f32::consts::FRAC_PI_4;
+                                let ang = (oy.atan2(ox) / step).round() * step;
+                                let (dxn, dyn_) = (ang.cos(), ang.sin());
+                                let len = ox * dxn + oy * dyn_;
+                                (ox, oy) = (dxn * len, dyn_ * len);
+                            }
+                            let (dx, dy) = mp.inverse().apply_vec(ox, oy);
                             let nb = Obb { cx: src.cx + dx, cy: src.cy + dy, ..src };
                             self.write_box(li, nb, None, src_idx);
                         }
@@ -4164,13 +4289,13 @@ impl GifForgeApp {
                                         }
                                     });
                                     ui.horizontal(|ui| {
-                                        if ui.small_button("◀").on_hover_text("Move left").clicked() {
+                                        if chip(ui, "◀").on_hover_text("Move left").clicked() {
                                             action = Some((i, "left"));
                                         }
-                                        if ui.small_button("▶").on_hover_text("Move right").clicked() {
+                                        if chip(ui, "▶").on_hover_text("Move right").clicked() {
                                             action = Some((i, "right"));
                                         }
-                                        if ui.small_button("✕").on_hover_text("Delete frame").clicked() {
+                                        if chip(ui, "✕").on_hover_text("Delete frame").clicked() {
                                             action = Some((i, "delete"));
                                         }
                                     });
@@ -4249,7 +4374,7 @@ impl GifForgeApp {
         ui.horizontal(|ui| {
             ui.checkbox(&mut enabled, "Enabled");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                do_bake = ui.button("⬇ Bake").on_hover_text("Apply frame edits to the frames permanently. Layers stay live.").clicked();
+                do_bake = ui.button("⬇ Bake").on_hover_text("Make frame edits permanent. Layers stay editable.").clicked();
                 do_reset = ui.button("Reset").clicked();
             });
         });
@@ -4307,13 +4432,13 @@ impl GifForgeApp {
             if *by_pct {
                 let mut pct = if tr.rs_pct > 0.0 { tr.rs_pct } else { 100.0 };
                 let r1 = ui.add(egui::Slider::new(&mut pct, 1.0..=400.0).suffix(" %").max_decimals(1).clamping(egui::SliderClamping::Never).logarithmic(true))
-                    .on_hover_text("Drag, or type any value (e.g. 37.5 or 1200)");
+                    .on_hover_text("Drag or type any value such as 37.5 or 1200");
                 if r1.changed() {
                     tr.rs_pct = pct.clamp(0.1, 6400.0);
                 }
                 ui.horizontal_wrapped(|ui| {
                     for pc in [10.0, 25.0, 33.3, 50.0, 75.0, 150.0, 200.0, 400.0] {
-                        if ui.small_button(format!("{pc}%")).clicked() {
+                        if chip(ui, format!("{pc}%")).clicked() {
                             tr.rs_pct = pc;
                         }
                     }
@@ -4322,13 +4447,13 @@ impl GifForgeApp {
                 tr.rs_pct = 0.0;
                 egui::Grid::new("rs").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                     ui.label("Width");
-                    ui.add(egui::DragValue::new(&mut tr.rs_w).range(0..=16384).suffix(" px")).on_hover_text("0 = keep aspect");
+                    ui.add(egui::DragValue::new(&mut tr.rs_w).range(0..=16384).suffix(" px")).on_hover_text("Leave at 0 to keep the aspect ratio");
                     ui.end_row();
                     ui.label("Height");
-                    ui.add(egui::DragValue::new(&mut tr.rs_h).range(0..=16384).suffix(" px")).on_hover_text("0 = keep aspect");
+                    ui.add(egui::DragValue::new(&mut tr.rs_h).range(0..=16384).suffix(" px")).on_hover_text("Leave at 0 to keep the aspect ratio");
                     ui.end_row();
                 });
-                if ui.small_button("Clear").clicked() {
+                if chip(ui, "Clear").clicked() {
                     tr.rs_w = 0;
                     tr.rs_h = 0;
                 }
@@ -4366,10 +4491,10 @@ impl GifForgeApp {
         let (w, h) = self.dims();
         ui.horizontal(|ui| {
             ui.label("Show");
-            ui.selectable_value(&mut self.crop_live, true, "With edits").on_hover_text("Effects and layers, whole frame");
-            ui.selectable_value(&mut self.crop_live, false, "Original").on_hover_text("The source frames only");
+            ui.selectable_value(&mut self.crop_live, true, "With edits").on_hover_text("Show effects and layers on the whole frame");
+            ui.selectable_value(&mut self.crop_live, false, "Original").on_hover_text("Show the source frames only");
         });
-        hint(ui, "Drag on the image");
+        hint(ui, "Drag on the image to set the crop");
         let tr = &mut self.stack.transform;
         let before = tr.crop;
         group(ui, "Area", |ui| {
@@ -4405,7 +4530,7 @@ impl GifForgeApp {
             ui.horizontal(|ui| {
                 ui.label("Tolerance");
                 ui.add(egui::DragValue::new(&mut self.trim_tol).range(0..=255));
-                detect = ui.button("Detect").on_hover_text("Fit the area to non-background pixels across all frames").clicked();
+                detect = ui.button("Detect").on_hover_text("Shrink the area to the content of every frame").clicked();
             });
         });
         if detect {
@@ -4471,15 +4596,15 @@ impl GifForgeApp {
         let tr = &mut self.stack.transform;
         group(ui, "Playback", |ui| {
             ui.checkbox(&mut tr.reverse, "⟲ Reverse");
-            ui.checkbox(&mut tr.boomerang, "⇄ Boomerang").on_hover_text("Play forward, then backward");
+            ui.checkbox(&mut tr.boomerang, "⇄ Boomerang").on_hover_text("Play forward and then backward");
             ui.horizontal(|ui| {
                 ui.checkbox(&mut tr.set_loop, "Loop count");
                 if tr.set_loop {
-                    ui.add(egui::DragValue::new(&mut tr.loop_count).range(0..=65535)).on_hover_text("0 = forever");
+                    ui.add(egui::DragValue::new(&mut tr.loop_count).range(0..=65535)).on_hover_text("0 loops forever");
                 }
             });
         });
-        if ui.button("⬇ Bake").on_hover_text("Apply frame edits to the frames permanently. Layers stay live.").clicked() {
+        if ui.button("⬇ Bake").on_hover_text("Make frame edits permanent. Layers stay editable.").clicked() {
             self.bake(ctx, true);
         }
     }
@@ -4504,15 +4629,15 @@ impl GifForgeApp {
                     })
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut tr.speed_mode, SpeedMode::Percent, "% of original");
-                        ui.selectable_value(&mut tr.speed_mode, SpeedMode::DelayAll, "cs per frame").on_hover_text("Same delay for every frame, in 1/100 s");
-                        ui.selectable_value(&mut tr.speed_mode, SpeedMode::Fps, "fps").on_hover_text("Same rate for every frame");
+                        ui.selectable_value(&mut tr.speed_mode, SpeedMode::DelayAll, "cs per frame").on_hover_text("One delay for every frame in hundredths of a second");
+                        ui.selectable_value(&mut tr.speed_mode, SpeedMode::Fps, "fps").on_hover_text("One frame rate for every frame");
                     });
             });
             if tr.speed_mode == SpeedMode::Percent {
                 ui.add(soft_slider(&mut tr.speed_val, 10.0..=400.0, "%"));
                 ui.horizontal(|ui| {
                     for pc in [25.0, 50.0, 100.0, 150.0, 200.0, 300.0] {
-                        if ui.small_button(format!("{pc:.0}%")).clicked() {
+                        if chip(ui, format!("{pc:.0}%")).clicked() {
                             tr.speed_val = pc;
                         }
                     }
@@ -4520,7 +4645,7 @@ impl GifForgeApp {
             } else {
                 let d = if tr.speed_mode == SpeedMode::Fps { (100.0 / tr.speed_val).round() } else { tr.speed_val };
                 if d < 2.0 {
-                    ui.label(RichText::new("⚠ Too fast for browsers").color(p().neutral)).on_hover_text("Delays under 2 cs are played at 10 cs by most browsers.");
+                    ui.label(RichText::new("⚠ Too fast for browsers").color(p().neutral)).on_hover_text("Most browsers play delays under 2 cs at 10 cs.");
                 }
                 if tr.speed_mode == SpeedMode::Fps {
                     hint(ui, &format!("= {} cs ({:.2} fps)", d.max(1.0), 100.0 / d.max(1.0)));
@@ -4562,10 +4687,10 @@ impl GifForgeApp {
                 });
                 tr.cut_end = if end >= n { 0 } else { end };
                 ui.horizontal(|ui| {
-                    if ui.small_button("Start here").on_hover_text("Use the current frame").clicked() {
+                    if chip(ui, "Start here").on_hover_text("Use the current frame").clicked() {
                         tr.cut_start = src;
                     }
-                    if ui.small_button("End here").on_hover_text("Use the current frame").clicked() {
+                    if chip(ui, "End here").on_hover_text("Use the current frame").clicked() {
                         tr.cut_end = src;
                     }
                 });
@@ -4628,11 +4753,11 @@ impl GifForgeApp {
                 ui.add(egui::DragValue::new(&mut self.target_val).range(0.01..=10000.0).speed(0.1).max_decimals(2));
                 ui.selectable_value(&mut self.target_mb, true, "MiB");
                 ui.selectable_value(&mut self.target_mb, false, "KiB");
-                find = ui.add_enabled(idle && self.export_fmt.can_target(), egui::Button::new("Find settings")).on_hover_text("Search for the best quality that fits and apply it. Lowers quality first, then size.").clicked();
+                find = ui.add_enabled(idle && self.export_fmt.can_target(), egui::Button::new("Find settings")).on_hover_text("Finds the best quality under this size and applies it. Quality drops first and size only if needed.").clicked();
             });
             ui.horizontal_wrapped(|ui| {
                 for (lbl, v, mb) in TARGET_PRESETS {
-                    if ui.small_button(lbl).clicked() {
+                    if chip(ui, lbl).clicked() {
                         self.target_val = v;
                         self.target_mb = mb;
                     }
@@ -4640,10 +4765,10 @@ impl GifForgeApp {
             });
         });
         ui.horizontal(|ui| {
-            if ui.checkbox(&mut self.fit_keep_size, "Keep size").on_hover_text("Find settings only changes compression, never shrinks the frames").changed() {
+            if ui.checkbox(&mut self.fit_keep_size, "Keep size").on_hover_text("Find settings changes compression only and never shrinks the frames").changed() {
                 theme::set_setting("fit_keep_size", if self.fit_keep_size { "1" } else { "0" });
             }
-            reset = ui.add_enabled(idle, egui::Button::new("Reset compression")).on_hover_text("Back to lossless defaults; also undoes a downscale made by Find").clicked();
+            reset = ui.add_enabled(idle, egui::Button::new("Reset compression")).on_hover_text("Go back to lossless settings and undo any downscale from Find settings").clicked();
         });
         if reset {
             self.undo_last_fit();
@@ -4688,14 +4813,14 @@ impl GifForgeApp {
                     if !o.lossless {
                         ui.add(egui::Slider::new(&mut o.quality, 0.0..=100.0).text("quality")).on_hover_text("75–90 looks like the original for most GIFs");
                     }
-                    ui.add(egui::Slider::new(&mut o.method, 0..=6).text("effort")).on_hover_text("Higher = smaller file, slower");
+                    ui.add(egui::Slider::new(&mut o.method, 0..=6).text("effort")).on_hover_text("Higher makes smaller files but takes longer");
                 });
                 return;
             }
             ExportFormat::Avif => {
                 group(ui, "AVIF", |ui| {
                     ui.add(egui::Slider::new(&mut self.avif_quality, 0..=100).text("quality")).on_hover_text("50–70 is a good balance");
-                    hint(ui, "Slow to encode – the preview takes a while");
+                    hint(ui, "Slow to encode so the preview takes a while");
                 });
                 return;
             }
@@ -4703,13 +4828,13 @@ impl GifForgeApp {
                 group(ui, "MP4", |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Background");
-                        ui.color_edit_button_srgb(&mut self.video_bg).on_hover_text("MP4 has no transparency; this fills it");
+                        ui.color_edit_button_srgb(&mut self.video_bg).on_hover_text("MP4 has no transparency. This colour fills it.");
                     });
                 });
                 return;
             }
             ExportFormat::Apng => {
-                hint(ui, "APNG is lossless – no settings");
+                hint(ui, "APNG is lossless and has no settings");
                 return;
             }
             _ => {
@@ -4719,16 +4844,16 @@ impl GifForgeApp {
         }
         group(ui, "Presets", |ui| {
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Best").clicked() {
+                if chip(ui, "Best").clicked() {
                     self.gif_opts = GifOptions { quant_speed: 1, ..GifOptions::default() };
                 }
-                if ui.button("Balanced").clicked() {
+                if chip(ui, "Balanced").clicked() {
                     self.gif_opts = GifOptions { lossy: 30, ..GifOptions::default() };
                 }
-                if ui.button("Small").clicked() {
+                if chip(ui, "Small").clicked() {
                     self.gif_opts = GifOptions { lossy: 60, colors: 128, global_palette: true, ..GifOptions::default() };
                 }
-                if ui.button("Tiny").clicked() {
+                if chip(ui, "Tiny").clicked() {
                     self.gif_opts = GifOptions { lossy: 120, colors: 48, global_palette: true, ..GifOptions::default() };
                 }
             });
@@ -4739,9 +4864,9 @@ impl GifForgeApp {
         });
         group(ui, "Colours", |ui| {
             ui.add(egui::Slider::new(&mut o.colors, 2..=256).text("max"));
-            ui.checkbox(&mut o.global_palette, "One palette for all frames").on_hover_text("Smaller files; can band on varied footage");
+            ui.checkbox(&mut o.global_palette, "One palette for all frames").on_hover_text("Smaller files but may show banding on varied footage");
             ui.checkbox(&mut o.dither, "Dither");
-            ui.add(egui::Slider::new(&mut o.quant_speed, 1..=30).text("quantizer speed")).on_hover_text("1 = best palette, 30 = fastest");
+            ui.add(egui::Slider::new(&mut o.quant_speed, 1..=30).text("quantizer speed")).on_hover_text("1 gives the best palette and 30 is fastest");
         });
         let drop_nth = &mut self.opt_drop_nth;
         let mut drop_go = false;
@@ -4753,7 +4878,7 @@ impl GifForgeApp {
                 ui.label("Drop every");
                 ui.add(egui::DragValue::new(drop_nth).range(0..=100));
                 ui.label("th frame");
-                drop_go = ui.add_enabled(*drop_nth >= 2, egui::Button::new("Apply")).on_hover_text("Removes source frames; timing is kept").clicked();
+                drop_go = ui.add_enabled(*drop_nth >= 2, egui::Button::new("Apply")).on_hover_text("Removes source frames and keeps the timing").clicked();
             });
         });
         if drop_go {
@@ -4780,7 +4905,7 @@ impl GifForgeApp {
                 ui.checkbox(&mut self.stack.layers[i].visible, "Visible");
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if !fx_layers.is_empty() && ui.button("+ Layer").on_hover_text("Add another effects layer, e.g. one below your text and one above").clicked() {
+                if !fx_layers.is_empty() && ui.button("+ Layer").on_hover_text("Add another effects layer to place effects above or below other layers").clicked() {
                     self.add_layer(LayerKind::Effects(Box::default()));
                 }
                 if ui.button("Reset").clicked() {
@@ -4811,9 +4936,9 @@ impl GifForgeApp {
     fn angle_row(ui: &mut egui::Ui, angle: &mut f32) {
         ui.horizontal(|ui| {
             ui.label("Angle");
-            ui.add(egui::DragValue::new(angle).speed(0.5).suffix("°").max_decimals(1)).on_hover_text("Or drag the round handle on the image (Shift snaps)");
+            ui.add(egui::DragValue::new(angle).speed(0.5).suffix("°").max_decimals(1)).on_hover_text("Or drag the round handle. Hold Shift to snap.");
             for (lbl, v) in [("0", 0.0), ("−90", -90.0), ("90", 90.0), ("180", 180.0)] {
-                if ui.small_button(lbl).clicked() {
+                if chip(ui, lbl).clicked() {
                     *angle = v;
                 }
             }
@@ -4981,7 +5106,7 @@ impl GifForgeApp {
             let (w, h) = s.dims();
             s.add_layer(LayerKind::Text(Annotation { text: "Your text".into(), x: (w as i32 / 2 - 80).max(0), y: (h as i32 - 60).max(0), ..Default::default() }));
         }) else {
-            hint(ui, "Add text, then drag it on the image");
+            hint(ui, "Add text and drag it into place");
             return;
         };
         let n = self.base.as_ref().map(|b| b.len()).unwrap_or(1).max(1);
@@ -4996,7 +5121,7 @@ impl GifForgeApp {
         let mut load_file = false;
         group(ui, "Font", |ui| {
             picked = self.font_picker(ui, cur_font);
-            load_file = ui.small_button("Load font file…").clicked();
+            load_file = chip(ui, "Load font file…").clicked();
         });
         if load_file {
             if let Some(path) = rfd::FileDialog::new().add_filter("Fonts", &["ttf", "otf", "ttc"]).pick_file() {
@@ -5028,11 +5153,10 @@ impl GifForgeApp {
                 ui.end_row();
                 ui.label("Outline");
                 ui.horizontal(|ui| {
-                    egui::ComboBox::from_id_salt("border").width(80.0).selected_text(format!("{:?}", a.border)).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut a.border, Border::None, "None");
-                        ui.selectable_value(&mut a.border, Border::Light, "Light");
-                        ui.selectable_value(&mut a.border, Border::Heavy, "Heavy");
-                    });
+                    let mut w = a.outline_px() as f32;
+                    if ui.add(egui::DragValue::new(&mut w).range(0.0..=200.0).speed(0.2).suffix(" px")).on_hover_text("0 turns the outline off").changed() {
+                        a.border_width = Some(w.round());
+                    }
                     ui.color_edit_button_srgba_unmultiplied(&mut a.border_color);
                 });
                 ui.end_row();
@@ -5135,7 +5259,7 @@ impl GifForgeApp {
                 s.load_overlay(path, ctx);
             }
         }) else {
-            hint(ui, "PNG, GIF, JPG or WebP – or drop a file");
+            hint(ui, "Add a PNG, GIF, JPG or WebP. You can also drop one here.");
             return;
         };
         let (aw, ah) = self.dims();
@@ -5177,15 +5301,15 @@ impl GifForgeApp {
             });
             Self::angle_row(ui, &mut pl.angle);
             ui.horizontal_wrapped(|ui| {
-                if ui.small_button("Native").on_hover_text("Original image size").clicked() {
+                if chip(ui, "Native").on_hover_text("Original image size").clicked() {
                     pl.w = native.0;
                     pl.h = native.1;
                 }
-                if ui.small_button("Center").clicked() {
+                if chip(ui, "Center").clicked() {
                     pl.x = (aw as i32 - pl.w as i32) / 2;
                     pl.y = (ah as i32 - pl.h as i32) / 2;
                 }
-                if ui.small_button("Fill").on_hover_text("Cover the whole frame").clicked() {
+                if chip(ui, "Fill").on_hover_text("Cover the whole frame").clicked() {
                     pl.x = 0;
                     pl.y = 0;
                     pl.w = aw;
@@ -5209,7 +5333,7 @@ impl GifForgeApp {
                     o.placements[cur].enabled = pl.enabled;
                 }
             }
-            if ui.small_button("Show on all frames").clicked() {
+            if chip(ui, "Show on all frames").clicked() {
                 for q in &mut o.placements {
                     q.enabled = true;
                 }
@@ -5222,7 +5346,7 @@ impl GifForgeApp {
         let Some(sel) = self.layer_chooser(ui, Kind::Watermark, "+ Watermark", |s| {
             s.add_layer(LayerKind::Watermark(Box::default()));
         }) else {
-            hint(ui, "Text or logo, pinned to the frame");
+            hint(ui, "Add text or a logo that stays in place");
             return;
         };
         let (cur_font, use_image) = match &self.stack.layers[sel].kind {
@@ -5249,6 +5373,13 @@ impl GifForgeApp {
                     ui.horizontal(|ui| {
                         ui.color_edit_button_srgba_unmultiplied(&mut w.color);
                         ui.checkbox(&mut w.outline, "Outline");
+                        if w.outline {
+                            let mut px = w.outline_px.unwrap_or(0.0);
+                            let r = ui.add(egui::DragValue::new(&mut px).range(0.0..=100.0).speed(0.2).suffix(" px")).on_hover_text("0 picks a width from the text size");
+                            if r.changed() {
+                                w.outline_px = if px <= 0.0 { None } else { Some(px.round()) };
+                            }
+                        }
                     });
                 }
             });
@@ -5276,7 +5407,7 @@ impl GifForgeApp {
             w.font_idx = fi;
         }
         group(ui, "Placement", |ui| {
-            ui.add(soft_slider(&mut w.size, 1.0..=40.0, "size %")).on_hover_text("Relative to the frame's shorter side");
+            ui.add(soft_slider(&mut w.size, 1.0..=40.0, "size %")).on_hover_text("Size as a share of the frame's shorter side");
             ui.add(egui::Slider::new(&mut w.opacity, 0.0..=100.0).text("opacity %"));
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut w.tiled, false, "Single");
@@ -5312,23 +5443,24 @@ impl GifForgeApp {
         let Some(sel) = self.layer_chooser(ui, Kind::Shield, "+ AI shield", |s| {
             s.add_layer(LayerKind::Shield(ShieldSettings::default()));
         }) else {
-            hint(ui, "Perturbation noise against AI training");
+            hint(ui, "Adds faint noise that makes frames worse as AI training data");
             return;
         };
-        ui.label(RichText::new("ℹ What this does").size(12.0).color(p().fg_muted)).on_hover_text(
-            "Adds subtle, structured noise that makes frames less clean as AI training data and can confuse some image models.\n\nIt is not a guarantee: it is far weaker than tools like Glaze or Nightshade, and strong GIF compression removes part of it. Pair it with the “noai” tag on export.",
+        hint(ui, "Adds faint noise that makes frames worse as AI training data.");
+        ui.label(RichText::new("Not a guarantee. More…").size(12.0).color(p().fg_muted).underline()).on_hover_text(
+            "It is much weaker than tools like Glaze or Nightshade. Strong GIF compression also removes some of it.\n\nPair it with the “noai” tag in the Export window.",
         );
         let LayerKind::Shield(s) = &mut self.stack.layers[sel].kind else { return };
         group(ui, "Perturbation", |ui| {
-            ui.add(soft_slider(&mut s.strength, 0.0..=20.0, "strength")).on_hover_text("Colour levels; 4–8 is hard to see");
+            ui.add(soft_slider(&mut s.strength, 0.0..=20.0, "strength")).on_hover_text("How strong the noise is. 4 to 8 is hard to see.");
             ui.checkbox(&mut s.pattern, "High-frequency pattern");
             ui.checkbox(&mut s.noise, "Colour noise");
-            ui.checkbox(&mut s.jitter, "Sub-pixel jitter").on_hover_text("Tiny geometric warp");
-            ui.checkbox(&mut s.per_frame, "Vary every frame").on_hover_text("Stronger, but makes GIFs much larger");
+            ui.checkbox(&mut s.jitter, "Sub-pixel jitter").on_hover_text("Warps the image by tiny amounts");
+            ui.checkbox(&mut s.per_frame, "Vary every frame").on_hover_text("Stronger protection but much larger GIFs");
             ui.horizontal(|ui| {
                 ui.label("Seed");
                 ui.add(egui::DragValue::new(&mut s.seed));
-                if ui.small_button("Randomise").clicked() {
+                if chip(ui, "Randomise").clicked() {
                     s.seed = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(1) % 1_000_000) as u32;
                 }
             });
@@ -5339,7 +5471,7 @@ impl GifForgeApp {
         let pal = *p();
         let n = self.base.as_ref().map(|a| a.len()).unwrap_or(1);
         let now = ctx.input(|i| i.time);
-        if ui.button("+ Add frames…").on_hover_text("Append images as frames").clicked() {
+        if ui.button("+ Add frames…").on_hover_text("Add images to the end as new frames").clicked() {
             if let Some(mut ps) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "bmp"]).pick_files() {
                 ps.sort();
                 let d = self.fr_delay;
@@ -5415,14 +5547,14 @@ impl GifForgeApp {
         group(ui, "Blend", |ui| {
             ui.horizontal(|ui| {
                 ui.label("Crossfade");
-                ui.add(egui::DragValue::new(&mut self.fr_crossfade).range(1..=30)).on_hover_text("In-between frames");
-                ui.checkbox(&mut self.fr_crossfade_wrap, "loop").on_hover_text("Also blend last → first");
+                ui.add(egui::DragValue::new(&mut self.fr_crossfade).range(1..=30)).on_hover_text("Number of in-between frames");
+                ui.checkbox(&mut self.fr_crossfade_wrap, "loop").on_hover_text("Also blend the last frame into the first");
                 if ui.button("Apply").clicked() {
                     let (s, w) = (self.fr_crossfade, self.fr_crossfade_wrap);
                     self.run_anim(ctx, "Crossfade", move |a, _| Ok(ops::crossfade(a, s, w)));
                 }
             });
-            if ui.button("First frame as background").on_hover_text("Composite every frame over frame 1").clicked() {
+            if ui.button("First frame as background").on_hover_text("Draw every frame over frame 1").clicked() {
                 self.run_anim(ctx, "First frame as background", move |a, _| Ok(ops::first_frame_as_background(a)));
             }
         });
@@ -5466,7 +5598,7 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
         ui.add(soft_slider(&mut fx.lightness, 0.0..=200.0, "Lightness"));
         ui.add(soft_slider(&mut fx.brightness, -100.0..=100.0, "Brightness"));
         ui.add(soft_slider(&mut fx.contrast, -100.0..=100.0, "Contrast"));
-        if ui.small_button("Reset").clicked() {
+        if chip(ui, "Reset").clicked() {
             fx.hue = 100.0;
             fx.saturation = 100.0;
             fx.lightness = 100.0;
@@ -5478,8 +5610,8 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
         ui.horizontal_wrapped(|ui| {
             ui.toggle_value(&mut fx.grayscale, "Grayscale");
             ui.toggle_value(&mut fx.sepia, "Sepia");
-            ui.toggle_value(&mut fx.monochrome, "Mono");
-            ui.toggle_value(&mut fx.negative, "Invert");
+            ui.toggle_value(&mut fx.monochrome, "Mono").on_hover_text("Black and white only");
+            ui.toggle_value(&mut fx.negative, "Invert").on_hover_text("Negative colours");
         });
         ui.horizontal(|ui| {
             ui.checkbox(&mut fx.tint, "Tint");
@@ -5516,7 +5648,7 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
         if fx.rc_white || fx.rc_black || fx.rc_custom {
             ui.add(soft_slider(&mut fx.rc_fuzz, 0.0..=60.0, "fuzz %")).on_hover_text("How close a colour must be to count");
             ui.horizontal(|ui| {
-                ui.checkbox(&mut fx.rc_clean_edges, "Clean edges");
+                ui.checkbox(&mut fx.rc_clean_edges, "Clean edges").on_hover_text("Removes leftover fringe around cut-out areas");
                 if fx.rc_clean_edges {
                     ui.add(egui::DragValue::new(&mut fx.rc_edge_px).range(1..=50).suffix(" px"));
                 }
@@ -5527,12 +5659,12 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
         ui.horizontal_wrapped(|ui| {
             ui.toggle_value(&mut tr.reverse, "Reverse");
             ui.toggle_value(&mut tr.boomerang, "Boomerang");
-            ui.toggle_value(&mut fx.counter, "Timer").on_hover_text("Seconds counter");
+            ui.toggle_value(&mut fx.counter, "Timer").on_hover_text("Shows a running seconds counter");
         });
         ui.horizontal(|ui| {
             ui.checkbox(&mut tr.set_loop, "Loop count");
             if tr.set_loop {
-                ui.add(egui::DragValue::new(&mut tr.loop_count).range(0..=65535)).on_hover_text("0 = forever");
+                ui.add(egui::DragValue::new(&mut tr.loop_count).range(0..=65535)).on_hover_text("0 loops forever");
             }
         });
         ui.horizontal(|ui| {
@@ -5540,7 +5672,7 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
             ui.toggle_value(&mut fx.fade_out, "Fade out");
             if fx.fade_in || fx.fade_out {
                 ui.add(egui::DragValue::new(&mut fx.fade_frames).range(1..=10000).suffix(" fr"));
-                ui.checkbox(&mut fx.fade_to_transparent, "to clear");
+                ui.checkbox(&mut fx.fade_to_transparent, "to clear").on_hover_text("Fade to transparent instead of black");
             }
         });
     });
@@ -5556,8 +5688,8 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
     });
     group_ex(ui, "Dither", false, on(&[fx.ordered_dither, fx.error_dither]), |ui| {
         ui.horizontal(|ui| {
-            ui.toggle_value(&mut fx.ordered_dither, "Ordered");
-            ui.toggle_value(&mut fx.error_dither, "Diffusion");
+            ui.toggle_value(&mut fx.ordered_dither, "Ordered").on_hover_text("Regular pattern dithering");
+            ui.toggle_value(&mut fx.error_dither, "Diffusion").on_hover_text("Error diffusion dithering");
         });
         if fx.ordered_dither || fx.error_dither {
             ui.add(egui::Slider::new(&mut fx.dither_levels, 2..=16).text("levels").clamping(egui::SliderClamping::Never));
@@ -5565,11 +5697,11 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
     });
     group_ex(ui, "Artistic", false, on(&[fx.oil, fx.emboss, fx.posterize, fx.solarize, fx.noise]), |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.toggle_value(&mut fx.oil, "Oil paint");
-            ui.toggle_value(&mut fx.emboss, "Emboss");
-            ui.toggle_value(&mut fx.posterize, "Posterize");
-            ui.toggle_value(&mut fx.solarize, "Solarize");
-            ui.toggle_value(&mut fx.noise, "Noise");
+            ui.toggle_value(&mut fx.oil, "Oil paint").on_hover_text("Smooths detail into brush-like patches");
+            ui.toggle_value(&mut fx.emboss, "Emboss").on_hover_text("Raised relief look");
+            ui.toggle_value(&mut fx.posterize, "Posterize").on_hover_text("Fewer colour steps");
+            ui.toggle_value(&mut fx.solarize, "Solarize").on_hover_text("Inverts the brightest tones");
+            ui.toggle_value(&mut fx.noise, "Noise").on_hover_text("Adds random grain");
         });
         if fx.oil {
             ui.add(egui::Slider::new(&mut fx.oil_radius, 1..=8).text("oil radius").clamping(egui::SliderClamping::Never));
@@ -5583,9 +5715,9 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
     });
     group_ex(ui, "Distort", false, on(&[fx.swirl, fx.implode, fx.wave]), |ui| {
         ui.horizontal(|ui| {
-            ui.toggle_value(&mut fx.swirl, "Swirl");
-            ui.toggle_value(&mut fx.implode, "Implode");
-            ui.toggle_value(&mut fx.wave, "Wave");
+            ui.toggle_value(&mut fx.swirl, "Swirl").on_hover_text("Twists the image around the centre");
+            ui.toggle_value(&mut fx.implode, "Implode").on_hover_text("Pulls the image toward the centre");
+            ui.toggle_value(&mut fx.wave, "Wave").on_hover_text("Ripples the image sideways");
         });
         if fx.swirl {
             ui.add(soft_slider(&mut fx.swirl_deg, -720.0..=720.0, "swirl °"));
@@ -5600,20 +5732,20 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
     });
     group_ex(ui, "Filters", false, on(&[fx.gotham, fx.lomo, fx.nashville, fx.toaster, fx.vignette, fx.polaroid]), |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.toggle_value(&mut fx.gotham, "Gotham");
-            ui.toggle_value(&mut fx.lomo, "Lomo");
-            ui.toggle_value(&mut fx.nashville, "Nashville");
-            ui.toggle_value(&mut fx.toaster, "Toaster");
-            ui.toggle_value(&mut fx.vignette, "Vignette");
-            ui.toggle_value(&mut fx.polaroid, "Polaroid");
+            ui.toggle_value(&mut fx.gotham, "Gotham").on_hover_text("Cool and gritty high contrast");
+            ui.toggle_value(&mut fx.lomo, "Lomo").on_hover_text("Saturated with dark corners");
+            ui.toggle_value(&mut fx.nashville, "Nashville").on_hover_text("Warm pink vintage tint");
+            ui.toggle_value(&mut fx.toaster, "Toaster").on_hover_text("Warm faded film look");
+            ui.toggle_value(&mut fx.vignette, "Vignette").on_hover_text("Darkens the corners");
+            ui.toggle_value(&mut fx.polaroid, "Polaroid").on_hover_text("White instant-photo frame");
         });
     });
     group_ex(ui, "Frame", false, on(&[fx.frame_camera, fx.frame_fuzzy, fx.frame_rounded, fx.frame_border]), |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.toggle_value(&mut fx.frame_camera, "Camera");
-            ui.toggle_value(&mut fx.frame_fuzzy, "Fuzzy");
-            ui.toggle_value(&mut fx.frame_rounded, "Rounded");
-            ui.toggle_value(&mut fx.frame_border, "Border");
+            ui.toggle_value(&mut fx.frame_camera, "Camera").on_hover_text("Viewfinder frame");
+            ui.toggle_value(&mut fx.frame_fuzzy, "Fuzzy").on_hover_text("Soft blurred edges");
+            ui.toggle_value(&mut fx.frame_rounded, "Rounded").on_hover_text("Rounded corners");
+            ui.toggle_value(&mut fx.frame_border, "Border").on_hover_text("Solid border");
         });
         if fx.frame_rounded {
             ui.add(soft_slider(&mut fx.rounded_radius, 1.0..=200.0, "radius px"));

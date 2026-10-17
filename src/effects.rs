@@ -1170,6 +1170,8 @@ pub struct WatermarkSettings {
     pub size: f32,
     pub color: [u8; 4],
     pub outline: bool,
+    /// outline width in pixels (None = automatic)
+    pub outline_px: Option<f32>,
     /// 0..=100
     pub opacity: f32,
     pub anchor: Anchor,
@@ -1199,6 +1201,7 @@ impl Default for WatermarkSettings {
             size: 6.0,
             color: [255, 255, 255, 255],
             outline: true,
+            outline_px: None,
             opacity: 60.0,
             anchor: Anchor::BottomRight,
             margin: 3.0,
@@ -1239,6 +1242,7 @@ impl WatermarkSettings {
                 size: px,
                 color: self.color,
                 border: if self.outline { crate::text::Border::Light } else { crate::text::Border::None },
+                border_width: if self.outline { self.outline_px } else { Some(0.0) },
                 border_color: [0, 0, 0, (self.color[3] as f32 * 0.8) as u8],
                 ..Default::default()
             };

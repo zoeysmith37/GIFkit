@@ -60,6 +60,8 @@ pub struct Annotation {
     pub size: f32,
     pub color: [u8; 4],
     pub border: Border,
+    /// outline width in pixels; None = from `border` (older files)
+    pub border_width: Option<f32>,
     pub border_color: [u8; 4],
     /// top-left of the text block (pixels)
     pub x: i32,
@@ -83,6 +85,7 @@ impl Default for Annotation {
             size: 32.0,
             color: [255, 255, 255, 255],
             border: Border::Light,
+            border_width: None,
             border_color: [0, 0, 0, 255],
             x: 10,
             y: 10,
@@ -161,11 +164,21 @@ pub fn rasterize(font: &FontArc, text: &str, size: f32, align: Align) -> (u32, u
     (maxw, total_h, mask)
 }
 
+impl Annotation {
+    /// Outline width in whole pixels.
+    pub fn outline_px(&self) -> i32 {
+        match self.border_width {
+            Some(w) => w.round().clamp(0.0, 200.0) as i32,
+            None => self.border.radius(self.size),
+        }
+    }
+}
+
 /// Size of the rendered text block including border.
 pub fn measure(fonts: &[FontEntry], a: &Annotation) -> (u32, u32) {
     let font = &fonts[a.font_idx.min(fonts.len() - 1)].font;
     let (w, h, _) = rasterize(font, &a.text, a.size, a.align);
-    let r = a.border.radius(a.size) as u32;
+    let r = a.outline_px() as u32;
     (w + 2 * r, h + 2 * r)
 }
 
@@ -173,7 +186,7 @@ pub fn measure(fonts: &[FontEntry], a: &Annotation) -> (u32, u32) {
 pub fn render_sprite(fonts: &[FontEntry], a: &Annotation) -> RgbaImage {
     let font = &fonts[a.font_idx.min(fonts.len() - 1)].font;
     let (w, h, mask) = rasterize(font, &a.text, a.size, a.align);
-    let r = a.border.radius(a.size);
+    let r = a.outline_px();
     let sw = w + 2 * r as u32;
     let sh = h + 2 * r as u32;
     let mut out = RgbaImage::new(sw, sh);

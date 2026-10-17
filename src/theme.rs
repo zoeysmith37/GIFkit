@@ -235,8 +235,8 @@ pub fn install(ctx: &egui::Context) {
     ctx.set_visuals_of(Theme::Light, visuals(l, false));
     ctx.all_styles_mut(|s| {
         s.spacing.item_spacing = Vec2::new(6.0, 6.0);
-        s.spacing.button_padding = Vec2::new(10.0, 4.0);
-        s.spacing.interact_size = Vec2::new(40.0, 24.0);
+        s.spacing.button_padding = Vec2::new(10.0, 3.0);
+        s.spacing.interact_size = Vec2::new(40.0, 26.0);
         s.spacing.slider_width = 150.0;
         s.spacing.combo_width = 120.0;
         s.spacing.icon_width = 16.0;
