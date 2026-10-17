@@ -2010,7 +2010,7 @@ impl GifForgeApp {
                 };
                 let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, label, None, false);
                 let space = if crop_mode { Space::Source } else { Space::Output };
-                self.canvas_interaction(ui, &resp, m, (size.x, size.y), space);
+                self.canvas_interaction(ui, &resp, m, (size.x, size.y), space, vi);
             }
             ViewSource::Original => {
                 let Some(i) = self.original_index() else { return };
@@ -2022,7 +2022,7 @@ impl GifForgeApp {
                 let tex = self.orig_texture(ctx, i);
                 let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, Some((label, Color32::WHITE)), None, false);
                 if same {
-                    self.canvas_interaction(ui, &resp, m, (size.x, size.y), Space::Source);
+                    self.canvas_interaction(ui, &resp, m, (size.x, size.y), Space::Source, vi);
                 }
             }
             ViewSource::Compressed => {
@@ -2041,7 +2041,7 @@ impl GifForgeApp {
                     let tex = self.cmp_texture(ctx, i);
                     let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, Some((label, Color32::WHITE)), None, false);
                     if !crop_mode {
-                        self.canvas_interaction(ui, &resp, m, (size.x, size.y), Space::Output);
+                        self.canvas_interaction(ui, &resp, m, (size.x, size.y), Space::Output, vi);
                     }
                 } else {
                     // compression pending / running: show the live preview with a warning
@@ -2051,7 +2051,7 @@ impl GifForgeApp {
                     let badge = if encoding { "⚠ Compressing… showing uncompressed preview" } else { "⚠ Waiting for edits to settle – uncompressed preview" };
                     let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, Some((label, Color32::from_gray(200))), Some(badge.into()), encoding);
                     if !crop_mode {
-                        self.canvas_interaction(ui, &resp, m, (size.x, size.y), Space::Output);
+                        self.canvas_interaction(ui, &resp, m, (size.x, size.y), Space::Output, vi);
                     }
                 }
             }
@@ -2077,8 +2077,13 @@ impl GifForgeApp {
 
     /// Canvas editing. `space` says which coordinates the viewport shows:
     /// source frames (original / crop view) or the edited output.
-    fn canvas_interaction(&mut self, ui: &mut egui::Ui, resp: &egui::Response, m: Mapper, bounds: (f32, f32), space: Space) {
+    fn canvas_interaction(&mut self, ui: &mut egui::Ui, resp: &egui::Response, m: Mapper, bounds: (f32, f32), space: Space, vi: usize) {
         let painter = ui.painter_at(resp.rect);
+        // in split view, gizmos only appear in the viewport you're working in
+        if resp.hovered() || resp.dragged() {
+            self.active_view = vi;
+        }
+        let show = !self.compare || self.active_view == vi;
         let pal = *p();
         let alt = ui.input(|i| i.modifiers.alt);
         let started = resp.drag_started_by(PointerButton::Primary) && !alt;
@@ -2097,6 +2102,9 @@ impl GifForgeApp {
                 self.stack.transform.crop_on = true;
             }
             let sr = m.rect_to_screen(r[0], r[1], r[2], r[3]);
+            if !show {
+                return;
+            }
             if self.stack.transform.crop_on {
                 let full = m.rect;
                 let dim = Color32::from_black_alpha(150);
@@ -2141,7 +2149,7 @@ impl GifForgeApp {
         let sel_li = self.sel_index(kind);
         let sel = sel_li.and_then(|li| cands.iter().find(|c| c.0 == li).copied());
         let to_screen = |p: (f32, f32)| m.to_screen(pos2(p.0, p.1));
-        let rot_handle = |o: &Obb| to_screen(o.from_local(0.0, -o.h / 2.0 - 24.0 / m.scale));
+        let rot_handle = |o: &Obb| to_screen(o.from_local(0.0, -o.h / 2.0 - 30.0 / m.scale));
         let ptr_img = resp.interact_pointer_pos().map(|p| m.to_img(p));
         let shift = ui.input(|i| i.modifiers.shift);
 
@@ -2150,10 +2158,10 @@ impl GifForgeApp {
             if let (Some(sp), Some(pi)) = (resp.interact_pointer_pos(), ptr_img) {
                 let mut new_drag = None;
                 if let Some((li, id, b, o)) = sel {
-                    if rot_handle(&o).distance(sp) <= 10.0 {
+                    if rot_handle(&o).distance(sp) <= HANDLE_HIT {
                         let a0 = (pi.y - o.cy).atan2(pi.x - o.cx).to_degrees();
                         new_drag = Some(BoxDrag::Rotate { id, li, a0, out0: o, src: b });
-                    } else if let Some(k) = o.corners().iter().position(|c| to_screen(*c).distance(sp) <= 9.0) {
+                    } else if let Some(k) = o.corners().iter().position(|c| to_screen(*c).distance(sp) <= HANDLE_HIT) {
                         let f = o.to_local(o.corners()[(k + 2) % 4].0, o.corners()[(k + 2) % 4].1);
                         let size0 = match &self.stack.layers[li].kind {
                             LayerKind::Text(t) => t.size,
@@ -2253,6 +2261,9 @@ impl GifForgeApp {
             Space::Output => Some(self.stack.layer_maps(bw, bh)),
             Space::Source => None,
         };
+        if !show {
+            return;
+        }
         for (li, l) in self.stack.layers.iter().enumerate() {
             if l.kind() != kind || !l.visible {
                 continue;
@@ -2267,10 +2278,10 @@ impl GifForgeApp {
                 let top_mid = to_screen(o.from_local(0.0, -o.h / 2.0));
                 let rh = rot_handle(&o);
                 painter.line_segment([top_mid, rh], Stroke::new(1.2, pal.highlight));
-                painter.circle_filled(rh, 5.5, Color32::WHITE);
-                painter.circle_stroke(rh, 5.5, Stroke::new(1.2, pal.highlight));
+                painter.circle_filled(rh, 7.0, Color32::WHITE);
+                painter.circle_stroke(rh, 7.0, Stroke::new(1.5, pal.highlight));
                 for c in &pts {
-                    let h = Rect::from_center_size(*c, vec2(8.0, 8.0));
+                    let h = Rect::from_center_size(*c, vec2(10.0, 10.0));
                     painter.rect_filled(h, 1.0, Color32::WHITE);
                     painter.rect_stroke(h, 1.0, Stroke::new(1.0, pal.highlight), egui::StrokeKind::Middle);
                 }
@@ -2283,9 +2294,9 @@ impl GifForgeApp {
                 let pi = m.to_img(pp);
                 if let Some(sid) = sel_id {
                     if let Some(c) = cands.iter().find(|c| c.1 == sid) {
-                        if rot_handle(&c.3).distance(pp) <= 10.0 {
+                        if rot_handle(&c.3).distance(pp) <= HANDLE_HIT {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::Alias);
-                        } else if c.3.corners().iter().any(|q| to_screen(*q).distance(pp) <= 9.0) {
+                        } else if c.3.corners().iter().any(|q| to_screen(*q).distance(pp) <= HANDLE_HIT) {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
                         } else if c.3.contains(pi.x, pi.y) {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
@@ -3886,11 +3897,14 @@ fn parse_hex(s: &str) -> Option<[u8; 3]> {
     Some([(v >> 16) as u8, (v >> 8) as u8, v as u8])
 }
 
+/// Screen-space pick radius for resize corners and the rotate handle.
+const HANDLE_HIT: f32 = 16.0;
+
 fn draw_sel(painter: &egui::Painter, r: Rect, accent: Color32) {
     painter.rect_stroke(r, 0.0, Stroke::new(2.0, Color32::from_black_alpha(160)), egui::StrokeKind::Middle);
     painter.rect_stroke(r, 0.0, Stroke::new(1.0, accent), egui::StrokeKind::Middle);
     for c in [r.left_top(), r.right_top(), r.left_bottom(), r.right_bottom()] {
-        let h = Rect::from_center_size(c, vec2(8.0, 8.0));
+        let h = Rect::from_center_size(c, vec2(10.0, 10.0));
         painter.rect_filled(h, 1.0, Color32::WHITE);
         painter.rect_stroke(h, 1.0, Stroke::new(1.0, accent), egui::StrokeKind::Middle);
     }
@@ -3904,7 +3918,7 @@ fn hit_corner(m: &Mapper, r: &[f32; 4], screen: Pos2) -> Option<Pos2> {
         (pos2(r[0] + r[2], r[1] + r[3]), pos2(r[0], r[1])),
     ];
     for (c, opp) in corners {
-        if m.to_screen(c).distance(screen) <= 9.0 {
+        if m.to_screen(c).distance(screen) <= HANDLE_HIT {
             return Some(opp);
         }
     }
