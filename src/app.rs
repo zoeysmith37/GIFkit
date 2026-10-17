@@ -936,16 +936,46 @@ fn chip(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::Response 
     ui.add(egui::Button::new(text.into()).wrap_mode(egui::TextWrapMode::Extend).min_size(vec2(28.0, CHIP_H)))
 }
 
-/// Square flat icon button.
-fn icon_button(ui: &mut egui::Ui, icon: &str, enabled: bool) -> egui::Response {
-    let pal = p();
-    ui.add_enabled(enabled, egui::Button::new(RichText::new(icon).size(15.0).color(if enabled { pal.fg } else { pal.fg_muted })).frame_when_inactive(false).min_size(vec2(28.0, 28.0)))
+/// Outlined choice button (one of several), selected = highlighted.
+fn seg<T: PartialEq>(ui: &mut egui::Ui, current: &mut T, value: T, text: impl Into<egui::WidgetText>) -> egui::Response {
+    let mut r = ui.add(egui::Button::new(text.into()).selected(*current == value).wrap_mode(egui::TextWrapMode::Extend));
+    if r.clicked() && *current != value {
+        *current = value;
+        r.mark_changed();
+    }
+    r
 }
 
-/// Flat icon toggle; returns true when clicked.
+fn seg_label(ui: &mut egui::Ui, selected: bool, text: impl Into<egui::WidgetText>) -> egui::Response {
+    ui.add(egui::Button::new(text.into()).selected(selected).wrap_mode(egui::TextWrapMode::Extend))
+}
+
+/// Outlined on/off button.
+fn toggle_btn(ui: &mut egui::Ui, on: &mut bool, text: impl Into<egui::WidgetText>) -> egui::Response {
+    let mut r = ui.add(egui::Button::new(text.into()).selected(*on).wrap_mode(egui::TextWrapMode::Extend));
+    if r.clicked() {
+        *on = !*on;
+        r.mark_changed();
+    }
+    r
+}
+
+/// Square outlined icon button (panels, playback bar).
+fn icon_button(ui: &mut egui::Ui, icon: &str, enabled: bool) -> egui::Response {
+    let pal = p();
+    ui.add_enabled(enabled, egui::Button::new(RichText::new(icon).size(15.0).color(if enabled { pal.fg } else { pal.fg_muted })).min_size(vec2(TOOLBAR_H, TOOLBAR_H)))
+}
+
+/// Flat icon button for the top toolbar (frame only on hover, as in KDE toolbars).
+fn flat_icon(ui: &mut egui::Ui, icon: &str, enabled: bool) -> egui::Response {
+    let pal = p();
+    ui.add_enabled(enabled, egui::Button::new(RichText::new(icon).size(15.0).color(if enabled { pal.fg } else { pal.fg_muted })).frame_when_inactive(false).min_size(vec2(TOOLBAR_H, TOOLBAR_H)))
+}
+
+/// Outlined icon toggle; returns true when clicked.
 fn toggle_icon(ui: &mut egui::Ui, icon: &str, on: bool, tip: &str) -> bool {
     let pal = p();
-    ui.add(egui::Button::new(RichText::new(icon).size(15.0).color(if on { pal.fg } else { pal.fg_muted })).selected(on).frame_when_inactive(on).min_size(vec2(28.0, 28.0))).on_hover_text(tip).clicked()
+    ui.add(egui::Button::new(RichText::new(icon).size(15.0).color(if on { pal.fg } else { pal.fg_muted })).selected(on).min_size(vec2(TOOLBAR_H, TOOLBAR_H))).on_hover_text(tip).clicked()
 }
 
 /// One segment of a segmented control.
@@ -2424,11 +2454,11 @@ impl GifForgeApp {
             toolbar_sep(ui);
             let pending = self.committed.as_ref().map(|c| c.0 != self.live_sig()).unwrap_or(false);
             let undo_tip = self.undo.last().map(|u| format!("Undo {} (Ctrl+Z)", u.label)).unwrap_or_else(|| "Undo (Ctrl+Z)".into());
-            if icon_button(ui, "↶", idle && (pending || !self.undo.is_empty())).on_hover_text(undo_tip).clicked() {
+            if flat_icon(ui, "↶", idle && (pending || !self.undo.is_empty())).on_hover_text(undo_tip).clicked() {
                 self.do_undo();
             }
             let redo_tip = self.redo.last().map(|u| format!("Redo {} (Ctrl+Y)", u.label)).unwrap_or_else(|| "Redo (Ctrl+Y)".into());
-            if icon_button(ui, "↷", idle && !self.redo.is_empty()).on_hover_text(redo_tip).clicked() {
+            if flat_icon(ui, "↷", idle && !self.redo.is_empty()).on_hover_text(redo_tip).clicked() {
                 self.do_redo();
             }
             let hr = ui.add(egui::Button::new("").selected(self.history_open).frame_when_inactive(self.history_open).min_size(vec2(28.0, 28.0))).on_hover_text("History");
@@ -2458,7 +2488,7 @@ impl GifForgeApp {
                 }
                 let before = self.theme;
                 let mut about = false;
-                let mr = icon_button(ui, "⋮", true).on_hover_text("Theme, links and About");
+                let mr = flat_icon(ui, "⋮", true).on_hover_text("Theme, links and About");
                 egui::Popup::menu(&mr).show(|ui| {
                     ui.set_min_width(190.0);
                     ui.label(RichText::new("Theme").size(11.5).color(pal.fg_muted));
@@ -2645,17 +2675,17 @@ impl GifForgeApp {
                         self.bake(ctx, false);
                     }
                 });
-                ui.menu_button(RichText::new("+").size(16.0).color(pal.fg), |ui| {
+                let add = icon_button(ui, "+", true).on_hover_text("Add layer");
+                egui::Popup::menu(&add).show(|ui| {
                     for (t, label) in [(Tool::Effects, "Effects"), (Tool::Text, "Text"), (Tool::Censor, "Censor"), (Tool::AddImage, "Image…"), (Tool::Watermark, "Watermark"), (Tool::Shield, "AI shield")] {
                         let b = ui.add(egui::Button::new(format!("      {label}")).min_size(vec2(150.0, 0.0)));
                         paint_tool_icon(ui.painter(), t, pos2(b.rect.left() + 16.0, b.rect.center().y), 13.0, pal.fg);
                         if b.clicked() {
                             self.new_layer_of(t, ctx);
+                            ui.close();
                         }
                     }
-                })
-                .response
-                .on_hover_text("Add layer");
+                });
             });
         });
         if self.layers_collapsed {
@@ -3110,7 +3140,7 @@ impl GifForgeApp {
             if icon_button(ui, "|◀", true).on_hover_text("Previous frame (←)").clicked() {
                 self.step(-1);
             }
-            if ui.add(egui::Button::new(if self.playing { "❚❚" } else { "▶" }).min_size(vec2(34.0, 26.0))).on_hover_text("Play / pause (Space)").clicked() {
+            if ui.add(egui::Button::new(if self.playing { "❚❚" } else { "▶" }).min_size(vec2(36.0, TOOLBAR_H))).on_hover_text("Play or pause (Space)").clicked() {
                 self.playing = !self.playing;
             }
             if icon_button(ui, "▶|", true).on_hover_text("Next frame (→)").clicked() {
@@ -3141,7 +3171,7 @@ impl GifForgeApp {
                 if icon_button(ui, "1:1", true).on_hover_text("Actual size (1)").clicked() {
                     self.zoom_to(1.0);
                 }
-                if ui.add(egui::Button::new("Fit").selected(self.views[self.active()].zoom.is_none()).min_size(vec2(0.0, 24.0))).on_hover_text("Fit (F)").clicked() {
+                if ui.add(egui::Button::new("Fit").selected(self.views[self.active()].zoom.is_none()).min_size(vec2(0.0, TOOLBAR_H))).on_hover_text("Fit (F)").clicked() {
                     self.zoom_fit();
                 }
                 if icon_button(ui, "+", true).on_hover_text("Zoom in").clicked() {
@@ -3220,8 +3250,8 @@ impl GifForgeApp {
                         ExportFormat::Webp => {
                             let o = &mut self.webp_opts;
                             ui.horizontal(|ui| {
-                                ui.selectable_value(&mut o.lossless, false, "Lossy");
-                                ui.selectable_value(&mut o.lossless, true, "Lossless");
+                                seg(ui, &mut o.lossless, false, "Lossy");
+                                seg(ui, &mut o.lossless, true, "Lossless");
                             });
                             if !o.lossless {
                                 ui.add(egui::Slider::new(&mut o.quality, 0.0..=100.0).text("quality")).on_hover_text("75–90 looks like the original for most GIFs");
@@ -3247,11 +3277,11 @@ impl GifForgeApp {
                         }
                         ExportFormat::Frames => {
                             ui.horizontal(|ui| {
-                                ui.selectable_value(&mut self.split_fmt, SplitFormat::Png, "PNG");
-                                ui.selectable_value(&mut self.split_fmt, SplitFormat::Gif, "GIF");
+                                seg(ui, &mut self.split_fmt, SplitFormat::Png, "PNG");
+                                seg(ui, &mut self.split_fmt, SplitFormat::Gif, "GIF");
                                 ui.separator();
-                                ui.selectable_value(&mut self.frames_zip, false, "Folder");
-                                ui.selectable_value(&mut self.frames_zip, true, "ZIP").on_hover_text("ZIP files always contain PNGs");
+                                seg(ui, &mut self.frames_zip, false, "Folder");
+                                seg(ui, &mut self.frames_zip, true, "ZIP").on_hover_text("ZIP files always contain PNGs");
                             });
                             ui.horizontal(|ui| {
                                 ui.label("Prefix");
@@ -3290,8 +3320,8 @@ impl GifForgeApp {
                         ui.checkbox(&mut self.target_on, "Fit under").on_hover_text("Finds the best quality that fits. Quality drops first and size only if needed.");
                         ui.add_enabled_ui(self.target_on, |ui| {
                             ui.add(egui::DragValue::new(&mut self.target_val).range(0.01..=10000.0).speed(0.1).max_decimals(2));
-                            ui.selectable_value(&mut self.target_mb, true, "MiB");
-                            ui.selectable_value(&mut self.target_mb, false, "KiB");
+                            seg(ui, &mut self.target_mb, true, "MiB");
+                            seg(ui, &mut self.target_mb, false, "KiB");
                         });
                     });
                     if self.target_on {
@@ -4408,7 +4438,7 @@ impl GifForgeApp {
         let by_pct = &mut self.resize_by_pct;
         group(ui, "Size", |ui| {
             ui.horizontal(|ui| {
-                if ui.selectable_label(!*by_pct, "Pixels").clicked() && *by_pct {
+                if seg_label(ui, !*by_pct, "Pixels").clicked() && *by_pct {
                     *by_pct = false;
                     if tr.rs_pct > 0.0 {
                         // keep the current size when switching
@@ -4419,7 +4449,7 @@ impl GifForgeApp {
                         tr.rs_pct = 0.0;
                     }
                 }
-                if ui.selectable_label(*by_pct, "Percent").clicked() && !*by_pct {
+                if seg_label(ui, *by_pct, "Percent").clicked() && !*by_pct {
                     *by_pct = true;
                     let cur = match stack::resize_target(w, h, tr.rs_w, tr.rs_h, 0.0) {
                         Some((tw, _)) => tw as f32 / w.max(1) as f32 * 100.0,
@@ -4491,8 +4521,8 @@ impl GifForgeApp {
         let (w, h) = self.dims();
         ui.horizontal(|ui| {
             ui.label("Show");
-            ui.selectable_value(&mut self.crop_live, true, "With edits").on_hover_text("Show effects and layers on the whole frame");
-            ui.selectable_value(&mut self.crop_live, false, "Original").on_hover_text("Show the source frames only");
+            seg(ui, &mut self.crop_live, true, "With edits").on_hover_text("Show effects and layers on the whole frame");
+            seg(ui, &mut self.crop_live, false, "Original").on_hover_text("Show the source frames only");
         });
         hint(ui, "Drag on the image to set the crop");
         let tr = &mut self.stack.transform;
@@ -4557,14 +4587,14 @@ impl GifForgeApp {
         let before = format!("{} {} {} {} {} {} {} {:?}", tr.flip_v, tr.flip_h, tr.rot, tr.rot_any, tr.rot_deg, tr.rot_expand, tr.rot_bg_transparent, tr.rot_bg);
         group(ui, "Flip", |ui| {
             ui.horizontal(|ui| {
-                ui.toggle_value(&mut tr.flip_h, "↔ Horizontal");
-                ui.toggle_value(&mut tr.flip_v, "↕ Vertical");
+                toggle_btn(ui, &mut tr.flip_h, "↔ Horizontal");
+                toggle_btn(ui, &mut tr.flip_v, "↕ Vertical");
             });
         });
         group(ui, "Rotate", |ui| {
             ui.horizontal(|ui| {
                 for (deg, label) in [(0u16, "0°"), (90, "↻ 90°"), (180, "180°"), (270, "↺ 90°")] {
-                    if ui.selectable_label(tr.rot == deg, label).clicked() {
+                    if seg_label(ui, tr.rot == deg, label).clicked() {
                         tr.rot = deg;
                     }
                 }
@@ -4669,8 +4699,8 @@ impl GifForgeApp {
         let before = format!("{} {} {} {} {}", tr.cut_by_time, tr.cut_start, tr.cut_end, tr.cut_t0, tr.cut_t1);
         group(ui, "Range", |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut tr.cut_by_time, false, "Frames");
-                ui.selectable_value(&mut tr.cut_by_time, true, "Seconds");
+                seg(ui, &mut tr.cut_by_time, false, "Frames");
+                seg(ui, &mut tr.cut_by_time, true, "Seconds");
             });
             if tr.cut_by_time {
                 ui.horizontal(|ui| {
@@ -4751,8 +4781,8 @@ impl GifForgeApp {
             ui.horizontal(|ui| {
                 ui.label("Under");
                 ui.add(egui::DragValue::new(&mut self.target_val).range(0.01..=10000.0).speed(0.1).max_decimals(2));
-                ui.selectable_value(&mut self.target_mb, true, "MiB");
-                ui.selectable_value(&mut self.target_mb, false, "KiB");
+                seg(ui, &mut self.target_mb, true, "MiB");
+                seg(ui, &mut self.target_mb, false, "KiB");
                 find = ui.add_enabled(idle && self.export_fmt.can_target(), egui::Button::new("Find settings")).on_hover_text("Finds the best quality under this size and applies it. Quality drops first and size only if needed.").clicked();
             });
             ui.horizontal_wrapped(|ui| {
@@ -4807,8 +4837,8 @@ impl GifForgeApp {
                 let o = &mut self.webp_opts;
                 group(ui, "WebP", |ui| {
                     ui.horizontal(|ui| {
-                        ui.selectable_value(&mut o.lossless, false, "Lossy");
-                        ui.selectable_value(&mut o.lossless, true, "Lossless");
+                        seg(ui, &mut o.lossless, false, "Lossy");
+                        seg(ui, &mut o.lossless, true, "Lossless");
                     });
                     if !o.lossless {
                         ui.add(egui::Slider::new(&mut o.quality, 0.0..=100.0).text("quality")).on_hover_text("75–90 looks like the original for most GIFs");
@@ -4893,7 +4923,7 @@ impl GifForgeApp {
         if fx_layers.len() > 1 {
             ui.horizontal_wrapped(|ui| {
                 for (n, (i, id)) in fx_layers.iter().enumerate() {
-                    if ui.selectable_label(Some(*i) == sel, format!("Effects {}", n + 1)).clicked() {
+                    if seg_label(ui, Some(*i) == sel, format!("Effects {}", n + 1)).clicked() {
                         self.select(Kind::Effects, *id);
                     }
                 }
@@ -5076,7 +5106,7 @@ impl GifForgeApp {
         ui.horizontal_wrapped(|ui| {
             if items.len() > 1 {
                 for (i, id, name) in &items {
-                    if ui.selectable_label(Some(*i) == sel, name).clicked() {
+                    if seg_label(ui, Some(*i) == sel, name).clicked() {
                         self.select(kind, *id);
                     }
                 }
@@ -5162,9 +5192,9 @@ impl GifForgeApp {
                 ui.end_row();
                 ui.label("Align");
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut a.align, Align::Left, "L");
-                    ui.selectable_value(&mut a.align, Align::Center, "C");
-                    ui.selectable_value(&mut a.align, Align::Right, "R");
+                    seg(ui, &mut a.align, Align::Left, "L");
+                    seg(ui, &mut a.align, Align::Center, "C");
+                    seg(ui, &mut a.align, Align::Right, "R");
                 });
                 ui.end_row();
                 ui.label("Opacity");
@@ -5213,9 +5243,9 @@ impl GifForgeApp {
         let LayerKind::Censor(c) = &mut self.stack.layers[sel].kind else { return };
         group(ui, "Method", |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut c.method, CensorMethod::Pixelate, "Pixelate");
-                ui.selectable_value(&mut c.method, CensorMethod::Blur, "Blur");
-                ui.selectable_value(&mut c.method, CensorMethod::Solid, "Solid");
+                seg(ui, &mut c.method, CensorMethod::Pixelate, "Pixelate");
+                seg(ui, &mut c.method, CensorMethod::Blur, "Blur");
+                seg(ui, &mut c.method, CensorMethod::Solid, "Solid");
             });
             match c.method {
                 CensorMethod::Pixelate => {
@@ -5358,8 +5388,8 @@ impl GifForgeApp {
         if let LayerKind::Watermark(w) = &mut self.stack.layers[sel].kind {
             group(ui, "Content", |ui| {
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut w.use_image, false, "Text");
-                    ui.selectable_value(&mut w.use_image, true, "Image");
+                    seg(ui, &mut w.use_image, false, "Text");
+                    seg(ui, &mut w.use_image, true, "Image");
                 });
                 if w.use_image {
                     ui.horizontal(|ui| {
@@ -5410,8 +5440,8 @@ impl GifForgeApp {
             ui.add(soft_slider(&mut w.size, 1.0..=40.0, "size %")).on_hover_text("Size as a share of the frame's shorter side");
             ui.add(egui::Slider::new(&mut w.opacity, 0.0..=100.0).text("opacity %"));
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut w.tiled, false, "Single");
-                ui.selectable_value(&mut w.tiled, true, "Tiled");
+                seg(ui, &mut w.tiled, false, "Single");
+                seg(ui, &mut w.tiled, true, "Tiled");
             });
             if w.tiled {
                 ui.add(egui::Slider::new(&mut w.angle, -90.0..=90.0).text("angle °"));
@@ -5608,10 +5638,10 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
     });
     group_ex(ui, "Looks", true, on(&[fx.grayscale, fx.sepia, fx.monochrome, fx.negative, fx.tint, fx.change_bg]), |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.toggle_value(&mut fx.grayscale, "Grayscale");
-            ui.toggle_value(&mut fx.sepia, "Sepia");
-            ui.toggle_value(&mut fx.monochrome, "Mono").on_hover_text("Black and white only");
-            ui.toggle_value(&mut fx.negative, "Invert").on_hover_text("Negative colours");
+            toggle_btn(ui, &mut fx.grayscale, "Grayscale");
+            toggle_btn(ui, &mut fx.sepia, "Sepia");
+            toggle_btn(ui, &mut fx.monochrome, "Mono").on_hover_text("Black and white only");
+            toggle_btn(ui, &mut fx.negative, "Invert").on_hover_text("Negative colours");
         });
         ui.horizontal(|ui| {
             ui.checkbox(&mut fx.tint, "Tint");
@@ -5630,9 +5660,9 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
     group_ex(ui, "Transparency", false, on(&[fx.rc_white, fx.rc_black, fx.rc_custom]), |ui| {
         ui.horizontal(|ui| {
             ui.label("Remove");
-            ui.toggle_value(&mut fx.rc_white, "White");
-            ui.toggle_value(&mut fx.rc_black, "Black");
-            ui.toggle_value(&mut fx.rc_custom, "Colour");
+            toggle_btn(ui, &mut fx.rc_white, "White");
+            toggle_btn(ui, &mut fx.rc_black, "Black");
+            toggle_btn(ui, &mut fx.rc_custom, "Colour");
             if fx.rc_custom {
                 ui.color_edit_button_srgb(&mut fx.rc_color);
             }
@@ -5657,9 +5687,9 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
     });
     group_ex(ui, "Animation", false, on(&[tr.reverse, tr.boomerang, tr.set_loop, fx.counter, fx.fade_in, fx.fade_out]), |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.toggle_value(&mut tr.reverse, "Reverse");
-            ui.toggle_value(&mut tr.boomerang, "Boomerang");
-            ui.toggle_value(&mut fx.counter, "Timer").on_hover_text("Shows a running seconds counter");
+            toggle_btn(ui, &mut tr.reverse, "Reverse");
+            toggle_btn(ui, &mut tr.boomerang, "Boomerang");
+            toggle_btn(ui, &mut fx.counter, "Timer").on_hover_text("Shows a running seconds counter");
         });
         ui.horizontal(|ui| {
             ui.checkbox(&mut tr.set_loop, "Loop count");
@@ -5668,8 +5698,8 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
             }
         });
         ui.horizontal(|ui| {
-            ui.toggle_value(&mut fx.fade_in, "Fade in");
-            ui.toggle_value(&mut fx.fade_out, "Fade out");
+            toggle_btn(ui, &mut fx.fade_in, "Fade in");
+            toggle_btn(ui, &mut fx.fade_out, "Fade out");
             if fx.fade_in || fx.fade_out {
                 ui.add(egui::DragValue::new(&mut fx.fade_frames).range(1..=10000).suffix(" fr"));
                 ui.checkbox(&mut fx.fade_to_transparent, "to clear").on_hover_text("Fade to transparent instead of black");
@@ -5688,8 +5718,8 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
     });
     group_ex(ui, "Dither", false, on(&[fx.ordered_dither, fx.error_dither]), |ui| {
         ui.horizontal(|ui| {
-            ui.toggle_value(&mut fx.ordered_dither, "Ordered").on_hover_text("Regular pattern dithering");
-            ui.toggle_value(&mut fx.error_dither, "Diffusion").on_hover_text("Error diffusion dithering");
+            toggle_btn(ui, &mut fx.ordered_dither, "Ordered").on_hover_text("Regular pattern dithering");
+            toggle_btn(ui, &mut fx.error_dither, "Diffusion").on_hover_text("Error diffusion dithering");
         });
         if fx.ordered_dither || fx.error_dither {
             ui.add(egui::Slider::new(&mut fx.dither_levels, 2..=16).text("levels").clamping(egui::SliderClamping::Never));
@@ -5697,11 +5727,11 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
     });
     group_ex(ui, "Artistic", false, on(&[fx.oil, fx.emboss, fx.posterize, fx.solarize, fx.noise]), |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.toggle_value(&mut fx.oil, "Oil paint").on_hover_text("Smooths detail into brush-like patches");
-            ui.toggle_value(&mut fx.emboss, "Emboss").on_hover_text("Raised relief look");
-            ui.toggle_value(&mut fx.posterize, "Posterize").on_hover_text("Fewer colour steps");
-            ui.toggle_value(&mut fx.solarize, "Solarize").on_hover_text("Inverts the brightest tones");
-            ui.toggle_value(&mut fx.noise, "Noise").on_hover_text("Adds random grain");
+            toggle_btn(ui, &mut fx.oil, "Oil paint").on_hover_text("Smooths detail into brush-like patches");
+            toggle_btn(ui, &mut fx.emboss, "Emboss").on_hover_text("Raised relief look");
+            toggle_btn(ui, &mut fx.posterize, "Posterize").on_hover_text("Fewer colour steps");
+            toggle_btn(ui, &mut fx.solarize, "Solarize").on_hover_text("Inverts the brightest tones");
+            toggle_btn(ui, &mut fx.noise, "Noise").on_hover_text("Adds random grain");
         });
         if fx.oil {
             ui.add(egui::Slider::new(&mut fx.oil_radius, 1..=8).text("oil radius").clamping(egui::SliderClamping::Never));
@@ -5715,9 +5745,9 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
     });
     group_ex(ui, "Distort", false, on(&[fx.swirl, fx.implode, fx.wave]), |ui| {
         ui.horizontal(|ui| {
-            ui.toggle_value(&mut fx.swirl, "Swirl").on_hover_text("Twists the image around the centre");
-            ui.toggle_value(&mut fx.implode, "Implode").on_hover_text("Pulls the image toward the centre");
-            ui.toggle_value(&mut fx.wave, "Wave").on_hover_text("Ripples the image sideways");
+            toggle_btn(ui, &mut fx.swirl, "Swirl").on_hover_text("Twists the image around the centre");
+            toggle_btn(ui, &mut fx.implode, "Implode").on_hover_text("Pulls the image toward the centre");
+            toggle_btn(ui, &mut fx.wave, "Wave").on_hover_text("Ripples the image sideways");
         });
         if fx.swirl {
             ui.add(soft_slider(&mut fx.swirl_deg, -720.0..=720.0, "swirl °"));
@@ -5732,20 +5762,20 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
     });
     group_ex(ui, "Filters", false, on(&[fx.gotham, fx.lomo, fx.nashville, fx.toaster, fx.vignette, fx.polaroid]), |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.toggle_value(&mut fx.gotham, "Gotham").on_hover_text("Cool and gritty high contrast");
-            ui.toggle_value(&mut fx.lomo, "Lomo").on_hover_text("Saturated with dark corners");
-            ui.toggle_value(&mut fx.nashville, "Nashville").on_hover_text("Warm pink vintage tint");
-            ui.toggle_value(&mut fx.toaster, "Toaster").on_hover_text("Warm faded film look");
-            ui.toggle_value(&mut fx.vignette, "Vignette").on_hover_text("Darkens the corners");
-            ui.toggle_value(&mut fx.polaroid, "Polaroid").on_hover_text("White instant-photo frame");
+            toggle_btn(ui, &mut fx.gotham, "Gotham").on_hover_text("Cool and gritty high contrast");
+            toggle_btn(ui, &mut fx.lomo, "Lomo").on_hover_text("Saturated with dark corners");
+            toggle_btn(ui, &mut fx.nashville, "Nashville").on_hover_text("Warm pink vintage tint");
+            toggle_btn(ui, &mut fx.toaster, "Toaster").on_hover_text("Warm faded film look");
+            toggle_btn(ui, &mut fx.vignette, "Vignette").on_hover_text("Darkens the corners");
+            toggle_btn(ui, &mut fx.polaroid, "Polaroid").on_hover_text("White instant-photo frame");
         });
     });
     group_ex(ui, "Frame", false, on(&[fx.frame_camera, fx.frame_fuzzy, fx.frame_rounded, fx.frame_border]), |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.toggle_value(&mut fx.frame_camera, "Camera").on_hover_text("Viewfinder frame");
-            ui.toggle_value(&mut fx.frame_fuzzy, "Fuzzy").on_hover_text("Soft blurred edges");
-            ui.toggle_value(&mut fx.frame_rounded, "Rounded").on_hover_text("Rounded corners");
-            ui.toggle_value(&mut fx.frame_border, "Border").on_hover_text("Solid border");
+            toggle_btn(ui, &mut fx.frame_camera, "Camera").on_hover_text("Viewfinder frame");
+            toggle_btn(ui, &mut fx.frame_fuzzy, "Fuzzy").on_hover_text("Soft blurred edges");
+            toggle_btn(ui, &mut fx.frame_rounded, "Rounded").on_hover_text("Rounded corners");
+            toggle_btn(ui, &mut fx.frame_border, "Border").on_hover_text("Solid border");
         });
         if fx.frame_rounded {
             ui.add(soft_slider(&mut fx.rounded_radius, 1.0..=200.0, "radius px"));
@@ -5759,10 +5789,10 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
     });
     group_ex(ui, "Transform", false, on(&[fx.flip_v, fx.flip_h, fx.rot90, fx.rot270, fx.rot_any]), |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.toggle_value(&mut fx.flip_h, "↔ Flip");
-            ui.toggle_value(&mut fx.flip_v, "↕ Flip");
-            ui.toggle_value(&mut fx.rot90, "↻ 90°");
-            ui.toggle_value(&mut fx.rot270, "↺ 90°");
+            toggle_btn(ui, &mut fx.flip_h, "↔ Flip");
+            toggle_btn(ui, &mut fx.flip_v, "↕ Flip");
+            toggle_btn(ui, &mut fx.rot90, "↻ 90°");
+            toggle_btn(ui, &mut fx.rot270, "↺ 90°");
         });
         ui.horizontal(|ui| {
             ui.checkbox(&mut fx.rot_any, "Rotate");

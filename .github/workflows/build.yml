@@ -47,7 +47,7 @@ jobs:
           mkdir -p dist/gifforge-${{ matrix.name }}
           cp target/release/gifforge README.md dist/gifforge-${{ matrix.name }}/
           cp assets/*.txt dist/gifforge-${{ matrix.name }}/
-          cp assets/linux/gifforge.desktop assets/linux/install.sh assets/icon/gifforge.svg dist/gifforge-${{ matrix.name }}/
+          cp assets/linux/install.sh assets/icon/gifforge.svg dist/gifforge-${{ matrix.name }}/
           cp assets/icon/gifforge-256.png dist/gifforge-${{ matrix.name }}/gifforge.png
           tar -C dist -czf gifforge-${{ matrix.name }}.tar.gz gifforge-${{ matrix.name }}
 
