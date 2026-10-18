@@ -37,11 +37,10 @@ enum Tool {
     Shield,
     Cut,
     Frames,
-    Format,
 }
 
 impl Tool {
-    const ALL: [Tool; 15] = [
+    const ALL: [Tool; 14] = [
         Tool::Effects,
         Tool::Text,
         Tool::Censor,
@@ -55,7 +54,6 @@ impl Tool {
         Tool::Speed,
         Tool::Cut,
         Tool::Frames,
-        Tool::Format,
         Tool::Optimize,
     ];
     fn label(self) -> &'static str {
@@ -74,7 +72,6 @@ impl Tool {
             Tool::Shield => "AI shield",
             Tool::Cut => "Cut",
             Tool::Frames => "Frames",
-            Tool::Format => "Format",
         }
     }
     fn icon(self) -> &'static str {
@@ -93,7 +90,6 @@ impl Tool {
             Tool::Shield => "◈",
             Tool::Cut => "✄",
             Tool::Frames => "▤",
-            Tool::Format => "⬇",
         }
     }
     fn tip(self) -> &'static str {
@@ -112,7 +108,6 @@ impl Tool {
             Tool::Shield => "Noise that discourages AI training",
             Tool::Cut => "Keep a range of frames",
             Tool::Frames => "Edit, reorder and time single frames",
-            Tool::Format => "Output format and file options",
         }
     }
     fn title(self) -> &'static str {
@@ -121,7 +116,6 @@ impl Tool {
             Tool::Reverse => "Reverse / loop",
             Tool::Optimize => "Compression",
             Tool::AddImage => "Image",
-            Tool::Format => "Output format",
             _ => self.label(),
         }
     }
@@ -573,7 +567,6 @@ pub struct GifForgeApp {
     prep_cache: Option<(u64, Arc<stack::Prepared>)>,
     webp_opts: io::WebpOptions,
     avif_quality: u8,
-    target_on: bool,
     target_val: f32,
     target_mb: bool,
     history_open: bool,
@@ -678,15 +671,6 @@ fn paint_tool_icon(painter: &egui::Painter, t: Tool, c: Pos2, size: f32, col: Co
             painter.line_segment([c + vec2(-b, b), c + vec2(a + 1.5 * s, b)], stroke);
             painter.line_segment([c + vec2(-a - 1.5 * s, -b), c + vec2(b, -b)], stroke);
             painter.line_segment([c + vec2(b, -b), c + vec2(b, a + 1.5 * s)], stroke);
-        }
-        Tool::Format => {
-            // page with a folded corner
-            let (w, h, f) = (5.0 * s, 7.0 * s, 3.5 * s);
-            let pts = vec![c + vec2(-w, -h), c + vec2(w - f, -h), c + vec2(w, -h + f), c + vec2(w, h), c + vec2(-w, h), c + vec2(-w, -h)];
-            painter.add(egui::Shape::line(pts, stroke));
-            painter.add(egui::Shape::line(vec![c + vec2(w - f, -h), c + vec2(w - f, -h + f), c + vec2(w, -h + f)], stroke));
-            painter.line_segment([c + vec2(-2.5 * s, 1.0 * s), c + vec2(2.5 * s, 1.0 * s)], stroke);
-            painter.line_segment([c + vec2(-2.5 * s, 4.0 * s), c + vec2(2.5 * s, 4.0 * s)], stroke);
         }
         _ => {
             painter.text(c, egui::Align2::CENTER_CENTER, t.icon(), egui::FontId::proportional(size), col);
@@ -1160,7 +1144,6 @@ impl GifForgeApp {
             prep_cache: None,
             webp_opts: io::WebpOptions::default(),
             avif_quality: 60,
-            target_on: false,
             target_val: 9.5,
             target_mb: true,
             history_open: false,
@@ -1578,27 +1561,14 @@ impl GifForgeApp {
         });
     }
 
-    /// Frames: file type and where they go (Format panel and Export window).
-    fn frames_files_ui(&mut self, ui: &mut egui::Ui) {
+    /// Frames: file type and colours (Optimize panel).
+    fn frames_settings_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("Files");
             seg(ui, &mut self.split_fmt, SplitFormat::Png, "PNG");
-            ui.add_enabled_ui(!self.frames_zip, |ui| seg(ui, &mut self.split_fmt, SplitFormat::Gif, "GIF"));
+            seg(ui, &mut self.split_fmt, SplitFormat::Gif, "GIF").on_hover_text("Single-frame GIFs. ZIP export needs PNG.");
         });
-        ui.horizontal(|ui| {
-            ui.label("Save to");
-            seg(ui, &mut self.frames_zip, false, "Folder");
-            seg(ui, &mut self.frames_zip, true, "ZIP").on_hover_text("ZIP files always contain PNGs");
-        });
-        ui.horizontal(|ui| {
-            ui.label("Prefix");
-            ui.add(egui::TextEdit::singleline(&mut self.split_prefix).desired_width(140.0)).on_hover_text("Files are named prefix_000, prefix_001 and so on");
-        });
-    }
-
-    /// Frames: colour settings (Optimize panel).
-    fn frames_colours_ui(&mut self, ui: &mut egui::Ui) {
-        if self.split_fmt == SplitFormat::Png || self.frames_zip {
+        if self.split_fmt == SplitFormat::Png {
             Self::png_colours_ui(ui, &mut self.frames_png);
         } else {
             ui.add(egui::Slider::new(&mut self.gif_opts.colors, 2..=256).text("colours"));
@@ -1615,11 +1585,11 @@ impl GifForgeApp {
         format!("{cols}×{rows} frames · {cw}×{ch} px{used}")
     }
 
-    /// Sprite sheet layout and metadata files (Format panel and Export window).
-    fn sheet_layout_ui(&mut self, ui: &mut egui::Ui, id: &str) {
+    /// Sprite sheet layout (Optimize panel).
+    fn sheet_layout_ui(&mut self, ui: &mut egui::Ui) {
         let n = self.plan.iter().filter(|f| f.enabled).count().max(1) as u32;
         let s = &mut self.sheet;
-        egui::Grid::new(("sheetgrid", id)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+        egui::Grid::new("sheetgrid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
             ui.label("Columns");
             ui.add(egui::DragValue::new(&mut s.columns).range(0..=n)).on_hover_text("0 picks the layout automatically");
             ui.end_row();
@@ -1630,42 +1600,68 @@ impl GifForgeApp {
         ui.checkbox(&mut s.pow2, "Power-of-two size").on_hover_text("Pads the sheet to sizes like 512, 1024 or 2048 as most game engines expect. Automatic columns then pick the smallest such sheet.");
         let h = self.sheet_hint();
         hint(ui, &h);
-        let s = &mut self.sheet;
-        ui.checkbox(&mut s.write_json, "JSON metadata");
-        ui.checkbox(&mut s.write_godot, "Godot SpriteFrames (.tres)").on_hover_text("Assign the .tres to an AnimatedSprite2D/3D. Frame delays are kept.");
-        if s.write_godot {
-            ui.horizontal(|ui| {
-                ui.label("res://");
-                ui.add(egui::TextEdit::singleline(&mut s.godot_res_dir).desired_width(110.0)).on_hover_text("Where the PNG will sit in your Godot project");
-            });
-            ui.horizontal(|ui| {
-                ui.label("Animation");
-                ui.add(egui::TextEdit::singleline(&mut s.anim_name).desired_width(110.0));
-            });
-        }
     }
 
-    /// File options of the current format (not compression).
-    fn format_options_ui(&mut self, ui: &mut egui::Ui, id: &str) {
-        match self.export_fmt {
-            ExportFormat::Gif => {
-                ui.checkbox(&mut self.gif_opts.noai_tag, "Add “noai” tag").on_hover_text("Adds a “noai, noimageai” note to the file. Some sites and scrapers respect it.");
-                hint(ui, "Looping and timing are in Frames");
+    /// Options that only matter when writing the file (Export window).
+    fn save_options_ui(&mut self, ui: &mut egui::Ui) {
+        let noai_tip = "Adds a “noai, noimageai” note to the file. Some sites and scrapers respect it.";
+        egui::Grid::new("saveopts").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+            match self.export_fmt {
+                ExportFormat::Gif | ExportFormat::Apng => {
+                    ui.label("Tag");
+                    ui.checkbox(&mut self.gif_opts.noai_tag, "Add “noai” tag").on_hover_text(noai_tip);
+                    ui.end_row();
+                }
+                ExportFormat::Frames => {
+                    if self.split_fmt == SplitFormat::Gif {
+                        self.frames_zip = false;
+                    }
+                    ui.label("Save to");
+                    ui.horizontal(|ui| {
+                        seg(ui, &mut self.frames_zip, false, "Folder");
+                        ui.add_enabled_ui(self.split_fmt == SplitFormat::Png, |ui| seg(ui, &mut self.frames_zip, true, "ZIP").on_disabled_hover_text("ZIP holds PNG frames. Pick PNG in Optimize."));
+                    });
+                    ui.end_row();
+                    ui.label("Prefix");
+                    ui.add(egui::TextEdit::singleline(&mut self.split_prefix).desired_width(160.0)).on_hover_text("Files are named prefix_000, prefix_001 and so on");
+                    ui.end_row();
+                }
+                ExportFormat::Sheet => {
+                    let s = &mut self.sheet;
+                    ui.label("Also write");
+                    ui.vertical(|ui| {
+                        ui.checkbox(&mut s.write_json, "JSON metadata");
+                        ui.checkbox(&mut s.write_godot, "Godot SpriteFrames (.tres)").on_hover_text("Assign the .tres to an AnimatedSprite2D/3D. Frame delays are kept.");
+                    });
+                    ui.end_row();
+                    if s.write_godot {
+                        ui.label("Godot path");
+                        ui.add(egui::TextEdit::singleline(&mut s.godot_res_dir).desired_width(170.0)).on_hover_text("Where the PNG will sit in your Godot project");
+                        ui.end_row();
+                        ui.label("Animation");
+                        ui.add(egui::TextEdit::singleline(&mut s.anim_name).desired_width(130.0));
+                        ui.end_row();
+                    }
+                }
+                _ => {}
             }
-            ExportFormat::Apng => {
-                ui.checkbox(&mut self.gif_opts.noai_tag, "Add “noai” tag").on_hover_text("Adds a “noai, noimageai” note to the file. Some sites and scrapers respect it.");
-            }
-            ExportFormat::Webp | ExportFormat::Avif => hint(ui, "No file options. Quality is in Optimize."),
-            ExportFormat::Mp4 => {
+            let folder = self.export_fmt == ExportFormat::Frames && !self.frames_zip;
+            if !folder {
+                ui.label("Name");
                 ui.horizontal(|ui| {
-                    ui.label("Background");
-                    ui.color_edit_button_srgb(&mut self.video_bg).on_hover_text("MP4 has no transparency. This colour fills it.");
+                    if ui.add(egui::TextEdit::singleline(&mut self.export_name).desired_width(170.0)).changed() {
+                        self.export_name_edited = !self.export_name.trim().is_empty();
+                    }
+                    ui.label(RichText::new(format!(".{}", self.export_ext())).color(p().fg_muted));
                 });
+                ui.end_row();
             }
-            ExportFormat::Webm => hint(ui, "VP9 video that keeps transparency"),
-            ExportFormat::Frames => self.frames_files_ui(ui),
-            ExportFormat::Sheet => self.sheet_layout_ui(ui, id),
-        }
+            ui.label("");
+            if ui.checkbox(&mut self.open_after_save, "Open the folder after saving").changed() {
+                theme::set_setting("open_after_save", if self.open_after_save { "1" } else { "0" });
+            }
+            ui.end_row();
+        });
     }
 
     /// One line describing the compression settings in use.
@@ -1706,37 +1702,6 @@ impl GifForgeApp {
             self.export_fmt = f;
         }
         r
-    }
-
-    /// Format list with a short description under each name.
-    fn format_list_ui(&mut self, ui: &mut egui::Ui) {
-        let pal = *p();
-        ui.spacing_mut().item_spacing.y = 4.0;
-        for f in ExportFormat::ALL {
-            let en = !f.needs_ffmpeg() || self.ffmpeg;
-            let sel = self.export_fmt == f;
-            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), if en { Sense::click() } else { Sense::hover() });
-            let painter = ui.painter();
-            let (fill, stroke) = if sel {
-                (pal.highlight_soft, pal.highlight)
-            } else if resp.hovered() && en {
-                (pal.button_hover, pal.highlight)
-            } else {
-                (pal.button, pal.border_strong)
-            };
-            painter.rect_filled(r, 3.0, fill);
-            painter.rect_stroke(r, 3.0, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
-            let fg = if en { pal.fg } else { pal.fg_muted };
-            painter.text(r.left_top() + vec2(10.0, 5.0), egui::Align2::LEFT_TOP, f.label(), theme::medium(13.5), fg);
-            let sub = if en { f.tip() } else { "Needs ffmpeg on PATH" };
-            let g = painter.layout_no_wrap(sub.to_string(), egui::FontId::proportional(11.5), pal.fg_muted);
-            let clip = Rect::from_min_max(r.min, pos2(r.right() - 8.0, r.bottom()));
-            ui.painter_at(clip).galley(r.left_top() + vec2(10.0, 22.0), g, pal.fg_muted);
-            if resp.clicked() {
-                self.export_fmt = f;
-            }
-            resp.on_hover_cursor(if en { egui::CursorIcon::PointingHand } else { egui::CursorIcon::NotAllowed });
-        }
     }
 
     /// File name stem for the save dialog.
@@ -3506,14 +3471,7 @@ impl GifForgeApp {
                     ui.add_space(8.0);
                     ui.vertical(|ui| {
                         ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            self.format_menu(ui, 28.0);
-                            if ui.link("Format options").clicked() {
-                                self.tool = Tool::Format;
-                                cancel = true;
-                            }
-                        });
-                        ui.add_space(4.0);
+                        ui.label(RichText::new(self.export_fmt.label()).font(theme::medium(17.0)).color(pal.fg));
                         let fresh = self.cmp.as_ref().filter(|c| c.key == self.cmp_key());
                         match fresh {
                             Some(c) => {
@@ -3551,33 +3509,20 @@ impl GifForgeApp {
                                 cancel = true;
                             }
                         });
-                        ui.add_space(6.0);
-                        ui.separator();
+                        ui.add_space(10.0);
+                        ui.label(RichText::new("Save options").font(theme::medium(13.5)).color(pal.fg));
                         ui.add_space(2.0);
-                        self.format_options_ui(ui, "dialog");
-                        if self.export_fmt.can_target() {
-                            self.fit_under_ui(ui);
-                        }
+                        egui::Frame::new().fill(mix(pal.window, pal.view, 0.35)).stroke(Stroke::new(1.0, pal.border)).corner_radius(3.0).inner_margin(10.0).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            self.save_options_ui(ui);
+                        });
                     });
                 });
                 ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(4.0);
                 let folder = self.export_fmt == ExportFormat::Frames && !self.frames_zip;
                 ui.horizontal(|ui| {
                     if folder {
                         hint(ui, "You'll pick a folder for the frames");
-                    } else {
-                        ui.label("Name");
-                        if ui.add(egui::TextEdit::singleline(&mut self.export_name).desired_width(220.0)).changed() {
-                            self.export_name_edited = !self.export_name.trim().is_empty();
-                        }
-                        ui.label(RichText::new(format!(".{}", self.export_ext())).color(pal.fg_muted));
-                    }
-                });
-                ui.horizontal(|ui| {
-                    if ui.checkbox(&mut self.open_after_save, "Open the folder after saving").changed() {
-                        theme::set_setting("open_after_save", if self.open_after_save { "1" } else { "0" });
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         go = primary(ui, if folder { "Choose folder…" } else { "Save…" });
@@ -3686,27 +3631,6 @@ impl GifForgeApp {
             return;
         }
         self.pending_open = None;
-        if self.target_on && self.export_fmt.can_target() {
-            let (ext, fmt) = match self.export_fmt {
-                ExportFormat::Gif => ("gif", crate::target::TargetFormat::Gif(self.gif_opts.clone())),
-                ExportFormat::Webp => ("webp", crate::target::TargetFormat::Webp(self.webp_opts)),
-                _ => ("avif", crate::target::TargetFormat::Avif(self.avif_quality)),
-            };
-            let max = self.target_bytes();
-            if let Some(path) = self.save_path(ext, &[ext]) {
-                self.run_export(ctx, &format!("Fitting under {}", fmt_size(max)), move |a, p| {
-                    let fit = crate::target::fit(a, &fmt, max, p)?;
-                    std::fs::write(&path, &fit.bytes)?;
-                    let n = fit.bytes.len() as u64;
-                    if fit.reached {
-                        Ok(format!("Saved {} ({}, {})", path.display(), fmt_size(n), fit.settings))
-                    } else {
-                        Ok(format!("Couldn't reach target – smallest is {} ({}). Saved anyway.", fmt_size(n), fit.settings))
-                    }
-                });
-            }
-            return;
-        }
         // the preview already holds the encoded file: save it directly
         let reuse = !matches!(self.export_fmt, ExportFormat::Frames | ExportFormat::Sheet) && !(self.export_fmt == ExportFormat::Apng && self.gif_opts.noai_tag);
         if reuse && self.preview_format().is_some() {
@@ -4743,7 +4667,6 @@ impl GifForgeApp {
             Tool::Shield => self.ui_shield(ui, ctx),
             Tool::Cut => self.ui_cut(ui, ctx),
             Tool::Frames => self.ui_frames(ui, ctx),
-            Tool::Format => self.ui_format(ui, ctx),
         }
     }
 
@@ -5091,9 +5014,6 @@ impl GifForgeApp {
         ui.horizontal(|ui| {
             ui.label("Format");
             self.format_menu(ui, 26.0);
-            if ui.link("Options").on_hover_text("File options for this format").clicked() {
-                self.tool = Tool::Format;
-            }
         });
         ui.add_space(4.0);
         let cur_key = self.cmp_key();
@@ -5122,29 +5042,34 @@ impl GifForgeApp {
         let mut find = false;
         let mut reset = false;
         let idle = !self.busy();
-        group(ui, "Target size", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Under");
-                ui.add(egui::DragValue::new(&mut self.target_val).range(0.01..=10000.0).speed(0.1).max_decimals(2));
-                seg(ui, &mut self.target_mb, true, "MiB");
-                seg(ui, &mut self.target_mb, false, "KiB");
-                find = ui.add_enabled(idle && self.export_fmt.can_target(), egui::Button::new("Find settings")).on_hover_text("Finds the best quality under this size and applies it. Quality drops first and size only if needed.").clicked();
-            });
-            ui.horizontal_wrapped(|ui| {
-                for (lbl, v, mb) in TARGET_PRESETS {
-                    if chip(ui, lbl).clicked() {
-                        self.target_val = v;
-                        self.target_mb = mb;
-                    }
+        if self.export_fmt.can_target() {
+            group(ui, "Target size", |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Limit");
+                    ui.add(egui::DragValue::new(&mut self.target_val).range(0.01..=10000.0).speed(0.1).max_decimals(2));
+                    seg(ui, &mut self.target_mb, true, "MiB");
+                    seg(ui, &mut self.target_mb, false, "KiB");
+                    let r = ui.add(egui::Button::new("Presets  ▾").min_size(vec2(0.0, 26.0))).on_hover_text("Common upload limits");
+                    egui::Popup::menu(&r).show(|ui| {
+                        ui.set_min_width(170.0);
+                        for (lbl, v, mb) in TARGET_PRESETS {
+                            if ui.button(lbl).clicked() {
+                                self.target_val = v;
+                                self.target_mb = mb;
+                            }
+                        }
+                    });
+                });
+                if ui.checkbox(&mut self.fit_keep_size, "Keep frame size").on_hover_text("Only change compression and never shrink the frames").changed() {
+                    theme::set_setting("fit_keep_size", if self.fit_keep_size { "1" } else { "0" });
                 }
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    find = ui.add_enabled(idle, egui::Button::new(RichText::new("Find settings").font(theme::medium(13.5))).min_size(vec2(130.0, 28.0))).on_hover_text("Finds the best quality under the limit and applies it. Quality drops first and size only if needed.").clicked();
+                    reset = ui.add_enabled(idle, egui::Button::new("Reset").min_size(vec2(0.0, 28.0))).on_hover_text("Back to lossless settings. Also undoes any downscale from Find settings.").clicked();
+                });
             });
-        });
-        ui.horizontal(|ui| {
-            if ui.checkbox(&mut self.fit_keep_size, "Keep size").on_hover_text("Find settings changes compression only and never shrinks the frames").changed() {
-                theme::set_setting("fit_keep_size", if self.fit_keep_size { "1" } else { "0" });
-            }
-            reset = ui.add_enabled(idle, egui::Button::new("Reset compression")).on_hover_text("Go back to lossless settings and undo any downscale from Find settings").clicked();
-        });
+        }
         if reset {
             self.undo_last_fit();
             self.gif_opts = GifOptions { noai_tag: self.gif_opts.noai_tag, ..GifOptions::default() };
@@ -5199,18 +5124,27 @@ impl GifForgeApp {
                 });
                 return;
             }
+            ExportFormat::Mp4 => {
+                group(ui, "MP4", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Background");
+                        ui.color_edit_button_srgb(&mut self.video_bg).on_hover_text("MP4 has no transparency. This colour fills it.");
+                    });
+                });
+                return;
+            }
             ExportFormat::Apng => {
                 hint(ui, "APNG is lossless and has no settings");
                 return;
             }
             ExportFormat::Frames => {
-                group(ui, "Colours", |ui| self.frames_colours_ui(ui));
+                group(ui, "Frames", |ui| self.frames_settings_ui(ui));
                 return;
             }
             ExportFormat::Sheet => {
-                group(ui, "Colours", |ui| Self::png_colours_ui(ui, &mut self.sheet.png));
-                let h = self.sheet_hint();
-                hint(ui, &format!("Sheet is {h}. The compressed view shows all of it."));
+                group(ui, "Layout", |ui| self.sheet_layout_ui(ui));
+                group(ui, "PNG", |ui| Self::png_colours_ui(ui, &mut self.sheet.png));
+                hint(ui, "The compressed view shows the whole sheet");
                 return;
             }
             _ => {
@@ -5261,37 +5195,6 @@ impl GifForgeApp {
             let n = self.opt_drop_nth;
             self.run_anim(ctx, "Drop frames", move |a, _| Ok(ops::drop_every_nth(a, n)));
         }
-    }
-
-    fn ui_format(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
-        group(ui, "Format", |ui| self.format_list_ui(ui));
-        let title = format!("{} options", self.export_fmt.label());
-        group(ui, &title, |ui| self.format_options_ui(ui, "panel"));
-        group(ui, "Saving", |ui| {
-            if self.export_fmt.can_target() {
-                self.fit_under_ui(ui);
-            }
-            if ui.checkbox(&mut self.open_after_save, "Open the folder after saving").changed() {
-                theme::set_setting("open_after_save", if self.open_after_save { "1" } else { "0" });
-            }
-        });
-        ui.horizontal(|ui| {
-            hint(ui, &self.comp_summary());
-            if ui.link("Compression").on_hover_text("Open Optimize").clicked() {
-                self.tool = Tool::Optimize;
-            }
-        });
-    }
-
-    fn fit_under_ui(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.target_on, "Fit under").on_hover_text("When saving, finds the best quality that fits. Quality drops first and size only if needed.");
-            ui.add_enabled_ui(self.target_on, |ui| {
-                ui.add(egui::DragValue::new(&mut self.target_val).range(0.01..=10000.0).speed(0.1).max_decimals(2));
-                seg(ui, &mut self.target_mb, true, "MiB");
-                seg(ui, &mut self.target_mb, false, "KiB");
-            });
-        });
     }
 
     fn ui_effects(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {

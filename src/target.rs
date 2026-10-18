@@ -127,6 +127,7 @@ fn locked_ladder(fmt: &TargetFormat) -> Vec<Rung> {
 }
 
 /// Scale every frame (Lanczos-ish triangle filter, alpha kept).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn scaled(anim: &Animation, s: f32) -> Animation {
     if s >= 0.999 {
         return anim.clone();
@@ -169,6 +170,7 @@ fn make_fit(rungs: &[Rung], i: usize, bytes: Vec<u8>, reached: bool) -> Fit {
 
 /// Find the highest-quality settings whose output is at most `max_bytes`.
 /// Binary search over a quality ladder (sizes are close to monotonic).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn fit(anim: &Animation, fmt: &TargetFormat, max_bytes: u64, trials: &AtomicUsize) -> Result<Fit> {
     fit_with(fmt, max_bytes, true, trials, |s| scaled(anim, s))
 }
