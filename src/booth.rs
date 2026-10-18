@@ -143,10 +143,10 @@ pub fn apply(src: &RgbaImage, fx: BoothFx, amount: f32, cx: f32, cy: f32) -> Rgb
             let mut out = src.clone();
             out.par_chunks_mut(4).zip(blur.par_chunks(4)).for_each(|(o, b)| {
                 for c in 0..3 {
-                    let s = o[c] as f32 / 255.0 * 1.06;
+                    let s = o[c] as f32 / 255.0 * (1.0 + 0.06 * a);
                     let g = b[c] as f32 / 255.0;
                     let screen = 1.0 - (1.0 - s) * (1.0 - g);
-                    o[c] = c8(lerp(s, screen, 0.35 + 0.65 * a) * 255.0);
+                    o[c] = c8(lerp(s, screen, a) * 255.0);
                 }
             });
             out
@@ -260,9 +260,9 @@ pub fn apply(src: &RgbaImage, fx: BoothFx, amount: f32, cx: f32, cy: f32) -> Rgb
         }
         BoothFx::Bulge | BoothFx::Dent | BoothFx::FishEye => {
             let (r0, k) = match fx {
-                BoothFx::Bulge => (rad * 1.1, 0.25 + a * 1.4),
-                BoothFx::Dent => (rad * 1.1, -(0.2 + a * 0.6)),
-                _ => (w.max(h) as f32 * 0.5, 0.4 + a * 1.2),
+                BoothFx::Bulge => (rad * 1.1, a * 1.65),
+                BoothFx::Dent => (rad * 1.1, -(a * 0.8)),
+                _ => (w.max(h) as f32 * 0.5, a * 1.6),
             };
             let fish = fx == BoothFx::FishEye;
             let mut out = warp(src, true, |x, y| {
@@ -281,7 +281,7 @@ pub fn apply(src: &RgbaImage, fx: BoothFx, amount: f32, cx: f32, cy: f32) -> Rgb
                 out.par_chunks_mut(4).enumerate().for_each(|(i, o)| {
                     let (x, y) = ((i as u32 % w) as f32 + 0.5, (i as u32 / w) as f32 + 0.5);
                     let d = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
-                    let m = ((r0 - d) / 1.5).clamp(0.0, 1.0);
+                    let m = lerp(1.0, ((r0 - d) / 1.5).clamp(0.0, 1.0), a);
                     for c in 0..3 {
                         o[c] = c8(o[c] as f32 * m);
                     }
@@ -290,7 +290,7 @@ pub fn apply(src: &RgbaImage, fx: BoothFx, amount: f32, cx: f32, cy: f32) -> Rgb
             out
         }
         BoothFx::Twirl => {
-            let ang = (90.0 + a * 450.0).to_radians();
+            let ang = (a * 540.0).to_radians();
             let r0 = rad * 1.2;
             warp(src, true, |x, y| {
                 let (dx, dy) = (x - cx, y - cy);
@@ -336,7 +336,7 @@ pub fn apply(src: &RgbaImage, fx: BoothFx, amount: f32, cx: f32, cy: f32) -> Rgb
                 if d <= r0 {
                     return (x, y);
                 }
-                let s = (r0 + (d - r0) * 0.04) / d;
+                let s = (r0 + (d - r0) * lerp(1.0, 0.04, a)) / d;
                 (cx + dx * s, cy + dy * s)
             })
         }

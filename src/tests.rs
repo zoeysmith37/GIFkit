@@ -1091,3 +1091,15 @@ fn project_round_trip() {
     assert!(load(&dir.join("bad.gifkit")).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn booth_zero_strength_is_identity() {
+    use crate::booth::{apply, BoothFx};
+    let a = synth(false);
+    let src = &a.frames[3].image;
+    for fx in [BoothFx::Glow, BoothFx::Bulge, BoothFx::Dent, BoothFx::Twirl, BoothFx::Squeeze, BoothFx::Stretch, BoothFx::Tunnel, BoothFx::FishEye] {
+        let out = apply(src, fx, 0.0, 50.0, 50.0);
+        let worst = out.pixels().zip(src.pixels()).map(|(p, q)| (0..4).map(|c| (p[c] as i32 - q[c] as i32).abs()).max().unwrap_or(0)).max().unwrap_or(0);
+        assert!(worst <= 1, "{fx:?} at 0% still changes pixels by {worst}");
+    }
+}
