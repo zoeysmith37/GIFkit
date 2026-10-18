@@ -2,7 +2,7 @@
 
 use crate::anim::{effective_delay, Animation};
 use crate::effects::{CensorMethod, CensorSettings, EffectSettings, ShieldSettings};
-use crate::shapes::{MarkupSettings, PenMode, PenStroke, ShapeKind, ShapeSettings};
+use crate::shapes::{EmojiSettings, MarkupSettings, PenMode, PenStroke, ShapeKind, ShapeSettings};
 use crate::geo::{map_box, source_angle, unmap_box, Affine, Obb};
 use crate::encode::GifOptions;
 use crate::io::{self, SheetOptions, SplitFormat, VideoFormat};
@@ -40,13 +40,15 @@ enum Tool {
     Frames,
     Shapes,
     Markup,
+    Emoji,
 }
 
 impl Tool {
-    const ALL: [Tool; 16] = [
+    const ALL: [Tool; 17] = [
         Tool::Effects,
         Tool::Text,
         Tool::Shapes,
+        Tool::Emoji,
         Tool::Markup,
         Tool::Censor,
         Tool::AddImage,
@@ -79,6 +81,7 @@ impl Tool {
             Tool::Frames => "Frames",
             Tool::Shapes => "Shapes",
             Tool::Markup => "Markup",
+            Tool::Emoji => "Emoji",
         }
     }
     fn icon(self) -> &'static str {
@@ -99,6 +102,7 @@ impl Tool {
             Tool::Frames => "▤",
             Tool::Shapes => "◆",
             Tool::Markup => "✎",
+            Tool::Emoji => "☺",
         }
     }
     fn tip(self) -> &'static str {
@@ -117,7 +121,8 @@ impl Tool {
             Tool::Shield => "Noise that discourages AI training",
             Tool::Cut => "Keep a range of frames",
             Tool::Frames => "Edit, reorder and time single frames",
-            Tool::Shapes => "Shapes, arrows, speech bubbles and emoji",
+            Tool::Shapes => "Shapes, arrows and speech bubbles",
+            Tool::Emoji => "Emoji stickers",
             Tool::Markup => "Draw and highlight with a pen",
         }
     }
@@ -140,12 +145,13 @@ impl Tool {
             Tool::Shield => Some(Kind::Shield),
             Tool::Shapes => Some(Kind::Shape),
             Tool::Markup => Some(Kind::Markup),
+            Tool::Emoji => Some(Kind::Emoji),
             _ => None,
         }
     }
     /// Tools that use left-drag on the canvas (otherwise left-drag pans).
     fn uses_canvas_drag(self) -> bool {
-        matches!(self, Tool::Crop | Tool::Text | Tool::Censor | Tool::AddImage | Tool::Shapes | Tool::Markup)
+        matches!(self, Tool::Crop | Tool::Text | Tool::Censor | Tool::AddImage | Tool::Shapes | Tool::Markup | Tool::Emoji)
     }
 }
 
@@ -159,6 +165,7 @@ fn kind_tool(k: Kind) -> Tool {
         Kind::Shield => Tool::Shield,
         Kind::Shape => Tool::Shapes,
         Kind::Markup => Tool::Markup,
+        Kind::Emoji => Tool::Emoji,
     }
 }
 
@@ -620,12 +627,25 @@ pub struct GifKitApp {
     /// style for the next shape drawn
     shape_tpl: ShapeSettings,
     emoji_tex: HashMap<String, TextureHandle>,
+    /// emoji picker: current pick (file), skin tone, search, tab, recent picks, click mode
+    emoji_pick: String,
+    emoji_tone: usize,
+    emoji_search: String,
+    emoji_tab: EmojiTab,
+    emoji_recent: Vec<String>,
+    emoji_replace: bool,
     pen: PenStroke,
     highlighter: PenStroke,
     pen_tool: PenTool,
     pen_scope: PenScope,
     /// stroke being drawn: (layer id, points in the viewport's image space, space)
     pen_live: Option<(u64, Vec<Pos2>, Space)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EmojiTab {
+    Recent,
+    Group(u8),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -710,6 +730,17 @@ fn paint_tool_icon(painter: &egui::Painter, t: Tool, c: Pos2, size: f32, col: Co
             let a = 4.8 * s;
             painter.rect_stroke(Rect::from_center_size(c + vec2(-2.4 * s, -2.4 * s), vec2(a * 2.0, a * 2.0)), 1.5 * s, stroke, egui::StrokeKind::Middle);
             painter.circle_filled(c + vec2(3.0 * s, 3.0 * s), 4.6 * s, col);
+        }
+        Tool::Emoji => {
+            // a smiley face
+            painter.circle_stroke(c, 7.0 * s, stroke);
+            painter.circle_filled(c + vec2(-2.6 * s, -1.8 * s), 1.2 * s, col);
+            painter.circle_filled(c + vec2(2.6 * s, -1.8 * s), 1.2 * s, col);
+            let pts: Vec<Pos2> = (0..=10).map(|i| {
+                let a = (20.0 + 140.0 * i as f32 / 10.0).to_radians();
+                c + vec2(a.cos(), a.sin()) * 4.0 * s
+            }).collect();
+            painter.add(egui::Shape::line(pts, stroke));
         }
         Tool::Markup => {
             // a pen drawn at 45° over a squiggle
@@ -855,6 +886,7 @@ fn changed_fields(a: &LayerKind, b: &LayerKind) -> String {
             LayerKind::Shield(x) => serde_json::to_value(x).ok(),
             LayerKind::Shape(x) => serde_json::to_value(&**x).ok(),
             LayerKind::Markup(x) => Some(serde_json::json!({ "strokes": x.strokes.len() })),
+            LayerKind::Emoji(x) => serde_json::to_value(&**x).ok(),
             LayerKind::Overlay(_) => None,
         }
     };
@@ -961,6 +993,7 @@ fn kind_key(k: Kind) -> &'static str {
         Kind::Shield => "shield",
         Kind::Shape => "shape",
         Kind::Markup => "markup",
+        Kind::Emoji => "emoji",
     }
 }
 
@@ -1277,6 +1310,12 @@ impl GifKitApp {
             transport_right_w: 430.0,
             shape_tpl: ShapeSettings::default(),
             emoji_tex: HashMap::new(),
+            emoji_pick: "1f600".into(),
+            emoji_tone: theme::get_setting("emoji_tone").and_then(|v| v.parse().ok()).filter(|t: &usize| *t <= 5).unwrap_or(0),
+            emoji_search: String::new(),
+            emoji_tab: EmojiTab::Group(0),
+            emoji_recent: theme::get_setting("recent_emoji").map(|v| v.split(',').filter(|s| !s.is_empty()).map(String::from).collect()).unwrap_or_default(),
+            emoji_replace: false,
             pen: PenStroke::default(),
             highlighter: PenStroke { color: [255, 230, 0], width: 22.0, opacity: 40.0, mode: PenMode::Highlighter, ..Default::default() },
             pen_tool: PenTool::Pen,
@@ -1304,6 +1343,9 @@ impl GifKitApp {
             if let Some(f) = ExportFormat::ALL.iter().find(|x| x.label().to_lowercase().starts_with(&f.to_lowercase())) {
                 app.export_fmt = *f;
             }
+        }
+        if let Ok(q) = std::env::var("GIFKIT_EMOJI_SEARCH") {
+            app.emoji_search = q;
         }
         if std::env::var("GIFKIT_ABOUT").is_ok() {
             app.about_open = true;
@@ -1454,7 +1496,7 @@ impl GifKitApp {
                     self.add_layer(LayerKind::Shape(Box::new(ShapeSettings { stroke: [34, 38, 44], fill: [255, 255, 255], corner: 30.0, ..mk(ShapeKind::Speech, 150, 18, 150, 82, 0.0, [255, 255, 255]) })));
                     self.add_layer(LayerKind::Shape(Box::new(ShapeSettings { stroke_on: false, shadow: true, ..mk(ShapeKind::Arrow, 30, 150, 120, 34, -25.0, [255, 59, 48]) })));
                     self.add_layer(LayerKind::Shape(Box::new(ShapeSettings { points: 5, ..mk(ShapeKind::Star, 20, 20, 70, 70, 10.0, [255, 204, 0]) })));
-                    self.add_layer(LayerKind::Shape(Box::new(ShapeSettings { emoji: "1f525".into(), shadow: true, ..mk(ShapeKind::Emoji, 240, 150, 64, 64, -12.0, [0, 0, 0]) })));
+                    self.add_layer(LayerKind::Emoji(Box::new(EmojiSettings { emoji: "1f525".into(), shadow: true, x: 240, y: 150, w: 64, h: 64, angle: -12.0, ..Default::default() })));
                     let pts: Vec<[f32; 2]> = (0..40).map(|i| { let t = i as f32 / 39.0; [170.0 + 120.0 * t, 205.0 + 10.0 * (t * 9.0).sin()] }).collect();
                     let hl: Vec<[f32; 2]> = vec![[30.0, 112.0], [140.0, 112.0]];
                     self.add_layer(LayerKind::Markup(MarkupSettings { strokes: vec![
@@ -1911,7 +1953,7 @@ impl GifKitApp {
                 hint(ui, "Built with Rust, egui, image, gif, libwebp and rayon");
                 hint(ui, "Video and AVIF via ffmpeg (optional)");
                 hint(ui, "Fonts: Noto Sans (OFL) and DejaVu");
-                hint(ui, "Emoji: Twemoji (CC-BY 4.0)");
+                hint(ui, "Emoji: Twemoji (CC-BY 4.0) with names from emojibase (MIT)");
                 ui.add_space(4.0);
                 hint(ui, "Licensed under Apache 2.0");
             });
@@ -3022,7 +3064,7 @@ impl GifKitApp {
                 });
                 let add = icon_button(ui, "+", true).on_hover_text("Add layer");
                 egui::Popup::menu(&add).show(|ui| {
-                    for (t, label) in [(Tool::Effects, "Effects"), (Tool::Text, "Text"), (Tool::Shapes, "Shape"), (Tool::Markup, "Markup"), (Tool::Censor, "Censor"), (Tool::AddImage, "Image…"), (Tool::Watermark, "Watermark"), (Tool::Shield, "AI shield")] {
+                    for (t, label) in [(Tool::Effects, "Effects"), (Tool::Text, "Text"), (Tool::Shapes, "Shape"), (Tool::Emoji, "Emoji"), (Tool::Markup, "Markup"), (Tool::Censor, "Censor"), (Tool::AddImage, "Image…"), (Tool::Watermark, "Watermark"), (Tool::Shield, "AI shield")] {
                         let b = ui.add(egui::Button::new(format!("      {label}")).min_size(vec2(150.0, 0.0)));
                         paint_tool_icon(ui.painter(), t, pos2(b.rect.left() + 16.0, b.rect.center().y), 13.0, pal.fg);
                         if b.clicked() {
@@ -3457,6 +3499,10 @@ impl GifKitApp {
             }
             Tool::Markup => {
                 self.add_layer(LayerKind::Markup(MarkupSettings::default()));
+            }
+            Tool::Emoji => {
+                let e = self.default_emoji(w, h, None);
+                self.add_layer(LayerKind::Emoji(Box::new(e)));
             }
             _ => {}
         }
@@ -3967,6 +4013,7 @@ impl GifKitApp {
                         LayerKind::Shield(s) => PresetLayer::Shield { visible, shield: s.clone() },
                         LayerKind::Shape(s) => PresetLayer::Shape { visible, shape: (**s).clone() },
                         LayerKind::Markup(m) => PresetLayer::Markup { visible, markup: m.clone() },
+                        LayerKind::Emoji(e) => PresetLayer::Emoji { visible, emoji: (**e).clone() },
                     })
                 })
                 .collect()
@@ -4050,6 +4097,13 @@ impl GifKitApp {
                             st.width *= fs;
                         }
                         (self.stack.push(LayerKind::Markup(markup)), visible)
+                    }
+                    PresetLayer::Emoji { visible, mut emoji } => {
+                        emoji.x = sc(emoji.x, fx);
+                        emoji.y = sc(emoji.y, fy);
+                        emoji.w = ((emoji.w as f32 * fs) as u32).max(1);
+                        emoji.h = ((emoji.h as f32 * fs) as u32).max(1);
+                        (self.stack.push(LayerKind::Emoji(Box::new(emoji))), visible)
                     }
                 };
                 if let Some(i) = self.stack.index_of(id.0) {
@@ -4459,6 +4513,7 @@ impl GifKitApp {
                 LayerKind::Text(t) => t.applies_to(src_idx),
                 LayerKind::Censor(c) => c.w == 0 || c.applies_to(src_idx),
                 LayerKind::Shape(sh) => sh.w == 0 || sh.applies_to(src_idx),
+                LayerKind::Emoji(e) => e.w == 0 || e.applies_to(src_idx),
                 _ => true,
             };
             if !applies {
@@ -4512,6 +4567,14 @@ impl GifKitApp {
                         let id = self.add_layer(LayerKind::Shape(Box::new(sh)));
                         let li = self.stack.layers.len() - 1;
                         new_drag = Some(BoxDrag::New { id, li, anchor: pi });
+                    } else if kind == Kind::Emoji {
+                        let now = ui.input(|i| i.time);
+                        self.snapshot(&format!("addemoji{now}"), now);
+                        let e = EmojiSettings { emoji: self.emoji_pick.clone(), ..Default::default() };
+                        self.note_recent_emoji();
+                        let id = self.add_layer(LayerKind::Emoji(Box::new(e)));
+                        let li = self.stack.layers.len() - 1;
+                        new_drag = Some(BoxDrag::New { id, li, anchor: pi });
                     }
                 }
                 self.box_drag = new_drag;
@@ -4548,7 +4611,7 @@ impl GifKitApp {
                             } else {
                                 let lp = out0.to_local(pi.x, pi.y);
                                 let (mut w, mut h) = ((lp.0 - fixed.0).abs().max(1.0), (lp.1 - fixed.1).abs().max(1.0));
-                                let emoji = matches!(&self.stack.layers[li].kind, LayerKind::Shape(sh) if sh.kind == ShapeKind::Emoji);
+                                let emoji = matches!(&self.stack.layers[li].kind, LayerKind::Shape(sh) if sh.kind == ShapeKind::Emoji) || kind == Kind::Emoji;
                                 if (kind == Kind::Overlay || emoji) && !shift {
                                     let r = out0.w / out0.h.max(1e-3);
                                     w = w.max(h * r);
@@ -4589,6 +4652,14 @@ impl GifKitApp {
                             let th = source_angle(&mp, ang, false);
                             self.write_box(li, unmap_box(&mp, out, th), None, src_idx);
                         }
+                        BoxDrag::New { anchor, .. } if kind == Kind::Emoji => {
+                            // emoji stay square: the larger side of the drag wins
+                            let side = (pi.x - anchor.x).abs().max((pi.y - anchor.y).abs()).max(1.0);
+                            let (sx, sy) = (if pi.x >= anchor.x { 1.0 } else { -1.0 }, if pi.y >= anchor.y { 1.0 } else { -1.0 });
+                            let out = Obb { cx: anchor.x + sx * side / 2.0, cy: anchor.y + sy * side / 2.0, w: side, h: side, angle: 0.0 };
+                            let th = source_angle(&mp, 0.0, true);
+                            self.write_box(li, unmap_box(&mp, out, th), None, src_idx);
+                        }
                         BoxDrag::New { anchor, .. } => {
                             let (x0, y0) = (anchor.x.min(pi.x), anchor.y.min(pi.y));
                             let (x1, y1) = (anchor.x.max(pi.x), anchor.y.max(pi.y));
@@ -4604,6 +4675,18 @@ impl GifKitApp {
             // a click without a drag drops a shape of the default size there
             if let Some(BoxDrag::New { id, li, anchor }) = self.box_drag {
                 if li < self.stack.layers.len() && self.stack.layers[li].id == id {
+                    let tiny = match &self.stack.layers[li].kind {
+                        LayerKind::Emoji(e) => e.w < 4 || e.h < 4,
+                        _ => false,
+                    };
+                    if tiny {
+                        let mp = maps.as_ref().map(|_| self.stack.layer_maps(bw, bh)[li].m).unwrap_or(Affine::IDENTITY);
+                        let (sx, sy) = mp.inverse().apply(anchor.x, anchor.y);
+                        let d = self.default_emoji(bw, bh, Some((sx, sy)));
+                        if let LayerKind::Emoji(e) = &mut self.stack.layers[li].kind {
+                            **e = d;
+                        }
+                    }
                     if let LayerKind::Shape(sh) = &self.stack.layers[li].kind {
                         if sh.w < 4 || sh.h < 4 {
                             let mut d = self.default_shape(bw, bh);
@@ -4841,6 +4924,13 @@ impl GifKitApp {
                 sh.y = (b.cy - sh.h as f32 / 2.0).round() as i32;
                 sh.angle = b.angle;
             }
+            LayerKind::Emoji(e) => {
+                e.w = b.w.round().max(1.0) as u32;
+                e.h = b.h.round().max(1.0) as u32;
+                e.x = (b.cx - e.w as f32 / 2.0).round() as i32;
+                e.y = (b.cy - e.h as f32 / 2.0).round() as i32;
+                e.angle = b.angle;
+            }
             LayerKind::Effects(_) | LayerKind::Watermark(_) | LayerKind::Shield(_) | LayerKind::Markup(_) => {}
         }
         self.modified = true;
@@ -4993,6 +5083,7 @@ impl GifKitApp {
             Tool::Shield => self.ui_shield(ui, ctx),
             Tool::Shapes => self.ui_shapes(ui, ctx),
             Tool::Markup => self.ui_markup(ui, ctx),
+            Tool::Emoji => self.ui_emoji(ui, ctx),
             Tool::Cut => self.ui_cut(ui, ctx),
             Tool::Frames => self.ui_frames(ui, ctx),
         }
@@ -6101,7 +6192,7 @@ impl GifKitApp {
         if let Some(t) = self.emoji_tex.get(code) {
             return Some(t.clone());
         }
-        let img = crate::shapes::emoji_image(code)?;
+        let img = crate::emoji::render(code, 64)?;
         let t = ctx.load_texture(format!("emoji-{code}"), to_color_image(&img), TextureOptions::LINEAR);
         self.emoji_tex.insert(code.to_string(), t.clone());
         Some(t)
@@ -6127,7 +6218,7 @@ impl GifKitApp {
         });
     }
 
-    fn ui_shapes(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn ui_shapes(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
         let (w, h) = self.dims();
         let n = self.base.as_ref().map(|b| b.len()).unwrap_or(1).max(1);
         let sel = self.layer_chooser(ui, Kind::Shape, "+ Shape", |s| {
@@ -6155,20 +6246,7 @@ impl GifKitApp {
             }
         });
         if st.kind == ShapeKind::Emoji {
-            group(ui, "Emoji", |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = vec2(3.0, 3.0);
-                    for (code, name, _) in crate::emoji::EMOJI {
-                        let Some(t) = self.emoji_texture(ctx, code) else { continue };
-                        let on = st.emoji == *code;
-                        let r = ui.add(egui::Button::image(egui::Image::new(&t).fit_to_exact_size(vec2(24.0, 24.0))).selected(on).min_size(vec2(32.0, 32.0))).on_hover_text(*name);
-                        if r.clicked() {
-                            st.emoji = code.to_string();
-                        }
-                    }
-                });
-                hint(ui, "Emoji by Twemoji (CC-BY 4.0)");
-            });
+            hint(ui, "Emoji have their own tool now");
         } else {
             group(ui, "Style", |ui| {
                 if st.kind != ShapeKind::Line {
@@ -6224,6 +6302,167 @@ impl GifKitApp {
         // the next shape uses the latest style
         let geo = (self.shape_tpl.x, self.shape_tpl.y, self.shape_tpl.w, self.shape_tpl.h, self.shape_tpl.angle, self.shape_tpl.from, self.shape_tpl.to);
         self.shape_tpl = ShapeSettings { x: geo.0, y: geo.1, w: geo.2, h: geo.3, angle: geo.4, from: geo.5, to: geo.6, ..st };
+    }
+
+    /// A new emoji layer with the current pick, square, centred on `at` (source px) or the frame.
+    fn default_emoji(&self, w: u32, h: u32, at: Option<(f32, f32)>) -> EmojiSettings {
+        let side = ((w.min(h) as f32) * 0.3).max(16.0) as u32;
+        let (cx, cy) = at.unwrap_or((w as f32 / 2.0, h as f32 / 2.0));
+        EmojiSettings { emoji: self.emoji_pick.clone(), x: (cx - side as f32 / 2.0).round() as i32, y: (cy - side as f32 / 2.0).round() as i32, w: side, h: side, ..Default::default() }
+    }
+
+    /// Put the current pick at the front of the recent list (saved).
+    fn note_recent_emoji(&mut self) {
+        let f = self.emoji_pick.clone();
+        self.emoji_recent.retain(|x| *x != f);
+        self.emoji_recent.insert(0, f);
+        self.emoji_recent.truncate(32);
+        theme::set_setting("recent_emoji", &self.emoji_recent.join(","));
+    }
+
+    fn ui_emoji(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let pal = *p();
+        let (w, h) = self.dims();
+        let n = self.base.as_ref().map(|b| b.len()).unwrap_or(1).max(1);
+        let sel = self.layer_chooser(ui, Kind::Emoji, "+ Emoji", |s| {
+            let e = s.default_emoji(w, h, None);
+            s.add_layer(LayerKind::Emoji(Box::new(e)));
+        });
+        let full = ui.available_width();
+        ui.add(egui::TextEdit::singleline(&mut self.emoji_search).hint_text("Search emoji").desired_width(full - 4.0));
+        let searching = !self.emoji_search.trim().is_empty();
+        if !searching {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                if !self.emoji_recent.is_empty() {
+                    seg(ui, &mut self.emoji_tab, EmojiTab::Recent, "Recent");
+                }
+                for (g, name) in crate::emoji::GROUP_SHORT.iter().enumerate() {
+                    seg(ui, &mut self.emoji_tab, EmojiTab::Group(g as u8), *name).on_hover_text(crate::emoji::GROUPS[g]);
+                }
+            });
+        }
+        // skin tone
+        ui.horizontal(|ui| {
+            ui.label("Skin tone");
+            const TONE_COL: [[u8; 3]; 6] = [[255, 204, 77], [247, 222, 206], [243, 210, 162], [213, 171, 136], [175, 126, 87], [124, 83, 62]];
+            for (t, c) in TONE_COL.iter().enumerate() {
+                let (r, resp) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::click());
+                ui.painter().circle_filled(r.center(), 8.0, Color32::from_rgb(c[0], c[1], c[2]));
+                if self.emoji_tone == t {
+                    ui.painter().circle_stroke(r.center(), 9.5, Stroke::new(2.0, pal.highlight));
+                }
+                if resp.on_hover_text(crate::emoji::TONES[t]).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.emoji_tone = t;
+                    theme::set_setting("emoji_tone", &t.to_string());
+                }
+            }
+        });
+        // the list to show: files with the skin tone applied
+        let files: Vec<String> = if searching {
+            crate::emoji::search(&self.emoji_search, None).into_iter().map(|i| crate::emoji::all()[i].file(self.emoji_tone).to_string()).collect()
+        } else {
+            match self.emoji_tab {
+                EmojiTab::Recent => self.emoji_recent.clone(),
+                EmojiTab::Group(g) => crate::emoji::search("", Some(g)).into_iter().map(|i| crate::emoji::all()[i].file(self.emoji_tone).to_string()).collect(),
+            }
+        };
+        if searching {
+            hint(ui, &format!("{} found", files.len()));
+        }
+        let cell = 34.0;
+        // leave room for the frame, its margin and the scroll bar so the panel never grows
+        let cols = ((full - 30.0) / (cell + 3.0)).floor().max(1.0) as usize;
+        let rows = files.len().div_ceil(cols);
+        let mut picked: Option<String> = None;
+        let mut budget = 48; // new textures per frame, so the picker never stalls
+        egui::Frame::new().fill(pal.view).stroke(Stroke::new(1.0, pal.border)).corner_radius(3.0).inner_margin(3.0).show(ui, |ui| {
+            ui.set_width(full - 8.0);
+            egui::ScrollArea::vertical().id_salt(("emoji-grid", self.emoji_tab == EmojiTab::Recent, searching)).max_height(300.0).auto_shrink([false, true]).show_rows(ui, cell + 3.0, rows, |ui, range| {
+                ui.spacing_mut().item_spacing = vec2(3.0, 3.0);
+                ui.spacing_mut().button_padding = vec2(2.0, 2.0);
+                for r in range {
+                    ui.horizontal(|ui| {
+                        for f in files.iter().skip(r * cols).take(cols) {
+                            let tex = if self.emoji_tex.contains_key(f) || budget > 0 {
+                                if !self.emoji_tex.contains_key(f) {
+                                    budget -= 1;
+                                }
+                                self.emoji_texture(ctx, f)
+                            } else {
+                                None
+                            };
+                            let on = *f == self.emoji_pick;
+                            let b = match &tex {
+                                Some(t) => egui::Button::image(egui::Image::new(t).fit_to_exact_size(vec2(26.0, 26.0))),
+                                None => egui::Button::new(""),
+                            };
+                            let resp = ui.add(b.selected(on).frame_when_inactive(false).min_size(vec2(cell, cell))).on_hover_text(crate::emoji::name_of(f));
+                            if resp.clicked() {
+                                picked = Some(f.clone());
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        if budget == 0 {
+            ctx.request_repaint();
+        }
+        if files.is_empty() {
+            hint(ui, if searching { "Nothing matches. Try another word." } else { "Nothing here yet" });
+        }
+        if sel.is_some() {
+            ui.horizontal(|ui| {
+                ui.label("Clicking an emoji");
+                seg(ui, &mut self.emoji_replace, false, "Adds one");
+                seg(ui, &mut self.emoji_replace, true, "Swaps selected");
+            });
+        } else {
+            hint(ui, "Click an emoji to add it, or drag on the image to place the current one");
+        }
+        if let Some(f) = picked {
+            self.emoji_pick = f.clone();
+            self.note_recent_emoji();
+            let now = ui.input(|i| i.time);
+            self.snapshot(&format!("emoji{now}"), now);
+            match sel {
+                Some(i) if self.emoji_replace => {
+                    if let LayerKind::Emoji(e) = &mut self.stack.layers[i].kind {
+                        e.emoji = f;
+                    }
+                    self.modified = true;
+                }
+                _ => {
+                    let e = self.default_emoji(w, h, None);
+                    self.add_layer(LayerKind::Emoji(Box::new(e)));
+                }
+            }
+        }
+        let Some(i) = self.sel_index(Kind::Emoji) else { return };
+        let LayerKind::Emoji(e) = &mut self.stack.layers[i].kind else { return };
+        group(ui, "Look", |ui| {
+            ui.add(egui::Slider::new(&mut e.opacity, 0.0..=100.0).text("opacity").suffix("%"));
+            ui.checkbox(&mut e.shadow, "Drop shadow");
+        });
+        group(ui, "Placement", |ui| {
+            egui::Grid::new("emojipos").num_columns(4).spacing([8.0, 6.0]).show(ui, |ui| {
+                ui.label("X");
+                ui.add(egui::DragValue::new(&mut e.x));
+                ui.label("Y");
+                ui.add(egui::DragValue::new(&mut e.y));
+                ui.end_row();
+                ui.label("Size");
+                let mut sz = e.w;
+                if ui.add(egui::DragValue::new(&mut sz).range(4..=w.max(h) * 4)).changed() {
+                    e.h = ((e.h as f32 * sz as f32 / e.w.max(1) as f32).round() as u32).max(1);
+                    e.w = sz;
+                }
+                ui.end_row();
+            });
+            Self::angle_row(ui, &mut e.angle);
+            frames_row(ui, &mut e.from, &mut e.to, n);
+        });
     }
 
     fn ui_markup(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {

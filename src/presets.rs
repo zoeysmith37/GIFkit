@@ -20,6 +20,7 @@ pub enum PresetLayer {
     Shield { visible: bool, shield: ShieldSettings },
     Shape { visible: bool, shape: crate::shapes::ShapeSettings },
     Markup { visible: bool, markup: crate::shapes::MarkupSettings },
+    Emoji { visible: bool, emoji: crate::shapes::EmojiSettings },
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

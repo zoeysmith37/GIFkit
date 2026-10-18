@@ -897,7 +897,7 @@ fn noai_avif_still_decodes() {
 fn shapes_render_every_kind() {
     use crate::geo::Obb;
     use crate::shapes::{shape_sprite, ShapeKind, ShapeSettings};
-    for k in ShapeKind::ALL {
+    for k in ShapeKind::ALL.into_iter().chain([ShapeKind::Emoji]) {
         for shadow in [false, true] {
             let s = ShapeSettings { kind: k, shadow, ..Default::default() };
             let (img, x, y) = shape_sprite(&s, Obb { cx: 100.0, cy: 80.0, w: 120.0, h: 70.0, angle: 20.0 }, 1.0).unwrap_or_else(|| panic!("{k:?} gave no sprite"));
@@ -906,11 +906,6 @@ fn shapes_render_every_kind() {
             // the sprite covers the rotated box
             assert!(x < 40 && y < 45 && x + img.width() as i64 > 160 && y + img.height() as i64 > 115, "{k:?} sprite at {x},{y} {}x{}", img.width(), img.height());
         }
-    }
-    // every bundled emoji decodes
-    for (code, _, _) in crate::emoji::EMOJI {
-        let i = crate::shapes::emoji_image(code).unwrap_or_else(|| panic!("emoji {code}"));
-        assert_eq!(i.dimensions(), (160, 160));
     }
     // fill off + outline on leaves the middle clear
     let s = ShapeSettings { kind: ShapeKind::Rect, fill_on: false, stroke_w: 3.0, ..Default::default() };
@@ -945,4 +940,48 @@ fn shape_and_markup_layers_in_stack() {
     let out = st.flatten(&a, &[], None);
     let w = out.width();
     assert_eq!(out.frames[0].image.get_pixel(w - 1 - 25, 20).0, [255, 0, 255, 255]);
+}
+
+#[test]
+fn emoji_set_search_and_render() {
+    use crate::emoji;
+    let all = emoji::all();
+    assert!(all.len() > 1800, "only {} emoji", all.len());
+    // every graphic (skin tones too) is in the archive and draws something
+    let files: Vec<&str> = all.iter().flat_map(|e| std::iter::once(e.f.as_str()).chain(e.s.iter().map(|s| s.1.as_str()))).collect();
+    assert!(files.len() > 3400);
+    use rayon::prelude::*;
+    let bad: Vec<&&str> = files.par_iter().filter(|f| emoji::render(f, 24).map(|i| i.pixels().filter(|p| p[3] > 0).count() < 10).unwrap_or(true)).collect();
+    assert!(bad.is_empty(), "emoji that don't render: {bad:?}");
+    // every group has emoji, in order
+    for g in 0..9u8 {
+        assert!(emoji::search("", Some(g)).len() > 50, "group {g}");
+    }
+    // search by name and by keyword, name matches first
+    let fire = emoji::search("fire", None);
+    assert_eq!(all[fire[0]].f, "1f525");
+    let happy = emoji::search("happy", None);
+    assert!(happy.iter().any(|&i| all[i].f == "1f600"), "keyword search");
+    assert!(emoji::search("cat face", None).iter().any(|&i| all[i].f == "1f431"));
+    assert!(emoji::search("zzqqxx", None).is_empty());
+    // skin tones resolve to their base emoji
+    let wave = &all[emoji::search("waving hand", None)[0]];
+    assert_eq!(wave.s.len(), 5);
+    assert_eq!(emoji::by_file(wave.file(5)).map(|x| x.1), Some(5));
+    assert!(emoji::name_of(wave.file(1)).contains("light skin tone"));
+}
+
+#[test]
+fn emoji_layer_renders() {
+    use crate::shapes::EmojiSettings;
+    use crate::stack::{LayerKind, Stack};
+    let a = synth(false);
+    let mut st = Stack::default();
+    st.push(LayerKind::Emoji(Box::new(EmojiSettings { emoji: "1f525".into(), x: 20, y: 10, w: 40, h: 40, ..Default::default() })));
+    let out = st.flatten(&a, &[], None);
+    let before = &a.frames[0].image;
+    let after = &out.frames[0].image;
+    let changed = (20..60).flat_map(|x| (10..50).map(move |y| (x, y))).filter(|&(x, y)| before.get_pixel(x, y) != after.get_pixel(x, y)).count();
+    assert!(changed > 600, "emoji changed only {changed} pixels");
+    assert_eq!(before.get_pixel(90, 60), after.get_pixel(90, 60), "outside the box stays as it was");
 }

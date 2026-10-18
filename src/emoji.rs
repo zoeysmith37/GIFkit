@@ -1,61 +1,158 @@
-//! Built-in emoji (Twemoji, CC-BY 4.0; see assets/TWEMOJI_LICENSE.txt).
+//! Emoji: the full Twemoji set (CC-BY 4.0) as SVGs, with names, keywords and
+//! groups from emojibase (MIT). Built by tools/build_emoji.py.
+//! Rendered with resvg at whatever size they are placed, so they stay crisp.
 
-/// (codepoint file name, short name, 160 px PNG)
-pub static EMOJI: &[(&str, &str, &[u8])] = &[
-    ("1f600", "grinning", include_bytes!("../assets/emoji/1f600.png")),
-    ("1f602", "joy", include_bytes!("../assets/emoji/1f602.png")),
-    ("1f923", "rofl", include_bytes!("../assets/emoji/1f923.png")),
-    ("1f60d", "heart eyes", include_bytes!("../assets/emoji/1f60d.png")),
-    ("1f60e", "cool", include_bytes!("../assets/emoji/1f60e.png")),
-    ("1f914", "thinking", include_bytes!("../assets/emoji/1f914.png")),
-    ("1f62e", "wow", include_bytes!("../assets/emoji/1f62e.png")),
-    ("1f622", "sad", include_bytes!("../assets/emoji/1f622.png")),
-    ("1f62d", "crying", include_bytes!("../assets/emoji/1f62d.png")),
-    ("1f621", "angry", include_bytes!("../assets/emoji/1f621.png")),
-    ("1f631", "scream", include_bytes!("../assets/emoji/1f631.png")),
-    ("1f644", "eye roll", include_bytes!("../assets/emoji/1f644.png")),
-    ("1f60f", "smirk", include_bytes!("../assets/emoji/1f60f.png")),
-    ("1f97a", "pleading", include_bytes!("../assets/emoji/1f97a.png")),
-    ("1f480", "skull", include_bytes!("../assets/emoji/1f480.png")),
-    ("1f47b", "ghost", include_bytes!("../assets/emoji/1f47b.png")),
-    ("1f916", "robot", include_bytes!("../assets/emoji/1f916.png")),
-    ("1f47e", "alien", include_bytes!("../assets/emoji/1f47e.png")),
-    ("1f4a9", "poop", include_bytes!("../assets/emoji/1f4a9.png")),
-    ("1f648", "see no evil", include_bytes!("../assets/emoji/1f648.png")),
-    ("1f44d", "thumbs up", include_bytes!("../assets/emoji/1f44d.png")),
-    ("1f44e", "thumbs down", include_bytes!("../assets/emoji/1f44e.png")),
-    ("1f44f", "clap", include_bytes!("../assets/emoji/1f44f.png")),
-    ("1f64f", "pray", include_bytes!("../assets/emoji/1f64f.png")),
-    ("1f4aa", "muscle", include_bytes!("../assets/emoji/1f4aa.png")),
-    ("1f440", "eyes", include_bytes!("../assets/emoji/1f440.png")),
-    ("1f449", "point right", include_bytes!("../assets/emoji/1f449.png")),
-    ("1f448", "point left", include_bytes!("../assets/emoji/1f448.png")),
-    ("1f446", "point up", include_bytes!("../assets/emoji/1f446.png")),
-    ("1f447", "point down", include_bytes!("../assets/emoji/1f447.png")),
-    ("2764", "heart", include_bytes!("../assets/emoji/2764.png")),
-    ("1f494", "broken heart", include_bytes!("../assets/emoji/1f494.png")),
-    ("1f525", "fire", include_bytes!("../assets/emoji/1f525.png")),
-    ("1f4af", "hundred", include_bytes!("../assets/emoji/1f4af.png")),
-    ("2b50", "star", include_bytes!("../assets/emoji/2b50.png")),
-    ("2728", "sparkles", include_bytes!("../assets/emoji/2728.png")),
-    ("1f4a5", "boom", include_bytes!("../assets/emoji/1f4a5.png")),
-    ("26a1", "lightning", include_bytes!("../assets/emoji/26a1.png")),
-    ("1f389", "party", include_bytes!("../assets/emoji/1f389.png")),
-    ("1f3c6", "trophy", include_bytes!("../assets/emoji/1f3c6.png")),
-    ("1f3af", "target", include_bytes!("../assets/emoji/1f3af.png")),
-    ("1f3ae", "game", include_bytes!("../assets/emoji/1f3ae.png")),
-    ("1f680", "rocket", include_bytes!("../assets/emoji/1f680.png")),
-    ("1f4a1", "idea", include_bytes!("../assets/emoji/1f4a1.png")),
-    ("1f4ac", "speech", include_bytes!("../assets/emoji/1f4ac.png")),
-    ("2705", "check", include_bytes!("../assets/emoji/2705.png")),
-    ("274c", "cross", include_bytes!("../assets/emoji/274c.png")),
-    ("26a0", "warning", include_bytes!("../assets/emoji/26a0.png")),
-    ("2753", "question", include_bytes!("../assets/emoji/2753.png")),
-    ("2757", "exclamation", include_bytes!("../assets/emoji/2757.png")),
-    ("1f6ab", "no", include_bytes!("../assets/emoji/1f6ab.png")),
-    ("1f308", "rainbow", include_bytes!("../assets/emoji/1f308.png")),
-    ("1f355", "pizza", include_bytes!("../assets/emoji/1f355.png")),
-    ("2615", "coffee", include_bytes!("../assets/emoji/2615.png")),
-    ("1f431", "cat", include_bytes!("../assets/emoji/1f431.png")),
-    ("1f436", "dog", include_bytes!("../assets/emoji/1f436.png")),
-];
+use image::RgbaImage;
+use std::collections::HashMap;
+use std::io::Read;
+use std::sync::{Arc, Mutex, OnceLock};
+
+static ZIP: &[u8] = include_bytes!("../assets/emoji/twemoji.zip");
+static INDEX: &str = include_str!("../assets/emoji/emoji.json");
+
+pub const GROUPS: [&str; 9] = ["Smileys & emotion", "People & body", "Animals & nature", "Food & drink", "Travel & places", "Activities", "Objects", "Symbols", "Flags"];
+
+/// Short labels for the category tabs.
+pub const GROUP_SHORT: [&str; 9] = ["Smileys", "People", "Nature", "Food", "Travel", "Activities", "Objects", "Symbols", "Flags"];
+
+pub const TONES: [&str; 6] = ["Default", "Light", "Medium-light", "Medium", "Medium-dark", "Dark"];
+
+#[derive(serde::Deserialize)]
+pub struct Emoji {
+    /// the character(s)
+    #[allow(dead_code)]
+    pub e: String,
+    /// Twemoji file name (hex code points)
+    pub f: String,
+    /// group index into GROUPS
+    pub g: u8,
+    /// name
+    pub n: String,
+    /// search keywords, space separated
+    pub k: String,
+    /// skin tone versions 1..=5: (character, file)
+    pub s: Vec<(String, String)>,
+}
+
+impl Emoji {
+    /// File for a skin tone (0 = default), falling back to the default.
+    pub fn file(&self, tone: usize) -> &str {
+        if tone > 0 {
+            if let Some((_, f)) = self.s.get(tone - 1) {
+                return f;
+            }
+        }
+        &self.f
+    }
+}
+
+pub fn all() -> &'static [Emoji] {
+    static ALL: OnceLock<Vec<Emoji>> = OnceLock::new();
+    ALL.get_or_init(|| serde_json::from_str(INDEX).unwrap_or_default())
+}
+
+/// Emoji (and tone) for a file name, including skin-tone files.
+pub fn by_file(f: &str) -> Option<(&'static Emoji, usize)> {
+    static MAP: OnceLock<HashMap<&'static str, (usize, usize)>> = OnceLock::new();
+    let m = MAP.get_or_init(|| {
+        let mut m = HashMap::new();
+        for (i, e) in all().iter().enumerate() {
+            m.insert(e.f.as_str(), (i, 0));
+            for (t, (_, sf)) in e.s.iter().enumerate() {
+                m.insert(sf.as_str(), (i, t + 1));
+            }
+        }
+        m
+    });
+    m.get(f).map(|&(i, t)| (&all()[i], t))
+}
+
+/// Name for display ("fire", "waving hand: dark skin tone").
+pub fn name_of(f: &str) -> String {
+    match by_file(f) {
+        Some((e, 0)) => e.n.clone(),
+        Some((e, t)) => format!("{}: {} skin tone", e.n, TONES[t].to_lowercase()),
+        None => "emoji".into(),
+    }
+}
+
+/// Indices of emoji matching every word of `query` (name or keywords),
+/// optionally within one group. Best matches first: the exact name, then
+/// names starting with the query, other name matches, then keyword matches.
+pub fn search(query: &str, group: Option<u8>) -> Vec<usize> {
+    let q = query.trim().to_lowercase();
+    let words: Vec<&str> = q.split_whitespace().collect();
+    let mut hits: Vec<(u8, usize)> = Vec::new();
+    for (i, e) in all().iter().enumerate() {
+        if group.is_some_and(|g| e.g != g) {
+            continue;
+        }
+        if words.is_empty() {
+            hits.push((0, i));
+            continue;
+        }
+        let name = e.n.to_lowercase();
+        let in_name = |w: &str| name.split(|c: char| !c.is_alphanumeric()).any(|nw| nw.starts_with(w));
+        if !words.iter().all(|w| in_name(w) || name.contains(w) || e.k.split(' ').any(|k| k.starts_with(w))) {
+            continue;
+        }
+        let score = if name == q {
+            0
+        } else if name.starts_with(&q) {
+            1
+        } else if words.iter().all(|w| in_name(w)) {
+            2
+        } else if words.iter().all(|w| name.contains(w)) {
+            3
+        } else {
+            4
+        };
+        hits.push((score, i));
+    }
+    hits.sort_by_key(|h| h.0);
+    hits.into_iter().map(|h| h.1).collect()
+}
+
+fn archive() -> &'static Mutex<zip::ZipArchive<std::io::Cursor<&'static [u8]>>> {
+    static A: OnceLock<Mutex<zip::ZipArchive<std::io::Cursor<&'static [u8]>>>> = OnceLock::new();
+    A.get_or_init(|| Mutex::new(zip::ZipArchive::new(std::io::Cursor::new(ZIP)).expect("bundled emoji archive")))
+}
+
+/// Parsed SVG of an emoji file (cached).
+pub fn tree(f: &str) -> Option<Arc<resvg::usvg::Tree>> {
+    static TREES: OnceLock<Mutex<HashMap<String, Arc<resvg::usvg::Tree>>>> = OnceLock::new();
+    let cache = TREES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(t) = cache.lock().ok()?.get(f) {
+        return Some(t.clone());
+    }
+    let mut data = Vec::new();
+    {
+        let mut a = archive().lock().ok()?;
+        let mut file = a.by_name(&format!("{f}.svg")).ok()?;
+        file.read_to_end(&mut data).ok()?;
+    }
+    let t = Arc::new(resvg::usvg::Tree::from_data(&data, &resvg::usvg::Options::default()).ok()?);
+    cache.lock().ok()?.insert(f.to_string(), t.clone());
+    Some(t)
+}
+
+/// Draw an emoji into `pm` filling a `w`×`h` box that `tf` places.
+pub fn draw(f: &str, pm: &mut resvg::tiny_skia::PixmapMut, w: f32, h: f32, tf: resvg::tiny_skia::Transform) -> Option<()> {
+    let t = tree(f)?;
+    let s = t.size();
+    let tf = tf.pre_scale(w / s.width(), h / s.height());
+    resvg::render(&t, tf, pm);
+    Some(())
+}
+
+/// The emoji as an image of `size`×`size` pixels.
+pub fn render(f: &str, size: u32) -> Option<RgbaImage> {
+    let mut pm = resvg::tiny_skia::Pixmap::new(size.max(1), size.max(1))?;
+    draw(f, &mut pm.as_mut(), size as f32, size as f32, resvg::tiny_skia::Transform::identity())?;
+    let mut out = RgbaImage::new(pm.width(), pm.height());
+    for (d, p) in out.pixels_mut().zip(pm.pixels()) {
+        let c = p.demultiply();
+        *d = image::Rgba([c.red(), c.green(), c.blue(), c.alpha()]);
+    }
+    Some(out)
+}

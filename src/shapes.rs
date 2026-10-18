@@ -3,8 +3,6 @@
 
 use crate::geo::{Affine, Obb};
 use image::RgbaImage;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
 use tiny_skia::{FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, PixmapPaint, Rect, Stroke, Transform};
 
 // ---------------------------------------------------------------- shapes
@@ -27,7 +25,9 @@ pub enum ShapeKind {
 }
 
 impl ShapeKind {
-    pub const ALL: [ShapeKind; 13] = [
+    /// Shapes offered in the Shapes tool. `Emoji` stays in the enum so
+    /// projects and presets from 0.7.0 still load; it is its own tool now.
+    pub const ALL: [ShapeKind; 12] = [
         ShapeKind::Rect,
         ShapeKind::Rounded,
         ShapeKind::Ellipse,
@@ -40,7 +40,6 @@ impl ShapeKind {
         ShapeKind::Speech,
         ShapeKind::Bubble,
         ShapeKind::Thought,
-        ShapeKind::Emoji,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -244,22 +243,6 @@ fn shape_path(s: &ShapeSettings, hw: f32, hh: f32) -> Option<tiny_skia::Path> {
     pb.finish()
 }
 
-fn emoji_cache() -> &'static Mutex<HashMap<String, Arc<RgbaImage>>> {
-    static C: OnceLock<Mutex<HashMap<String, Arc<RgbaImage>>>> = OnceLock::new();
-    C.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Decoded emoji image by its file name.
-pub fn emoji_image(code: &str) -> Option<Arc<RgbaImage>> {
-    if let Some(i) = emoji_cache().lock().ok()?.get(code) {
-        return Some(i.clone());
-    }
-    let (_, _, bytes) = crate::emoji::EMOJI.iter().find(|e| e.0 == code)?;
-    let img = Arc::new(image::load_from_memory(bytes).ok()?.to_rgba8());
-    emoji_cache().lock().ok()?.insert(code.to_string(), img.clone());
-    Some(img)
-}
-
 fn pixmap_to_rgba(p: &Pixmap) -> RgbaImage {
     let mut out = RgbaImage::new(p.width(), p.height());
     for (dst, px) in out.pixels_mut().zip(p.pixels()) {
@@ -290,27 +273,7 @@ pub fn shape_sprite(s: &ShapeSettings, o: Obb, scale: f32) -> Option<(RgbaImage,
     let tf = Transform::from_rotate(o.angle).post_translate(o.cx - x0, o.cy - y0);
 
     if s.kind == ShapeKind::Emoji {
-        let src = emoji_image(&s.emoji)?;
-        let tw = o.w.round().max(1.0) as u32;
-        let th = o.h.round().max(1.0) as u32;
-        let scaled = image::imageops::resize(&*src, tw, th, image::imageops::FilterType::CatmullRom);
-        let mut data = Vec::with_capacity((tw * th * 4) as usize);
-        for p in scaled.pixels() {
-            let a = p[3] as u32;
-            data.extend_from_slice(&[(p[0] as u32 * a / 255) as u8, (p[1] as u32 * a / 255) as u8, (p[2] as u32 * a / 255) as u8, p[3]]);
-        }
-        let img = Pixmap::from_vec(data, tiny_skia::IntSize::from_wh(tw, th)?)?;
-        let t = tf.pre_translate(-hw, -hh);
-        if s.shadow {
-            let off = o.w.max(o.h) * 0.04 + 2.0;
-            let mut sh = img.clone();
-            for px in sh.pixels_mut() {
-                *px = tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, (px.alpha() as u32 * 90 / 255) as u8).unwrap_or(*px);
-            }
-            pm.draw_pixmap(0, 0, sh.as_ref(), &PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..Default::default() }, t.post_translate(off, off), None);
-        }
-        pm.draw_pixmap(0, 0, img.as_ref(), &PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..Default::default() }, t, None);
-        return Some((pixmap_to_rgba(&pm), x0 as i64, y0 as i64));
+        return emoji_sprite(&s.emoji, o, s.shadow);
     }
 
     let path = shape_path(s, hw, hh)?;
@@ -341,6 +304,70 @@ pub fn shape_sprite(s: &ShapeSettings, o: Obb, scale: f32) -> Option<(RgbaImage,
     } else if sw > 0.0 {
         pm.stroke_path(&path, &paint(s.stroke, 255), &Stroke { width: sw, line_join: LineJoin::Round, ..Default::default() }, tf, None);
     }
+    Some((pixmap_to_rgba(&pm), x0 as i64, y0 as i64))
+}
+
+// ---------------------------------------------------------------- emoji
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct EmojiSettings {
+    /// Twemoji file name (hex code points), skin tone included
+    pub emoji: String,
+    /// top-left of the unrotated box (source-frame pixels)
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+    /// clockwise degrees about the box centre
+    pub angle: f32,
+    /// 0..=100
+    pub opacity: f32,
+    pub shadow: bool,
+    pub from: usize,
+    /// 0 = end
+    pub to: usize,
+}
+
+impl Default for EmojiSettings {
+    fn default() -> Self {
+        Self { emoji: "1f600".into(), x: 0, y: 0, w: 0, h: 0, angle: 0.0, opacity: 100.0, shadow: false, from: 1, to: 0 }
+    }
+}
+
+impl EmojiSettings {
+    pub fn applies_to(&self, frame: usize) -> bool {
+        let i = frame + 1;
+        self.w > 0 && self.h > 0 && i >= self.from.max(1) && (self.to == 0 || i <= self.to)
+    }
+}
+
+/// Draw an emoji into an output-space box (vector, so sharp at any size).
+pub fn emoji_sprite(file: &str, o: Obb, shadow: bool) -> Option<(RgbaImage, i64, i64)> {
+    if o.w < 1.0 || o.h < 1.0 {
+        return None;
+    }
+    let off = if shadow { o.w.max(o.h) * 0.04 + 2.0 } else { 0.0 };
+    let pad = 2.0 + off;
+    let (bx0, by0, bx1, by1) = o.bounds();
+    let x0 = (bx0 - pad).floor();
+    let y0 = (by0 - pad).floor();
+    let pw = ((bx1 + pad).ceil() - x0).max(1.0) as u32;
+    let ph = ((by1 + pad).ceil() - y0).max(1.0) as u32;
+    if pw as u64 * ph as u64 > 64_000_000 {
+        return None;
+    }
+    let mut pm = Pixmap::new(pw, ph)?;
+    let tf = Transform::from_rotate(o.angle).post_translate(o.cx - x0, o.cy - y0).pre_translate(-o.w / 2.0, -o.h / 2.0);
+    if shadow {
+        let mut sh = Pixmap::new(pw, ph)?;
+        crate::emoji::draw(file, &mut sh.as_mut(), o.w, o.h, tf.post_translate(off, off))?;
+        for px in sh.pixels_mut() {
+            *px = tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, (px.alpha() as u32 * 90 / 255) as u8).unwrap_or(*px);
+        }
+        pm.draw_pixmap(0, 0, sh.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+    }
+    crate::emoji::draw(file, &mut pm.as_mut(), o.w, o.h, tf)?;
     Some((pixmap_to_rgba(&pm), x0 as i64, y0 as i64))
 }
 

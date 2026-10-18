@@ -15,7 +15,7 @@ use crate::effects::{self, CensorSettings, EffectSettings, ShieldSettings, Water
 use crate::geo::{map_box, GeoMap, Obb};
 use crate::ops::{self, AspectMode, ResizeFilter};
 use crate::overlay::{OverlaySource, Placement};
-use crate::shapes::{self, MarkupSettings, ShapeKind, ShapeSettings, StrokeSprite};
+use crate::shapes::{self, EmojiSettings, MarkupSettings, ShapeKind, ShapeSettings, StrokeSprite};
 use crate::text::{self, Annotation, FontEntry};
 use image::{imageops, Rgba, RgbaImage};
 use rayon::prelude::*;
@@ -292,6 +292,7 @@ pub enum LayerKind {
     Shield(ShieldSettings),
     Shape(Box<ShapeSettings>),
     Markup(MarkupSettings),
+    Emoji(Box<EmojiSettings>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -304,6 +305,7 @@ pub enum Kind {
     Shield,
     Shape,
     Markup,
+    Emoji,
 }
 
 #[derive(Clone)]
@@ -326,6 +328,7 @@ impl Layer {
             LayerKind::Shield(_) => Kind::Shield,
             LayerKind::Shape(_) => Kind::Shape,
             LayerKind::Markup(_) => Kind::Markup,
+            LayerKind::Emoji(_) => Kind::Emoji,
         }
     }
     pub fn active(&self) -> bool {
@@ -339,6 +342,7 @@ impl Layer {
                 LayerKind::Shield(s) => s.strength > 0.0 && (s.pattern || s.noise || s.jitter),
                 LayerKind::Shape(s) => s.w > 0 && s.h > 0,
                 LayerKind::Markup(m) => !m.strokes.is_empty(),
+                LayerKind::Emoji(e) => e.w > 0 && e.h > 0,
             }
     }
     /// The layer's oriented box in source-frame space (for source frame `src`).
@@ -346,6 +350,7 @@ impl Layer {
         match &self.kind {
             LayerKind::Effects(_) | LayerKind::Watermark(_) | LayerKind::Shield(_) | LayerKind::Markup(_) => None,
             LayerKind::Shape(s) => Some(Obb::from_rect(s.x as f32, s.y as f32, s.w as f32, s.h as f32, s.angle)),
+            LayerKind::Emoji(e) => Some(Obb::from_rect(e.x as f32, e.y as f32, e.w as f32, e.h as f32, e.angle)),
             LayerKind::Text(t) => {
                 if t.text.is_empty() {
                     return None;
@@ -384,13 +389,13 @@ impl Layer {
             LayerKind::Shield(_) => "AI shield".into(),
             LayerKind::Shape(s) => {
                 if s.kind == ShapeKind::Emoji {
-                    let name = crate::emoji::EMOJI.iter().find(|e| e.0 == s.emoji).map(|e| e.1).unwrap_or("emoji");
-                    format!("Emoji · {name}")
+                    format!("Emoji · {}", crate::emoji::name_of(&s.emoji))
                 } else {
                     format!("Shape · {}", s.kind.label())
                 }
             }
             LayerKind::Markup(m) => format!("Markup · {} stroke{}", m.strokes.len(), if m.strokes.len() == 1 { "" } else { "s" }),
+            LayerKind::Emoji(e) => format!("Emoji · {}", crate::emoji::name_of(&e.emoji)),
         }
     }
 }
@@ -407,6 +412,7 @@ pub fn layer_signature(l: &Layer) -> u64 {
         LayerKind::Shield(sh) => format!("{sh:?}").hash(&mut h),
         LayerKind::Shape(sh) => format!("{sh:?}").hash(&mut h),
         LayerKind::Markup(m) => format!("{m:?}").hash(&mut h),
+        LayerKind::Emoji(e) => format!("{e:?}").hash(&mut h),
     }
     h.finish()
 }
@@ -587,6 +593,11 @@ impl Stack {
                         let o = map_box(m, b, l.readable());
                         shapes::shape_sprite(s, o, shapes::map_scale(m)).map(|(img, x, y)| vec![StrokeSprite { img, x, y, from: s.from, to: s.to }]).unwrap_or_default()
                     }
+                    LayerKind::Emoji(e) => {
+                        let Some(b) = l.source_box(0, fonts) else { return Vec::new() };
+                        let o = map_box(m, b, true);
+                        shapes::emoji_sprite(&e.emoji, o, e.shadow).map(|(img, x, y)| vec![StrokeSprite { img, x, y, from: e.from, to: e.to }]).unwrap_or_default()
+                    }
                     LayerKind::Markup(mk) => {
                         let sc = shapes::map_scale(m);
                         mk.strokes
@@ -645,6 +656,13 @@ impl Stack {
                     if let Some(st) = prep.stamps.get(li) {
                         for sp in st.iter().filter(|_| sh.applies_to(src)) {
                             crate::ops::overlay_with_opacity(&mut img, &sp.img, sp.x, sp.y, sh.opacity / 100.0);
+                        }
+                    }
+                }
+                LayerKind::Emoji(e) => {
+                    if let Some(st) = prep.stamps.get(li) {
+                        for sp in st.iter().filter(|_| e.applies_to(src)) {
+                            crate::ops::overlay_with_opacity(&mut img, &sp.img, sp.x, sp.y, e.opacity / 100.0);
                         }
                     }
                 }
