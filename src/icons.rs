@@ -13,7 +13,7 @@ macro_rules! icon_set {
 }
 
 static ICONS: &[(&str, &str, &str)] = icon_set!(
-    "application-exit", "archive-insert", "arrow-down", "arrow-right", "collapse-all", "expand-all", "go-next", "bookmarks", "configure-shortcuts", "dialog-ok-apply", "document-export",
+    "application-exit", "archive-insert", "arrow-down", "arrow-right", "collapse-all", "color-picker", "expand-all", "go-next", "bookmarks", "configure-shortcuts", "dialog-ok-apply", "document-export",
     "document-new", "document-open", "document-open-recent", "document-save", "document-save-as", "document-sign",
     "draw-freehand", "draw-text", "edit-clear-all", "edit-cut", "edit-delete", "edit-duplicate", "edit-redo",
     "edit-rename", "edit-undo", "format-fill-color", "go-bottom", "go-down", "go-top", "go-up", "grid-rectangular",

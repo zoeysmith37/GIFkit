@@ -1147,11 +1147,6 @@ pub enum Anchor {
 }
 
 impl Anchor {
-    pub const GRID: [[Anchor; 3]; 3] = [
-        [Anchor::TopLeft, Anchor::Top, Anchor::TopRight],
-        [Anchor::Left, Anchor::Center, Anchor::Right],
-        [Anchor::BottomLeft, Anchor::Bottom, Anchor::BottomRight],
-    ];
     /// (fx, fy) in 0..=1
     fn frac(self) -> (f32, f32) {
         match self {
@@ -1199,7 +1194,27 @@ pub struct WatermarkSettings {
 
 impl PartialEq for WatermarkSettings {
     fn eq(&self, o: &Self) -> bool {
-        format!("{self:?}") == format!("{o:?}")
+        let same_image = match (&self.image, &o.image) {
+            (None, None) => true,
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        same_image
+            && self.text == o.text
+            && self.font_idx == o.font_idx
+            && self.font_key == o.font_key
+            && self.use_image == o.use_image
+            && self.image_path == o.image_path
+            && self.size == o.size
+            && self.color == o.color
+            && self.outline == o.outline
+            && self.outline_px == o.outline_px
+            && self.opacity == o.opacity
+            && self.anchor == o.anchor
+            && self.margin == o.margin
+            && self.tiled == o.tiled
+            && self.angle == o.angle
+            && self.spacing == o.spacing
     }
 }
 
