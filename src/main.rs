@@ -2,6 +2,7 @@
 
 mod anim;
 mod app;
+mod booth;
 mod effects;
 mod encode;
 mod geo;

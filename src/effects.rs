@@ -103,6 +103,13 @@ pub struct EffectSettings {
     pub frame_border: bool,
     pub border_px: u32,
     pub border_color: [u8; 3],
+
+    // Photo Booth style effect (one at a time)
+    pub booth: crate::booth::BoothFx,
+    pub booth_amount: f32,
+    /// centre of the distortion, % of the frame
+    pub booth_cx: f32,
+    pub booth_cy: f32,
 }
 
 impl Default for EffectSettings {
@@ -179,6 +186,10 @@ impl Default for EffectSettings {
             frame_border: false,
             border_px: 8,
             border_color: [0, 0, 0],
+            booth: crate::booth::BoothFx::None,
+            booth_amount: 50.0,
+            booth_cx: 50.0,
+            booth_cy: 50.0,
         }
     }
 }
@@ -808,6 +819,9 @@ pub fn apply_frame(src: &RgbaImage, idx: usize, n: usize, elapsed_s: f32, s: &Ef
     if s.wave {
         let phase = idx as f32 / n.max(1) as f32 * std::f32::consts::TAU;
         img = wave(&img, s.wave_amp, s.wave_len, phase);
+    }
+    if s.booth != crate::booth::BoothFx::None {
+        img = crate::booth::apply(&img, s.booth, s.booth_amount, s.booth_cx, s.booth_cy);
     }
     if s.gotham {
         gotham(&mut img);

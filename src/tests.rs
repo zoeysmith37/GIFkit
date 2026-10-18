@@ -985,3 +985,54 @@ fn emoji_layer_renders() {
     assert!(changed > 600, "emoji changed only {changed} pixels");
     assert_eq!(before.get_pixel(90, 60), after.get_pixel(90, 60), "outside the box stays as it was");
 }
+
+#[test]
+#[ignore]
+fn booth_contact_sheet() {
+    // GIFKIT_BOOTH_IN=photo.png GIFKIT_BOOTH_OUT=sheet.png cargo test booth_contact_sheet -- --ignored
+    use crate::booth::{apply, BoothFx};
+    let Ok(inp) = std::env::var("GIFKIT_BOOTH_IN") else { return };
+    let src = image::open(inp).unwrap().to_rgba8();
+    let all: Vec<BoothFx> = BoothFx::LOOKS.iter().chain(BoothFx::DISTORT.iter()).copied().collect();
+    let (w, h) = src.dimensions();
+    let cols = 4u32;
+    let rows = (all.len() as u32 + 1).div_ceil(cols);
+    let mut sheet = image::RgbaImage::from_pixel(cols * w, rows * h, image::Rgba([0, 0, 0, 255]));
+    image::imageops::overlay(&mut sheet, &src, 0, 0);
+    for (i, fx) in all.iter().enumerate() {
+        let out = apply(&src, *fx, 50.0, 50.0, 50.0);
+        let k = i as u32 + 1;
+        image::imageops::overlay(&mut sheet, &out, ((k % cols) * w) as i64, ((k / cols) * h) as i64);
+    }
+    sheet.save(std::env::var("GIFKIT_BOOTH_OUT").unwrap()).unwrap();
+}
+
+#[test]
+fn booth_effects_change_pixels() {
+    use crate::booth::{apply, BoothFx};
+    let a = synth(false);
+    let src = &a.frames[3].image;
+    for fx in BoothFx::LOOKS.iter().chain(BoothFx::DISTORT.iter()) {
+        let out = apply(src, *fx, 60.0, 50.0, 50.0);
+        assert_eq!(out.dimensions(), src.dimensions(), "{fx:?}");
+        let diff = out.pixels().zip(src.pixels()).filter(|(x, y)| x != y).count();
+        assert!(diff > 100, "{fx:?} changed only {diff} pixels");
+    }
+    // the effects layer runs it
+    let fx = crate::effects::EffectSettings { booth: BoothFx::Thermal, ..Default::default() };
+    let out = crate::effects::apply_frame(src, 0, 1, 0.0, &fx, &[]);
+    assert_ne!(out.as_raw(), src.as_raw());
+}
+
+#[test]
+fn text_stretch_changes_width_only() {
+    let fonts = crate::text::builtin_fonts();
+    let t = crate::text::Annotation { text: "Hello".into(), size: 30.0, ..Default::default() };
+    let (w, h) = crate::text::measure(&fonts, &t);
+    let t2 = crate::text::Annotation { stretch: 0.5, ..t.clone() };
+    let (w2, h2) = crate::text::measure(&fonts, &t2);
+    assert_eq!(h, h2);
+    assert!((w2 as i64 - (w as i64 / 2)).abs() <= 1, "{w} -> {w2}");
+    let sp = crate::text::render_sprite(&fonts, &t2);
+    assert_eq!(sp.dimensions(), (w2, h2));
+}

@@ -75,6 +75,8 @@ pub struct Annotation {
     pub visible: bool,
     /// clockwise rotation in degrees about the text centre
     pub angle: f32,
+    /// horizontal squash (<1) or stretch (>1) of the rendered text
+    pub stretch: f32,
 }
 
 impl Default for Annotation {
@@ -95,6 +97,7 @@ impl Default for Annotation {
             to: 0,
             visible: true,
             angle: 0.0,
+            stretch: 1.0,
         }
     }
 }
@@ -179,7 +182,15 @@ pub fn measure(fonts: &[FontEntry], a: &Annotation) -> (u32, u32) {
     let font = &fonts[a.font_idx.min(fonts.len() - 1)].font;
     let (w, h, _) = rasterize(font, &a.text, a.size, a.align);
     let r = a.outline_px() as u32;
-    (w + 2 * r, h + 2 * r)
+    (stretched(w + 2 * r, a.stretch), h + 2 * r)
+}
+
+fn stretched(w: u32, s: f32) -> u32 {
+    if (s - 1.0).abs() < 1e-3 || !s.is_finite() {
+        w
+    } else {
+        ((w as f32 * s.clamp(0.05, 20.0)).round() as u32).max(1)
+    }
 }
 
 /// Pre-rendered RGBA sprite of an annotation (so it is rasterised once per apply).
@@ -232,6 +243,10 @@ pub fn render_sprite(fonts: &[FontEntry], a: &Annotation) -> RgbaImage {
                 *px = blend_over(*px, Rgba([c[0], c[1], c[2], (c[3] as f32 * v) as u8]));
             }
         }
+    }
+    let nw = stretched(out.width(), a.stretch);
+    if nw != out.width() {
+        out = image::imageops::resize(&out, nw, out.height(), image::imageops::FilterType::CatmullRom);
     }
     out
 }

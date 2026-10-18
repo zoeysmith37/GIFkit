@@ -421,7 +421,9 @@ enum Space {
 #[derive(Clone, Copy)]
 enum BoxDrag {
     Move { id: u64, li: usize, start: Pos2, src: Obb },
-    Resize { id: u64, li: usize, fixed: (f32, f32), out0: Obb, src: Obb, size0: f32, d0: f32 },
+    /// `axis`: 0 = both (corner), 1 = width only, 2 = height only (edge handles).
+    /// `size0` / `stretch0`: text size and stretch at the start.
+    Resize { id: u64, li: usize, fixed: (f32, f32), out0: Obb, src: Obb, size0: f32, stretch0: f32, axis: u8 },
     Rotate { id: u64, li: usize, a0: f32, out0: Obb, src: Obb },
     New { id: u64, li: usize, anchor: Pos2 },
 }
@@ -518,7 +520,9 @@ pub struct GifKitApp {
     active_view: usize,
     link_views: bool,
     box_drag: Option<BoxDrag>,
-    checker: bool,
+    /// what transparent pixels show on in the viewports
+    backdrop: Backdrop,
+    backdrop_col: [u8; 3],
     pixelated: bool,
 
     base_tex: TexCache,
@@ -640,6 +644,15 @@ pub struct GifKitApp {
     pen_scope: PenScope,
     /// stroke being drawn: (layer id, points in the viewport's image space, space)
     pen_live: Option<(u64, Vec<Pos2>, Space)>,
+}
+
+/// Behind transparent pixels in the viewports.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Backdrop {
+    Checker,
+    Solid,
+    /// the viewport background itself
+    Canvas,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1217,7 +1230,12 @@ impl GifKitApp {
             active_view: 2,
             link_views: false,
             box_drag: None,
-            checker: true,
+            backdrop: match theme::get_setting("backdrop").as_deref() {
+                Some("solid") => Backdrop::Solid,
+                Some("canvas") => Backdrop::Canvas,
+                _ => Backdrop::Checker,
+            },
+            backdrop_col: theme::get_setting("backdrop_col").and_then(|v| parse_hex(&v)).unwrap_or([255, 255, 255]),
             pixelated: false,
             base_tex: TexCache::default(),
             thumb_tex: TexCache::default(),
@@ -2680,6 +2698,22 @@ impl GifKitApp {
         Some(self.cmp_tex.put(ctx, i, &img, o, "cmp"))
     }
 
+    /// What sits behind transparent pixels: `vis` is the visible part of `img_rect`.
+    fn paint_backdrop(&mut self, painter: &egui::Painter, ctx: &egui::Context, vis: Rect, img_rect: Rect) {
+        match self.backdrop {
+            Backdrop::Checker => {
+                let ct = self.checker(ctx);
+                let uv = Rect::from_min_max(((vis.min - img_rect.min) / 16.0).to_pos2(), ((vis.max - img_rect.min) / 16.0).to_pos2());
+                painter.image(ct.id(), vis, uv, Color32::WHITE);
+            }
+            Backdrop::Solid => {
+                let c = self.backdrop_col;
+                painter.rect_filled(vis, 0.0, Color32::from_rgb(c[0], c[1], c[2]));
+            }
+            Backdrop::Canvas => {}
+        }
+    }
+
     fn checker(&mut self, ctx: &egui::Context) -> TextureHandle {
         if self.checker_tex.is_none() {
             let a = Color32::from_gray(0xcc);
@@ -2953,7 +2987,7 @@ impl GifKitApp {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(RichText::new("?").size(12.5).color(pal.fg_muted)).on_hover_text(
-                    "Mouse wheel zooms. Middle or right drag pans.\nAlt+drag pans in drawing tools.\nShift+drag moves in straight lines.\nF fits the view. 1 shows actual size.\nSpace plays or pauses. ← and → step.\nC switches single and split view.\nCtrl+S exports. Ctrl+Z and Ctrl+Y undo and redo.\nCtrl+V opens copied files.",
+                    "Mouse wheel zooms. Middle or right drag pans.\nAlt+drag pans in drawing tools.\nShift+drag moves in straight lines.\nWhen resizing, Shift keeps or frees the proportions and Ctrl scales one way. Edge handles stretch one side.\nF fits the view. 1 shows actual size.\nSpace plays or pauses. ← and → step.\nC switches single and split view.\nCtrl+S exports. Ctrl+Z and Ctrl+Y undo and redo.\nCtrl+V opens copied files.",
                 );
             });
         });
@@ -3604,8 +3638,33 @@ impl GifKitApp {
             self.link_views = !self.link_views;
         }
         toolbar_sep(ui);
-        if toggle_icon(ui, "▦", self.checker, "Checkerboard behind transparency") {
-            self.checker = !self.checker;
+        let (icon, tip) = match self.backdrop {
+            Backdrop::Checker => ("▦", "Transparency: checkerboard"),
+            Backdrop::Solid => ("■", "Transparency: solid colour"),
+            Backdrop::Canvas => ("□", "Transparency: viewport background"),
+        };
+        let br = ui.add(egui::Button::new(RichText::new(icon).size(15.0).color(p().fg)).min_size(vec2(TOOLBAR_H, TOOLBAR_H))).on_hover_text(tip);
+        let before = (self.backdrop, self.backdrop_col);
+        egui::Popup::menu(&br).show(|ui| {
+            ui.set_min_width(200.0);
+            ui.label(RichText::new("Show transparency on").size(11.5).color(p().fg_muted));
+            ui.selectable_value(&mut self.backdrop, Backdrop::Checker, "▦  Checkerboard");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.backdrop, Backdrop::Solid, "■  Solid colour");
+                if ui.color_edit_button_srgb(&mut self.backdrop_col).changed() {
+                    self.backdrop = Backdrop::Solid;
+                }
+            });
+            ui.selectable_value(&mut self.backdrop, Backdrop::Canvas, "□  Viewport background");
+        });
+        if before != (self.backdrop, self.backdrop_col) {
+            theme::set_setting("backdrop", match self.backdrop {
+                Backdrop::Checker => "checker",
+                Backdrop::Solid => "solid",
+                Backdrop::Canvas => "canvas",
+            });
+            let c = self.backdrop_col;
+            theme::set_setting("backdrop_col", &format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]));
         }
         if toggle_icon(ui, "▩", self.pixelated, "Pixelated preview (nearest neighbour)") {
             self.pixelated = !self.pixelated;
@@ -3734,12 +3793,7 @@ impl GifKitApp {
         let inner = rect.shrink(10.0);
         let sc = (inner.width() / size.x).min(inner.height() / size.y);
         let ir = Rect::from_center_size(inner.center(), size * sc);
-        if self.checker {
-            let ct = self.checker(ctx);
-            painter.image(ct.id(), ir, Rect::from_min_max(pos2(0.0, 0.0), (ir.size() / 16.0).to_pos2()), Color32::WHITE);
-        } else {
-            painter.rect_filled(ir, 0.0, Color32::WHITE);
-        }
+        self.paint_backdrop(&painter, ctx, ir, ir);
         if let Some(t) = tex {
             painter.image(t.id(), ir, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), if fresh { Color32::WHITE } else { Color32::from_white_alpha(140) });
         }
@@ -4192,14 +4246,10 @@ impl GifKitApp {
         painter.rect_filled(rect, 0.0, pal.canvas);
         let vis = img_rect.intersect(rect);
         if vis.is_positive() {
-            painter.rect_filled(img_rect.translate(vec2(0.0, 2.0)).expand(1.0), 2.0, Color32::from_black_alpha(60));
-            if self.checker {
-                let ct = self.checker(ctx);
-                let uv = Rect::from_min_max(((vis.min - img_rect.min) / 16.0).to_pos2(), ((vis.max - img_rect.min) / 16.0).to_pos2());
-                painter.image(ct.id(), vis, uv, Color32::WHITE);
-            } else {
-                painter.rect_filled(vis, 0.0, Color32::WHITE);
+            if self.backdrop != Backdrop::Canvas {
+                painter.rect_filled(img_rect.translate(vec2(0.0, 2.0)).expand(1.0), 2.0, Color32::from_black_alpha(60));
             }
+            self.paint_backdrop(&painter, ctx, vis, img_rect);
             if let Some(t) = &tex {
                 let ts = t.size_vec2();
                 let tr = Rect::from_min_size(img_rect.min, ts * scale);
@@ -4538,14 +4588,22 @@ impl GifKitApp {
                     if rot_handle(&o).distance(sp) <= HANDLE_HIT {
                         let a0 = (pi.y - o.cy).atan2(pi.x - o.cx).to_degrees();
                         new_drag = Some(BoxDrag::Rotate { id, li, a0, out0: o, src: b });
-                    } else if let Some(k) = o.corners().iter().position(|c| to_screen(*c).distance(sp) <= HANDLE_HIT) {
-                        let f = o.to_local(o.corners()[(k + 2) % 4].0, o.corners()[(k + 2) % 4].1);
-                        let size0 = match &self.stack.layers[li].kind {
-                            LayerKind::Text(t) => t.size,
-                            _ => 0.0,
+                    } else if let Some((fixed, axis)) = o
+                        .corners()
+                        .iter()
+                        .position(|c| to_screen(*c).distance(sp) <= HANDLE_HIT)
+                        .map(|k| (o.to_local(o.corners()[(k + 2) % 4].0, o.corners()[(k + 2) % 4].1), 0u8))
+                        .or_else(|| edge_mids(&o).iter().position(|c| to_screen(*c).distance(sp) <= HANDLE_HIT).map(|k| {
+                            // the opposite edge stays put
+                            let f = [(0.0, o.h / 2.0), (-o.w / 2.0, 0.0), (0.0, -o.h / 2.0), (o.w / 2.0, 0.0)][k];
+                            (f, if k % 2 == 0 { 2 } else { 1 })
+                        }))
+                    {
+                        let (size0, stretch0) = match &self.stack.layers[li].kind {
+                            LayerKind::Text(t) => (t.size, t.stretch),
+                            _ => (0.0, 1.0),
                         };
-                        let d0 = ((pi.x - o.cx).powi(2) + (pi.y - o.cy).powi(2)).sqrt().max(1.0);
-                        new_drag = Some(BoxDrag::Resize { id, li, fixed: f, out0: o, src: b, size0, d0 });
+                        new_drag = Some(BoxDrag::Resize { id, li, fixed, out0: o, src: b, size0, stretch0, axis });
                     } else if o.contains(pi.x, pi.y) {
                         new_drag = Some(BoxDrag::Move { id, li, start: pi, src: b });
                     }
@@ -4603,27 +4661,44 @@ impl GifKitApp {
                             let nb = Obb { cx: src.cx + dx, cy: src.cy + dy, ..src };
                             self.write_box(li, nb, None, src_idx);
                         }
-                        BoxDrag::Resize { fixed, out0, src, size0, d0, .. } => {
-                            if size0 > 0.0 {
-                                let d = ((pi.x - out0.cx).powi(2) + (pi.y - out0.cy).powi(2)).sqrt();
-                                let ns = (size0 * d / d0).clamp(4.0, 4000.0);
-                                self.write_box(li, src, Some(ns), src_idx);
-                            } else {
-                                let lp = out0.to_local(pi.x, pi.y);
-                                let (mut w, mut h) = ((lp.0 - fixed.0).abs().max(1.0), (lp.1 - fixed.1).abs().max(1.0));
-                                let emoji = matches!(&self.stack.layers[li].kind, LayerKind::Shape(sh) if sh.kind == ShapeKind::Emoji) || kind == Kind::Emoji;
-                                if (kind == Kind::Overlay || emoji) && !shift {
+                        BoxDrag::Resize { fixed, out0, src, size0, stretch0, axis, .. } => {
+                            // Shift flips the proportion lock (images and emoji start locked),
+                            // Ctrl scales along one axis only, edge handles always do
+                            let ctrl = ui.input(|i| i.modifiers.command);
+                            let emoji = matches!(&self.stack.layers[li].kind, LayerKind::Shape(sh) if sh.kind == ShapeKind::Emoji) || kind == Kind::Emoji;
+                            let lock = (kind == Kind::Overlay || emoji) != shift;
+                            let lp = out0.to_local(pi.x, pi.y);
+                            let (mut w, mut h) = ((lp.0 - fixed.0).abs().max(1.0), (lp.1 - fixed.1).abs().max(1.0));
+                            let mut axis = axis;
+                            if axis == 0 && ctrl {
+                                axis = if (w / out0.w - 1.0).abs() >= (h / out0.h.max(1e-3) - 1.0).abs() { 1 } else { 2 };
+                            }
+                            match axis {
+                                1 => h = out0.h,
+                                2 => w = out0.w,
+                                _ if lock => {
                                     let r = out0.w / out0.h.max(1e-3);
                                     w = w.max(h * r);
                                     h = w / r;
                                 }
-                                let sx = if lp.0 >= fixed.0 { 1.0 } else { -1.0 };
-                                let sy = if lp.1 >= fixed.1 { 1.0 } else { -1.0 };
-                                let lc = (fixed.0 + sx * w / 2.0, fixed.1 + sy * h / 2.0);
-                                let c = out0.from_local(lc.0, lc.1);
-                                let out = Obb { cx: c.0, cy: c.1, w, h, angle: out0.angle };
-                                self.write_box(li, unmap_box(&mp, out, src.angle), None, src_idx);
+                                _ => {}
                             }
+                            let sx = if lp.0 >= fixed.0 { 1.0 } else { -1.0 };
+                            let sy = if lp.1 >= fixed.1 { 1.0 } else { -1.0 };
+                            let lcx = if axis == 2 { 0.0 } else { fixed.0 + sx * w / 2.0 };
+                            let lcy = if axis == 1 { 0.0 } else { fixed.1 + sy * h / 2.0 };
+                            let c = out0.from_local(lcx, lcy);
+                            let out = Obb { cx: c.0, cy: c.1, w, h, angle: out0.angle };
+                            let nb = unmap_box(&mp, out, src.angle);
+                            if size0 > 0.0 {
+                                // text: height sets the font size, width the stretch
+                                let (ky, kx) = (nb.h / src.h.max(1e-3), nb.w / src.w.max(1e-3));
+                                if let LayerKind::Text(t) = &mut self.stack.layers[li].kind {
+                                    t.size = (size0 * ky).clamp(2.0, 4000.0);
+                                    t.stretch = (stretch0 * kx / ky.max(1e-3)).clamp(0.05, 20.0);
+                                }
+                            }
+                            self.write_box(li, nb, None, src_idx);
                         }
                         BoxDrag::Rotate { a0, out0, src, .. } => {
                             let a = (pi.y - out0.cy).atan2(pi.x - out0.cx).to_degrees();
@@ -4742,6 +4817,11 @@ impl GifKitApp {
                     painter.rect_filled(h, 1.0, Color32::WHITE);
                     painter.rect_stroke(h, 1.0, Stroke::new(1.0, pal.highlight), egui::StrokeKind::Middle);
                 }
+                for c in edge_mids(&o) {
+                    let h = Rect::from_center_size(to_screen(c), vec2(7.0, 7.0));
+                    painter.rect_filled(h, 1.0, Color32::WHITE);
+                    painter.rect_stroke(h, 1.0, Stroke::new(1.0, pal.highlight), egui::StrokeKind::Middle);
+                }
             } else {
                 painter.add(egui::Shape::closed_line(pts, Stroke::new(1.0, Color32::from_white_alpha(110))));
             }
@@ -4755,6 +4835,10 @@ impl GifKitApp {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::Alias);
                         } else if c.3.corners().iter().any(|q| to_screen(*q).distance(pp) <= HANDLE_HIT) {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                        } else if let Some(k) = edge_mids(&c.3).iter().position(|q| to_screen(*q).distance(pp) <= HANDLE_HIT) {
+                            // pick the arrow closest to how the edge faces on screen
+                            let a = (c.3.angle + if k % 2 == 0 { 90.0 } else { 0.0 }).rem_euclid(180.0);
+                            ui.ctx().set_cursor_icon(if (45.0..135.0).contains(&a) { egui::CursorIcon::ResizeVertical } else { egui::CursorIcon::ResizeHorizontal });
                         } else if c.3.contains(pi.x, pi.y) {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
                         }
@@ -5880,6 +5964,17 @@ impl GifKitApp {
                     ui.color_edit_button_srgba_unmultiplied(&mut a.color);
                 });
                 ui.end_row();
+                ui.label("Stretch");
+                ui.horizontal(|ui| {
+                    let mut pct = a.stretch * 100.0;
+                    if ui.add(egui::DragValue::new(&mut pct).range(5.0..=2000.0).speed(0.5).max_decimals(0).suffix("%")).on_hover_text("Squash or stretch the text sideways. Drag a side handle on the image to do it by hand.").changed() {
+                        a.stretch = pct / 100.0;
+                    }
+                    if (a.stretch - 1.0).abs() > 1e-3 && chip(ui, "Reset").clicked() {
+                        a.stretch = 1.0;
+                    }
+                });
+                ui.end_row();
                 ui.label("Outline");
                 ui.horizontal(|ui| {
                     let mut w = a.outline_px() as f32;
@@ -6706,6 +6801,35 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
             }
         });
     });
+    let booth_on = fx.booth != crate::booth::BoothFx::None;
+    group_ex(ui, "Photo Booth", true, booth_on.then(|| "●".to_string()), |ui| {
+        use crate::booth::BoothFx;
+        let pick = |ui: &mut egui::Ui, list: &[BoothFx], fx: &mut EffectSettings| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                for &b in list {
+                    if seg_label(ui, fx.booth == b, b.label()).on_hover_text(b.tip()).clicked() {
+                        fx.booth = if fx.booth == b { BoothFx::None } else { b };
+                    }
+                }
+            });
+        };
+        hint(ui, "Looks");
+        pick(ui, &BoothFx::LOOKS, fx);
+        hint(ui, "Distortions");
+        pick(ui, &BoothFx::DISTORT, fx);
+        if fx.booth != BoothFx::None {
+            ui.add(egui::Slider::new(&mut fx.booth_amount, 0.0..=100.0).text("strength").suffix("%"));
+            if fx.booth.has_centre() {
+                ui.add(egui::Slider::new(&mut fx.booth_cx, 0.0..=100.0).text("centre X").suffix("%"));
+                ui.add(egui::Slider::new(&mut fx.booth_cy, 0.0..=100.0).text("centre Y").suffix("%"));
+                if chip(ui, "Centre").clicked() {
+                    fx.booth_cx = 50.0;
+                    fx.booth_cy = 50.0;
+                }
+            }
+        }
+    });
     group_ex(ui, "Transparency", false, on(&[fx.rc_white, fx.rc_black, fx.rc_custom]), |ui| {
         ui.horizontal(|ui| {
             ui.label("Remove");
@@ -6734,18 +6858,10 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
             });
         }
     });
-    group_ex(ui, "Animation", false, on(&[tr.reverse, tr.boomerang, tr.set_loop, fx.counter, fx.fade_in, fx.fade_out]), |ui| {
-        ui.horizontal_wrapped(|ui| {
-            toggle_btn(ui, &mut tr.reverse, "Reverse");
-            toggle_btn(ui, &mut tr.boomerang, "Boomerang");
-            toggle_btn(ui, &mut fx.counter, "Timer").on_hover_text("Shows a running seconds counter");
-        });
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut tr.set_loop, "Loop count");
-            if tr.set_loop {
-                ui.add(egui::DragValue::new(&mut tr.loop_count).range(0..=65535)).on_hover_text("0 loops forever");
-            }
-        });
+    // reverse, boomerang and looping live in the Reverse frame edit
+    let _ = tr;
+    group_ex(ui, "Fades & timer", false, on(&[fx.counter, fx.fade_in, fx.fade_out]), |ui| {
+        toggle_btn(ui, &mut fx.counter, "Timer").on_hover_text("Shows a running seconds counter");
         ui.horizontal(|ui| {
             toggle_btn(ui, &mut fx.fade_in, "Fade in");
             toggle_btn(ui, &mut fx.fade_out, "Fade out");
@@ -6836,7 +6952,12 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
             });
         }
     });
-    group_ex(ui, "Transform", false, on(&[fx.flip_v, fx.flip_h, fx.rot90, fx.rot270, fx.rot_any]), |ui| {
+    // flips and rotation live in the Rotate frame edit; only shown for old layers that use them
+    if !(fx.flip_v || fx.flip_h || fx.rot90 || fx.rot270 || fx.rot_any) {
+        return;
+    }
+    group_ex(ui, "Transform (old)", true, on(&[fx.flip_v, fx.flip_h, fx.rot90, fx.rot270, fx.rot_any]), |ui| {
+        hint(ui, "Use the Rotate frame edit instead. These stay for older projects.");
         ui.horizontal_wrapped(|ui| {
             toggle_btn(ui, &mut fx.flip_h, "↔ Flip");
             toggle_btn(ui, &mut fx.flip_v, "↕ Flip");
@@ -6893,6 +7014,11 @@ fn parse_hex(s: &str) -> Option<[u8; 3]> {
 
 /// Screen-space pick radius for resize corners and the rotate handle.
 const HANDLE_HIT: f32 = 16.0;
+
+/// Midpoints of a box's top, right, bottom and left edges.
+fn edge_mids(o: &Obb) -> [(f32, f32); 4] {
+    [o.from_local(0.0, -o.h / 2.0), o.from_local(o.w / 2.0, 0.0), o.from_local(0.0, o.h / 2.0), o.from_local(-o.w / 2.0, 0.0)]
+}
 
 fn draw_sel(painter: &egui::Painter, r: Rect, accent: Color32) {
     painter.rect_stroke(r, 0.0, Stroke::new(2.0, Color32::from_black_alpha(160)), egui::StrokeKind::Middle);
