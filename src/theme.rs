@@ -148,9 +148,9 @@ fn parse_kde_color(v: &str) -> Option<Color32> {
     (c.len() >= 3).then(|| Color32::from_rgb(c[0], c[1], c[2]))
 }
 
-/// `GIFFORGE_ACCENT=r,g,b` overrides the accent; `GIFFORGE_ACCENT=default` keeps Breeze blue.
+/// `GIFKIT_ACCENT=r,g,b` overrides the accent; `GIFKIT_ACCENT=default` keeps Breeze blue.
 fn accent_override() -> Option<Option<Color32>> {
-    std::env::var("GIFFORGE_ACCENT").ok().map(|v| parse_kde_color(&v))
+    std::env::var("GIFKIT_ACCENT").ok().map(|v| parse_kde_color(&v))
 }
 
 fn kdeglobals_path() -> Option<std::path::PathBuf> {
@@ -415,7 +415,38 @@ pub fn config_path() -> Option<std::path::PathBuf> {
     } else {
         std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
     }?;
-    Some(base.join("gifforge").join("settings.conf"))
+    let dir = base.join("gifkit");
+    migrate_old_config(&base, &dir);
+    Some(dir.join("settings.conf"))
+}
+
+/// The app used to be called GifForge: carry its settings and presets over once.
+fn migrate_old_config(base: &std::path::Path, dir: &std::path::Path) {
+    static DONE: std::sync::Once = std::sync::Once::new();
+    DONE.call_once(|| {
+        let old = base.join("gifforge");
+        if dir.exists() || !old.is_dir() {
+            return;
+        }
+        if std::fs::rename(&old, dir).is_err() {
+            // different file system or locked: copy instead
+            let _ = copy_dir(&old, dir);
+        }
+    });
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for e in std::fs::read_dir(from)? {
+        let e = e?;
+        let target = to.join(e.file_name());
+        if e.file_type()?.is_dir() {
+            copy_dir(&e.path(), &target)?;
+        } else {
+            std::fs::copy(e.path(), target)?;
+        }
+    }
+    Ok(())
 }
 
 fn read_settings() -> Vec<(String, String)> {

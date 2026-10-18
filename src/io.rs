@@ -97,7 +97,7 @@ fn load_video_dec(path: &Path, max_side: Option<u32>, crop_to: Option<(u32, u32)
     let delay_cs = [2u16, 3, 4, 5, 6, 8, 10].into_iter().find(|d| 100.0 / *d as f64 <= src_fps + 0.01).unwrap_or(10);
     let fps = 100.0 / delay_cs as f64;
     static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let tmp = std::env::temp_dir().join(format!("gifforge_vid_{}_{}", std::process::id(), RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    let tmp = std::env::temp_dir().join(format!("gifkit_vid_{}_{}", std::process::id(), RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
     let mut vf = format!("fps={fps}");
@@ -687,7 +687,7 @@ pub fn encode_preview(anim: &Animation, f: &PreviewFormat) -> Result<(Animation,
         PreviewFormat::Video(vf, bg) => {
             static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let ext = if *vf == VideoFormat::Mp4 { "mp4" } else { "webm" };
-            let tmp = std::env::temp_dir().join(format!("gifforge_prev_{}_{}.{ext}", std::process::id(), RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+            let tmp = std::env::temp_dir().join(format!("gifkit_prev_{}_{}.{ext}", std::process::id(), RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
             export_video(anim, &tmp, *vf, *bg, false)?;
             let b = std::fs::read(&tmp)?;
             let dec = if *vf == VideoFormat::WebmAlpha { Some("libvpx-vp9") } else { None };
@@ -700,7 +700,7 @@ pub fn encode_preview(anim: &Animation, f: &PreviewFormat) -> Result<(Animation,
 
 fn decode_video_bytes(b: &[u8], ext: &str, size: (u32, u32)) -> Result<Animation> {
     static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let tmp = std::env::temp_dir().join(format!("gifforge_dec_{}_{}.{ext}", std::process::id(), RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    let tmp = std::env::temp_dir().join(format!("gifkit_dec_{}_{}.{ext}", std::process::id(), RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     std::fs::write(&tmp, b)?;
     let a = load_video_opts(&tmp, None, Some(size));
     let _ = std::fs::remove_file(&tmp);
@@ -709,7 +709,7 @@ fn decode_video_bytes(b: &[u8], ext: &str, size: (u32, u32)) -> Result<Animation
 
 /// Encode an animated AVIF with ffmpeg; `quality` 0..=100.
 pub fn encode_avif(anim: &Animation, quality: u8) -> Result<Vec<u8>> {
-    let tmp = std::env::temp_dir().join(format!("gifforge_avif_{}_{}.avif", std::process::id(), quality));
+    let tmp = std::env::temp_dir().join(format!("gifkit_avif_{}_{}.avif", std::process::id(), quality));
     export_video_q(anim, &tmp, VideoFormat::Avif, [0, 0, 0], Some(quality), false)?;
     let b = std::fs::read(&tmp)?;
     let _ = std::fs::remove_file(&tmp);
@@ -727,7 +727,7 @@ pub fn export_video_q(anim: &Animation, path: &Path, fmt: VideoFormat, bg: [u8; 
     static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let frames = anim.enabled_frames();
     anyhow::ensure!(!frames.is_empty(), "No enabled frames");
-    let tmp = std::env::temp_dir().join(format!("gifforge_{}_{}", std::process::id(), RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    let tmp = std::env::temp_dir().join(format!("gifkit_{}_{}", std::process::id(), RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     let has_alpha = frames.iter().any(|f| f.image.pixels().any(|p| p[3] < 255));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;

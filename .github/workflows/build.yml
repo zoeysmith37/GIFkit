@@ -44,11 +44,11 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           cargo build --release
-          mkdir -p dist/gifforge-${{ matrix.name }}
-          cp target/release/gifforge README.md dist/gifforge-${{ matrix.name }}/
-          cp assets/*.txt dist/gifforge-${{ matrix.name }}/
-          cp assets/linux/install.sh assets/icon/gifforge.svg dist/gifforge-${{ matrix.name }}/
-          tar -C dist -czf gifforge-${{ matrix.name }}.tar.gz gifforge-${{ matrix.name }}
+          mkdir -p dist/gifkit-${{ matrix.name }}
+          cp target/release/gifkit README.md dist/gifkit-${{ matrix.name }}/
+          cp assets/*.txt dist/gifkit-${{ matrix.name }}/
+          cp assets/linux/install.sh assets/icon/gifkit.svg dist/gifkit-${{ matrix.name }}/
+          tar -C dist -czf gifkit-${{ matrix.name }}.tar.gz gifkit-${{ matrix.name }}
 
       # ---------------------------------------------------------------- Windows
       - name: Build (Windows)
@@ -56,11 +56,11 @@ jobs:
         shell: pwsh
         run: |
           cargo build --release
-          $d = "dist/gifforge-${{ matrix.name }}"
+          $d = "dist/gifkit-${{ matrix.name }}"
           New-Item -ItemType Directory -Force $d | Out-Null
-          Copy-Item target/release/gifforge.exe, README.md $d
+          Copy-Item target/release/gifkit.exe, README.md $d
           Copy-Item assets/*.txt $d
-          Compress-Archive -Path $d -DestinationPath gifforge-${{ matrix.name }}.zip
+          Compress-Archive -Path $d -DestinationPath gifkit-${{ matrix.name }}.zip
 
       # ---------------------------------------------------------------- macOS (universal .app)
       - name: Build (macOS)
@@ -68,22 +68,22 @@ jobs:
         run: |
           cargo build --release --target aarch64-apple-darwin
           cargo build --release --target x86_64-apple-darwin
-          APP=dist/GifForge.app
+          APP=dist/GIFkit.app
           mkdir -p $APP/Contents/MacOS $APP/Contents/Resources
-          lipo -create -output $APP/Contents/MacOS/gifforge \
-            target/aarch64-apple-darwin/release/gifforge \
-            target/x86_64-apple-darwin/release/gifforge
-          cp assets/icon/gifforge.icns $APP/Contents/Resources/gifforge.icns
+          lipo -create -output $APP/Contents/MacOS/gifkit \
+            target/aarch64-apple-darwin/release/gifkit \
+            target/x86_64-apple-darwin/release/gifkit
+          cp assets/icon/gifkit.icns $APP/Contents/Resources/gifkit.icns
           VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           cat > $APP/Contents/Info.plist <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0"><dict>
-            <key>CFBundleName</key><string>GifForge</string>
-            <key>CFBundleDisplayName</key><string>GifForge</string>
-            <key>CFBundleIdentifier</key><string>io.github.zoeysmith37.gifforge</string>
-            <key>CFBundleExecutable</key><string>gifforge</string>
-            <key>CFBundleIconFile</key><string>gifforge</string>
+            <key>CFBundleName</key><string>GIFkit</string>
+            <key>CFBundleDisplayName</key><string>GIFkit</string>
+            <key>CFBundleIdentifier</key><string>io.github.zoeysmith37.gifkit</string>
+            <key>CFBundleExecutable</key><string>gifkit</string>
+            <key>CFBundleIconFile</key><string>gifkit</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>${VERSION}</string>
             <key>CFBundleVersion</key><string>${VERSION}</string>
@@ -100,12 +100,12 @@ jobs:
           EOF
           codesign --force --deep --sign - $APP
           cp README.md dist/
-          cd dist && zip -qry ../gifforge-${{ matrix.name }}.zip GifForge.app README.md
+          cd dist && zip -qry ../gifkit-${{ matrix.name }}.zip GIFkit.app README.md
 
       - uses: actions/upload-artifact@v4
         with:
-          name: gifforge-${{ matrix.name }}
-          path: gifforge-${{ matrix.name }}.*
+          name: gifkit-${{ matrix.name }}
+          path: gifkit-${{ matrix.name }}.*
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')

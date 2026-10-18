@@ -464,7 +464,7 @@ struct Status {
 
 // ================================================================ app
 
-pub struct GifForgeApp {
+pub struct GifKitApp {
     base: Option<Animation>,
     original: Option<Animation>,
     orig_gen: u64,
@@ -1087,10 +1087,10 @@ fn small_flat(ui: &mut egui::Ui, text: &str, tip: &str) -> bool {
     ui.add(egui::Button::new(RichText::new(text).size(11.5).color(pal.fg_muted)).frame_when_inactive(false).min_size(vec2(18.0, 20.0))).on_hover_text(tip).clicked()
 }
 
-impl GifForgeApp {
+impl GifKitApp {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
         theme::install(&cc.egui_ctx);
-        let theme_choice = match std::env::var("GIFFORGE_THEME").as_deref() {
+        let theme_choice = match std::env::var("GIFKIT_THEME").as_deref() {
             Ok("dark") => ThemeChoice::Dark,
             Ok("light") => ThemeChoice::Light,
             _ => theme::load_theme_choice(),
@@ -1185,7 +1185,7 @@ impl GifForgeApp {
             presets_open: false,
             presets: Vec::new(),
             preset_problems: Vec::new(),
-            preset_name: std::env::var("GIFFORGE_PRESET_NAME").unwrap_or_default(),
+            preset_name: std::env::var("GIFKIT_PRESET_NAME").unwrap_or_default(),
             preset_inc: (true, true, true),
             font_preview_queue: Vec::new(),
             preview_fonts: HashMap::new(),
@@ -1228,23 +1228,23 @@ impl GifForgeApp {
             });
         }
         // Optional start-up state (handy for scripting & screenshots)
-        if let Ok(t) = std::env::var("GIFFORGE_TOOL") {
+        if let Ok(t) = std::env::var("GIFKIT_TOOL") {
             if let Some(tool) = Tool::ALL.iter().find(|x| x.label().to_lowercase().starts_with(&t.to_lowercase())) {
                 app.tool = *tool;
             }
         }
-        if let Ok(f) = std::env::var("GIFFORGE_FORMAT") {
+        if let Ok(f) = std::env::var("GIFKIT_FORMAT") {
             if let Some(f) = ExportFormat::ALL.iter().find(|x| x.label().to_lowercase().starts_with(&f.to_lowercase())) {
                 app.export_fmt = *f;
             }
         }
-        if std::env::var("GIFFORGE_ABOUT").is_ok() {
+        if std::env::var("GIFKIT_ABOUT").is_ok() {
             app.about_open = true;
         }
-        if std::env::var("GIFFORGE_EXPORT").is_ok() {
+        if std::env::var("GIFKIT_EXPORT").is_ok() {
             app.export_open = true;
         }
-        if std::env::var("GIFFORGE_COMPARE").is_ok() {
+        if std::env::var("GIFKIT_COMPARE").is_ok() {
             app.compare = true;
         }
         if let Some(p) = initial {
@@ -1374,15 +1374,15 @@ impl GifForgeApp {
                 let name = self.path.as_ref().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "sequence".into());
                 self.info(format!("Opened {name}"));
                 // scripting hook (screenshots): a typical layer stack
-                if std::env::var("GIFFORGE_DEMO").is_ok() {
+                if std::env::var("GIFKIT_DEMO").is_ok() {
                     self.add_layer(LayerKind::Shield(ShieldSettings::default()));
                     self.add_layer(LayerKind::Effects(Box::new(EffectSettings { saturation: 140.0, vignette: true, ..Default::default() })));
                     self.add_layer(LayerKind::Censor(CensorSettings { x: 200, y: 140, w: 70, h: 60, angle: 12.0, ..Default::default() }));
                     self.add_layer(LayerKind::Text(Annotation { text: "This caption is a really long line of text for testing".into(), size: 22.0, x: 20, y: 190, ..Default::default() }));
                     self.add_layer(LayerKind::Watermark(Box::default()));
                 }
-                // scripting hook: GIFFORGE_OVERLAY=path adds an image layer on open
-                if let Ok(ov) = std::env::var("GIFFORGE_OVERLAY") {
+                // scripting hook: GIFKIT_OVERLAY=path adds an image layer on open
+                if let Ok(ov) = std::env::var("GIFKIT_OVERLAY") {
                     if let Ok(a) = io::load_animation(std::path::Path::new(&ov)) {
                         self.add_overlay(OverlaySource { name: ov.rsplit('/').next().unwrap_or("overlay").into(), path: Some(PathBuf::from(&ov)), delays: a.frames.iter().map(|f| f.delay_cs).collect(), frames: a.frames.iter().map(|f| (*f.image).clone()).collect() });
                     }
@@ -1800,10 +1800,10 @@ impl GifForgeApp {
                     paint_app_icon(ui.painter(), r, &pal);
                     ui.vertical(|ui| {
                         ui.add_space(6.0);
-                        ui.label(RichText::new("GifForge").font(theme::medium(22.0)).color(pal.fg));
+                        ui.label(RichText::new("GIFkit").font(theme::medium(22.0)).color(pal.fg));
                         ui.label(RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).color(pal.fg));
-                        let commit = env!("GIFFORGE_COMMIT");
-                        let built = if commit.is_empty() { format!("Built {}", env!("GIFFORGE_BUILD_DATE")) } else { format!("Built {} · {commit}", env!("GIFFORGE_BUILD_DATE")) };
+                        let commit = env!("GIFKIT_COMMIT");
+                        let built = if commit.is_empty() { format!("Built {}", env!("GIFKIT_BUILD_DATE")) } else { format!("Built {} · {commit}", env!("GIFKIT_BUILD_DATE")) };
                         hint(ui, &built);
                     });
                 });
@@ -2531,7 +2531,7 @@ impl GifForgeApp {
                 let t1 = t0.elapsed();
                 let (anim, bytes) = io::encode_preview(&out, &pf)?;
                 let t2 = t0.elapsed();
-                if std::env::var_os("GIFFORGE_PERF").is_some() {
+                if std::env::var_os("GIFKIT_PERF").is_some() {
                     eprintln!("compress: flatten {:.1}s encode {:.1}s decode {:.1}s", t1.as_secs_f32(), (t2 - t1).as_secs_f32(), (t0.elapsed() - t2).as_secs_f32());
                 }
                 Ok((anim, bytes))
@@ -2580,7 +2580,7 @@ impl GifForgeApp {
 
 // ================================================================ UI
 
-impl eframe::App for GifForgeApp {
+impl eframe::App for GifKitApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let perf_t0 = std::time::Instant::now();
@@ -2677,14 +2677,14 @@ impl eframe::App for GifForgeApp {
         self.track_live_edits(&ctx, now);
         self.presets_window(&ctx);
         clear_group_command(&ctx);
-        if std::env::var_os("GIFFORGE_PERF").is_some() {
+        if std::env::var_os("GIFKIT_PERF").is_some() {
             let ms = perf_t0.elapsed().as_secs_f64() * 1000.0;
             eprintln!("frame {:.1} ms cur={} prerender={}", ms, self.cur, self.prerender.is_some());
         }
 
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             let r = ctx.content_rect();
-            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("gifforge_drop_overlay")));
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("gifkit_drop_overlay")));
             painter.rect_filled(r, 0.0, Color32::from_black_alpha(150));
             painter.rect_stroke(r.shrink(12.0), 6.0, Stroke::new(2.0, pal.highlight), egui::StrokeKind::Inside);
             let msg = match (self.base.is_some(), self.tool) {
@@ -2697,7 +2697,7 @@ impl eframe::App for GifForgeApp {
     }
 }
 
-impl GifForgeApp {
+impl GifKitApp {
     fn toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let pal = *p();
         ui.horizontal(|ui| {
@@ -2778,7 +2778,7 @@ impl GifForgeApp {
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("About GifForge").clicked() {
+                    if ui.button("About GIFkit").clicked() {
                         about = true;
                         ui.close();
                     }
@@ -4050,7 +4050,7 @@ impl GifForgeApp {
                 painter.image(t.id(), tr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
             }
         }
-        let resp = ui.interact(rect, egui::Id::unique(("gifforge-viewport", vi)), Sense::click_and_drag());
+        let resp = ui.interact(rect, egui::Id::unique(("gifkit-viewport", vi)), Sense::click_and_drag());
         if resp.hovered() || resp.dragged() {
             self.active_view = vi;
         }

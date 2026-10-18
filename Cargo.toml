@@ -1,5 +1,5 @@
 [package]
-name = "gifforge"
+name = "gifkit"
 version = "0.6.0"
 edition = "2021"
 description = "Local, cross-platform animated GIF editor / optimiser"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the raster app icons from gifforge.svg.
+"""Build the raster app icons from gifkit.svg.
 
 The SVG adapts to the KDE colour scheme. Its default colours are the mono
 dark look, which is what every other platform gets as PNG, ICO and ICNS.
@@ -17,7 +17,7 @@ import cairosvg
 from PIL import Image
 
 HERE = Path(__file__).resolve().parent
-SVG = (HERE / "gifforge.svg").read_text()
+SVG = (HERE / "gifkit.svg").read_text()
 
 
 def render(svg: str, size: int) -> Image.Image:
@@ -40,9 +40,9 @@ def main() -> None:
     sizes = [16, 24, 32, 48, 64, 128, 256, 512]
     imgs = {s: render(SVG, s) for s in sizes}
     for s in (16, 32, 48, 128, 256, 512):
-        imgs[s].save(HERE / f"gifforge-{s}.png")
-    imgs[256].save(HERE / "gifforge.ico", sizes=[(s, s) for s in (16, 24, 32, 48, 64, 128, 256)])
-    imgs[512].save(HERE / "gifforge.icns")
+        imgs[s].save(HERE / f"gifkit-{s}.png")
+    imgs[256].save(HERE / "gifkit.ico", sizes=[(s, s) for s in (16, 24, 32, 48, 64, 128, 256)])
+    imgs[512].save(HERE / "gifkit.icns")
     print("wrote PNG, ICO and ICNS")
 
     if "--preview" in sys.argv:

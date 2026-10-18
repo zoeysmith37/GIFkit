@@ -201,7 +201,7 @@ fn text_and_censor_and_overlay() {
 
 #[test]
 fn exports() {
-    let dir = std::env::temp_dir().join(format!("gifforge_test_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("gifkit_test_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let a = synth(true);
     assert_eq!(io::export_frames_dir(&a, &dir.join("png"), "f", io::SplitFormat::Png).unwrap(), 12);
@@ -884,7 +884,7 @@ fn noai_avif_still_decodes() {
         for (f, g) in x.frames.iter().zip(&y.frames) {
             assert_eq!(f.image.as_raw(), g.image.as_raw(), "alpha={alpha}: pixels changed");
         }
-        if let Ok(keep) = std::env::var("GIFFORGE_KEEP_AVIF") {
+        if let Ok(keep) = std::env::var("GIFKIT_KEEP_AVIF") {
             std::fs::copy(&tp, std::path::Path::new(&keep).join(format!("tagged_{alpha}.avif"))).unwrap();
             std::fs::copy(&pp, std::path::Path::new(&keep).join(format!("plain_{alpha}.avif"))).unwrap();
         }

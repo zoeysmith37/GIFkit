@@ -5,7 +5,7 @@ fn main() {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let days = (secs / 86_400) as i64;
     let (y, m, d) = civil_from_days(days);
-    println!("cargo:rustc-env=GIFFORGE_BUILD_DATE={y:04}-{m:02}-{d:02}");
+    println!("cargo:rustc-env=GIFKIT_BUILD_DATE={y:04}-{m:02}-{d:02}");
     // short commit hash when building from a git checkout
     let hash = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
@@ -14,16 +14,16 @@ fn main() {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
-    println!("cargo:rustc-env=GIFFORGE_COMMIT={hash}");
+    println!("cargo:rustc-env=GIFKIT_COMMIT={hash}");
     println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=assets/icon/gifforge.ico");
+    println!("cargo:rerun-if-changed=assets/icon/gifkit.ico");
 
     #[cfg(windows)]
     {
         let mut res = winresource::WindowsResource::new();
-        res.set_icon("assets/icon/gifforge.ico");
-        res.set("ProductName", "GifForge");
-        res.set("FileDescription", "GifForge – local GIF editor");
+        res.set_icon("assets/icon/gifkit.ico");
+        res.set("ProductName", "GIFkit");
+        res.set("FileDescription", "GIFkit – local GIF editor");
         if let Err(e) = res.compile() {
             println!("cargo:warning=could not embed the Windows icon: {e}");
         }
