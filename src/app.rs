@@ -2417,6 +2417,7 @@ impl GifKitApp {
                 hint(ui, "Fonts: Noto Sans (OFL) and DejaVu");
                 hint(ui, "Emoji: Twemoji (CC-BY 4.0) with names from emojibase (MIT)");
                 hint(ui, "Icons: KDE Breeze (LGPL 3)");
+                hint(ui, "Text fonts: open licence fonts from Google Fonts (OFL, Apache 2.0, UFL)");
                 ui.add_space(4.0);
                 hint(ui, "Licensed under Apache 2.0");
             });
@@ -5152,20 +5153,28 @@ impl GifKitApp {
         }
         let batch: Vec<String> = self.font_preview_queue.drain(..).take(6).collect();
         self.font_preview_queue.clear();
-        let faces: Vec<(String, crate::sysfonts::SysFace)> = {
-            let Ok(g) = self.sys_fonts.lock() else { return };
-            let Some(fams) = g.as_ref() else { return };
-            batch.iter().filter_map(|n| fams.iter().find(|f| &f.name == n).map(|f| (n.clone(), f.default_face().clone()))).collect()
-        };
-        for (name, face) in faces {
-            self.preview_fonts.insert(name.clone(), false);
-            let ok = std::fs::metadata(&face.path).map(|m| m.len() < 12_000_000).unwrap_or(false);
-            if !ok {
-                continue;
+        // (name, file data, face index): bundled fonts, then the system's
+        let mut faces: Vec<(String, Option<Vec<u8>>, u32)> = Vec::new();
+        {
+            let g = self.sys_fonts.lock().ok();
+            let fams = g.as_ref().and_then(|g| g.as_ref());
+            for n in &batch {
+                if let Some(b) = crate::bundled::family(n) {
+                    faces.push((n.clone(), crate::bundled::bytes(&b.default_face().file).map(|d| (*d).clone()), 0));
+                } else if let Some(f) = fams.and_then(|v| v.iter().find(|f| &f.name == n)) {
+                    let face = f.default_face();
+                    let ok = std::fs::metadata(&face.path).map(|m| m.len() < 12_000_000).unwrap_or(false);
+                    faces.push((n.clone(), if ok { std::fs::read(&face.path).ok() } else { None }, face.index));
+                } else if fams.is_some() {
+                    faces.push((n.clone(), None, 0));
+                }
             }
-            if let Ok(data) = std::fs::read(&face.path) {
+        }
+        for (name, data, index) in faces {
+            self.preview_fonts.insert(name.clone(), false);
+            if let Some(data) = data {
                 let mut fd = egui::FontData::from_owned(data);
-                fd.index = face.index;
+                fd.index = index;
                 ctx.add_font(egui::epaint::text::FontInsert::new(
                     &format!("sys:{name}"),
                     fd,
@@ -6707,11 +6716,23 @@ impl GifKitApp {
         });
     }
 
-    /// Load (or reuse) a system font face, returning its index in `self.fonts`.
+    /// Load (or reuse) a bundled or system font face, returning its index in `self.fonts`.
     fn font_index_for(&mut self, family: &str, style: &str) -> Option<usize> {
         let key = format!("{family}|{style}");
         if let Some(i) = self.font_keys.get(&key) {
             return Some(*i);
+        }
+        // fonts that ship with GIFkit come first, so projects look the same everywhere
+        if crate::bundled::family(family).is_some() {
+            let Some((entry, real_style)) = crate::bundled::load(family, style) else {
+                self.error(format!("Could not load {family}"));
+                return None;
+            };
+            self.fonts.push(entry);
+            let i = self.fonts.len() - 1;
+            self.font_keys.insert(key, i);
+            self.font_meta.insert(i, (family.to_string(), real_style));
+            return Some(i);
         }
         let face = {
             let guard = self.sys_fonts.lock().ok()?;
@@ -6719,9 +6740,9 @@ impl GifKitApp {
             let f = fams.iter().find(|f| f.name == family)?;
             f.faces.iter().find(|x| x.style == style).or_else(|| Some(f.default_face())).cloned()?
         };
-        match crate::sysfonts::load(&face) {
-            Ok(font) => {
-                self.fonts.push(FontEntry { name: format!("{family} {}", face.style), font });
+        match crate::sysfonts::load(family, &face) {
+            Ok(entry) => {
+                self.fonts.push(entry);
                 let i = self.fonts.len() - 1;
                 self.font_keys.insert(key, i);
                 self.font_meta.insert(i, (family.to_string(), face.style.clone()));
@@ -6759,11 +6780,14 @@ impl GifKitApp {
             self.font_search.clear();
         }
         if let Some((fam, style)) = self.font_meta.get(&cur_idx).cloned() {
-            let styles: Vec<String> = self.sys_fonts.lock().ok().and_then(|g| g.as_ref().and_then(|v| v.iter().find(|f| f.name == fam).map(|f| f.faces.iter().map(|x| x.style.clone()).collect()))).unwrap_or_default();
+            let styles: Vec<String> = match crate::bundled::family(&fam) {
+                Some(b) => b.faces.iter().map(|x| x.style.clone()).collect(),
+                None => self.sys_fonts.lock().ok().and_then(|g| g.as_ref().and_then(|v| v.iter().find(|f| f.name == fam).map(|f| f.faces.iter().map(|x| x.style.clone()).collect()))).unwrap_or_default(),
+            };
             if styles.len() > 1 {
-                ui.horizontal(|ui| {
-                    ui.label("Style");
-                    egui::ComboBox::from_id_salt("fontstyle").width(150.0).selected_text(&style).show_ui(ui, |ui| {
+                ui.add_space(2.0);
+                form_row(ui, "Style", |ui| {
+                    egui::ComboBox::from_id_salt("fontstyle").width(ui.available_width()).selected_text(&style).show_ui(ui, |ui| {
                         for st in &styles {
                             if ui.selectable_label(*st == style, st).clicked() {
                                 pick_sys = Some((fam.clone(), st.clone()));
@@ -6791,34 +6815,65 @@ impl GifKitApp {
                     }
                 }
                 ui.separator();
-                match fams {
-                    None => {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            hint(ui, "Scanning fonts…");
-                        });
+                // bundled fonts by script, then the system's
+                enum Row {
+                    Head(String),
+                    Font(String),
+                }
+                let mut rows: Vec<Row> = Vec::new();
+                let mut last_group = "";
+                for f in crate::bundled::families() {
+                    if !(q.is_empty() || f.family.to_lowercase().contains(&q) || f.group.to_lowercase().contains(&q)) {
+                        continue;
                     }
-                    Some(fams) => {
-                        let row_h = 26.0;
-                        egui::ScrollArea::vertical().max_height(260.0).auto_shrink([false, true]).show_rows(ui, row_h, fams.len(), |ui, range| {
-                            ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
-                            ui.spacing_mut().item_spacing.y = 4.0;
-                            for fam in &fams[range] {
-                                let font = self.preview_font(fam, 15.0);
-                                let sel = cur_fam.as_deref() == Some(fam.as_str());
-                                let r = ui.add(egui::Button::selectable(sel, RichText::new(elide(fam, 34)).font(font)).min_size(vec2(0.0, row_h - 4.0)));
-                                if r.on_hover_text(fam).clicked() {
-                                    pick_sys = Some((fam.clone(), String::new()));
+                    if f.group != last_group {
+                        rows.push(Row::Head(f.group.clone()));
+                        last_group = &f.group;
+                    }
+                    rows.push(Row::Font(f.family.clone()));
+                }
+                let scanning = fams.is_none();
+                if let Some(fams) = &fams {
+                    let sys: Vec<&String> = fams.iter().filter(|f| crate::bundled::family(f).is_none()).collect();
+                    if !sys.is_empty() {
+                        rows.push(Row::Head("On This Computer".into()));
+                        rows.extend(sys.into_iter().map(|f| Row::Font(f.clone())));
+                    }
+                }
+                let row_h = 26.0;
+                egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]).show_rows(ui, row_h, rows.len(), |ui, range| {
+                    ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for row in &rows[range] {
+                            match row {
+                                Row::Head(g) => {
+                                    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::hover());
+                                    ui.painter().text(r.left_center() + vec2(4.0, 2.0), egui::Align2::LEFT_CENTER, g, theme::medium(13.0), pal.fg_muted);
+                                }
+                                Row::Font(fam) => {
+                                    let font = self.preview_font(fam, 15.0);
+                                    let sel = cur_fam.as_deref() == Some(fam.as_str());
+                                    let r = ui.add(egui::Button::selectable(sel, RichText::new(format!("   {}", elide(fam, 34))).font(font)).min_size(vec2(0.0, row_h)));
+                                    if r.on_hover_text(fam).clicked() {
+                                        pick_sys = Some((fam.clone(), String::new()));
+                                    }
                                 }
                             }
-                            });
-                        });
-                    }
+                        }
+                    });
+                });
+                if scanning {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        hint(ui, "Looking for fonts on this computer…");
+                    });
                 }
             });
         }
         if let Some((fam, st)) = pick_sys {
-            let style = if st.is_empty() {
+            let style = if st.is_empty() && crate::bundled::family(&fam).is_some() {
+                crate::bundled::family(&fam).map(|b| b.default_face().style.clone()).unwrap_or_default()
+            } else if st.is_empty() {
                 self.sys_fonts.lock().ok().and_then(|g| g.as_ref().and_then(|v| v.iter().find(|f| f.name == fam).map(|f| f.default_face().style.clone()))).unwrap_or_default()
             } else {
                 st

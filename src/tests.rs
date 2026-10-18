@@ -1103,3 +1103,52 @@ fn booth_zero_strength_is_identity() {
         assert!(worst <= 1, "{fx:?} at 0% still changes pixels by {worst}");
     }
 }
+
+#[test]
+fn bundled_fonts_load_and_draw() {
+    let fams = crate::bundled::families();
+    assert!(fams.len() >= 50, "font index missing");
+    for f in fams {
+        for face in &f.faces {
+            let (e, _) = crate::bundled::load(&f.family, &face.style).unwrap_or_else(|| panic!("{} {}", f.family, face.style));
+            let a = crate::text::Annotation { text: "Ab".into(), size: 32.0, ..Default::default() };
+            let img = crate::text::render_sprite(&[e], &a);
+            assert!(img.pixels().any(|p| p[3] > 0), "{} {} drew nothing", f.family, face.style);
+        }
+    }
+}
+
+#[test]
+fn arabic_is_shaped_right_to_left() {
+    // joined Arabic is narrower than its isolated letters laid side by side
+    let (e, _) = crate::bundled::load("Amiri", "Regular").unwrap();
+    let joined = crate::text::rasterize(&e, "سلام", 48.0, crate::text::Align::Left).0;
+    let apart = crate::text::rasterize(&e, "س ل ا م", 48.0, crate::text::Align::Left).0;
+    assert!(joined < apart);
+}
+
+#[test]
+#[ignore]
+fn bundled_font_sheet() {
+    let samples: &[(&str, &str)] = &[
+        ("Oswald", "GIFkit Привет"), ("Anton", "SO MUCH WOW"), ("Lobster", "Have a nice day"), ("Press Start 2P", "GAME OVER"),
+        ("Amiri", "مرحبا بالعالم"), ("Cairo", "أهلاً وسهلاً"), ("Frank Ruhl Libre", "שלום עולם"), ("Kanit", "สวัสดีครับ"),
+        ("Catamaran", "வணக்கம்"), ("Mallanna", "నమస్కారం"), ("Hind", "नमस्ते दुनिया"), ("Noto Sans Georgian", "გამარჯობა"),
+        ("Dela Gothic One", "こんにちは世界"), ("Do Hyeon", "안녕하세요"), ("ZCOOL KuaiLe", "你好世界"), ("Rubik Glitch", "GLITCH"),
+    ];
+    let mut rows = Vec::new();
+    for (fam, text) in samples {
+        let (e, _) = crate::bundled::load(fam, "Regular").unwrap();
+        let a = crate::text::Annotation { text: format!("{fam}: {text}"), size: 30.0, color: [20, 20, 20, 255], border_width: Some(0.0), ..Default::default() };
+        rows.push(crate::text::render_sprite(&[e], &a));
+    }
+    let w = rows.iter().map(|r| r.width()).max().unwrap() + 20;
+    let h: u32 = rows.iter().map(|r| r.height() + 6).sum::<u32>() + 20;
+    let mut out = image::RgbaImage::from_pixel(w, h, image::Rgba([250, 250, 250, 255]));
+    let mut y = 10;
+    for r in rows {
+        image::imageops::overlay(&mut out, &r, 10, y as i64);
+        y += r.height() + 6;
+    }
+    out.save("target/font_sheet.png").unwrap();
+}

@@ -1,31 +1,46 @@
 //! Text rendering onto frames (ab_glyph).
 
 use crate::ops::blend_over;
-use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
+use ab_glyph::{Font, FontArc, FontVec, GlyphId, PxScale, ScaleFont, VariableFont};
+use std::sync::Arc;
 use image::{Rgba, RgbaImage};
 
 pub static SANS_BOLD: &[u8] = include_bytes!("../assets/DejaVuSans-Bold.ttf");
 pub static MONO_BOLD: &[u8] = include_bytes!("../assets/DejaVuSansMono-Bold.ttf");
 
+/// A loaded font: the rasteriser's copy, plus the raw file for shaping.
 #[derive(Clone)]
 pub struct FontEntry {
     pub name: String,
     pub font: FontArc,
+    /// the font file, for the shaper (right-to-left text, joined and combining letters)
+    pub data: Arc<Vec<u8>>,
+    pub index: u32,
+    /// variable font axis settings, e.g. wght = 700
+    pub coords: Vec<([u8; 4], f32)>,
+}
+
+impl FontEntry {
+    pub fn from_data(name: impl Into<String>, data: Vec<u8>, index: u32, coords: Vec<([u8; 4], f32)>) -> anyhow::Result<Self> {
+        let mut fv = FontVec::try_from_vec_and_index(data.clone(), index).map_err(|e| anyhow::anyhow!("Invalid font: {e}"))?;
+        for (tag, v) in &coords {
+            fv.set_variation(tag, *v);
+        }
+        Ok(Self { name: name.into(), font: FontArc::new(fv), data: Arc::new(data), index, coords })
+    }
 }
 
 pub fn builtin_fonts() -> Vec<FontEntry> {
-    vec![
-        FontEntry { name: "Sans Bold (built-in)".into(), font: FontArc::try_from_slice(SANS_BOLD).expect("font") },
-        FontEntry { name: "Mono Bold (built-in)".into(), font: FontArc::try_from_slice(MONO_BOLD).expect("font") },
-        FontEntry { name: "Noto Sans (built-in)".into(), font: FontArc::try_from_slice(crate::theme::NOTO_MEDIUM).expect("font") },
-    ]
+    [("Sans Bold (built-in)", SANS_BOLD), ("Mono Bold (built-in)", MONO_BOLD), ("Noto Sans (built-in)", crate::theme::NOTO_MEDIUM)]
+        .into_iter()
+        .map(|(n, d)| FontEntry::from_data(n, d.to_vec(), 0, Vec::new()).expect("font"))
+        .collect()
 }
 
 pub fn load_font_file(path: &std::path::Path) -> anyhow::Result<FontEntry> {
     let data = std::fs::read(path)?;
-    let font = FontArc::try_from_vec(data).map_err(|e| anyhow::anyhow!("Invalid font: {e}"))?;
     let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Custom".into());
-    Ok(FontEntry { name, font })
+    FontEntry::from_data(name, data, 0, Vec::new())
 }
 
 #[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
@@ -109,49 +124,86 @@ impl Annotation {
     }
 }
 
+/// One shaped glyph: id and pen offset (pixels) from the start of the line.
+struct Placed {
+    id: GlyphId,
+    x: f32,
+    y: f32,
+}
+
+/// Shape a line with HarfBuzz rules (rustybuzz): right-to-left scripts,
+/// joined Arabic letters, Indic and Thai marks, ligatures and kerning. Mixed
+/// direction text is split into runs and put in visual order first (Unicode
+/// bidi). Falls back to plain glyph-by-glyph layout if the font can't be shaped.
+fn shape_line(f: &FontEntry, line: &str, scale: PxScale) -> (Vec<Placed>, f32) {
+    let sf = f.font.as_scaled(scale);
+    if let Some(mut face) = rustybuzz::Face::from_slice(&f.data, f.index) {
+        if !f.coords.is_empty() {
+            let vars: Vec<rustybuzz::Variation> = f.coords.iter().map(|(t, v)| rustybuzz::Variation { tag: rustybuzz::ttf_parser::Tag::from_bytes(t), value: *v }).collect();
+            face.set_variations(&vars);
+        }
+        let (hs, vs) = (sf.h_scale_factor(), sf.v_scale_factor());
+        let mut x = 0.0;
+        let mut v = Vec::new();
+        let bidi = unicode_bidi::BidiInfo::new(line, None);
+        let runs: Vec<(std::ops::Range<usize>, bool)> = match bidi.paragraphs.first() {
+            Some(para) => {
+                let (levels, runs) = bidi.visual_runs(para, para.range.clone());
+                runs.into_iter().map(|r| {
+                    let rtl = levels[r.start].is_rtl();
+                    (r, rtl)
+                }).collect()
+            }
+            None => Vec::new(),
+        };
+        for (range, rtl) in runs {
+            let mut buf = rustybuzz::UnicodeBuffer::new();
+            buf.push_str(&line[range]);
+            buf.set_direction(if rtl { rustybuzz::Direction::RightToLeft } else { rustybuzz::Direction::LeftToRight });
+            buf.guess_segment_properties();
+            let out = rustybuzz::shape(&face, &[], buf);
+            for (info, pos) in out.glyph_infos().iter().zip(out.glyph_positions()) {
+                v.push(Placed { id: GlyphId(info.glyph_id as u16), x: x + pos.x_offset as f32 * hs, y: -(pos.y_offset as f32) * vs });
+                x += pos.x_advance as f32 * hs;
+            }
+        }
+        return (v, x);
+    }
+    let mut x = 0.0;
+    let mut prev = None;
+    let mut v = Vec::new();
+    for c in line.chars() {
+        let id = sf.glyph_id(c);
+        if let Some(p) = prev {
+            x += sf.kern(p, id);
+        }
+        v.push(Placed { id, x, y: 0.0 });
+        x += sf.h_advance(id);
+        prev = Some(id);
+    }
+    (v, x)
+}
+
 /// Rasterise text to a coverage mask (w, h, alpha) – no colour.
-pub fn rasterize(font: &FontArc, text: &str, size: f32, align: Align) -> (u32, u32, Vec<f32>) {
+pub fn rasterize(f: &FontEntry, text: &str, size: f32, align: Align) -> (u32, u32, Vec<f32>) {
+    let font = &f.font;
     let scale = PxScale::from(size);
     let sf = font.as_scaled(scale);
     let line_h = sf.ascent() - sf.descent() + sf.line_gap();
-    let lines: Vec<&str> = text.split('\n').collect();
-    let widths: Vec<f32> = lines
-        .iter()
-        .map(|l| {
-            let mut w = 0.0;
-            let mut prev = None;
-            for c in l.chars() {
-                let id = sf.glyph_id(c);
-                if let Some(p) = prev {
-                    w += sf.kern(p, id);
-                }
-                w += sf.h_advance(id);
-                prev = Some(id);
-            }
-            w
-        })
-        .collect();
-    let maxw = widths.iter().cloned().fold(0.0, f32::max).ceil() as u32 + 2;
+    let lines: Vec<(Vec<Placed>, f32)> = text.split('\n').map(|l| shape_line(f, l, scale)).collect();
+    let maxw = lines.iter().map(|l| l.1).fold(0.0, f32::max).ceil() as u32 + 2;
     let total_h = (line_h * lines.len() as f32).ceil() as u32 + 2;
     let mut mask = vec![0f32; (maxw * total_h) as usize];
-    for (li, line) in lines.iter().enumerate() {
+    for (li, (glyphs, width)) in lines.iter().enumerate() {
         let off_x = match align {
             Align::Left => 0.0,
-            Align::Center => (maxw as f32 - widths[li]) / 2.0,
-            Align::Right => maxw as f32 - widths[li],
+            Align::Center => (maxw as f32 - width) / 2.0,
+            Align::Right => maxw as f32 - width,
         };
         let base_y = sf.ascent() + li as f32 * line_h;
-        let mut x = off_x;
-        let mut prev = None;
-        for c in line.chars() {
-            let id = sf.glyph_id(c);
-            if let Some(p) = prev {
-                x += sf.kern(p, id);
-            }
-            let g = id.with_scale_and_position(scale, ab_glyph::point(x, base_y));
-            x += sf.h_advance(id);
-            prev = Some(id);
-            if let Some(og) = font.outline_glyph(g) {
+        for g in glyphs {
+            let gl = g.id.with_scale_and_position(scale, ab_glyph::point(off_x + g.x, base_y + g.y));
+            if let Some(og) = font.outline_glyph(gl) {
                 let b = og.px_bounds();
                 og.draw(|gx, gy, cov| {
                     let px = b.min.x as i32 + gx as i32;
@@ -179,7 +231,7 @@ impl Annotation {
 
 /// Size of the rendered text block including border.
 pub fn measure(fonts: &[FontEntry], a: &Annotation) -> (u32, u32) {
-    let font = &fonts[a.font_idx.min(fonts.len() - 1)].font;
+    let font = &fonts[a.font_idx.min(fonts.len() - 1)];
     let (w, h, _) = rasterize(font, &a.text, a.size, a.align);
     let r = a.outline_px() as u32;
     (stretched(w + 2 * r, a.stretch), h + 2 * r)
@@ -195,7 +247,7 @@ fn stretched(w: u32, s: f32) -> u32 {
 
 /// Pre-rendered RGBA sprite of an annotation (so it is rasterised once per apply).
 pub fn render_sprite(fonts: &[FontEntry], a: &Annotation) -> RgbaImage {
-    let font = &fonts[a.font_idx.min(fonts.len() - 1)].font;
+    let font = &fonts[a.font_idx.min(fonts.len() - 1)];
     let (w, h, mask) = rasterize(font, &a.text, a.size, a.align);
     let r = a.outline_px();
     let sw = w + 2 * r as u32;

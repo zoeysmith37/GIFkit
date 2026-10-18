@@ -1,7 +1,6 @@
 //! System font discovery (fontconfig dirs on Linux, the OS font folders on
 //! Windows / macOS) via `fontdb`, grouped into families and styles.
 
-use ab_glyph::{FontArc, FontVec};
 use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
@@ -69,8 +68,7 @@ pub fn scan() -> Vec<SysFamily> {
     out
 }
 
-pub fn load(face: &SysFace) -> anyhow::Result<FontArc> {
+pub fn load(family: &str, face: &SysFace) -> anyhow::Result<crate::text::FontEntry> {
     let data = std::fs::read(&face.path)?;
-    let fv = FontVec::try_from_vec_and_index(data, face.index).map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(FontArc::new(fv))
+    crate::text::FontEntry::from_data(format!("{family} {}", face.style), data, face.index, Vec::new())
 }

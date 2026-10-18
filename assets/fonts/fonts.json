@@ -1,0 +1,1812 @@
+[
+ {
+  "family": "Oswald",
+  "group": "Latin & Cyrillic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "oswald/Oswald[wght].ttf",
+    "coords": []
+   },
+   {
+    "style": "ExtraLight",
+    "file": "oswald/Oswald[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      200.0
+     ]
+    ]
+   },
+   {
+    "style": "Light",
+    "file": "oswald/Oswald[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      300.0
+     ]
+    ]
+   },
+   {
+    "style": "Medium",
+    "file": "oswald/Oswald[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      500.0
+     ]
+    ]
+   },
+   {
+    "style": "SemiBold",
+    "file": "oswald/Oswald[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      600.0
+     ]
+    ]
+   },
+   {
+    "style": "Bold",
+    "file": "oswald/Oswald[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      700.0
+     ]
+    ]
+   }
+  ]
+ },
+ {
+  "family": "Russo One",
+  "group": "Latin & Cyrillic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "russoone/RussoOne-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Roboto",
+  "group": "Latin & Cyrillic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "roboto/Roboto[wdth,wght].ttf",
+    "coords": []
+   },
+   {
+    "style": "Thin",
+    "file": "roboto/Roboto[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      100.0
+     ]
+    ]
+   },
+   {
+    "style": "ExtraLight",
+    "file": "roboto/Roboto[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      200.0
+     ]
+    ]
+   },
+   {
+    "style": "Light",
+    "file": "roboto/Roboto[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      300.0
+     ]
+    ]
+   },
+   {
+    "style": "Medium",
+    "file": "roboto/Roboto[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      500.0
+     ]
+    ]
+   },
+   {
+    "style": "SemiBold",
+    "file": "roboto/Roboto[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      600.0
+     ]
+    ]
+   },
+   {
+    "style": "Bold",
+    "file": "roboto/Roboto[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      700.0
+     ]
+    ]
+   },
+   {
+    "style": "ExtraBold",
+    "file": "roboto/Roboto[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      800.0
+     ]
+    ]
+   },
+   {
+    "style": "Black",
+    "file": "roboto/Roboto[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      900.0
+     ]
+    ]
+   },
+   {
+    "style": "Thin Italic",
+    "file": "roboto/Roboto-Italic[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      100.0
+     ]
+    ]
+   },
+   {
+    "style": "ExtraLight Italic",
+    "file": "roboto/Roboto-Italic[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      200.0
+     ]
+    ]
+   },
+   {
+    "style": "Light Italic",
+    "file": "roboto/Roboto-Italic[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      300.0
+     ]
+    ]
+   },
+   {
+    "style": "Italic",
+    "file": "roboto/Roboto-Italic[wdth,wght].ttf",
+    "coords": []
+   },
+   {
+    "style": "Medium Italic",
+    "file": "roboto/Roboto-Italic[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      500.0
+     ]
+    ]
+   },
+   {
+    "style": "SemiBold Italic",
+    "file": "roboto/Roboto-Italic[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      600.0
+     ]
+    ]
+   },
+   {
+    "style": "Bold Italic",
+    "file": "roboto/Roboto-Italic[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      700.0
+     ]
+    ]
+   },
+   {
+    "style": "ExtraBold Italic",
+    "file": "roboto/Roboto-Italic[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      800.0
+     ]
+    ]
+   },
+   {
+    "style": "Black Italic",
+    "file": "roboto/Roboto-Italic[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      900.0
+     ]
+    ]
+   }
+  ]
+ },
+ {
+  "family": "Open Sans",
+  "group": "Latin & Cyrillic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "opensans/OpenSans[wdth,wght].ttf",
+    "coords": []
+   },
+   {
+    "style": "Light",
+    "file": "opensans/OpenSans[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      300.0
+     ]
+    ]
+   },
+   {
+    "style": "SemiBold",
+    "file": "opensans/OpenSans[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      600.0
+     ]
+    ]
+   },
+   {
+    "style": "Bold",
+    "file": "opensans/OpenSans[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      700.0
+     ]
+    ]
+   },
+   {
+    "style": "ExtraBold",
+    "file": "opensans/OpenSans[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      800.0
+     ]
+    ]
+   },
+   {
+    "style": "Light Italic",
+    "file": "opensans/OpenSans-Italic[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      300.0
+     ]
+    ]
+   },
+   {
+    "style": "Italic",
+    "file": "opensans/OpenSans-Italic[wdth,wght].ttf",
+    "coords": []
+   },
+   {
+    "style": "SemiBold Italic",
+    "file": "opensans/OpenSans-Italic[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      600.0
+     ]
+    ]
+   },
+   {
+    "style": "Bold Italic",
+    "file": "opensans/OpenSans-Italic[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      700.0
+     ]
+    ]
+   },
+   {
+    "style": "ExtraBold Italic",
+    "file": "opensans/OpenSans-Italic[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      800.0
+     ]
+    ]
+   }
+  ]
+ },
+ {
+  "family": "Montserrat",
+  "group": "Latin & Cyrillic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "montserrat/Montserrat[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      400.0
+     ]
+    ]
+   },
+   {
+    "style": "Thin",
+    "file": "montserrat/Montserrat[wght].ttf",
+    "coords": []
+   },
+   {
+    "style": "ExtraLight",
+    "file": "montserrat/Montserrat[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      200.0
+     ]
+    ]
+   },
+   {
+    "style": "Light",
+    "file": "montserrat/Montserrat[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      300.0
+     ]
+    ]
+   },
+   {
+    "style": "Medium",
+    "file": "montserrat/Montserrat[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      500.0
+     ]
+    ]
+   },
+   {
+    "style": "SemiBold",
+    "file": "montserrat/Montserrat[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      600.0
+     ]
+    ]
+   },
+   {
+    "style": "Bold",
+    "file": "montserrat/Montserrat[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      700.0
+     ]
+    ]
+   },
+   {
+    "style": "ExtraBold",
+    "file": "montserrat/Montserrat[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      800.0
+     ]
+    ]
+   },
+   {
+    "style": "Black",
+    "file": "montserrat/Montserrat[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      900.0
+     ]
+    ]
+   }
+  ]
+ },
+ {
+  "family": "Rubik",
+  "group": "Latin & Cyrillic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "rubik/Rubik[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      400.0
+     ]
+    ]
+   },
+   {
+    "style": "Light",
+    "file": "rubik/Rubik[wght].ttf",
+    "coords": []
+   },
+   {
+    "style": "Medium",
+    "file": "rubik/Rubik[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      500.0
+     ]
+    ]
+   },
+   {
+    "style": "SemiBold",
+    "file": "rubik/Rubik[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      600.0
+     ]
+    ]
+   },
+   {
+    "style": "Bold",
+    "file": "rubik/Rubik[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      700.0
+     ]
+    ]
+   },
+   {
+    "style": "ExtraBold",
+    "file": "rubik/Rubik[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      800.0
+     ]
+    ]
+   },
+   {
+    "style": "Black",
+    "file": "rubik/Rubik[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      900.0
+     ]
+    ]
+   },
+   {
+    "style": "Light Italic",
+    "file": "rubik/Rubik-Italic[wght].ttf",
+    "coords": []
+   },
+   {
+    "style": "Italic",
+    "file": "rubik/Rubik-Italic[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      400.0
+     ]
+    ]
+   },
+   {
+    "style": "Medium Italic",
+    "file": "rubik/Rubik-Italic[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      500.0
+     ]
+    ]
+   },
+   {
+    "style": "SemiBold Italic",
+    "file": "rubik/Rubik-Italic[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      600.0
+     ]
+    ]
+   },
+   {
+    "style": "Bold Italic",
+    "file": "rubik/Rubik-Italic[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      700.0
+     ]
+    ]
+   },
+   {
+    "style": "ExtraBold Italic",
+    "file": "rubik/Rubik-Italic[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      800.0
+     ]
+    ]
+   },
+   {
+    "style": "Black Italic",
+    "file": "rubik/Rubik-Italic[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      900.0
+     ]
+    ]
+   }
+  ]
+ },
+ {
+  "family": "PT Sans Narrow",
+  "group": "Latin & Cyrillic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "ptsansnarrow/PT_Sans-Narrow-Web-Regular.ttf",
+    "coords": []
+   },
+   {
+    "style": "Bold",
+    "file": "ptsansnarrow/PT_Sans-Narrow-Web-Bold.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Ubuntu",
+  "group": "Latin & Cyrillic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "ubuntu/Ubuntu-Regular.ttf",
+    "coords": []
+   },
+   {
+    "style": "Medium",
+    "file": "ubuntu/Ubuntu-Medium.ttf",
+    "coords": []
+   },
+   {
+    "style": "Bold",
+    "file": "ubuntu/Ubuntu-Bold.ttf",
+    "coords": []
+   },
+   {
+    "style": "Italic",
+    "file": "ubuntu/Ubuntu-Italic.ttf",
+    "coords": []
+   },
+   {
+    "style": "Bold Italic",
+    "file": "ubuntu/Ubuntu-BoldItalic.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Didact Gothic",
+  "group": "Latin & Cyrillic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "didactgothic/DidactGothic-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Jura",
+  "group": "Latin & Cyrillic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "jura/Jura[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      400.0
+     ]
+    ]
+   },
+   {
+    "style": "Light",
+    "file": "jura/Jura[wght].ttf",
+    "coords": []
+   },
+   {
+    "style": "Medium",
+    "file": "jura/Jura[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      500.0
+     ]
+    ]
+   },
+   {
+    "style": "SemiBold",
+    "file": "jura/Jura[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      600.0
+     ]
+    ]
+   },
+   {
+    "style": "Bold",
+    "file": "jura/Jura[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      700.0
+     ]
+    ]
+   }
+  ]
+ },
+ {
+  "family": "EB Garamond",
+  "group": "Latin & Cyrillic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "ebgaramond/EBGaramond[wght].ttf",
+    "coords": []
+   },
+   {
+    "style": "Medium",
+    "file": "ebgaramond/EBGaramond[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      500.0
+     ]
+    ]
+   },
+   {
+    "style": "SemiBold",
+    "file": "ebgaramond/EBGaramond[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      600.0
+     ]
+    ]
+   },
+   {
+    "style": "Bold",
+    "file": "ebgaramond/EBGaramond[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      700.0
+     ]
+    ]
+   },
+   {
+    "style": "ExtraBold",
+    "file": "ebgaramond/EBGaramond[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      800.0
+     ]
+    ]
+   },
+   {
+    "style": "Italic",
+    "file": "ebgaramond/EBGaramond-Italic[wght].ttf",
+    "coords": []
+   },
+   {
+    "style": "Medium Italic",
+    "file": "ebgaramond/EBGaramond-Italic[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      500.0
+     ]
+    ]
+   },
+   {
+    "style": "SemiBold Italic",
+    "file": "ebgaramond/EBGaramond-Italic[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      600.0
+     ]
+    ]
+   },
+   {
+    "style": "Bold Italic",
+    "file": "ebgaramond/EBGaramond-Italic[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      700.0
+     ]
+    ]
+   },
+   {
+    "style": "ExtraBold Italic",
+    "file": "ebgaramond/EBGaramond-Italic[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      800.0
+     ]
+    ]
+   }
+  ]
+ },
+ {
+  "family": "Playfair Display",
+  "group": "Latin & Cyrillic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "playfairdisplay/PlayfairDisplay[wght].ttf",
+    "coords": []
+   },
+   {
+    "style": "Medium",
+    "file": "playfairdisplay/PlayfairDisplay[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      500.0
+     ]
+    ]
+   },
+   {
+    "style": "SemiBold",
+    "file": "playfairdisplay/PlayfairDisplay[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      600.0
+     ]
+    ]
+   },
+   {
+    "style": "Bold",
+    "file": "playfairdisplay/PlayfairDisplay[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      700.0
+     ]
+    ]
+   },
+   {
+    "style": "ExtraBold",
+    "file": "playfairdisplay/PlayfairDisplay[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      800.0
+     ]
+    ]
+   },
+   {
+    "style": "Black",
+    "file": "playfairdisplay/PlayfairDisplay[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      900.0
+     ]
+    ]
+   }
+  ]
+ },
+ {
+  "family": "Poiret One",
+  "group": "Latin & Cyrillic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "poiretone/PoiretOne-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Lobster",
+  "group": "Latin & Cyrillic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "lobster/Lobster-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Pacifico",
+  "group": "Latin & Cyrillic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "pacifico/Pacifico-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Marck Script",
+  "group": "Latin & Cyrillic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "marckscript/MarckScript-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Caveat",
+  "group": "Latin & Cyrillic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "caveat/Caveat[wght].ttf",
+    "coords": []
+   },
+   {
+    "style": "Bold",
+    "file": "caveat/Caveat[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      700.0
+     ]
+    ]
+   }
+  ]
+ },
+ {
+  "family": "Amatic SC",
+  "group": "Latin & Cyrillic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "amaticsc/AmaticSC-Regular.ttf",
+    "coords": []
+   },
+   {
+    "style": "Bold",
+    "file": "amaticsc/AmaticSC-Bold.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Shantell Sans",
+  "group": "Latin & Cyrillic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "shantellsans/ShantellSans[BNCE,INFM,SPAC,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      400.0
+     ]
+    ]
+   },
+   {
+    "style": "Light",
+    "file": "shantellsans/ShantellSans[BNCE,INFM,SPAC,wght].ttf",
+    "coords": []
+   },
+   {
+    "style": "Medium",
+    "file": "shantellsans/ShantellSans[BNCE,INFM,SPAC,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      500.0
+     ]
+    ]
+   },
+   {
+    "style": "SemiBold",
+    "file": "shantellsans/ShantellSans[BNCE,INFM,SPAC,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      600.0
+     ]
+    ]
+   },
+   {
+    "style": "Bold",
+    "file": "shantellsans/ShantellSans[BNCE,INFM,SPAC,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      700.0
+     ]
+    ]
+   },
+   {
+    "style": "ExtraBold",
+    "file": "shantellsans/ShantellSans[BNCE,INFM,SPAC,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      800.0
+     ]
+    ]
+   }
+  ]
+ },
+ {
+  "family": "Oi",
+  "group": "Latin & Cyrillic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "oi/Oi-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Ruslan Display",
+  "group": "Latin & Cyrillic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "ruslandisplay/RuslanDisplay-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Rubik Glitch",
+  "group": "Latin & Cyrillic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "rubikglitch/RubikGlitch-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Rubik Vinyl",
+  "group": "Latin & Cyrillic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "rubikvinyl/RubikVinyl-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Rubik Mono One",
+  "group": "Latin & Cyrillic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "rubikmonoone/RubikMonoOne-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Press Start 2P",
+  "group": "Latin & Cyrillic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "pressstart2p/PressStart2P-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Anton",
+  "group": "Latin",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "anton/Anton-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Bebas Neue",
+  "group": "Latin",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "bebasneue/BebasNeue-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Archivo Black",
+  "group": "Latin",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "archivoblack/ArchivoBlack-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Fredoka",
+  "group": "Latin",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "fredoka/Fredoka[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      400.0
+     ]
+    ]
+   },
+   {
+    "style": "Light",
+    "file": "fredoka/Fredoka[wdth,wght].ttf",
+    "coords": []
+   },
+   {
+    "style": "Medium",
+    "file": "fredoka/Fredoka[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      500.0
+     ]
+    ]
+   },
+   {
+    "style": "SemiBold",
+    "file": "fredoka/Fredoka[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      600.0
+     ]
+    ]
+   },
+   {
+    "style": "Bold",
+    "file": "fredoka/Fredoka[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      700.0
+     ]
+    ]
+   }
+  ]
+ },
+ {
+  "family": "Comic Neue",
+  "group": "Latin",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "comicneue/ComicNeue-Regular.ttf",
+    "coords": []
+   },
+   {
+    "style": "Bold",
+    "file": "comicneue/ComicNeue-Bold.ttf",
+    "coords": []
+   },
+   {
+    "style": "Italic",
+    "file": "comicneue/ComicNeue-Italic.ttf",
+    "coords": []
+   },
+   {
+    "style": "Bold Italic",
+    "file": "comicneue/ComicNeue-BoldItalic.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Permanent Marker",
+  "group": "Latin",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "permanentmarker/PermanentMarker-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Gloria Hallelujah",
+  "group": "Latin",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "gloriahallelujah/GloriaHallelujah.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Bangers",
+  "group": "Latin",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "bangers/Bangers-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Luckiest Guy",
+  "group": "Latin",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "luckiestguy/LuckiestGuy-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Lilita One",
+  "group": "Latin",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "lilitaone/LilitaOne-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Righteous",
+  "group": "Latin",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "righteous/Righteous-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Shrikhand",
+  "group": "Latin",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "shrikhand/Shrikhand-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Coiny",
+  "group": "Latin",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "coiny/Coiny-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Creepster",
+  "group": "Latin",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "creepster/Creepster-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "VT323",
+  "group": "Latin",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "vt323/VT323-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Amiri",
+  "group": "Arabic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "amiri/Amiri-Regular.ttf",
+    "coords": []
+   },
+   {
+    "style": "Bold",
+    "file": "amiri/Amiri-Bold.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Cairo",
+  "group": "Arabic",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "cairo/Cairo[slnt,wght].ttf",
+    "coords": []
+   },
+   {
+    "style": "ExtraLight",
+    "file": "cairo/Cairo[slnt,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      200.0
+     ]
+    ]
+   },
+   {
+    "style": "Light",
+    "file": "cairo/Cairo[slnt,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      300.0
+     ]
+    ]
+   },
+   {
+    "style": "Medium",
+    "file": "cairo/Cairo[slnt,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      500.0
+     ]
+    ]
+   },
+   {
+    "style": "SemiBold",
+    "file": "cairo/Cairo[slnt,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      600.0
+     ]
+    ]
+   },
+   {
+    "style": "Bold",
+    "file": "cairo/Cairo[slnt,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      700.0
+     ]
+    ]
+   },
+   {
+    "style": "ExtraBold",
+    "file": "cairo/Cairo[slnt,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      800.0
+     ]
+    ]
+   },
+   {
+    "style": "Black",
+    "file": "cairo/Cairo[slnt,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      900.0
+     ]
+    ]
+   }
+  ]
+ },
+ {
+  "family": "Arimo",
+  "group": "Hebrew",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "arimo/Arimo[wght].ttf",
+    "coords": []
+   },
+   {
+    "style": "Medium",
+    "file": "arimo/Arimo[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      500.0
+     ]
+    ]
+   },
+   {
+    "style": "SemiBold",
+    "file": "arimo/Arimo[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      600.0
+     ]
+    ]
+   },
+   {
+    "style": "Bold",
+    "file": "arimo/Arimo[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      700.0
+     ]
+    ]
+   },
+   {
+    "style": "Italic",
+    "file": "arimo/Arimo-Italic[wght].ttf",
+    "coords": []
+   },
+   {
+    "style": "Medium Italic",
+    "file": "arimo/Arimo-Italic[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      500.0
+     ]
+    ]
+   },
+   {
+    "style": "SemiBold Italic",
+    "file": "arimo/Arimo-Italic[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      600.0
+     ]
+    ]
+   },
+   {
+    "style": "Bold Italic",
+    "file": "arimo/Arimo-Italic[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      700.0
+     ]
+    ]
+   }
+  ]
+ },
+ {
+  "family": "Frank Ruhl Libre",
+  "group": "Hebrew",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "frankruhllibre/FrankRuhlLibre[wght].ttf",
+    "coords": []
+   },
+   {
+    "style": "Light",
+    "file": "frankruhllibre/FrankRuhlLibre[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      300.0
+     ]
+    ]
+   },
+   {
+    "style": "Medium",
+    "file": "frankruhllibre/FrankRuhlLibre[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      500.0
+     ]
+    ]
+   },
+   {
+    "style": "SemiBold",
+    "file": "frankruhllibre/FrankRuhlLibre[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      600.0
+     ]
+    ]
+   },
+   {
+    "style": "Bold",
+    "file": "frankruhllibre/FrankRuhlLibre[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      700.0
+     ]
+    ]
+   },
+   {
+    "style": "ExtraBold",
+    "file": "frankruhllibre/FrankRuhlLibre[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      800.0
+     ]
+    ]
+   },
+   {
+    "style": "Black",
+    "file": "frankruhllibre/FrankRuhlLibre[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      900.0
+     ]
+    ]
+   }
+  ]
+ },
+ {
+  "family": "Kanit",
+  "group": "Thai",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "kanit/Kanit-Regular.ttf",
+    "coords": []
+   },
+   {
+    "style": "Light",
+    "file": "kanit/Kanit-Light.ttf",
+    "coords": []
+   },
+   {
+    "style": "Bold",
+    "file": "kanit/Kanit-Bold.ttf",
+    "coords": []
+   },
+   {
+    "style": "Black",
+    "file": "kanit/Kanit-Black.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Catamaran",
+  "group": "Tamil",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "catamaran/Catamaran[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      400.0
+     ]
+    ]
+   },
+   {
+    "style": "Thin",
+    "file": "catamaran/Catamaran[wght].ttf",
+    "coords": []
+   },
+   {
+    "style": "ExtraLight",
+    "file": "catamaran/Catamaran[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      200.0
+     ]
+    ]
+   },
+   {
+    "style": "Light",
+    "file": "catamaran/Catamaran[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      300.0
+     ]
+    ]
+   },
+   {
+    "style": "Medium",
+    "file": "catamaran/Catamaran[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      500.0
+     ]
+    ]
+   },
+   {
+    "style": "SemiBold",
+    "file": "catamaran/Catamaran[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      600.0
+     ]
+    ]
+   },
+   {
+    "style": "Bold",
+    "file": "catamaran/Catamaran[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      700.0
+     ]
+    ]
+   },
+   {
+    "style": "ExtraBold",
+    "file": "catamaran/Catamaran[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      800.0
+     ]
+    ]
+   },
+   {
+    "style": "Black",
+    "file": "catamaran/Catamaran[wght].ttf",
+    "coords": [
+     [
+      "wght",
+      900.0
+     ]
+    ]
+   }
+  ]
+ },
+ {
+  "family": "Mallanna",
+  "group": "Telugu",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "mallanna/Mallanna-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Mandali",
+  "group": "Telugu",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "mandali/Mandali-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Timmana",
+  "group": "Telugu",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "timmana/Timmana-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Hind",
+  "group": "Devanagari",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "hind/Hind-Regular.ttf",
+    "coords": []
+   },
+   {
+    "style": "Bold",
+    "file": "hind/Hind-Bold.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Noto Sans Georgian",
+  "group": "Georgian",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "notosansgeorgian/NotoSansGeorgian[wdth,wght].ttf",
+    "coords": []
+   },
+   {
+    "style": "Thin",
+    "file": "notosansgeorgian/NotoSansGeorgian[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      100.0
+     ]
+    ]
+   },
+   {
+    "style": "ExtraLight",
+    "file": "notosansgeorgian/NotoSansGeorgian[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      200.0
+     ]
+    ]
+   },
+   {
+    "style": "Light",
+    "file": "notosansgeorgian/NotoSansGeorgian[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      300.0
+     ]
+    ]
+   },
+   {
+    "style": "Medium",
+    "file": "notosansgeorgian/NotoSansGeorgian[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      500.0
+     ]
+    ]
+   },
+   {
+    "style": "SemiBold",
+    "file": "notosansgeorgian/NotoSansGeorgian[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      600.0
+     ]
+    ]
+   },
+   {
+    "style": "Bold",
+    "file": "notosansgeorgian/NotoSansGeorgian[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      700.0
+     ]
+    ]
+   },
+   {
+    "style": "ExtraBold",
+    "file": "notosansgeorgian/NotoSansGeorgian[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      800.0
+     ]
+    ]
+   },
+   {
+    "style": "Black",
+    "file": "notosansgeorgian/NotoSansGeorgian[wdth,wght].ttf",
+    "coords": [
+     [
+      "wght",
+      900.0
+     ]
+    ]
+   }
+  ]
+ },
+ {
+  "family": "Dela Gothic One",
+  "group": "Japanese",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "delagothicone/DelaGothicOne-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Do Hyeon",
+  "group": "Korean",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "dohyeon/DoHyeon-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "Black Han Sans",
+  "group": "Korean",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "blackhansans/BlackHanSans-Regular.ttf",
+    "coords": []
+   }
+  ]
+ },
+ {
+  "family": "ZCOOL KuaiLe",
+  "group": "Chinese (Simplified)",
+  "faces": [
+   {
+    "style": "Regular",
+    "file": "zcoolkuaile/ZCOOLKuaiLe-Regular.ttf",
+    "coords": []
+   }
+  ]
+ }
+]
