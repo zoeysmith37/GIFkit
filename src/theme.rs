@@ -1,7 +1,7 @@
 //! KDE Breeze-inspired look (Plasma 6 colour schemes), dark and light.
 
 use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, Shadow, Stroke, TextStyle, Theme, Vec2};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering};
 use std::sync::Arc;
 
 pub static NOTO_REGULAR: &[u8] = include_bytes!("../assets/NotoSans-Regular.ttf");
@@ -69,14 +69,56 @@ pub const LIGHT: Palette = Palette {
 };
 
 static IS_DARK: AtomicBool = AtomicBool::new(true);
+/// Current (dark, light) palettes. Replaced (and the old one leaked) only when
+/// the desktop colours change, which is rare.
+static PALS: AtomicPtr<(Palette, Palette)> = AtomicPtr::new(std::ptr::null_mut());
+/// KDE colour scheme darkness: 0 = no scheme found, 1 = dark, 2 = light.
+static SCHEME: AtomicU8 = AtomicU8::new(0);
+/// Set by the watcher thread when kdeglobals changed.
+static DIRTY: AtomicBool = AtomicBool::new(false);
 
-/// (dark, light) palettes with the system accent colour applied.
+/// (dark, light) palettes with the system colours applied.
 fn palettes() -> &'static (Palette, Palette) {
-    static P: std::sync::OnceLock<(Palette, Palette)> = std::sync::OnceLock::new();
-    P.get_or_init(|| match system_accent() {
+    let ptr = PALS.load(Ordering::Acquire);
+    if !ptr.is_null() {
+        // SAFETY: pointers stored in PALS come from Box::leak and are never freed
+        return unsafe { &*ptr };
+    }
+    let new = Box::into_raw(Box::new(build_palettes()));
+    match PALS.compare_exchange(std::ptr::null_mut(), new, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => unsafe { &*new },
+        Err(cur) => {
+            // another thread won the race
+            drop(unsafe { Box::from_raw(new) });
+            unsafe { &*cur }
+        }
+    }
+}
+
+fn build_palettes() -> (Palette, Palette) {
+    let kde = read_kde();
+    let accent = accent_override().unwrap_or(kde.accent);
+    let scheme = kde.scheme.map(|(pal, dark)| (accent.map(|a| with_accent(pal, a, dark)).unwrap_or(pal), dark));
+    SCHEME.store(match scheme { Some((_, true)) => 1, Some((_, false)) => 2, None => 0 }, Ordering::Relaxed);
+    let (mut d, mut l) = match accent {
         Some(a) => (with_accent(DARK, a, true), with_accent(LIGHT, a, false)),
         None => (DARK, LIGHT),
-    })
+    };
+    match scheme {
+        Some((pal, true)) => d = pal,
+        Some((pal, false)) => l = pal,
+        None => {}
+    }
+    (d, l)
+}
+
+/// Dark or light according to the KDE colour scheme, if there is one.
+pub fn scheme_is_dark() -> Option<bool> {
+    match SCHEME.load(Ordering::Relaxed) {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
 }
 
 fn lerp(a: Color32, b: Color32, t: f32) -> Color32 {
@@ -106,20 +148,36 @@ fn parse_kde_color(v: &str) -> Option<Color32> {
     (c.len() >= 3).then(|| Color32::from_rgb(c[0], c[1], c[2]))
 }
 
-/// KDE Plasma's accent colour from kdeglobals (custom accent first, then the
-/// colour scheme's selection colour). `GIFFORGE_ACCENT=r,g,b` overrides;
-/// `GIFFORGE_ACCENT=default` keeps Breeze blue. None elsewhere.
-fn system_accent() -> Option<Color32> {
-    if let Ok(v) = std::env::var("GIFFORGE_ACCENT") {
-        return parse_kde_color(&v);
-    }
+/// `GIFFORGE_ACCENT=r,g,b` overrides the accent; `GIFFORGE_ACCENT=default` keeps Breeze blue.
+fn accent_override() -> Option<Option<Color32>> {
+    std::env::var("GIFFORGE_ACCENT").ok().map(|v| parse_kde_color(&v))
+}
+
+fn kdeglobals_path() -> Option<std::path::PathBuf> {
     if !cfg!(all(unix, not(target_os = "macos"))) {
         return None;
     }
     let base = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
-    let text = std::fs::read_to_string(base.join("kdeglobals")).ok()?;
+    Some(base.join("kdeglobals"))
+}
+
+#[derive(Default)]
+struct Kde {
+    /// custom accent, else the colour scheme's selection colour
+    accent: Option<Color32>,
+    /// palette from the colour scheme and whether it is dark
+    scheme: Option<(Palette, bool)>,
+}
+
+/// KDE Plasma's colours from kdeglobals. Empty elsewhere.
+fn read_kde() -> Kde {
+    let Some(text) = kdeglobals_path().and_then(|p| std::fs::read_to_string(p).ok()) else { return Kde::default() };
+    parse_kdeglobals(&text)
+}
+
+fn parse_kdeglobals(text: &str) -> Kde {
     let mut section = String::new();
-    let (mut accent, mut selection) = (None, None);
+    let mut vals: std::collections::HashMap<(String, String), Color32> = Default::default();
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with('[') {
@@ -127,13 +185,75 @@ fn system_accent() -> Option<Color32> {
             continue;
         }
         let Some((k, v)) = line.split_once('=') else { continue };
-        match (section.as_str(), k.trim()) {
-            ("[General]", "AccentColor") => accent = parse_kde_color(v),
-            ("[Colors:Selection]", "BackgroundNormal") => selection = parse_kde_color(v),
-            _ => {}
+        if let Some(c) = parse_kde_color(v) {
+            vals.insert((section.clone(), k.trim().to_string()), c);
         }
     }
-    accent.or(selection)
+    let get = |sec: &str, key: &str| vals.get(&(format!("[{sec}]"), key.to_string())).copied();
+    let accent = get("General", "AccentColor").or(get("Colors:Selection", "BackgroundNormal"));
+    let scheme = (|| {
+        let window = get("Colors:Window", "BackgroundNormal")?;
+        let fg = get("Colors:Window", "ForegroundNormal")?;
+        let view = get("Colors:View", "BackgroundNormal").unwrap_or(window);
+        let button = get("Colors:Button", "BackgroundNormal").unwrap_or(window);
+        let luma = |c: Color32| 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
+        let dark = luma(window) < 128.0;
+        let base = if dark { DARK } else { LIGHT };
+        Some((
+            Palette {
+                window,
+                header: get("Colors:Header", "BackgroundNormal").unwrap_or(window),
+                view,
+                view_alt: get("Colors:View", "BackgroundAlternate").unwrap_or(lerp(view, window, 0.5)),
+                button,
+                button_hover: if dark { lerp(button, fg, 0.045) } else { base.button_hover },
+                fg,
+                fg_muted: get("Colors:Window", "ForegroundInactive").unwrap_or(lerp(window, fg, 0.6)),
+                border: lerp(window, fg, if dark { 0.136 } else { 0.21 }),
+                border_strong: lerp(window, fg, if dark { 0.24 } else { 0.35 }),
+                highlight: get("Colors:Selection", "BackgroundNormal").unwrap_or(base.highlight),
+                highlight_soft: base.highlight_soft,
+                negative: get("Colors:Window", "ForegroundNegative").unwrap_or(base.negative),
+                positive: get("Colors:Window", "ForegroundPositive").unwrap_or(base.positive),
+                neutral: get("Colors:Window", "ForegroundNeutral").unwrap_or(base.neutral),
+                canvas: if dark { lerp(view, Color32::BLACK, 0.2) } else { lerp(window, fg, 0.1) },
+            },
+            dark,
+        ))
+    })();
+    Kde { accent, scheme }
+}
+
+/// Watch kdeglobals so colour scheme and accent changes show up live.
+pub fn watch(ctx: &egui::Context) {
+    let Some(path) = kdeglobals_path() else { return };
+    let ctx = ctx.clone();
+    let _ = std::thread::Builder::new().name("kde-colours".into()).spawn(move || {
+        let stamp = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        let mut last = stamp(&path);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            let now = stamp(&path);
+            if now != last {
+                last = now;
+                DIRTY.store(true, Ordering::Release);
+                ctx.request_repaint();
+            }
+        }
+    });
+}
+
+/// Rebuild the palettes when the desktop colours changed. Call once per frame.
+pub fn refresh(ctx: &egui::Context, choice: ThemeChoice) {
+    if !DIRTY.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let new = Box::leak(Box::new(build_palettes()));
+    PALS.store(new, Ordering::Release);
+    ctx.set_visuals_of(Theme::Dark, visuals(&new.0, true));
+    ctx.set_visuals_of(Theme::Light, visuals(&new.1, false));
+    choice.apply(ctx);
+    ctx.request_repaint();
 }
 
 /// Palette of the theme currently in use (set every frame by the app).
@@ -269,13 +389,18 @@ impl ThemeChoice {
     pub fn label(self) -> &'static str {
         match self {
             ThemeChoice::System => "System",
-            ThemeChoice::Dark => "Breeze Dark",
-            ThemeChoice::Light => "Breeze Light",
+            ThemeChoice::Dark => "Dark",
+            ThemeChoice::Light => "Light",
         }
     }
     pub fn apply(self, ctx: &egui::Context) {
         ctx.set_theme(match self {
-            ThemeChoice::System => egui::ThemePreference::System,
+            // follow the KDE colour scheme when there is one
+            ThemeChoice::System => match scheme_is_dark() {
+                Some(true) => egui::ThemePreference::Dark,
+                Some(false) => egui::ThemePreference::Light,
+                None => egui::ThemePreference::System,
+            },
             ThemeChoice::Dark => egui::ThemePreference::Dark,
             ThemeChoice::Light => egui::ThemePreference::Light,
         });
@@ -328,4 +453,10 @@ pub fn save_theme_choice(c: ThemeChoice) {
         ThemeChoice::Light => "light",
     };
     set_setting("theme", v);
+}
+
+#[cfg(test)]
+pub fn parse_kdeglobals_for_test(text: &str) -> (Option<Color32>, Option<(Palette, bool)>) {
+    let k = parse_kdeglobals(text);
+    (k.accent, k.scheme)
 }

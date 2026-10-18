@@ -811,3 +811,18 @@ fn sheet_pow2_and_indexed_png() {
     assert_eq!(dec.len(), a.len());
     assert!(!bytes.is_empty());
 }
+
+#[test]
+fn kde_scheme_parsing() {
+    let txt = "[General]\nAccentColor=233,64,155\n\n[Colors:Window]\nBackgroundNormal=239,240,241\nForegroundNormal=35,38,41\nForegroundInactive=112,125,138\n\n[Colors:View]\nBackgroundNormal=255,255,255\n\n[Colors:Header][Inactive]\nBackgroundNormal=1,2,3\n";
+    let k = crate::theme::parse_kdeglobals_for_test(txt);
+    assert_eq!(k.0, Some(eframe::egui::Color32::from_rgb(233, 64, 155)));
+    let (pal, dark) = k.1.unwrap();
+    assert!(!dark);
+    assert_eq!(pal.window, eframe::egui::Color32::from_rgb(239, 240, 241));
+    // inactive header section must not be picked up
+    assert_eq!(pal.header, pal.window);
+    let dark_txt = "[Colors:Window]\nBackgroundNormal=#202326\nForegroundNormal=252,252,252\n";
+    assert!(crate::theme::parse_kdeglobals_for_test(dark_txt).1.unwrap().1);
+    assert!(crate::theme::parse_kdeglobals_for_test("[General]\nfoo=bar\n").1.is_none());
+}
