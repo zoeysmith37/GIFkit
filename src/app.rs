@@ -1106,9 +1106,9 @@ fn seg<T: PartialEq>(ui: &mut egui::Ui, current: &mut T, value: T, text: impl In
 /// A row of choices that share the width evenly (a segmented control).
 fn seg_row<T: PartialEq + Copy>(ui: &mut egui::Ui, current: &mut T, items: &[(T, &str)]) -> egui::Response {
     let mut out: Option<egui::Response> = None;
-    // a segmented control stays on one row unless it really can't fit
     let labels: Vec<&str> = items.iter().map(|i| i.1).collect();
-    let min_w = if items.len() <= 4 { label_w(ui, &labels) * 0.7 } else { label_w(ui, &labels) };
+    // rows wrap evenly rather than cutting labels short
+    let min_w = label_w(ui, &labels);
     even_grid(ui, items.len(), min_w, |ui, i, size| {
         let (v, label) = items[i];
         let mut r = ui.add_sized(size, sel_btn(egui::Button::new(label).truncate(), *current == v));
@@ -1140,6 +1140,8 @@ fn even_grid(ui: &mut egui::Ui, n: usize, min_w: f32, mut add: impl FnMut(&mut e
     let size = vec2(w, CHIP_H);
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing = vec2(gap, gap);
+        // a label too long for its cell is cut short instead of pushing the panel wider
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
         for r in 0..rows {
             ui.horizontal(|ui| {
                 for i in r * cols..((r + 1) * cols).min(n) {
@@ -1364,7 +1366,7 @@ fn form_row<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -
             let col = if ui.is_enabled() { p().fg } else { p().fg_muted };
             ui.painter().text(r.right_center() - vec2(2.0, 0.0), egui::Align2::RIGHT_CENTER, label, egui::FontId::proportional(13.5), col);
         }
-        let w = ui.available_width().max(40.0);
+        let w = (ui.available_width() - 1.0).max(40.0);
         ui.vertical(|ui| {
             ui.set_width(w);
             ui.set_max_width(w);
@@ -1426,6 +1428,7 @@ fn combo<T: PartialEq + Copy>(ui: &mut egui::Ui, id: &str, current: &mut T, item
     let w = ui.available_width();
     egui::ComboBox::from_id_salt(id)
         .width(w.max(40.0))
+        .truncate()
         .selected_text(text)
         .show_ui(ui, |ui| {
             for (v, l) in items {
@@ -1484,12 +1487,32 @@ fn check(ui: &mut egui::Ui, on: &mut bool, text: impl Into<egui::WidgetText>) ->
 fn slider(ui: &mut egui::Ui, s: egui::Slider<'_>) -> egui::Response {
     let pal = *p();
     ui.scope(|ui| {
+        let enabled = ui.is_enabled();
         let v = ui.visuals_mut();
-        v.selection.bg_fill = pal.highlight;
         let groove = mix(pal.button, pal.fg, 0.16);
-        v.widgets.inactive.bg_fill = groove;
-        v.widgets.hovered.bg_fill = mix(groove, pal.fg, 0.1);
-        v.widgets.active.bg_fill = mix(groove, pal.highlight, 0.4);
+        if enabled {
+            v.selection.bg_fill = pal.highlight;
+            v.widgets.inactive.bg_fill = groove;
+            v.widgets.hovered.bg_fill = mix(groove, pal.fg, 0.1);
+            v.widgets.active.bg_fill = mix(groove, pal.highlight, 0.4);
+        } else {
+            // greyed out: solid, darker colours rather than see-through ones,
+            // so the handle never shows the groove through it
+            let groove = mix(pal.button, pal.fg, 0.07);
+            let handle = mix(pal.button, pal.window, 0.5);
+            v.selection.bg_fill = mix(groove, pal.highlight, 0.35);
+            for w in [&mut v.widgets.noninteractive, &mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
+                w.bg_fill = handle;
+                w.weak_bg_fill = mix(pal.button, pal.window, 0.4);
+                w.fg_stroke = Stroke::new(1.0, pal.fg_muted);
+                w.bg_stroke = Stroke::new(1.0, mix(theme::outline(&pal), pal.window, 0.4));
+            }
+            v.widgets.noninteractive.bg_fill = groove;
+            v.widgets.inactive.bg_fill = groove;
+        }
+        if !enabled {
+            ui.set_opacity(1.0);
+        }
         ui.add(s)
     })
     .inner
@@ -3786,7 +3809,7 @@ impl GifKitApp {
         // the list, with a row of buttons under it
         let mut rect = ui.available_rect_before_wrap();
         // room for the buttons: gap, a toolbar row and item spacing, so the panel never creeps taller
-        let list_h = (rect.height() - 4.0 - TOOLBAR_H - 3.0 * ui.spacing().item_spacing.y - 2.0).max(40.0);
+        let list_h = (rect.height() - 4.0 - TOOLBAR_H - 3.0 * ui.spacing().item_spacing.y - 6.0).max(40.0);
         rect.set_height(list_h);
         ui.painter().rect_filled(rect, 3.0, pal.view);
         ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
@@ -4077,6 +4100,12 @@ impl GifKitApp {
                 }
             });
         });
+        // fill what's left: the panel takes its size from its contents, so
+        // without this it would shrink a little every frame
+        let rest = ui.available_rect_before_wrap();
+        if rest.height() > 0.0 {
+            ui.allocate_rect(rest, Sense::hover());
+        }
         if let Some((k, id)) = select {
             self.tool = kind_tool(k);
             self.select(k, id);
@@ -4415,7 +4444,9 @@ impl GifKitApp {
         if icon_toggle(ui, "view-split-left-right", self.compare, "Split view (C)") {
             self.compare = true;
         }
-        if self.compare && icon_toggle(ui, "link", self.link_views, "Link zoom and pan of both views") {
+        // always there, greyed out in single view, so the toolbar never shifts
+        let split = self.compare;
+        if ui.add_enabled_ui(split, |ui| icon_toggle(ui, "link", self.link_views && split, "Link zoom and pan of both views")).inner {
             self.link_views = !self.link_views;
         }
         toolbar_sep(ui);
@@ -4443,12 +4474,8 @@ impl GifKitApp {
         if icon_toggle(ui, "format-fill-color", self.backdrop == Backdrop::Solid, "Show transparency as a solid colour") {
             self.backdrop = Backdrop::Solid;
         }
-        if self.backdrop == Backdrop::Solid {
-            ui.scope(|ui| {
-                ui.spacing_mut().interact_size = vec2(22.0, 22.0);
-                colour_btn(ui, &mut self.backdrop_col).on_hover_text("Backdrop colour");
-            });
-        }
+        let solid = self.backdrop == Backdrop::Solid;
+        ui.add_enabled_ui(solid, |ui| colour_btn(ui, &mut self.backdrop_col).on_hover_text("Backdrop colour").on_disabled_hover_text("Backdrop colour, used with the solid colour backdrop"));
         if icon_toggle(ui, "markasblank", self.backdrop == Backdrop::Canvas, "Show transparency as the viewport background") {
             self.backdrop = Backdrop::Canvas;
         }
@@ -6223,7 +6250,7 @@ impl GifKitApp {
                 }
                 const PCTS: [f32; 8] = [10.0, 25.0, 33.3, 50.0, 75.0, 150.0, 200.0, 400.0];
                 form_row(ui, "", |ui| {
-                    even_grid(ui, PCTS.len(), 52.0, |ui, i, size| {
+                    even_grid(ui, PCTS.len(), 60.0, |ui, i, size| {
                         if ui.add_sized(size, sel_btn(egui::Button::new(format!("{}%", PCTS[i])), tr.rs_pct == PCTS[i])).clicked() {
                             tr.rs_pct = PCTS[i];
                         }
@@ -6381,7 +6408,7 @@ impl GifKitApp {
                     slider_row(ui, "Speed", soft_slider(&mut tr.speed_val, 10.0..=400.0, "").suffix(" %").max_decimals(0));
                     const PCTS: [f32; 6] = [25.0, 50.0, 100.0, 150.0, 200.0, 300.0];
                     form_row(ui, "", |ui| {
-                        even_grid(ui, PCTS.len(), 52.0, |ui, i, size| {
+                        even_grid(ui, PCTS.len(), 60.0, |ui, i, size| {
                             if ui.add_sized(size, sel_btn(egui::Button::new(format!("{:.0}%", PCTS[i])), tr.speed_val == PCTS[i])).clicked() {
                                 tr.speed_val = PCTS[i];
                             }
@@ -6787,7 +6814,7 @@ impl GifKitApp {
             if styles.len() > 1 {
                 ui.add_space(2.0);
                 form_row(ui, "Style", |ui| {
-                    egui::ComboBox::from_id_salt("fontstyle").width(ui.available_width()).selected_text(&style).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt("fontstyle").width(ui.available_width()).truncate().selected_text(&style).show_ui(ui, |ui| {
                         for st in &styles {
                             if ui.selectable_label(*st == style, st).clicked() {
                                 pick_sys = Some((fam.clone(), st.clone()));
@@ -7067,6 +7094,9 @@ impl GifKitApp {
         })
         .response
         .on_disabled_hover_text("Add a text layer first");
+        if sel.is_none() {
+            (a.x, a.y, a.angle, a.from, a.to) = (before.x, before.y, before.angle, before.from, before.to);
+        }
         let changed = a != before;
         if sel.is_none() && changed {
             self.place_text(&mut a);
@@ -7116,6 +7146,10 @@ impl GifKitApp {
         })
         .response
         .on_disabled_hover_text("Draw a region on the image first");
+        if sel.is_none() {
+            // the greyed-out placement boxes may clamp the stand-in values; that's no edit
+            (c.x, c.y, c.w, c.h, c.angle, c.from, c.to) = (before.x, before.y, before.w, before.h, before.angle, before.from, before.to);
+        }
         let changed = c != before;
         if sel.is_none() && changed {
             self.place_censor(&mut c);
@@ -7426,6 +7460,9 @@ impl GifKitApp {
         })
         .response
         .on_disabled_hover_text("Draw a shape on the image first");
+        if sel.is_none() {
+            (st.x, st.y, st.w, st.h, st.angle, st.from, st.to) = (before.x, before.y, before.w, before.h, before.angle, before.from, before.to);
+        }
         if let Some(i) = sel {
             if st != before {
                 if let LayerKind::Shape(s) = &mut self.stack.layers[i].kind {
@@ -7614,6 +7651,9 @@ impl GifKitApp {
         })
         .response
         .on_disabled_hover_text("Click an emoji or drag on the image first");
+        if sel.is_none() {
+            (e.x, e.y, e.w, e.h, e.angle, e.from, e.to) = (before.x, before.y, before.w, before.h, before.angle, before.from, before.to);
+        }
         self.emoji_tpl.opacity = e.opacity;
         self.emoji_tpl.shadow = e.shadow;
         if let Some(i) = sel {
