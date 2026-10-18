@@ -860,3 +860,35 @@ fn noai_markers_in_png_apng_webp() {
     assert_eq!(crate::noai::tag_png(b"hello".to_vec()), b"hello");
     assert_eq!(crate::noai::tag_webp(b"hello".to_vec()), b"hello");
 }
+
+#[test]
+fn noai_avif_still_decodes() {
+    if !io::ffmpeg_available() {
+        return;
+    }
+    let has = |b: &[u8], n: &[u8]| b.windows(n.len()).any(|w| w == n);
+    let dir = std::env::temp_dir().join(format!("gf_avif_tag_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for alpha in [false, true] {
+        let a = synth(alpha);
+        let plain = io::encode_avif(&a, 60).unwrap();
+        let tagged = crate::noai::tag_avif(plain.clone());
+        assert_ne!(plain, tagged, "alpha={alpha}: not tagged");
+        assert!(has(&tagged, b"DMI-PROHIBITED") && has(&tagged, b"application/rdf+xml"));
+        let (pp, tp) = (dir.join(format!("p{alpha}.avif")), dir.join(format!("t{alpha}.avif")));
+        std::fs::write(&pp, &plain).unwrap();
+        std::fs::write(&tp, &tagged).unwrap();
+        let (x, y) = (io::load_video(&pp).unwrap(), io::load_video(&tp).unwrap());
+        assert_eq!(x.len(), y.len());
+        assert_eq!((x.width(), x.height()), (y.width(), y.height()));
+        for (f, g) in x.frames.iter().zip(&y.frames) {
+            assert_eq!(f.image.as_raw(), g.image.as_raw(), "alpha={alpha}: pixels changed");
+        }
+        if let Ok(keep) = std::env::var("GIFFORGE_KEEP_AVIF") {
+            std::fs::copy(&tp, std::path::Path::new(&keep).join(format!("tagged_{alpha}.avif"))).unwrap();
+            std::fs::copy(&pp, std::path::Path::new(&keep).join(format!("plain_{alpha}.avif"))).unwrap();
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(crate::noai::tag_avif(b"hello".to_vec()), b"hello");
+}

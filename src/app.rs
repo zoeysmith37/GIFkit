@@ -186,9 +186,9 @@ impl ExportFormat {
     fn needs_ffmpeg(self) -> bool {
         matches!(self, ExportFormat::Mp4 | ExportFormat::Webm | ExportFormat::Avif)
     }
-    /// Formats that can carry the "noai" markers.
+    /// Formats that can carry the "noai" markers (all of them).
     fn can_tag(self) -> bool {
-        self != ExportFormat::Avif
+        true
     }
     fn can_target(self) -> bool {
         matches!(self, ExportFormat::Gif | ExportFormat::Webp | ExportFormat::Avif)
@@ -3644,6 +3644,7 @@ impl GifForgeApp {
                 let bytes: Arc<Vec<u8>> = match self.export_fmt {
                     ExportFormat::Webp if noai => Arc::new(crate::noai::tag_webp((*bytes).clone())),
                     ExportFormat::Apng if noai => Arc::new(crate::noai::tag_png((*bytes).clone())),
+                    ExportFormat::Avif if noai => Arc::new(crate::noai::tag_avif((*bytes).clone())),
                     _ => bytes,
                 };
                 let ext = self.export_ext();
@@ -3677,6 +3678,7 @@ impl GifForgeApp {
                     let q = self.avif_quality;
                     self.run_export(ctx, "Save AVIF", move |a, _| {
                         let b = io::encode_avif(a, q)?;
+                        let b = if noai { crate::noai::tag_avif(b) } else { b };
                         std::fs::write(&path, &b)?;
                         Ok(format!("Saved {} ({})", path.display(), fmt_size(b.len() as u64)))
                     });
