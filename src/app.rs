@@ -556,7 +556,6 @@ pub struct GifKitApp {
     font_keys: HashMap<String, usize>,
     font_meta: HashMap<usize, (String, String)>,
     font_search: String,
-    font_picker_open: bool,
     ffmpeg: bool,
     theme: ThemeChoice,
 
@@ -1698,7 +1697,6 @@ impl GifKitApp {
             font_keys: HashMap::new(),
             font_meta: HashMap::new(),
             font_search: String::new(),
-            font_picker_open: false,
             ffmpeg: io::ffmpeg_available(),
             theme: theme_choice,
             compare: true,
@@ -2707,7 +2705,6 @@ impl GifKitApp {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.export_open = false;
             self.shortcuts_open = false;
-            self.font_picker_open = false;
             self.about_open = false;
         }
         if typing {
@@ -6803,7 +6800,6 @@ impl GifKitApp {
         };
         let r = ui.add(egui::Button::new(RichText::new(format!("{}  ▾", elide(&cur_name, 30))).font(cur_font).color(pal.fg)).min_size(vec2(ui.available_width(), 30.0)));
         if r.clicked() {
-            self.font_picker_open = !self.font_picker_open;
             self.font_search.clear();
         }
         if let Some((fam, style)) = self.font_meta.get(&cur_idx).cloned() {
@@ -6824,20 +6820,22 @@ impl GifKitApp {
                 });
             }
         }
-        if self.font_picker_open {
+        // a popup, so it draws over the layers panel and everything else
+        let list_w = r.rect.width();
+        egui::Popup::from_toggle_button_response(&r).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).width(list_w).show(|ui| {
+            ui.set_width(list_w - 12.0);
             let q = self.font_search.to_lowercase();
             let fams: Option<Vec<String>> = self.sys_fonts.lock().ok().and_then(|g| g.as_ref().map(|v| v.iter().filter(|f| q.is_empty() || f.name.to_lowercase().contains(&q)).map(|f| f.name.clone()).collect()));
             let cur_fam = self.font_meta.get(&cur_idx).map(|m| m.0.clone());
-            egui::Frame::new().fill(pal.view).stroke(Stroke::new(1.0, pal.border)).corner_radius(3.0).inner_margin(6.0).show(ui, |ui| {
+            {
                 let r = ui.add(egui::TextEdit::singleline(&mut self.font_search).hint_text("Search fonts…").desired_width(f32::INFINITY));
                 if self.font_search.is_empty() && !r.has_focus() && !r.lost_focus() {
                     r.request_focus();
                 }
-                // built-in and file fonts
-                let extra: Vec<(usize, String)> = (0..self.fonts.len()).filter(|i| *i < self.builtin_font_count || !self.font_meta.contains_key(i)).map(|i| (i, self.fonts[i].name.clone())).filter(|(_, n)| q.is_empty() || n.to_lowercase().contains(&q)).collect();
+                // fonts loaded from a file this session
+                let extra: Vec<(usize, String)> = (self.builtin_font_count..self.fonts.len()).filter(|i| !self.font_meta.contains_key(i)).map(|i| (i, self.fonts[i].name.clone())).filter(|(_, n)| q.is_empty() || n.to_lowercase().contains(&q)).collect();
                 for (i, n) in extra {
-                    let f = if i < self.builtin_font_count { Self::builtin_preview_font(i, 15.0) } else { egui::FontId::proportional(15.0) };
-                    if ui.add(egui::Button::selectable(i == cur_idx, RichText::new(n).font(f))).clicked() {
+                    if ui.add(egui::Button::selectable(i == cur_idx, RichText::new(n).font(egui::FontId::proportional(15.0)))).clicked() {
                         pick = Some(i);
                     }
                 }
@@ -6846,6 +6844,7 @@ impl GifKitApp {
                 enum Row {
                     Head(String),
                     Font(String),
+                    Builtin(usize),
                 }
                 let mut rows: Vec<Row> = Vec::new();
                 let mut last_group = "";
@@ -6867,6 +6866,12 @@ impl GifKitApp {
                         rows.extend(sys.into_iter().map(|f| Row::Font(f.clone())));
                     }
                 }
+                // the original built-in faces, last
+                let builtins: Vec<usize> = (0..self.builtin_font_count).filter(|i| q.is_empty() || self.fonts[*i].name.to_lowercase().contains(&q)).collect();
+                if !builtins.is_empty() {
+                    rows.push(Row::Head("Built In".into()));
+                    rows.extend(builtins.into_iter().map(Row::Builtin));
+                }
                 let row_h = 26.0;
                 egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]).show_rows(ui, row_h, rows.len(), |ui, range| {
                     ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
@@ -6885,6 +6890,13 @@ impl GifKitApp {
                                         pick_sys = Some((fam.clone(), String::new()));
                                     }
                                 }
+                                Row::Builtin(i) => {
+                                    let name = self.fonts[*i].name.trim_end_matches(" (built-in)").to_string();
+                                    let r = ui.add(egui::Button::selectable(*i == cur_idx, RichText::new(format!("   {name}")).font(Self::builtin_preview_font(*i, 15.0))).min_size(vec2(0.0, row_h)));
+                                    if r.clicked() {
+                                        pick = Some(*i);
+                                    }
+                                }
                             }
                         }
                     });
@@ -6895,8 +6907,11 @@ impl GifKitApp {
                         hint(ui, "Looking for fonts on this computer…");
                     });
                 }
-            });
-        }
+            }
+            if pick.is_some() || pick_sys.is_some() {
+                ui.close();
+            }
+        });
         if let Some((fam, st)) = pick_sys {
             let style = if st.is_empty() && crate::bundled::family(&fam).is_some() {
                 crate::bundled::family(&fam).map(|b| b.default_face().style.clone()).unwrap_or_default()
@@ -6906,9 +6921,6 @@ impl GifKitApp {
                 st
             };
             pick = self.font_index_for(&fam, &style);
-        }
-        if pick.is_some() {
-            self.font_picker_open = false;
         }
         pick
     }
