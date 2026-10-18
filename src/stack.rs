@@ -15,6 +15,7 @@ use crate::effects::{self, CensorSettings, EffectSettings, ShieldSettings, Water
 use crate::geo::{map_box, GeoMap, Obb};
 use crate::ops::{self, AspectMode, ResizeFilter};
 use crate::overlay::{OverlaySource, Placement};
+use crate::shapes::{self, MarkupSettings, ShapeKind, ShapeSettings, StrokeSprite};
 use crate::text::{self, Annotation, FontEntry};
 use image::{imageops, Rgba, RgbaImage};
 use rayon::prelude::*;
@@ -289,6 +290,8 @@ pub enum LayerKind {
     Overlay(OverlayLayer),
     Watermark(Box<WatermarkSettings>),
     Shield(ShieldSettings),
+    Shape(Box<ShapeSettings>),
+    Markup(MarkupSettings),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -299,6 +302,8 @@ pub enum Kind {
     Overlay,
     Watermark,
     Shield,
+    Shape,
+    Markup,
 }
 
 #[derive(Clone)]
@@ -319,6 +324,8 @@ impl Layer {
             LayerKind::Overlay(_) => Kind::Overlay,
             LayerKind::Watermark(_) => Kind::Watermark,
             LayerKind::Shield(_) => Kind::Shield,
+            LayerKind::Shape(_) => Kind::Shape,
+            LayerKind::Markup(_) => Kind::Markup,
         }
     }
     pub fn active(&self) -> bool {
@@ -330,12 +337,15 @@ impl Layer {
                 LayerKind::Overlay(_) => true,
                 LayerKind::Watermark(w) => w.active(),
                 LayerKind::Shield(s) => s.strength > 0.0 && (s.pattern || s.noise || s.jitter),
+                LayerKind::Shape(s) => s.w > 0 && s.h > 0,
+                LayerKind::Markup(m) => !m.strokes.is_empty(),
             }
     }
     /// The layer's oriented box in source-frame space (for source frame `src`).
     pub fn source_box(&self, src: usize, fonts: &[FontEntry]) -> Option<Obb> {
         match &self.kind {
-            LayerKind::Effects(_) | LayerKind::Watermark(_) | LayerKind::Shield(_) => None,
+            LayerKind::Effects(_) | LayerKind::Watermark(_) | LayerKind::Shield(_) | LayerKind::Markup(_) => None,
+            LayerKind::Shape(s) => Some(Obb::from_rect(s.x as f32, s.y as f32, s.w as f32, s.h as f32, s.angle)),
             LayerKind::Text(t) => {
                 if t.text.is_empty() {
                     return None;
@@ -353,7 +363,12 @@ impl Layer {
 
     /// Content that should stay readable (never shown upside-down after flips).
     pub fn readable(&self) -> bool {
-        !matches!(self.kind, LayerKind::Censor(_))
+        match &self.kind {
+            LayerKind::Censor(_) => false,
+            // arrows and bubbles follow flips; an emoji stays the right way up
+            LayerKind::Shape(s) => s.kind == ShapeKind::Emoji,
+            _ => true,
+        }
     }
 
     pub fn name(&self) -> String {
@@ -367,6 +382,15 @@ impl Layer {
             LayerKind::Overlay(o) => o.src.name.clone(),
             LayerKind::Watermark(w) => if w.use_image { "Watermark · image".into() } else { format!("Watermark · {}", w.text) },
             LayerKind::Shield(_) => "AI shield".into(),
+            LayerKind::Shape(s) => {
+                if s.kind == ShapeKind::Emoji {
+                    let name = crate::emoji::EMOJI.iter().find(|e| e.0 == s.emoji).map(|e| e.1).unwrap_or("emoji");
+                    format!("Emoji · {name}")
+                } else {
+                    format!("Shape · {}", s.kind.label())
+                }
+            }
+            LayerKind::Markup(m) => format!("Markup · {} stroke{}", m.strokes.len(), if m.strokes.len() == 1 { "" } else { "s" }),
         }
     }
 }
@@ -381,6 +405,8 @@ pub fn layer_signature(l: &Layer) -> u64 {
         LayerKind::Overlay(o) => (o.opacity.to_bits(), format!("{:?}", o.placements), Arc::as_ptr(&o.src) as usize).hash(&mut h),
         LayerKind::Watermark(w) => (format!("{w:?}"), w.image.as_ref().map(|i| Arc::as_ptr(i) as usize)).hash(&mut h),
         LayerKind::Shield(sh) => format!("{sh:?}").hash(&mut h),
+        LayerKind::Shape(sh) => format!("{sh:?}").hash(&mut h),
+        LayerKind::Markup(m) => format!("{m:?}").hash(&mut h),
     }
     h.finish()
 }
@@ -406,6 +432,8 @@ pub struct Prepared {
     pub maps: Vec<GeoMap>,
     sprites: Vec<Option<(RgbaImage, i64, i64)>>,
     watermarks: Vec<Option<WatermarkSprite>>,
+    /// shape and markup sprites per layer, each with its source frame range
+    stamps: Vec<Vec<StrokeSprite>>,
 }
 
 /// Thread pool for background work (pre-rendering, compression, exports) so
@@ -544,7 +572,36 @@ impl Stack {
                 _ => None,
             })
             .collect();
-        Prepared { maps, sprites, watermarks }
+        let stamps = self
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(li, l)| {
+                if !l.active() {
+                    return Vec::new();
+                }
+                let m = &maps[li].m;
+                match &l.kind {
+                    LayerKind::Shape(s) => {
+                        let Some(b) = l.source_box(0, fonts) else { return Vec::new() };
+                        let o = map_box(m, b, l.readable());
+                        shapes::shape_sprite(s, o, shapes::map_scale(m)).map(|(img, x, y)| vec![StrokeSprite { img, x, y, from: s.from, to: s.to }]).unwrap_or_default()
+                    }
+                    LayerKind::Markup(mk) => {
+                        let sc = shapes::map_scale(m);
+                        mk.strokes
+                            .par_iter()
+                            .filter_map(|st| {
+                                let pts: Vec<(f32, f32)> = st.points.iter().map(|p| m.apply(p[0], p[1])).collect();
+                                shapes::stroke_sprite(st, &pts, st.width * sc)
+                            })
+                            .collect()
+                    }
+                    _ => Vec::new(),
+                }
+            })
+            .collect();
+        Prepared { maps, sprites, watermarks, stamps }
     }
 
     /// The transformed frame before any layer (geometry only).
@@ -584,6 +641,23 @@ impl Stack {
                     }
                 }
                 LayerKind::Shield(sh) => img = effects::shield(&img, sh, src),
+                LayerKind::Shape(sh) => {
+                    if let Some(st) = prep.stamps.get(li) {
+                        for sp in st.iter().filter(|_| sh.applies_to(src)) {
+                            crate::ops::overlay_with_opacity(&mut img, &sp.img, sp.x, sp.y, sh.opacity / 100.0);
+                        }
+                    }
+                }
+                LayerKind::Markup(_) => {
+                    if let Some(st) = prep.stamps.get(li) {
+                        for sp in st {
+                            let i = src + 1;
+                            if i >= sp.from.max(1) && (sp.to == 0 || i <= sp.to) {
+                                crate::ops::overlay_with_opacity(&mut img, &sp.img, sp.x, sp.y, 1.0);
+                            }
+                        }
+                    }
+                }
                 LayerKind::Text(t) => {
                     if let Some(Some((s, x, y))) = prep.sprites.get(li) {
                         if t.applies_to(src) {

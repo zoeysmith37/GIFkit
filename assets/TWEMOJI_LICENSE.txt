@@ -1,0 +1,5 @@
+Emoji graphics from Twemoji (https://github.com/jdecked/twemoji)
+Copyright 2019 Twitter, Inc and other contributors
+Copyright 2024 jdecked and other contributors
+Licensed under CC-BY 4.0: https://creativecommons.org/licenses/by/4.0/
+The SVG originals were rendered to 160 px PNG files for GIFkit.

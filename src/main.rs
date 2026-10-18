@@ -13,6 +13,8 @@ mod overlay;
 mod presets;
 mod stack;
 mod target;
+mod shapes;
+mod emoji;
 mod sysfonts;
 mod text;
 mod theme;

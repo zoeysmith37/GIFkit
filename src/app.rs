@@ -2,6 +2,7 @@
 
 use crate::anim::{effective_delay, Animation};
 use crate::effects::{CensorMethod, CensorSettings, EffectSettings, ShieldSettings};
+use crate::shapes::{MarkupSettings, PenMode, PenStroke, ShapeKind, ShapeSettings};
 use crate::geo::{map_box, source_angle, unmap_box, Affine, Obb};
 use crate::encode::GifOptions;
 use crate::io::{self, SheetOptions, SplitFormat, VideoFormat};
@@ -37,12 +38,16 @@ enum Tool {
     Shield,
     Cut,
     Frames,
+    Shapes,
+    Markup,
 }
 
 impl Tool {
-    const ALL: [Tool; 14] = [
+    const ALL: [Tool; 16] = [
         Tool::Effects,
         Tool::Text,
+        Tool::Shapes,
+        Tool::Markup,
         Tool::Censor,
         Tool::AddImage,
         Tool::Watermark,
@@ -72,6 +77,8 @@ impl Tool {
             Tool::Shield => "AI shield",
             Tool::Cut => "Cut",
             Tool::Frames => "Frames",
+            Tool::Shapes => "Shapes",
+            Tool::Markup => "Markup",
         }
     }
     fn icon(self) -> &'static str {
@@ -90,6 +97,8 @@ impl Tool {
             Tool::Shield => "◈",
             Tool::Cut => "✄",
             Tool::Frames => "▤",
+            Tool::Shapes => "◆",
+            Tool::Markup => "✎",
         }
     }
     fn tip(self) -> &'static str {
@@ -108,6 +117,8 @@ impl Tool {
             Tool::Shield => "Noise that discourages AI training",
             Tool::Cut => "Keep a range of frames",
             Tool::Frames => "Edit, reorder and time single frames",
+            Tool::Shapes => "Shapes, arrows, speech bubbles and emoji",
+            Tool::Markup => "Draw and highlight with a pen",
         }
     }
     fn title(self) -> &'static str {
@@ -127,12 +138,14 @@ impl Tool {
             Tool::AddImage => Some(Kind::Overlay),
             Tool::Watermark => Some(Kind::Watermark),
             Tool::Shield => Some(Kind::Shield),
+            Tool::Shapes => Some(Kind::Shape),
+            Tool::Markup => Some(Kind::Markup),
             _ => None,
         }
     }
     /// Tools that use left-drag on the canvas (otherwise left-drag pans).
     fn uses_canvas_drag(self) -> bool {
-        matches!(self, Tool::Crop | Tool::Text | Tool::Censor | Tool::AddImage)
+        matches!(self, Tool::Crop | Tool::Text | Tool::Censor | Tool::AddImage | Tool::Shapes | Tool::Markup)
     }
 }
 
@@ -144,6 +157,8 @@ fn kind_tool(k: Kind) -> Tool {
         Kind::Overlay => Tool::AddImage,
         Kind::Watermark => Tool::Watermark,
         Kind::Shield => Tool::Shield,
+        Kind::Shape => Tool::Shapes,
+        Kind::Markup => Tool::Markup,
     }
 }
 
@@ -602,6 +617,30 @@ pub struct GifKitApp {
     pending_open: Option<PathBuf>,
     /// measured width of the transport's view controls (last frame)
     transport_right_w: f32,
+    /// style for the next shape drawn
+    shape_tpl: ShapeSettings,
+    emoji_tex: HashMap<String, TextureHandle>,
+    pen: PenStroke,
+    highlighter: PenStroke,
+    pen_tool: PenTool,
+    pen_scope: PenScope,
+    /// stroke being drawn: (layer id, points in the viewport's image space, space)
+    pen_live: Option<(u64, Vec<Pos2>, Space)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PenTool {
+    Pen,
+    Highlighter,
+    Eraser,
+}
+
+/// Which frames a new markup stroke shows on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PenScope {
+    All,
+    FromHere,
+    ThisFrame,
 }
 
 fn hash_str(s: &str) -> u64 {
@@ -665,6 +704,23 @@ fn paint_tool_icon(painter: &egui::Painter, t: Tool, c: Pos2, size: f32, col: Co
             painter.circle_stroke(c, r, stroke);
             let d = r * std::f32::consts::FRAC_1_SQRT_2;
             painter.line_segment([c + vec2(-d, -d), c + vec2(d, d)], stroke);
+        }
+        Tool::Shapes => {
+            // a square behind a circle
+            let a = 4.8 * s;
+            painter.rect_stroke(Rect::from_center_size(c + vec2(-2.4 * s, -2.4 * s), vec2(a * 2.0, a * 2.0)), 1.5 * s, stroke, egui::StrokeKind::Middle);
+            painter.circle_filled(c + vec2(3.0 * s, 3.0 * s), 4.6 * s, col);
+        }
+        Tool::Markup => {
+            // a pen drawn at 45° over a squiggle
+            let d = vec2(1.0, -1.0) / std::f32::consts::SQRT_2;
+            let n = vec2(1.0, 1.0) / std::f32::consts::SQRT_2;
+            let tip = c + vec2(-6.0 * s, 4.5 * s);
+            let base = tip + d * 4.0 * s;
+            let end = tip + d * 13.0 * s;
+            painter.add(egui::Shape::convex_polygon(vec![tip, base + n * 2.2 * s, base - n * 2.2 * s], col, Stroke::NONE));
+            painter.add(egui::Shape::convex_polygon(vec![base + n * 2.2 * s, end + n * 2.2 * s, end - n * 2.2 * s, base - n * 2.2 * s], Color32::TRANSPARENT, stroke));
+            painter.line_segment([c + vec2(-1.0 * s, 7.0 * s), c + vec2(7.0 * s, 7.0 * s)], stroke);
         }
         Tool::Crop => {
             // two interlocking corner brackets
@@ -797,6 +853,8 @@ fn changed_fields(a: &LayerKind, b: &LayerKind) -> String {
             LayerKind::Censor(x) => serde_json::to_value(x).ok(),
             LayerKind::Watermark(x) => serde_json::to_value(&**x).ok(),
             LayerKind::Shield(x) => serde_json::to_value(x).ok(),
+            LayerKind::Shape(x) => serde_json::to_value(&**x).ok(),
+            LayerKind::Markup(x) => Some(serde_json::json!({ "strokes": x.strokes.len() })),
             LayerKind::Overlay(_) => None,
         }
     };
@@ -901,6 +959,8 @@ fn kind_key(k: Kind) -> &'static str {
         Kind::Overlay => "overlay",
         Kind::Watermark => "watermark",
         Kind::Shield => "shield",
+        Kind::Shape => "shape",
+        Kind::Markup => "markup",
     }
 }
 
@@ -1215,6 +1275,13 @@ impl GifKitApp {
             last_dir: theme::get_setting("last_dir").map(PathBuf::from).filter(|d| d.is_dir()),
             pending_open: None,
             transport_right_w: 430.0,
+            shape_tpl: ShapeSettings::default(),
+            emoji_tex: HashMap::new(),
+            pen: PenStroke::default(),
+            highlighter: PenStroke { color: [255, 230, 0], width: 22.0, opacity: 40.0, mode: PenMode::Highlighter, ..Default::default() },
+            pen_tool: PenTool::Pen,
+            pen_scope: PenScope::All,
+            pen_live: None,
             fit_keep_size: theme::get_setting("fit_keep_size").as_deref() == Some("1"),
         };
         // scan system fonts in the background
@@ -1380,6 +1447,20 @@ impl GifKitApp {
                     self.add_layer(LayerKind::Censor(CensorSettings { x: 200, y: 140, w: 70, h: 60, angle: 12.0, ..Default::default() }));
                     self.add_layer(LayerKind::Text(Annotation { text: "This caption is a really long line of text for testing".into(), size: 22.0, x: 20, y: 190, ..Default::default() }));
                     self.add_layer(LayerKind::Watermark(Box::default()));
+                }
+                // scripting hook (screenshots): shapes and markup
+                if std::env::var("GIFKIT_DEMO_SHAPES").is_ok() {
+                    let mk = |kind, x, y, w, h, angle, fill: [u8; 3]| ShapeSettings { kind, x, y, w, h, angle, fill, ..Default::default() };
+                    self.add_layer(LayerKind::Shape(Box::new(ShapeSettings { stroke: [34, 38, 44], fill: [255, 255, 255], corner: 30.0, ..mk(ShapeKind::Speech, 150, 18, 150, 82, 0.0, [255, 255, 255]) })));
+                    self.add_layer(LayerKind::Shape(Box::new(ShapeSettings { stroke_on: false, shadow: true, ..mk(ShapeKind::Arrow, 30, 150, 120, 34, -25.0, [255, 59, 48]) })));
+                    self.add_layer(LayerKind::Shape(Box::new(ShapeSettings { points: 5, ..mk(ShapeKind::Star, 20, 20, 70, 70, 10.0, [255, 204, 0]) })));
+                    self.add_layer(LayerKind::Shape(Box::new(ShapeSettings { emoji: "1f525".into(), shadow: true, ..mk(ShapeKind::Emoji, 240, 150, 64, 64, -12.0, [0, 0, 0]) })));
+                    let pts: Vec<[f32; 2]> = (0..40).map(|i| { let t = i as f32 / 39.0; [170.0 + 120.0 * t, 205.0 + 10.0 * (t * 9.0).sin()] }).collect();
+                    let hl: Vec<[f32; 2]> = vec![[30.0, 112.0], [140.0, 112.0]];
+                    self.add_layer(LayerKind::Markup(MarkupSettings { strokes: vec![
+                        PenStroke { points: hl, color: [255, 230, 0], width: 20.0, opacity: 45.0, mode: PenMode::Highlighter, ..Default::default() },
+                        PenStroke { points: pts, color: [61, 174, 233], width: 5.0, ..Default::default() },
+                    ] }));
                 }
                 // scripting hook: GIFKIT_OVERLAY=path adds an image layer on open
                 if let Ok(ov) = std::env::var("GIFKIT_OVERLAY") {
@@ -1830,6 +1911,7 @@ impl GifKitApp {
                 hint(ui, "Built with Rust, egui, image, gif, libwebp and rayon");
                 hint(ui, "Video and AVIF via ffmpeg (optional)");
                 hint(ui, "Fonts: Noto Sans (OFL) and DejaVu");
+                hint(ui, "Emoji: Twemoji (CC-BY 4.0)");
                 ui.add_space(4.0);
                 hint(ui, "Licensed under Apache 2.0");
             });
@@ -1947,15 +2029,8 @@ impl GifKitApp {
     }
 
     fn add_layer(&mut self, kind: LayerKind) -> u64 {
-        let k = match kind {
-            LayerKind::Effects(_) => Kind::Effects,
-            LayerKind::Text(_) => Kind::Text,
-            LayerKind::Censor(_) => Kind::Censor,
-            LayerKind::Overlay(_) => Kind::Overlay,
-            LayerKind::Watermark(_) => Kind::Watermark,
-            LayerKind::Shield(_) => Kind::Shield,
-        };
         let id = self.stack.push(kind);
+        let k = self.stack.layers.last().map(|l| l.kind()).unwrap_or(Kind::Effects);
         self.select(k, id);
         self.modified = true;
         id
@@ -2859,11 +2934,11 @@ impl GifKitApp {
                     ui.add_space(1.0);
                 }
             };
-            for (i, t) in Tool::ALL.iter().copied().enumerate() {
-                match i {
-                    0 => section(ui, "Layers"),
-                    6 => section(ui, "Frame edits"),
-                    12 => section(ui, "Frames & output"),
+            for t in Tool::ALL {
+                match t {
+                    Tool::Effects => section(ui, "Layers"),
+                    Tool::Resize => section(ui, "Frame edits"),
+                    Tool::Frames => section(ui, "Frames & output"),
                     _ => {}
                 }
                 self.sidebar_row(ui, t, compact);
@@ -2947,7 +3022,7 @@ impl GifKitApp {
                 });
                 let add = icon_button(ui, "+", true).on_hover_text("Add layer");
                 egui::Popup::menu(&add).show(|ui| {
-                    for (t, label) in [(Tool::Effects, "Effects"), (Tool::Text, "Text"), (Tool::Censor, "Censor"), (Tool::AddImage, "Image…"), (Tool::Watermark, "Watermark"), (Tool::Shield, "AI shield")] {
+                    for (t, label) in [(Tool::Effects, "Effects"), (Tool::Text, "Text"), (Tool::Shapes, "Shape"), (Tool::Markup, "Markup"), (Tool::Censor, "Censor"), (Tool::AddImage, "Image…"), (Tool::Watermark, "Watermark"), (Tool::Shield, "AI shield")] {
                         let b = ui.add(egui::Button::new(format!("      {label}")).min_size(vec2(150.0, 0.0)));
                         paint_tool_icon(ui.painter(), t, pos2(b.rect.left() + 16.0, b.rect.center().y), 13.0, pal.fg);
                         if b.clicked() {
@@ -3375,6 +3450,13 @@ impl GifKitApp {
             }
             Tool::Shield => {
                 self.add_layer(LayerKind::Shield(ShieldSettings::default()));
+            }
+            Tool::Shapes => {
+                let s = self.default_shape(w, h);
+                self.add_layer(LayerKind::Shape(Box::new(s)));
+            }
+            Tool::Markup => {
+                self.add_layer(LayerKind::Markup(MarkupSettings::default()));
             }
             _ => {}
         }
@@ -3883,6 +3965,8 @@ impl GifKitApp {
                             PresetLayer::Watermark { visible, watermark: w }
                         }
                         LayerKind::Shield(s) => PresetLayer::Shield { visible, shield: s.clone() },
+                        LayerKind::Shape(s) => PresetLayer::Shape { visible, shape: (**s).clone() },
+                        LayerKind::Markup(m) => PresetLayer::Markup { visible, markup: m.clone() },
                     })
                 })
                 .collect()
@@ -3949,6 +4033,24 @@ impl GifKitApp {
                         (self.stack.push(LayerKind::Watermark(Box::new(watermark))), visible)
                     }
                     PresetLayer::Shield { visible, shield } => (self.stack.push(LayerKind::Shield(shield)), visible),
+                    PresetLayer::Shape { visible, mut shape } => {
+                        shape.x = sc(shape.x, fx);
+                        shape.y = sc(shape.y, fy);
+                        shape.w = ((shape.w as f32 * fx) as u32).max(1);
+                        shape.h = ((shape.h as f32 * fy) as u32).max(1);
+                        shape.stroke_w *= fs;
+                        (self.stack.push(LayerKind::Shape(Box::new(shape))), visible)
+                    }
+                    PresetLayer::Markup { visible, mut markup } => {
+                        for st in &mut markup.strokes {
+                            for pt in &mut st.points {
+                                pt[0] *= fx;
+                                pt[1] *= fy;
+                            }
+                            st.width *= fs;
+                        }
+                        (self.stack.push(LayerKind::Markup(markup)), visible)
+                    }
                 };
                 if let Some(i) = self.stack.index_of(id.0) {
                     self.stack.layers[i].visible = id.1;
@@ -4335,6 +4437,10 @@ impl GifKitApp {
         if kind == Kind::Effects {
             return;
         }
+        if kind == Kind::Markup {
+            self.markup_interaction(ui, resp, m, space, show, (started, dragged, stopped));
+            return;
+        }
         let (bw, bh) = self.dims();
         let src_idx = self.plan.get(self.cur).map(|f| f.src).unwrap_or(0);
         let maps = match space {
@@ -4352,6 +4458,7 @@ impl GifKitApp {
             let applies = match &l.kind {
                 LayerKind::Text(t) => t.applies_to(src_idx),
                 LayerKind::Censor(c) => c.w == 0 || c.applies_to(src_idx),
+                LayerKind::Shape(sh) => sh.w == 0 || sh.applies_to(src_idx),
                 _ => true,
             };
             if !applies {
@@ -4398,6 +4505,13 @@ impl GifKitApp {
                         let id = self.add_layer(LayerKind::Censor(CensorSettings::default()));
                         let li = self.stack.layers.len() - 1;
                         new_drag = Some(BoxDrag::New { id, li, anchor: pi });
+                    } else if kind == Kind::Shape {
+                        let now = ui.input(|i| i.time);
+                        self.snapshot(&format!("addshape{now}"), now);
+                        let sh = ShapeSettings { w: 0, h: 0, from: 1, to: 0, angle: 0.0, ..self.shape_tpl.clone() };
+                        let id = self.add_layer(LayerKind::Shape(Box::new(sh)));
+                        let li = self.stack.layers.len() - 1;
+                        new_drag = Some(BoxDrag::New { id, li, anchor: pi });
                     }
                 }
                 self.box_drag = new_drag;
@@ -4434,7 +4548,8 @@ impl GifKitApp {
                             } else {
                                 let lp = out0.to_local(pi.x, pi.y);
                                 let (mut w, mut h) = ((lp.0 - fixed.0).abs().max(1.0), (lp.1 - fixed.1).abs().max(1.0));
-                                if kind == Kind::Overlay && !shift {
+                                let emoji = matches!(&self.stack.layers[li].kind, LayerKind::Shape(sh) if sh.kind == ShapeKind::Emoji);
+                                if (kind == Kind::Overlay || emoji) && !shift {
                                     let r = out0.w / out0.h.max(1e-3);
                                     w = w.max(h * r);
                                     h = w / r;
@@ -4456,6 +4571,24 @@ impl GifKitApp {
                             let th = source_angle(&mp, phi, readable);
                             self.write_box(li, Obb { angle: th, ..src }, None, src_idx);
                         }
+                        BoxDrag::New { anchor, .. } if matches!(&self.stack.layers[li].kind, LayerKind::Shape(sh) if sh.kind.is_linear()) => {
+                            // lines and arrows run from where the drag started to the pointer
+                            let (mut dx, mut dy) = (pi.x - anchor.x, pi.y - anchor.y);
+                            let len = (dx * dx + dy * dy).sqrt().max(1.0);
+                            let mut ang = dy.atan2(dx).to_degrees();
+                            if shift {
+                                ang = (ang / 15.0).round() * 15.0;
+                                (dx, dy) = (len * ang.to_radians().cos(), len * ang.to_radians().sin());
+                            }
+                            let thick = match &self.stack.layers[li].kind {
+                                LayerKind::Shape(sh) if sh.kind == ShapeKind::Arrow => (len * 0.22).clamp(12.0, 120.0),
+                                LayerKind::Shape(sh) => (sh.stroke_w * mp.det().abs().sqrt() * 3.0).max(8.0),
+                                _ => 8.0,
+                            };
+                            let out = Obb { cx: anchor.x + dx / 2.0, cy: anchor.y + dy / 2.0, w: len, h: thick, angle: ang };
+                            let th = source_angle(&mp, ang, false);
+                            self.write_box(li, unmap_box(&mp, out, th), None, src_idx);
+                        }
                         BoxDrag::New { anchor, .. } => {
                             let (x0, y0) = (anchor.x.min(pi.x), anchor.y.min(pi.y));
                             let (x1, y1) = (anchor.x.max(pi.x), anchor.y.max(pi.y));
@@ -4468,6 +4601,23 @@ impl GifKitApp {
             }
         }
         if stopped {
+            // a click without a drag drops a shape of the default size there
+            if let Some(BoxDrag::New { id, li, anchor }) = self.box_drag {
+                if li < self.stack.layers.len() && self.stack.layers[li].id == id {
+                    if let LayerKind::Shape(sh) = &self.stack.layers[li].kind {
+                        if sh.w < 4 || sh.h < 4 {
+                            let mut d = self.default_shape(bw, bh);
+                            let mp = maps.as_ref().map(|_| self.stack.layer_maps(bw, bh)[li].m).unwrap_or(Affine::IDENTITY);
+                            let (sx, sy) = mp.inverse().apply(anchor.x, anchor.y);
+                            d.x = (sx - d.w as f32 / 2.0).round() as i32;
+                            d.y = (sy - d.h as f32 / 2.0).round() as i32;
+                            if let LayerKind::Shape(sh) = &mut self.stack.layers[li].kind {
+                                **sh = d;
+                            }
+                        }
+                    }
+                }
+            }
             self.box_drag = None;
         }
         // plain click selects the topmost layer under the pointer
@@ -4531,6 +4681,120 @@ impl GifKitApp {
         }
     }
 
+    /// Pen, highlighter and eraser on the canvas.
+    fn markup_interaction(&mut self, ui: &mut egui::Ui, resp: &egui::Response, m: Mapper, space: Space, show: bool, (started, dragged, stopped): (bool, bool, bool)) {
+        let (bw, bh) = self.dims();
+        let src_idx = self.plan.get(self.cur).map(|f| f.src).unwrap_or(0);
+        let shift = ui.input(|i| i.modifiers.shift);
+        let layer_map = |s: &Self, li: usize| -> Affine {
+            match space {
+                Space::Output => s.stack.layer_maps(bw, bh)[li].m,
+                Space::Source => Affine::IDENTITY,
+            }
+        };
+        let painter = ui.painter_at(resp.rect);
+        if self.pen_tool == PenTool::Eraser {
+            let r_img = self.pen.width / 2.0;
+            if started || dragged {
+                if let (Some(pp), Some(li)) = (resp.interact_pointer_pos(), self.sel_index(Kind::Markup)) {
+                    let pi = m.to_img(pp);
+                    let mp = layer_map(self, li);
+                    let sc = crate::shapes::map_scale(&mp);
+                    if started {
+                        let now = ui.input(|i| i.time);
+                        self.snapshot(&format!("erase{now}"), now);
+                    }
+                    if let LayerKind::Markup(mk) = &mut self.stack.layers[li].kind {
+                        mk.strokes.retain(|st| {
+                            !st.applies_to(src_idx)
+                                || !st.points.iter().any(|q| {
+                                    let (x, y) = mp.apply(q[0], q[1]);
+                                    ((x - pi.x).powi(2) + (y - pi.y).powi(2)).sqrt() <= r_img + st.width * sc / 2.0
+                                })
+                        });
+                    }
+                }
+            }
+            if show {
+                if let Some(hp) = resp.hover_pos() {
+                    painter.circle_stroke(hp, (r_img * m.scale).max(3.0), Stroke::new(1.5, Color32::WHITE));
+                    painter.circle_stroke(hp, (r_img * m.scale).max(3.0) + 1.5, Stroke::new(1.0, Color32::from_black_alpha(160)));
+                }
+            }
+            return;
+        }
+        let brush = if self.pen_tool == PenTool::Highlighter { self.highlighter.clone() } else { self.pen.clone() };
+        if started {
+            if let Some(pp) = resp.interact_pointer_pos() {
+                let now = ui.input(|i| i.time);
+                self.snapshot(&format!("pen{now}"), now);
+                let id = match self.sel_index(Kind::Markup) {
+                    Some(li) => self.stack.layers[li].id,
+                    None => self.add_layer(LayerKind::Markup(MarkupSettings::default())),
+                };
+                self.pen_live = Some((id, vec![m.to_img(pp)], space));
+            }
+        }
+        if dragged {
+            if let (Some(pp), Some((_, pts, _))) = (resp.interact_pointer_pos(), self.pen_live.as_mut()) {
+                let pi = m.to_img(pp);
+                if shift {
+                    pts.truncate(1);
+                    pts.push(pi);
+                } else if pts.last().map(|l| l.distance(pi) * m.scale >= 1.5).unwrap_or(true) {
+                    pts.push(pi);
+                }
+            }
+        }
+        if stopped {
+            if let Some((id, pts, sp)) = self.pen_live.take() {
+                if let Some(li) = self.stack.index_of(id) {
+                    let mp = if sp == space { layer_map(self, li) } else { Affine::IDENTITY };
+                    let inv = mp.inverse();
+                    let sc = crate::shapes::map_scale(&mp);
+                    let (from, to) = match self.pen_scope {
+                        PenScope::All => (1, 0),
+                        PenScope::FromHere => (src_idx + 1, 0),
+                        PenScope::ThisFrame => (src_idx + 1, src_idx + 1),
+                    };
+                    let points = pts.iter().map(|q| {
+                        let (x, y) = inv.apply(q.x, q.y);
+                        [x, y]
+                    }).collect();
+                    let st = PenStroke { points, width: brush.width / sc, from, to, ..brush.clone() };
+                    if let LayerKind::Markup(mk) = &mut self.stack.layers[li].kind {
+                        mk.strokes.push(st);
+                    }
+                    self.modified = true;
+                }
+            }
+        }
+        if !show {
+            return;
+        }
+        // the stroke being drawn, shown straight away
+        let col = Color32::from_rgba_unmultiplied(brush.color[0], brush.color[1], brush.color[2], (brush.opacity / 100.0 * 255.0) as u8);
+        let w = (brush.width * m.scale).max(1.0);
+        if let Some((_, pts, _)) = &self.pen_live {
+            let sp: Vec<Pos2> = pts.iter().map(|q| m.to_screen(*q)).collect();
+            if sp.len() == 1 || brush.mode == PenMode::Pen {
+                for q in [sp[0], *sp.last().unwrap()] {
+                    painter.circle_filled(q, w / 2.0, col);
+                }
+            }
+            if sp.len() > 1 {
+                painter.add(egui::Shape::line(sp, Stroke::new(w, col)));
+            }
+            ui.ctx().request_repaint();
+        }
+        if let Some(hp) = resp.hover_pos() {
+            if !ui.input(|i| i.modifiers.alt) {
+                painter.circle_stroke(hp, w / 2.0, Stroke::new(1.0, Color32::from_white_alpha(200)));
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            }
+        }
+    }
+
     /// Write an edited source-space box back into layer `li`.
     fn write_box(&mut self, li: usize, b: Obb, text_size: Option<f32>, src_idx: usize) {
         let scope = self.place_scope;
@@ -4570,7 +4834,14 @@ impl GifKitApp {
                     q.angle = b.angle;
                 }
             }
-            LayerKind::Effects(_) | LayerKind::Watermark(_) | LayerKind::Shield(_) => {}
+            LayerKind::Shape(sh) => {
+                sh.w = b.w.round().max(1.0) as u32;
+                sh.h = b.h.round().max(1.0) as u32;
+                sh.x = (b.cx - sh.w as f32 / 2.0).round() as i32;
+                sh.y = (b.cy - sh.h as f32 / 2.0).round() as i32;
+                sh.angle = b.angle;
+            }
+            LayerKind::Effects(_) | LayerKind::Watermark(_) | LayerKind::Shield(_) | LayerKind::Markup(_) => {}
         }
         self.modified = true;
     }
@@ -4720,6 +4991,8 @@ impl GifKitApp {
             Tool::AddImage => self.ui_add_image(ui, ctx),
             Tool::Watermark => self.ui_watermark(ui, ctx),
             Tool::Shield => self.ui_shield(ui, ctx),
+            Tool::Shapes => self.ui_shapes(ui, ctx),
+            Tool::Markup => self.ui_markup(ui, ctx),
             Tool::Cut => self.ui_cut(ui, ctx),
             Tool::Frames => self.ui_frames(ui, ctx),
         }
@@ -5802,6 +6075,209 @@ impl GifKitApp {
                 });
             }
         });
+    }
+
+    /// A new shape from the current style, centred on the frame.
+    fn default_shape(&self, w: u32, h: u32) -> ShapeSettings {
+        let mut s = self.shape_tpl.clone();
+        let side = (w.min(h) as f32 * 0.4).max(8.0) as u32;
+        let (bw, bh) = match s.kind {
+            ShapeKind::Line => ((w as f32 * 0.5) as u32, ((s.stroke_w * 3.0) as u32).max(12)),
+            ShapeKind::Arrow => ((w as f32 * 0.5) as u32, (side / 3).max(16)),
+            ShapeKind::Speech | ShapeKind::Bubble | ShapeKind::Thought => (side * 3 / 2, side),
+            _ => (side, side),
+        };
+        s.w = bw.max(4);
+        s.h = bh.max(4);
+        s.x = (w as i32 - s.w as i32) / 2;
+        s.y = (h as i32 - s.h as i32) / 2;
+        s.angle = 0.0;
+        s.from = 1;
+        s.to = 0;
+        s
+    }
+
+    fn emoji_texture(&mut self, ctx: &egui::Context, code: &str) -> Option<TextureHandle> {
+        if let Some(t) = self.emoji_tex.get(code) {
+            return Some(t.clone());
+        }
+        let img = crate::shapes::emoji_image(code)?;
+        let t = ctx.load_texture(format!("emoji-{code}"), to_color_image(&img), TextureOptions::LINEAR);
+        self.emoji_tex.insert(code.to_string(), t.clone());
+        Some(t)
+    }
+
+    /// Colour button with a row of quick swatches.
+    fn colour_row(ui: &mut egui::Ui, label: &str, c: &mut [u8; 3]) {
+        const SW: [[u8; 3]; 9] = [[255, 255, 255], [34, 38, 44], [255, 59, 48], [255, 122, 26], [255, 204, 0], [52, 199, 89], [61, 174, 233], [175, 82, 222], [255, 105, 180]];
+        ui.horizontal(|ui| {
+            ui.label(label);
+            ui.color_edit_button_srgb(c);
+            ui.spacing_mut().item_spacing.x = 3.0;
+            for s in SW {
+                let (r, resp) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::click());
+                let col = Color32::from_rgb(s[0], s[1], s[2]);
+                ui.painter().rect_filled(r, 3.0, col);
+                let edge = if *c == s { p().highlight } else { p().border_strong };
+                ui.painter().rect_stroke(r, 3.0, Stroke::new(if *c == s { 2.0 } else { 1.0 }, edge), egui::StrokeKind::Inside);
+                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    *c = s;
+                }
+            }
+        });
+    }
+
+    fn ui_shapes(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let (w, h) = self.dims();
+        let n = self.base.as_ref().map(|b| b.len()).unwrap_or(1).max(1);
+        let sel = self.layer_chooser(ui, Kind::Shape, "+ Shape", |s| {
+            let sh = s.default_shape(w, h);
+            s.add_layer(LayerKind::Shape(Box::new(sh)));
+        });
+        if sel.is_none() {
+            hint(ui, "Pick a shape then drag on the image to draw it");
+        }
+        // edit the selected shape, or the style of the next one
+        let mut st = match sel.map(|i| &self.stack.layers[i].kind) {
+            Some(LayerKind::Shape(s)) => (**s).clone(),
+            _ => self.shape_tpl.clone(),
+        };
+        let before = st.clone();
+        group(ui, "Shape", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                for k in ShapeKind::ALL {
+                    seg(ui, &mut st.kind, k, k.label());
+                }
+            });
+            if st.kind.is_linear() {
+                hint(ui, "Drag from start to end. Shift keeps it straight.");
+            }
+        });
+        if st.kind == ShapeKind::Emoji {
+            group(ui, "Emoji", |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(3.0, 3.0);
+                    for (code, name, _) in crate::emoji::EMOJI {
+                        let Some(t) = self.emoji_texture(ctx, code) else { continue };
+                        let on = st.emoji == *code;
+                        let r = ui.add(egui::Button::image(egui::Image::new(&t).fit_to_exact_size(vec2(24.0, 24.0))).selected(on).min_size(vec2(32.0, 32.0))).on_hover_text(*name);
+                        if r.clicked() {
+                            st.emoji = code.to_string();
+                        }
+                    }
+                });
+                hint(ui, "Emoji by Twemoji (CC-BY 4.0)");
+            });
+        } else {
+            group(ui, "Style", |ui| {
+                if st.kind != ShapeKind::Line {
+                    ui.checkbox(&mut st.fill_on, "Fill");
+                    if st.fill_on {
+                        Self::colour_row(ui, "Colour", &mut st.fill);
+                    }
+                }
+                ui.checkbox(&mut st.stroke_on, if st.kind == ShapeKind::Line { "Line" } else { "Outline" });
+                if st.stroke_on || st.kind == ShapeKind::Line {
+                    Self::colour_row(ui, "Colour", &mut st.stroke);
+                    ui.add(egui::Slider::new(&mut st.stroke_w, 1.0..=60.0).text("width").clamping(egui::SliderClamping::Never));
+                }
+                match st.kind {
+                    ShapeKind::Rounded | ShapeKind::Speech => {
+                        ui.add(egui::Slider::new(&mut st.corner, 0.0..=50.0).text("corners").suffix("%"));
+                    }
+                    ShapeKind::Star | ShapeKind::Burst => {
+                        ui.add(egui::Slider::new(&mut st.points, 3..=24).text("points"));
+                    }
+                    _ => {}
+                }
+            });
+        }
+        group(ui, "Look", |ui| {
+            ui.add(egui::Slider::new(&mut st.opacity, 0.0..=100.0).text("opacity").suffix("%"));
+            ui.checkbox(&mut st.shadow, "Drop shadow");
+        });
+        if let Some(i) = sel {
+            group(ui, "Placement", |ui| {
+                egui::Grid::new("shapepos").num_columns(4).spacing([8.0, 6.0]).show(ui, |ui| {
+                    ui.label("X");
+                    ui.add(egui::DragValue::new(&mut st.x));
+                    ui.label("Y");
+                    ui.add(egui::DragValue::new(&mut st.y));
+                    ui.end_row();
+                    ui.label("W");
+                    ui.add(egui::DragValue::new(&mut st.w).range(1..=w * 4));
+                    ui.label("H");
+                    ui.add(egui::DragValue::new(&mut st.h).range(1..=h * 4));
+                    ui.end_row();
+                });
+                Self::angle_row(ui, &mut st.angle);
+                frames_row(ui, &mut st.from, &mut st.to, n);
+            });
+            if st != before {
+                if let LayerKind::Shape(s) = &mut self.stack.layers[i].kind {
+                    **s = st.clone();
+                }
+                self.modified = true;
+            }
+        }
+        // the next shape uses the latest style
+        let geo = (self.shape_tpl.x, self.shape_tpl.y, self.shape_tpl.w, self.shape_tpl.h, self.shape_tpl.angle, self.shape_tpl.from, self.shape_tpl.to);
+        self.shape_tpl = ShapeSettings { x: geo.0, y: geo.1, w: geo.2, h: geo.3, angle: geo.4, from: geo.5, to: geo.6, ..st };
+    }
+
+    fn ui_markup(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+        let sel = self.layer_chooser(ui, Kind::Markup, "+ Markup", |s| {
+            s.add_layer(LayerKind::Markup(MarkupSettings::default()));
+        });
+        group(ui, "Brush", |ui| {
+            ui.horizontal(|ui| {
+                seg(ui, &mut self.pen_tool, PenTool::Pen, "Pen");
+                seg(ui, &mut self.pen_tool, PenTool::Highlighter, "Highlighter");
+                seg(ui, &mut self.pen_tool, PenTool::Eraser, "Eraser").on_hover_text("Removes whole strokes you drag over");
+            });
+            let b = match self.pen_tool {
+                PenTool::Pen => Some(&mut self.pen),
+                PenTool::Highlighter => Some(&mut self.highlighter),
+                PenTool::Eraser => None,
+            };
+            if let Some(b) = b {
+                Self::colour_row(ui, "Colour", &mut b.color);
+                ui.add(egui::Slider::new(&mut b.width, 1.0..=80.0).text("size").suffix(" px").clamping(egui::SliderClamping::Never));
+                ui.add(egui::Slider::new(&mut b.opacity, 5.0..=100.0).text("opacity").suffix("%"));
+            } else {
+                ui.add(egui::Slider::new(&mut self.pen.width, 1.0..=80.0).text("eraser size").suffix(" px"));
+            }
+            hint(ui, "Drag on the image to draw. Hold Shift for a straight line.");
+        });
+        group(ui, "Draw on", |ui| {
+            ui.horizontal(|ui| {
+                seg(ui, &mut self.pen_scope, PenScope::All, "All frames");
+                seg(ui, &mut self.pen_scope, PenScope::FromHere, "From here");
+                seg(ui, &mut self.pen_scope, PenScope::ThisFrame, "This frame").on_hover_text("Step through frames to draw a little animation");
+            });
+        });
+        if let Some(i) = sel {
+            let count = match &self.stack.layers[i].kind {
+                LayerKind::Markup(m) => m.strokes.len(),
+                _ => 0,
+            };
+            let mut undo = false;
+            let mut clear = false;
+            ui.horizontal(|ui| {
+                undo = ui.add_enabled(count > 0, egui::Button::new("Remove last stroke")).clicked();
+                clear = ui.add_enabled(count > 0, egui::Button::new("Clear")).clicked();
+                hint(ui, &format!("{count} stroke{}", if count == 1 { "" } else { "s" }));
+            });
+            if let LayerKind::Markup(m) = &mut self.stack.layers[i].kind {
+                if undo {
+                    m.strokes.pop();
+                }
+                if clear {
+                    m.strokes.clear();
+                }
+            }
+        }
     }
 
     fn ui_shield(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {

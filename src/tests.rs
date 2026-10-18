@@ -892,3 +892,57 @@ fn noai_avif_still_decodes() {
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(crate::noai::tag_avif(b"hello".to_vec()), b"hello");
 }
+
+#[test]
+fn shapes_render_every_kind() {
+    use crate::geo::Obb;
+    use crate::shapes::{shape_sprite, ShapeKind, ShapeSettings};
+    for k in ShapeKind::ALL {
+        for shadow in [false, true] {
+            let s = ShapeSettings { kind: k, shadow, ..Default::default() };
+            let (img, x, y) = shape_sprite(&s, Obb { cx: 100.0, cy: 80.0, w: 120.0, h: 70.0, angle: 20.0 }, 1.0).unwrap_or_else(|| panic!("{k:?} gave no sprite"));
+            let opaque = img.pixels().filter(|p| p[3] > 200).count();
+            assert!(opaque > 200, "{k:?} shadow={shadow}: only {opaque} opaque pixels");
+            // the sprite covers the rotated box
+            assert!(x < 40 && y < 45 && x + img.width() as i64 > 160 && y + img.height() as i64 > 115, "{k:?} sprite at {x},{y} {}x{}", img.width(), img.height());
+        }
+    }
+    // every bundled emoji decodes
+    for (code, _, _) in crate::emoji::EMOJI {
+        let i = crate::shapes::emoji_image(code).unwrap_or_else(|| panic!("emoji {code}"));
+        assert_eq!(i.dimensions(), (160, 160));
+    }
+    // fill off + outline on leaves the middle clear
+    let s = ShapeSettings { kind: ShapeKind::Rect, fill_on: false, stroke_w: 3.0, ..Default::default() };
+    let (img, x, y) = shape_sprite(&s, Obb { cx: 50.0, cy: 50.0, w: 60.0, h: 60.0, angle: 0.0 }, 1.0).unwrap();
+    assert_eq!(img.get_pixel((50 - x) as u32, (50 - y) as u32)[3], 0);
+    assert!(img.get_pixel((20 - x) as u32, (50 - y) as u32)[3] > 200);
+}
+
+#[test]
+fn shape_and_markup_layers_in_stack() {
+    use crate::shapes::{MarkupSettings, PenStroke, ShapeKind, ShapeSettings};
+    use crate::stack::{LayerKind, Stack};
+    let a = synth(false);
+    let base = (*a.frames[0].image).clone();
+    let mut st = Stack::default();
+    st.push(LayerKind::Shape(Box::new(ShapeSettings { kind: ShapeKind::Rect, x: 10, y: 10, w: 30, h: 20, fill: [255, 0, 255], stroke_on: false, ..Default::default() })));
+    // one stroke on every frame, one on frame 3 only
+    st.push(LayerKind::Markup(MarkupSettings { strokes: vec![
+        PenStroke { points: vec![[60.0, 50.0], [90.0, 50.0]], color: [0, 255, 0], width: 6.0, ..Default::default() },
+        PenStroke { points: vec![[60.0, 10.0], [90.0, 10.0]], color: [0, 0, 255], width: 6.0, from: 3, to: 3, ..Default::default() },
+    ] }));
+    let out = st.flatten(&a, &[], None);
+    let f0 = &out.frames[0].image;
+    assert_eq!(f0.get_pixel(25, 20).0, [255, 0, 255, 255], "shape fill");
+    assert_ne!(base.get_pixel(25, 20).0, [255, 0, 255, 255]);
+    assert_eq!(f0.get_pixel(75, 50).0, [0, 255, 0, 255], "pen stroke");
+    assert_ne!(f0.get_pixel(75, 10).0, [0, 0, 255, 255], "frame-3 stroke must not show on frame 1");
+    assert_eq!(out.frames[2].image.get_pixel(75, 10).0, [0, 0, 255, 255], "frame-3 stroke shows on frame 3");
+    // a flipped frame carries the shape along
+    st.transform.rot_on = true;
+    st.transform.flip_h = true;
+    let out = st.flatten(&a, &[], None);
+    let w = out.width();
+    assert_eq!(out.frames[0].image.get_pixel(w - 1 - 25, 20).0, [255, 0, 255, 255]);
+}

@@ -18,6 +18,8 @@ pub enum PresetLayer {
     Image { visible: bool, path: PathBuf, placement: Placement, opacity: f32 },
     Watermark { visible: bool, watermark: WatermarkSettings },
     Shield { visible: bool, shield: ShieldSettings },
+    Shape { visible: bool, shape: crate::shapes::ShapeSettings },
+    Markup { visible: bool, markup: crate::shapes::MarkupSettings },
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

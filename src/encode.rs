@@ -52,7 +52,8 @@ impl Default for GifOptions {
             merge_duplicates: true,
             alpha_threshold: 128,
             force_custom_lzw: false,
-            noai_tag: false,
+            // on by default: files are marked as not for AI training
+            noai_tag: true,
         }
     }
 }
