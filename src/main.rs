@@ -7,6 +7,7 @@ mod encode;
 mod geo;
 mod io;
 mod lzw;
+mod noai;
 mod ops;
 mod overlay;
 mod presets;

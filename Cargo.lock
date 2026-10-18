@@ -1006,6 +1006,7 @@ dependencies = [
  "ab_glyph",
  "anyhow",
  "color_quant",
+ "crc32fast",
  "eframe",
  "fontdb",
  "gif",

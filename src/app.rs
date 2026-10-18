@@ -186,6 +186,10 @@ impl ExportFormat {
     fn needs_ffmpeg(self) -> bool {
         matches!(self, ExportFormat::Mp4 | ExportFormat::Webm | ExportFormat::Avif)
     }
+    /// Formats that can carry the "noai" markers.
+    fn can_tag(self) -> bool {
+        self != ExportFormat::Avif
+    }
     fn can_target(self) -> bool {
         matches!(self, ExportFormat::Gif | ExportFormat::Webp | ExportFormat::Avif)
     }
@@ -1018,8 +1022,8 @@ fn tinted(ui: &mut egui::Ui, text: &str, tint: Color32) -> bool {
     ui.add(egui::Button::new(RichText::new(text).size(12.0).color(pal.fg)).fill(mix(pal.button, tint, 0.3)).stroke(Stroke::new(1.0, mix(pal.border_strong, tint, 0.6)))).clicked()
 }
 
-fn hint(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).size(12.0).color(p().fg_muted));
+fn hint(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.label(RichText::new(text).size(12.0).color(p().fg_muted))
 }
 
 /// Slider whose handle stops at the range, but typed values can go beyond it.
@@ -1604,14 +1608,14 @@ impl GifForgeApp {
 
     /// Options that only matter when writing the file (Export window).
     fn save_options_ui(&mut self, ui: &mut egui::Ui) {
-        let noai_tip = "Adds a “noai, noimageai” note to the file. Some sites and scrapers respect it.";
+        let noai_tip = "Marks the file as not for AI training. Adds a “noai” note and the standard XMP “data mining prohibited” field where the format allows it. Some sites and scrapers respect it.";
         egui::Grid::new("saveopts").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+            if self.export_fmt.can_tag() {
+                ui.label("Tag");
+                ui.checkbox(&mut self.gif_opts.noai_tag, "Add “noai” tag").on_hover_text(noai_tip);
+                ui.end_row();
+            }
             match self.export_fmt {
-                ExportFormat::Gif | ExportFormat::Apng => {
-                    ui.label("Tag");
-                    ui.checkbox(&mut self.gif_opts.noai_tag, "Add “noai” tag").on_hover_text(noai_tip);
-                    ui.end_row();
-                }
                 ExportFormat::Frames => {
                     if self.split_fmt == SplitFormat::Gif {
                         self.frames_zip = false;
@@ -3632,9 +3636,16 @@ impl GifForgeApp {
         }
         self.pending_open = None;
         // the preview already holds the encoded file: save it directly
-        let reuse = !matches!(self.export_fmt, ExportFormat::Frames | ExportFormat::Sheet) && !(self.export_fmt == ExportFormat::Apng && self.gif_opts.noai_tag);
+        let noai = self.gif_opts.noai_tag && self.export_fmt.can_tag();
+        // video tags are written by ffmpeg, so a tagged video is encoded again
+        let reuse = !matches!(self.export_fmt, ExportFormat::Frames | ExportFormat::Sheet) && !(noai && matches!(self.export_fmt, ExportFormat::Mp4 | ExportFormat::Webm));
         if reuse && self.preview_format().is_some() {
             if let Some(bytes) = self.cmp.as_ref().filter(|c| c.key == self.cmp_key()).map(|c| c.bytes.clone()) {
+                let bytes: Arc<Vec<u8>> = match self.export_fmt {
+                    ExportFormat::Webp if noai => Arc::new(crate::noai::tag_webp((*bytes).clone())),
+                    ExportFormat::Apng if noai => Arc::new(crate::noai::tag_png((*bytes).clone())),
+                    _ => bytes,
+                };
                 let ext = self.export_ext();
                 if let Some(path) = self.save_path(&self.export_fmt.label().to_string(), &[ext]) {
                     let r = std::fs::write(&path, &*bytes).map(|_| format!("Saved {} ({})", path.display(), fmt_size(bytes.len() as u64))).map_err(anyhow::Error::from);
@@ -3655,6 +3666,7 @@ impl GifForgeApp {
                     let o = self.webp_opts;
                     self.run_export(ctx, "Save WebP", move |a, _| {
                         let b = io::encode_webp(a, &o)?;
+                        let b = if noai { crate::noai::tag_webp(b) } else { b };
                         std::fs::write(&path, &b)?;
                         Ok(format!("Saved {} ({})", path.display(), fmt_size(b.len() as u64)))
                     });
@@ -3680,24 +3692,25 @@ impl GifForgeApp {
                 let (fmt, ext) = if self.export_fmt == ExportFormat::Mp4 { (VideoFormat::Mp4, "mp4") } else { (VideoFormat::WebmAlpha, "webm") };
                 if let Some(path) = self.save_path(ext, &[ext]) {
                     let bg = self.video_bg;
-                    self.run_export(ctx, "Export video", move |a, _| io::export_video(a, &path, fmt, bg).map(|_| format!("Saved {}", path.display())));
+                    self.run_export(ctx, "Export video", move |a, _| io::export_video(a, &path, fmt, bg, noai).map(|_| format!("Saved {}", path.display())));
                 }
             }
             ExportFormat::Frames => {
                 let pre = self.split_prefix.clone();
                 if self.frames_zip {
                     if let Some(path) = self.save_path("ZIP", &["zip"]) {
-                        let png = self.frames_png;
+                        let png = io::PngOptions { noai, ..self.frames_png };
                         self.run_export(ctx, "ZIP frames", move |a, _| io::export_frames_zip_opts(a, &path, &pre, &png).map(|n| format!("Wrote {n} frames to {}", path.display())));
                     }
                 } else if let Some(dir) = self.pick_dir() {
-                    let (fmt, png, gif) = (self.split_fmt, self.frames_png, self.gif_opts.clone());
+                    let (fmt, png, gif) = (self.split_fmt, io::PngOptions { noai, ..self.frames_png }, self.gif_opts.clone());
                     self.run_export(ctx, "Split frames", move |a, _| io::export_frames_dir_opts(a, &dir, &pre, fmt, &png, &gif).map(|n| format!("Wrote {n} frames to {}", dir.display())));
                 }
             }
             ExportFormat::Sheet => {
                 if let Some(path) = self.save_path("PNG", &["png"]) {
-                    let opts = self.sheet.clone();
+                    let mut opts = self.sheet.clone();
+                    opts.png.noai = noai;
                     self.run_export(ctx, "Sprite sheet", move |a, _| io::export_spritesheet(a, &path, &opts).map(|s| format!("Wrote {s}")));
                 }
             }
@@ -5753,12 +5766,11 @@ impl GifForgeApp {
         let Some(sel) = self.layer_chooser(ui, Kind::Shield, "+ AI shield", |s| {
             s.add_layer(LayerKind::Shield(ShieldSettings::default()));
         }) else {
-            hint(ui, "Adds faint noise that makes frames worse as AI training data");
+            hint(ui, "Faint noise that spoils frames for AI training");
             return;
         };
-        hint(ui, "Adds faint noise that makes frames worse as AI training data.");
-        ui.label(RichText::new("Not a guarantee. More…").size(12.0).color(p().fg_muted).underline()).on_hover_text(
-            "It is much weaker than tools like Glaze or Nightshade. Strong GIF compression also removes some of it.\n\nPair it with the “noai” tag in the Export window.",
+        hint(ui, "Faint noise that spoils frames for AI training  ℹ").on_hover_text(
+            "Not a guarantee. Much weaker than Glaze or Nightshade and heavy compression removes some of it. Pair it with the “noai” tag when exporting.",
         );
         let LayerKind::Shield(s) = &mut self.stack.layers[sel].kind else { return };
         group(ui, "Perturbation", |ui| {

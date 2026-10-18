@@ -243,9 +243,6 @@ pub fn encode_apng(anim: &Animation, noai: bool) -> Result<Vec<u8>> {
         enc.set_color(png::ColorType::Rgba);
         enc.set_depth(png::BitDepth::Eight);
         enc.set_compression(png::Compression::High);
-        if noai {
-            enc.add_text_chunk("Comment".into(), crate::encode::NOAI_COMMENT.into())?;
-        }
         enc.set_animated(frames.len() as u32, anim.loop_count.map(|n| n as u32).unwrap_or(0))?;
         let mut wr = enc.write_header()?;
         for f in &frames {
@@ -254,7 +251,7 @@ pub fn encode_apng(anim: &Animation, noai: bool) -> Result<Vec<u8>> {
         }
         wr.finish()?;
     }
-    Ok(buf)
+    Ok(if noai { crate::noai::tag_png(buf) } else { buf })
 }
 
 pub fn save_apng(anim: &Animation, path: &Path, noai: bool) -> Result<u64> {
@@ -270,11 +267,14 @@ pub struct PngOptions {
     /// 0 = full colour; 2..=256 = indexed palette PNG (exact when the image
     /// has that few colours, quantised otherwise)
     pub colors: u16,
+    /// add the "noai" markers (set at export time)
+    #[serde(skip)]
+    pub noai: bool,
 }
 
 impl Default for PngOptions {
     fn default() -> Self {
-        Self { colors: 0 }
+        Self { colors: 0, noai: false }
     }
 }
 
@@ -351,7 +351,7 @@ pub fn encode_png(img: &RgbaImage, o: &PngOptions) -> Result<Vec<u8>> {
             enc.write_header()?.write_image_data(&data)?;
         }
     }
-    Ok(out)
+    Ok(if o.noai { crate::noai::tag_png(out) } else { out })
 }
 
 #[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
@@ -688,7 +688,7 @@ pub fn encode_preview(anim: &Animation, f: &PreviewFormat) -> Result<(Animation,
             static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let ext = if *vf == VideoFormat::Mp4 { "mp4" } else { "webm" };
             let tmp = std::env::temp_dir().join(format!("gifforge_prev_{}_{}.{ext}", std::process::id(), RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
-            export_video(anim, &tmp, *vf, *bg)?;
+            export_video(anim, &tmp, *vf, *bg, false)?;
             let b = std::fs::read(&tmp)?;
             let dec = if *vf == VideoFormat::WebmAlpha { Some("libvpx-vp9") } else { None };
             let a = load_video_dec(&tmp, None, Some((w, h)), dec);
@@ -710,7 +710,7 @@ fn decode_video_bytes(b: &[u8], ext: &str, size: (u32, u32)) -> Result<Animation
 /// Encode an animated AVIF with ffmpeg; `quality` 0..=100.
 pub fn encode_avif(anim: &Animation, quality: u8) -> Result<Vec<u8>> {
     let tmp = std::env::temp_dir().join(format!("gifforge_avif_{}_{}.avif", std::process::id(), quality));
-    export_video_q(anim, &tmp, VideoFormat::Avif, [0, 0, 0], Some(quality))?;
+    export_video_q(anim, &tmp, VideoFormat::Avif, [0, 0, 0], Some(quality), false)?;
     let b = std::fs::read(&tmp)?;
     let _ = std::fs::remove_file(&tmp);
     Ok(b)
@@ -718,12 +718,12 @@ pub fn encode_avif(anim: &Animation, quality: u8) -> Result<Vec<u8>> {
 
 /// Export to video via ffmpeg (must be on PATH). Uses the concat demuxer so
 /// per-frame delays are preserved exactly.
-pub fn export_video(anim: &Animation, path: &Path, fmt: VideoFormat, bg: [u8; 3]) -> Result<()> {
-    export_video_q(anim, path, fmt, bg, None)
+pub fn export_video(anim: &Animation, path: &Path, fmt: VideoFormat, bg: [u8; 3], noai: bool) -> Result<()> {
+    export_video_q(anim, path, fmt, bg, None, noai)
 }
 
 /// [`export_video`] with an optional quality (0..=100) mapped to the codec's CRF.
-pub fn export_video_q(anim: &Animation, path: &Path, fmt: VideoFormat, bg: [u8; 3], quality: Option<u8>) -> Result<()> {
+pub fn export_video_q(anim: &Animation, path: &Path, fmt: VideoFormat, bg: [u8; 3], quality: Option<u8>, noai: bool) -> Result<()> {
     static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let frames = anim.enabled_frames();
     anyhow::ensure!(!frames.is_empty(), "No enabled frames");
@@ -779,6 +779,9 @@ pub fn export_video_q(anim: &Animation, path: &Path, fmt: VideoFormat, bg: [u8; 
                 cmd.args(["-loop", "0"]);
             }
         }
+    }
+    if noai {
+        cmd.arg("-metadata").arg(format!("comment={}", crate::noai::COMMENT));
     }
     cmd.arg(path);
     let out = cmd.output().context("Failed to run ffmpeg (is it installed and on PATH?)")?;

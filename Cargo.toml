@@ -8,6 +8,7 @@ repository = "https://github.com/zoeysmith37/gifforge"
 build = "build.rs"
 
 [dependencies]
+crc32fast = "1"
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 image = { version = "0.25", default-features = false, features = ["gif", "png", "jpeg", "webp", "bmp", "rayon"] }
 gif = "0.14"

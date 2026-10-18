@@ -216,7 +216,7 @@ fn exports() {
     io::export_spritesheet(&a, &dir.join("sheet2.png"), &io::SheetOptions { pow2: false, ..Default::default() }).unwrap();
     assert_eq!(image::open(dir.join("sheet2.png")).unwrap().width(), 96 * 4);
     if io::ffmpeg_available() {
-        io::export_video(&synth(false), &dir.join("v.mp4"), io::VideoFormat::Mp4, [255, 255, 255]).unwrap();
+        io::export_video(&synth(false), &dir.join("v.mp4"), io::VideoFormat::Mp4, [255, 255, 255], false).unwrap();
         assert!(std::fs::metadata(dir.join("v.mp4")).unwrap().len() > 0);
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -731,12 +731,15 @@ fn video_import_if_ffmpeg() {
     let dir = std::env::temp_dir().join(format!("gf_vid_test_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join("clip.mp4");
-    io::export_video(&a, &p, io::VideoFormat::Mp4, [0, 0, 0]).unwrap();
+    io::export_video(&a, &p, io::VideoFormat::Mp4, [0, 0, 0], true).unwrap();
     let b = io::load_animation(&p).unwrap();
     assert!(b.len() >= 8, "{} frames", b.len());
     assert_eq!((b.width(), b.height()), (96, 64));
     let dur = b.duration_secs();
     assert!((dur - a.duration_secs()).abs() < 0.25, "{dur} vs {}", a.duration_secs());
+    // the noai comment ends up in the container
+    let raw = std::fs::read(&p).unwrap();
+    assert!(raw.windows(4).any(|w| w == b"noai"), "mp4 has no noai comment");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -788,7 +791,7 @@ fn sheet_pow2_and_indexed_png() {
     assert_eq!(rects.len(), 12);
     // indexed PNG: exact when colours fit, transparency kept, smaller than full colour
     o.png.colors = 256;
-    let full = io::encode_png(&sheet, &io::PngOptions { colors: 0 }).unwrap();
+    let full = io::encode_png(&sheet, &io::PngOptions { colors: 0, noai: false }).unwrap();
     let pal = io::encode_png(&sheet, &o.png).unwrap();
     let back = image::load_from_memory(&pal).unwrap().to_rgba8();
     assert_eq!(back.dimensions(), sheet.dimensions());
@@ -802,12 +805,12 @@ fn sheet_pow2_and_indexed_png() {
     assert!(pal.len() < full.len(), "{} vs {}", pal.len(), full.len());
     // quantised path (too many colours) still decodes
     let grad = RgbaImage::from_fn(64, 64, |x, y| Rgba([(x * 4) as u8, (y * 4) as u8, ((x + y) * 2) as u8, 255]));
-    let q = io::encode_png(&grad, &io::PngOptions { colors: 16 }).unwrap();
+    let q = io::encode_png(&grad, &io::PngOptions { colors: 16, noai: false }).unwrap();
     assert_eq!(image::load_from_memory(&q).unwrap().to_rgba8().dimensions(), (64, 64));
     // previews
     let (dec, _) = io::encode_preview(&a, &io::PreviewFormat::Sheet(o.clone())).unwrap();
     assert_eq!((dec.width(), dec.height()), (cw, ch));
-    let (dec, bytes) = io::encode_preview(&a, &io::PreviewFormat::Frames(io::SplitFormat::Png, io::PngOptions { colors: 64 }, GifOptions::default())).unwrap();
+    let (dec, bytes) = io::encode_preview(&a, &io::PreviewFormat::Frames(io::SplitFormat::Png, io::PngOptions { colors: 64, noai: false }, GifOptions::default())).unwrap();
     assert_eq!(dec.len(), a.len());
     assert!(!bytes.is_empty());
 }
@@ -825,4 +828,35 @@ fn kde_scheme_parsing() {
     let dark_txt = "[Colors:Window]\nBackgroundNormal=#202326\nForegroundNormal=252,252,252\n";
     assert!(crate::theme::parse_kdeglobals_for_test(dark_txt).1.unwrap().1);
     assert!(crate::theme::parse_kdeglobals_for_test("[General]\nfoo=bar\n").1.is_none());
+}
+
+#[test]
+fn noai_markers_in_png_apng_webp() {
+    let has = |b: &[u8], n: &[u8]| b.windows(n.len()).any(|w| w == n);
+    let a = synth(true);
+    // still PNG, full colour and palette
+    for colors in [0u16, 64] {
+        let img = (*a.frames[0].image).clone();
+        let plain = io::encode_png(&img, &io::PngOptions { colors, noai: false }).unwrap();
+        let tagged = io::encode_png(&img, &io::PngOptions { colors, noai: true }).unwrap();
+        assert!(!has(&plain, b"noai") && has(&tagged, b"noai") && has(&tagged, b"DMI-PROHIBITED"));
+        let dec = png::Decoder::new(std::io::Cursor::new(&tagged)).read_info().unwrap();
+        let info = dec.info();
+        assert!(info.uncompressed_latin1_text.iter().any(|t| t.keyword == "Comment" && t.text.contains("noai")));
+        assert!(info.utf8_text.iter().any(|t| t.keyword == "XML:com.adobe.xmp"));
+        assert_eq!(image::load_from_memory(&tagged).unwrap().to_rgba8().dimensions(), img.dimensions());
+    }
+    // APNG keeps its frames
+    let ap = io::encode_apng(&a, true).unwrap();
+    assert!(has(&ap, b"DMI-PROHIBITED"));
+    assert_eq!(io::load_animation_bytes(&ap).unwrap().len(), a.len());
+    // WebP: XMP chunk, flag set, RIFF size right, still decodes
+    let w = io::encode_webp(&a, &io::WebpOptions::default()).unwrap();
+    let t = crate::noai::tag_webp(w.clone());
+    assert!(has(&t, b"XMP ") && t[20] & 0x04 != 0);
+    assert_eq!(u32::from_le_bytes([t[4], t[5], t[6], t[7]]) as usize, t.len() - 8);
+    assert_eq!(io::load_animation_bytes(&t).unwrap().len(), io::load_animation_bytes(&w).unwrap().len());
+    // non-images pass through untouched
+    assert_eq!(crate::noai::tag_png(b"hello".to_vec()), b"hello");
+    assert_eq!(crate::noai::tag_webp(b"hello".to_vec()), b"hello");
 }
