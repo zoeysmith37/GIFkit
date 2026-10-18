@@ -26,9 +26,10 @@ if [ "$1" = "--uninstall" ]; then
 fi
 
 [ -f "$here/gifforge" ] || { echo "Run this from the folder that contains the gifforge program." >&2; exit 1; }
-mkdir -p "$(dirname "$bin")" "$apps" "$icons/256x256/apps" "$icons/scalable/apps"
+mkdir -p "$(dirname "$bin")" "$apps" "$icons/scalable/apps"
 install -m 755 "$here/gifforge" "$bin"
-install -m 644 "$here/gifforge.png" "$icons/256x256/apps/gifforge.png"
+# one scalable SVG: KDE recolours it to match your colour scheme and accent
+rm -f "$icons/256x256/apps/gifforge.png"
 install -m 644 "$here/gifforge.svg" "$icons/scalable/apps/gifforge.svg"
 
 # absolute paths so the entry works even if ~/.local/bin isn't on PATH
@@ -40,7 +41,7 @@ GenericName=GIF Editor
 Comment=Edit and optimise GIFs on your computer
 Exec="$bin" %f
 TryExec=$bin
-Icon=$icons/256x256/apps/gifforge.png
+Icon=gifforge
 Terminal=false
 Categories=Graphics;2DGraphics;RasterGraphics;
 MimeType=image/gif;image/webp;image/apng;image/png;video/mp4;video/webm;video/quicktime;video/x-matroska;

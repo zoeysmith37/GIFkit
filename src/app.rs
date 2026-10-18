@@ -594,7 +594,6 @@ pub struct GifForgeApp {
     fit_record: Option<(CompState, CompState)>,
     fit_keep_size: bool,
     frames_png: io::PngOptions,
-    about_icon: Option<TextureHandle>,
     export_name: String,
     export_name_edited: bool,
     open_after_save: bool,
@@ -680,6 +679,51 @@ fn paint_tool_icon(painter: &egui::Painter, t: Tool, c: Pos2, size: f32, col: Co
             painter.text(c, egui::Align2::CENTER_CENTER, t.icon(), egui::FontId::proportional(size), col);
         }
     }
+}
+
+/// The app icon drawn live. On KDE it follows the colour scheme like the
+/// installed SVG does (tile = window, frames = text, front = accent).
+/// Elsewhere it is the mono icon the other platforms get.
+fn paint_app_icon(painter: &egui::Painter, rect: Rect, pal: &theme::Palette) {
+    let (bg, text, hl, hl_text) = if theme::scheme_is_dark().is_some() {
+        (pal.window, pal.fg, pal.highlight, Color32::WHITE)
+    } else {
+        let (d, l) = (Color32::from_rgb(0x22, 0x26, 0x2c), Color32::from_rgb(0xe6, 0xeb, 0xef));
+        (d, l, l, d)
+    };
+    let k = rect.width() / 512.0;
+    let at = |x: f32, y: f32| rect.min + vec2(x, y) * k;
+    let r = |x: f32, y: f32, w: f32, h: f32| Rect::from_min_size(at(x, y), vec2(w, h) * k);
+    let rad = |v: f32| egui::CornerRadius::same((v * k).round().clamp(0.0, 255.0) as u8);
+    let alpha = |c: Color32, a: f32| Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (a * 255.0) as u8);
+    painter.rect_filled(r(16.0, 16.0, 480.0, 480.0), rad(112.0), bg);
+    painter.rect_stroke(r(17.5, 17.5, 477.0, 477.0), rad(110.5), Stroke::new(3.0 * k, alpha(text, 0.14)), egui::StrokeKind::Middle);
+    painter.rect_stroke(r(200.0, 88.0, 224.0, 192.0), rad(30.0), Stroke::new(18.0 * k, alpha(text, 0.45)), egui::StrokeKind::Middle);
+    painter.rect_filled(r(152.0, 136.0, 248.0, 200.0), rad(30.0), bg);
+    painter.rect_stroke(r(152.0, 136.0, 248.0, 200.0), rad(30.0), Stroke::new(18.0 * k, alpha(text, 0.7)), egui::StrokeKind::Middle);
+    painter.rect_filled(r(88.0, 196.0, 272.0, 216.0), rad(32.0), hl);
+    // the letters: round-capped strokes
+    let w = 26.0 * k;
+    let st = Stroke::new(w, hl_text);
+    let line = |pts: Vec<Pos2>| {
+        for p in [pts[0], *pts.last().unwrap()] {
+            painter.circle_filled(p, w / 2.0, hl_text);
+        }
+        for p in &pts[1..pts.len() - 1] {
+            painter.circle_filled(*p, w / 2.0, hl_text);
+        }
+        painter.add(egui::Shape::line(pts, st));
+    };
+    // G: arc from -58° anticlockwise round to 0°, then the bar inwards
+    let mut g: Vec<Pos2> = (0..=40).map(|i| {
+        let a = (-58.0f32 - 302.0 * i as f32 / 40.0).to_radians();
+        at(158.0 + 36.0 * a.cos(), 304.0 + 36.0 * a.sin())
+    }).collect();
+    g.push(at(174.0, 304.0));
+    line(g);
+    line(vec![at(238.0, 268.0), at(238.0, 340.0)]);
+    line(vec![at(282.0, 340.0), at(282.0, 268.0), at(326.0, 268.0)]);
+    line(vec![at(282.0, 302.0), at(316.0, 302.0)]);
 }
 
 /// Clock with a counter-clockwise arrow: the usual "history" symbol.
@@ -1172,7 +1216,6 @@ impl GifForgeApp {
             pending_open: None,
             transport_right_w: 430.0,
             fit_keep_size: theme::get_setting("fit_keep_size").as_deref() == Some("1"),
-            about_icon: None,
         };
         // scan system fonts in the background
         {
@@ -1194,6 +1237,9 @@ impl GifForgeApp {
             if let Some(f) = ExportFormat::ALL.iter().find(|x| x.label().to_lowercase().starts_with(&f.to_lowercase())) {
                 app.export_fmt = *f;
             }
+        }
+        if std::env::var("GIFFORGE_ABOUT").is_ok() {
+            app.about_open = true;
         }
         if std::env::var("GIFFORGE_EXPORT").is_ok() {
             app.export_open = true;
@@ -1741,11 +1787,6 @@ impl GifForgeApp {
             return;
         }
         let pal = *p();
-        if self.about_icon.is_none() {
-            if let Ok(img) = image::load_from_memory(include_bytes!("../assets/icon/gifforge-128.png")) {
-                self.about_icon = Some(ctx.load_texture("about-icon", to_color_image(&img.to_rgba8()), TextureOptions::LINEAR));
-            }
-        }
         let mut open = true;
         egui::Window::new(RichText::new("About").font(theme::medium(15.0)))
             .open(&mut open)
@@ -1755,9 +1796,8 @@ impl GifForgeApp {
             .show(ctx, |ui| {
                 ui.set_width(340.0);
                 ui.horizontal(|ui| {
-                    if let Some(t) = &self.about_icon {
-                        ui.add(egui::Image::new(t).fit_to_exact_size(vec2(72.0, 72.0)));
-                    }
+                    let (r, _) = ui.allocate_exact_size(vec2(72.0, 72.0), Sense::hover());
+                    paint_app_icon(ui.painter(), r, &pal);
                     ui.vertical(|ui| {
                         ui.add_space(6.0);
                         ui.label(RichText::new("GifForge").font(theme::medium(22.0)).color(pal.fg));
