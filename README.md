@@ -1,8 +1,10 @@
-# GifForge
+<p align="center"><img src="assets/icon/gifkit.svg" width="112" alt="GIFkit icon"></p>
+
+<h1 align="center">GIFkit</h1>
 
 A GIF editor and optimiser that runs on your own machine. Runs on Linux, Windows and macOS.
 
-![GifForge with the original on the left and the compressed result on the right](docs/img/app.png)
+![GIFkit with the original on the left and the compressed result on the right](docs/img/app.png)
 
 ## What it does
 

@@ -4,7 +4,7 @@ version = "0.6.0"
 edition = "2021"
 description = "Local, cross-platform animated GIF editor / optimiser"
 license = "Apache-2.0"
-repository = "https://github.com/zoeysmith37/gifforge"
+repository = "https://github.com/zoeysmith37/GIFkit"
 build = "build.rs"
 
 [dependencies]

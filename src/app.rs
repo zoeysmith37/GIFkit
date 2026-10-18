@@ -753,7 +753,7 @@ fn open_in_file_manager(dir: &std::path::Path) {
     open_external(&dir.to_string_lossy());
 }
 
-const REPO_URL: &str = "https://github.com/zoeysmith37/gifforge";
+const REPO_URL: &str = "https://github.com/zoeysmith37/GIFkit";
 
 /// Open a URL or path with the system's default handler.
 fn open_external(target: &str) {
