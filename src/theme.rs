@@ -272,14 +272,29 @@ pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
 }
 
+/// Breeze frame outline: the base colour moved a little toward the text colour.
+pub fn outline(pal: &Palette) -> Color32 {
+    lerp(pal.button, pal.fg, if IS_DARK.load(Ordering::Relaxed) { 0.22 } else { 0.28 })
+}
+
+/// Breeze "checked" fill: the button colour tinted with the accent.
+pub fn checked_fill(pal: &Palette) -> Color32 {
+    lerp(pal.button, pal.highlight, 0.32)
+}
+
+/// Corner radius of buttons, fields and frames (Breeze uses 5 px in Plasma 6).
+pub const RADIUS: u8 = 5;
+
 fn visuals(pal: &Palette, dark: bool) -> egui::Visuals {
     let mut v = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
-    let r = CornerRadius::same(3);
+    let r = CornerRadius::same(RADIUS);
+    let edge = lerp(pal.button, pal.fg, if dark { 0.22 } else { 0.28 });
+    let tint = lerp(pal.view, pal.highlight, if dark { 0.35 } else { 0.25 });
     v.panel_fill = pal.window;
     v.window_fill = pal.window;
     v.window_stroke = Stroke::new(1.0, pal.border);
-    v.window_corner_radius = CornerRadius::same(5);
-    v.menu_corner_radius = CornerRadius::same(4);
+    v.window_corner_radius = CornerRadius::same(6);
+    v.menu_corner_radius = CornerRadius::same(RADIUS);
     v.extreme_bg_color = pal.view;
     v.text_edit_bg_color = Some(pal.view);
     v.faint_bg_color = pal.view_alt;
@@ -287,11 +302,14 @@ fn visuals(pal: &Palette, dark: bool) -> egui::Visuals {
     v.hyperlink_color = pal.highlight;
     v.warn_fg_color = pal.neutral;
     v.error_fg_color = pal.negative;
-    v.selection.bg_fill = pal.highlight;
-    v.selection.stroke = Stroke::new(1.0, Color32::WHITE);
-    v.window_shadow = Shadow { offset: [0, 3], blur: 12, spread: 0, color: Color32::from_black_alpha(if dark { 110 } else { 40 }) };
+    // Breeze 6 selections are a soft accent tint. The stroke doubles as the
+    // focus ring of text fields and the text of selected list items.
+    v.selection.bg_fill = tint;
+    v.selection.stroke = Stroke::new(1.0, lerp(pal.highlight, pal.fg, if dark { 0.35 } else { 0.0 }));
+    v.window_shadow = Shadow { offset: [0, 3], blur: 14, spread: 0, color: Color32::from_black_alpha(if dark { 110 } else { 40 }) };
     v.popup_shadow = Shadow { offset: [0, 2], blur: 8, spread: 0, color: Color32::from_black_alpha(if dark { 100 } else { 35 }) };
     v.slider_trailing_fill = true;
+    v.handle_shape = egui::style::HandleShape::Circle;
     v.striped = false;
     v.indent_has_left_vline = false;
 
@@ -302,29 +320,30 @@ fn visuals(pal: &Palette, dark: bool) -> egui::Visuals {
     w.noninteractive.fg_stroke = Stroke::new(1.0, pal.fg);
     w.noninteractive.corner_radius = r;
 
-    w.inactive.bg_fill = pal.view; // checkbox / radio interior, slider rail
+    // bg_fill: checkbox and radio interiors, slider groove and handle
+    w.inactive.bg_fill = pal.button;
     w.inactive.weak_bg_fill = pal.button;
-    w.inactive.bg_stroke = Stroke::new(1.0, pal.border_strong);
+    w.inactive.bg_stroke = Stroke::new(1.0, edge);
     w.inactive.fg_stroke = Stroke::new(1.0, pal.fg);
     w.inactive.corner_radius = r;
     w.inactive.expansion = 0.0;
 
-    w.hovered.bg_fill = pal.view;
-    w.hovered.weak_bg_fill = pal.button_hover;
+    w.hovered.bg_fill = pal.button;
+    w.hovered.weak_bg_fill = lerp(pal.button, pal.highlight, 0.10);
     w.hovered.bg_stroke = Stroke::new(1.0, pal.highlight);
-    w.hovered.fg_stroke = Stroke::new(1.5, pal.fg);
+    w.hovered.fg_stroke = Stroke::new(1.0, pal.fg);
     w.hovered.corner_radius = r;
     w.hovered.expansion = 0.0;
 
-    w.active.bg_fill = pal.highlight_soft;
-    w.active.weak_bg_fill = pal.highlight_soft;
+    w.active.bg_fill = lerp(pal.button, pal.highlight, 0.25);
+    w.active.weak_bg_fill = lerp(pal.button, pal.highlight, 0.32);
     w.active.bg_stroke = Stroke::new(1.0, pal.highlight);
-    w.active.fg_stroke = Stroke::new(1.5, pal.fg);
+    w.active.fg_stroke = Stroke::new(1.0, pal.fg);
     w.active.corner_radius = r;
     w.active.expansion = 0.0;
 
-    w.open.bg_fill = pal.view;
-    w.open.weak_bg_fill = pal.button_hover;
+    w.open.bg_fill = pal.button;
+    w.open.weak_bg_fill = lerp(pal.button, pal.highlight, 0.18);
     w.open.bg_stroke = Stroke::new(1.0, pal.highlight);
     w.open.fg_stroke = Stroke::new(1.0, pal.fg);
     w.open.corner_radius = r;
@@ -354,10 +373,14 @@ pub fn install(ctx: &egui::Context) {
     ctx.set_visuals_of(Theme::Dark, visuals(d, true));
     ctx.set_visuals_of(Theme::Light, visuals(l, false));
     ctx.all_styles_mut(|s| {
+        // Kirigami units: 4 px inside a group, 6 px between controls, 8 px between groups
         s.spacing.item_spacing = Vec2::new(6.0, 6.0);
         s.spacing.button_padding = Vec2::new(10.0, 3.0);
-        s.spacing.interact_size = Vec2::new(40.0, 26.0);
+        // value boxes keep one width as their numbers grow
+        s.spacing.interact_size = Vec2::new(72.0, 26.0);
         s.spacing.slider_width = 150.0;
+        s.spacing.slider_rail_height = 4.0;
+        s.spacing.menu_margin = egui::Margin::same(4);
         s.spacing.combo_width = 120.0;
         s.spacing.icon_width = 16.0;
         s.spacing.icon_width_inner = 10.0;

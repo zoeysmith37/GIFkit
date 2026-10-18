@@ -41,10 +41,11 @@ enum Tool {
     Shapes,
     Markup,
     Emoji,
+    Presets,
 }
 
 impl Tool {
-    const ALL: [Tool; 17] = [
+    const ALL: [Tool; 18] = [
         Tool::Effects,
         Tool::Text,
         Tool::Shapes,
@@ -62,6 +63,7 @@ impl Tool {
         Tool::Cut,
         Tool::Frames,
         Tool::Optimize,
+        Tool::Presets,
     ];
     fn label(self) -> &'static str {
         match self {
@@ -82,27 +84,30 @@ impl Tool {
             Tool::Shapes => "Shapes",
             Tool::Markup => "Markup",
             Tool::Emoji => "Emoji",
+            Tool::Presets => "Presets",
         }
     }
-    fn icon(self) -> &'static str {
+    /// Breeze icon name.
+    fn breeze(self) -> &'static str {
         match self {
-            Tool::Resize => "⇲",
-            Tool::Crop => "✂",
-            Tool::Rotate => "⟳",
-            Tool::Reverse => "⇄",
-            Tool::Speed => "◷",
-            Tool::Optimize => "⚙",
-            Tool::Effects => "✦",
-            Tool::Text => "T",
-            Tool::Censor => "▦",
-            Tool::AddImage => "◩",
-            Tool::Watermark => "©",
-            Tool::Shield => "◈",
-            Tool::Cut => "✄",
-            Tool::Frames => "▤",
-            Tool::Shapes => "◆",
-            Tool::Markup => "✎",
-            Tool::Emoji => "☺",
+            Tool::Resize => "transform-scale",
+            Tool::Crop => "transform-crop",
+            Tool::Rotate => "object-rotate-right",
+            Tool::Reverse => "media-playlist-repeat",
+            Tool::Speed => "speedometer",
+            Tool::Optimize => "archive-insert",
+            Tool::Effects => "tools-wizard",
+            Tool::Text => "draw-text",
+            Tool::Censor => "pixelate",
+            Tool::AddImage => "insert-image",
+            Tool::Watermark => "document-sign",
+            Tool::Shield => "security-high",
+            Tool::Cut => "edit-cut",
+            Tool::Frames => "kdenlive-show-video",
+            Tool::Shapes => "shapes",
+            Tool::Markup => "draw-freehand",
+            Tool::Emoji => "smiley",
+            Tool::Presets => "bookmarks",
         }
     }
     fn tip(self) -> &'static str {
@@ -124,14 +129,16 @@ impl Tool {
             Tool::Shapes => "Shapes, arrows and speech bubbles",
             Tool::Emoji => "Emoji stickers",
             Tool::Markup => "Draw and highlight with a pen",
+            Tool::Presets => "Save edits to reuse on other files",
         }
     }
     fn title(self) -> &'static str {
         match self {
-            Tool::Rotate => "Rotate / flip",
-            Tool::Reverse => "Reverse / loop",
+            Tool::Rotate => "Rotate / Flip",
             Tool::Optimize => "Compression",
             Tool::AddImage => "Image",
+            Tool::Shield => "AI Shield",
+            Tool::Reverse => "Reverse / Loop",
             _ => self.label(),
         }
     }
@@ -589,7 +596,6 @@ pub struct GifKitApp {
     export_open: bool,
     export_fmt: ExportFormat,
     frames_zip: bool,
-    presets_open: bool,
     presets: Vec<crate::presets::Preset>,
     preset_problems: Vec<String>,
     preset_name: String,
@@ -629,7 +635,8 @@ pub struct GifKitApp {
     /// folder to open once the running export finishes
     pending_open: Option<PathBuf>,
     /// measured width of the transport's view controls (last frame)
-    transport_right_w: f32,
+    play_speed: f32,
+    shortcuts_open: bool,
     /// where the project was last saved (None = never)
     project_path: Option<PathBuf>,
     /// style for the next shape drawn
@@ -752,58 +759,7 @@ const TARGET_PRESETS: [(&str, f32, bool); 3] = [("Discord 10 MB", 9.5, true), ("
 /// Draw a tool's icon. A few are vector drawings because no bundled font has a
 /// clear glyph for them; the rest use the tool's text glyph.
 fn paint_tool_icon(painter: &egui::Painter, t: Tool, c: Pos2, size: f32, col: Color32) {
-    let s = size / 15.0; // designed at 15 px
-    let stroke = Stroke::new((1.6 * s).max(1.2), col);
-    match t {
-        Tool::Shield => {
-            // "no AI" sign: circle with a slash over the letters AI
-            let r = 7.0 * s;
-            painter.text(c + vec2(0.0, 0.3 * s), egui::Align2::CENTER_CENTER, "AI", egui::FontId::new(8.6 * s, egui::FontFamily::Name("gf-sans-bold".into())), col);
-            painter.circle_stroke(c, r, stroke);
-            let d = r * std::f32::consts::FRAC_1_SQRT_2;
-            painter.line_segment([c + vec2(-d, -d), c + vec2(d, d)], stroke);
-        }
-        Tool::Shapes => {
-            // a square behind a circle
-            let a = 4.8 * s;
-            painter.rect_stroke(Rect::from_center_size(c + vec2(-2.4 * s, -2.4 * s), vec2(a * 2.0, a * 2.0)), 1.5 * s, stroke, egui::StrokeKind::Middle);
-            painter.circle_filled(c + vec2(3.0 * s, 3.0 * s), 4.6 * s, col);
-        }
-        Tool::Emoji => {
-            // a smiley face
-            painter.circle_stroke(c, 7.0 * s, stroke);
-            painter.circle_filled(c + vec2(-2.6 * s, -1.8 * s), 1.2 * s, col);
-            painter.circle_filled(c + vec2(2.6 * s, -1.8 * s), 1.2 * s, col);
-            let pts: Vec<Pos2> = (0..=10).map(|i| {
-                let a = (20.0 + 140.0 * i as f32 / 10.0).to_radians();
-                c + vec2(a.cos(), a.sin()) * 4.0 * s
-            }).collect();
-            painter.add(egui::Shape::line(pts, stroke));
-        }
-        Tool::Markup => {
-            // a pen drawn at 45° over a squiggle
-            let d = vec2(1.0, -1.0) / std::f32::consts::SQRT_2;
-            let n = vec2(1.0, 1.0) / std::f32::consts::SQRT_2;
-            let tip = c + vec2(-6.0 * s, 4.5 * s);
-            let base = tip + d * 4.0 * s;
-            let end = tip + d * 13.0 * s;
-            painter.add(egui::Shape::convex_polygon(vec![tip, base + n * 2.2 * s, base - n * 2.2 * s], col, Stroke::NONE));
-            painter.add(egui::Shape::convex_polygon(vec![base + n * 2.2 * s, end + n * 2.2 * s, end - n * 2.2 * s, base - n * 2.2 * s], Color32::TRANSPARENT, stroke));
-            painter.line_segment([c + vec2(-1.0 * s, 7.0 * s), c + vec2(7.0 * s, 7.0 * s)], stroke);
-        }
-        Tool::Crop => {
-            // two interlocking corner brackets
-            let a = 6.5 * s;
-            let b = 3.5 * s;
-            painter.line_segment([c + vec2(-b, -a - 1.5 * s), c + vec2(-b, b)], stroke);
-            painter.line_segment([c + vec2(-b, b), c + vec2(a + 1.5 * s, b)], stroke);
-            painter.line_segment([c + vec2(-a - 1.5 * s, -b), c + vec2(b, -b)], stroke);
-            painter.line_segment([c + vec2(b, -b), c + vec2(b, a + 1.5 * s)], stroke);
-        }
-        _ => {
-            painter.text(c, egui::Align2::CENTER_CENTER, t.icon(), egui::FontId::proportional(size), col);
-        }
-    }
+    crate::icons::paint(painter, t.breeze(), c, if size > 19.0 { 22.0 } else { 16.0 }, col);
 }
 
 /// The app icon drawn live. On KDE it follows the colour scheme like the
@@ -849,28 +805,6 @@ fn paint_app_icon(painter: &egui::Painter, rect: Rect, pal: &theme::Palette) {
     line(vec![at(238.0, 268.0), at(238.0, 340.0)]);
     line(vec![at(282.0, 340.0), at(282.0, 268.0), at(326.0, 268.0)]);
     line(vec![at(282.0, 302.0), at(316.0, 302.0)]);
-}
-
-/// Clock with a counter-clockwise arrow: the usual "history" symbol.
-fn paint_history_icon(painter: &egui::Painter, c: Pos2, size: f32, col: Color32) {
-    let s = size / 15.0;
-    let stroke = Stroke::new((1.6 * s).max(1.2), col);
-    let r = 6.5 * s;
-    // open circle (gap at the upper left where the arrow head sits)
-    let n = 28;
-    let (a0, a1) = (-2.4f32, 2.9f32);
-    let pts: Vec<Pos2> = (0..=n).map(|i| {
-        let a = a0 + (a1 - a0) * i as f32 / n as f32;
-        c + vec2(a.cos(), a.sin()) * r
-    }).collect();
-    painter.add(egui::Shape::line(pts, stroke));
-    // arrow head at the start of the arc
-    let tip = c + vec2(a0.cos(), a0.sin()) * r;
-    painter.line_segment([tip, tip + vec2(-0.6, 3.4) * s], stroke);
-    painter.line_segment([tip, tip + vec2(3.4, 0.6) * s], stroke);
-    // hands
-    painter.line_segment([c, c + vec2(0.0, -3.8 * s)], stroke);
-    painter.line_segment([c, c + vec2(2.8 * s, 1.6 * s)], stroke);
 }
 
 /// Open a folder in the system file manager.
@@ -1060,14 +994,14 @@ fn group_ex<R>(ui: &mut egui::Ui, title: &str, default_open: bool, badge: Option
         let r = egui::Frame::new()
             .fill(mix(pal.window, pal.view, 0.35))
             .stroke(Stroke::new(1.0, pal.border))
-            .corner_radius(3.0)
-            .inner_margin(10.0)
+            .corner_radius(theme::RADIUS)
+            .inner_margin(egui::Margin { left: 12, right: 12, top: 10, bottom: 12 })
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 add(ui)
             })
             .inner;
-        ui.add_space(8.0);
+        ui.add_space(GROUP_GAP);
         return Some(r);
     }
     let id = ui.make_persistent_id(("grp", title));
@@ -1076,7 +1010,7 @@ fn group_ex<R>(ui: &mut egui::Ui, title: &str, default_open: bool, badge: Option
     if let Some(c) = cmd {
         open = c;
     }
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
     let hovered = resp.hovered();
     if resp.clicked() {
         open = !open;
@@ -1084,29 +1018,30 @@ fn group_ex<R>(ui: &mut egui::Ui, title: &str, default_open: bool, badge: Option
     ui.ctx().data_mut(|d| d.insert_persisted(id, open));
     let painter = ui.painter();
     if hovered {
-        painter.rect_filled(rect, 3.0, mix(pal.window, pal.highlight, 0.12));
+        painter.rect_filled(rect, theme::RADIUS, mix(pal.window, pal.highlight, 0.12));
     }
-    let arrow = if open { "▾" } else { "▸" };
-    painter.text(pos2(rect.left() + 4.0, rect.center().y), egui::Align2::LEFT_CENTER, arrow, egui::FontId::proportional(13.0), pal.fg_muted);
-    painter.text(pos2(rect.left() + 20.0, rect.center().y), egui::Align2::LEFT_CENTER, title, theme::medium(13.5), pal.fg);
+    crate::icons::paint(painter, if open { "arrow-down" } else { "arrow-right" }, pos2(rect.left() + 11.0, rect.center().y), 16.0, pal.fg_muted);
+    painter.text(pos2(rect.left() + 24.0, rect.center().y), egui::Align2::LEFT_CENTER, title, theme::medium(13.5), pal.fg);
     if let Some(b) = badge {
-        painter.text(pos2(rect.right() - 6.0, rect.center().y), egui::Align2::RIGHT_CENTER, b, egui::FontId::proportional(11.0), pal.highlight);
+        painter.circle_filled(pos2(rect.right() - 10.0, rect.center().y), 3.5, pal.highlight);
+        let _ = b;
     }
     if !open {
-        ui.add_space(2.0);
+        ui.add_space(4.0);
         return None;
     }
+    ui.add_space(2.0);
     let r = egui::Frame::new()
         .fill(mix(pal.window, pal.view, 0.35))
         .stroke(Stroke::new(1.0, pal.border))
-        .corner_radius(3.0)
-        .inner_margin(10.0)
+        .corner_radius(theme::RADIUS)
+        .inner_margin(egui::Margin { left: 12, right: 12, top: 10, bottom: 12 })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui)
         })
         .inner;
-    ui.add_space(8.0);
+    ui.add_space(GROUP_GAP);
     Some(r)
 }
 
@@ -1118,17 +1053,43 @@ fn toolbar_sep(ui: &mut egui::Ui) {
 
 /// Height of toolbar / transport controls.
 const TOOLBAR_H: f32 = 28.0;
-/// Height of quick-pick chips (preset rows).
-const CHIP_H: f32 = 22.0;
+/// Height of quick-pick chips and choice buttons.
+const CHIP_H: f32 = 26.0;
+/// Space between the boxes of the inspector (Kirigami largeSpacing + a bit).
+const GROUP_GAP: f32 = 12.0;
 
-/// Small quick-pick button (preset rows): same height and padding everywhere.
+/// Right-click actions in the layer list.
+#[derive(Clone, Copy)]
+enum LayerAct {
+    Rename(usize),
+    RenameEdit(Tool),
+    Duplicate(usize),
+    Toggle(usize),
+    Move(usize, usize),
+    Delete(usize),
+    CollapseTo(usize),
+    CollapseAll,
+    CollapseEdits,
+}
+
+/// Breeze checked look: accent tint with an accent outline, not a solid pill.
+fn sel_btn<'a>(b: egui::Button<'a>, on: bool) -> egui::Button<'a> {
+    let pal = p();
+    if on {
+        b.fill(theme::checked_fill(pal)).stroke(Stroke::new(1.0, pal.highlight))
+    } else {
+        b
+    }
+}
+
+/// Small quick-pick button: same height and padding everywhere.
 fn chip(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::Response {
     ui.add(egui::Button::new(text.into()).wrap_mode(egui::TextWrapMode::Extend).min_size(vec2(28.0, CHIP_H)))
 }
 
-/// Outlined choice button (one of several), selected = highlighted.
+/// Choice button (one of several). Selected = Breeze checked look.
 fn seg<T: PartialEq>(ui: &mut egui::Ui, current: &mut T, value: T, text: impl Into<egui::WidgetText>) -> egui::Response {
-    let mut r = ui.add(egui::Button::new(text.into()).selected(*current == value).wrap_mode(egui::TextWrapMode::Extend));
+    let mut r = ui.add(sel_btn(egui::Button::new(text.into()).wrap_mode(egui::TextWrapMode::Extend).min_size(vec2(0.0, CHIP_H)), *current == value));
     if r.clicked() && *current != value {
         *current = value;
         r.mark_changed();
@@ -1137,41 +1098,218 @@ fn seg<T: PartialEq>(ui: &mut egui::Ui, current: &mut T, value: T, text: impl In
 }
 
 fn seg_label(ui: &mut egui::Ui, selected: bool, text: impl Into<egui::WidgetText>) -> egui::Response {
-    ui.add(egui::Button::new(text.into()).selected(selected).wrap_mode(egui::TextWrapMode::Extend))
+    ui.add(sel_btn(egui::Button::new(text.into()).wrap_mode(egui::TextWrapMode::Extend).min_size(vec2(0.0, CHIP_H)), selected))
 }
 
-/// Outlined on/off button.
-fn toggle_btn(ui: &mut egui::Ui, on: &mut bool, text: impl Into<egui::WidgetText>) -> egui::Response {
-    let mut r = ui.add(egui::Button::new(text.into()).selected(*on).wrap_mode(egui::TextWrapMode::Extend));
-    if r.clicked() {
-        *on = !*on;
-        r.mark_changed();
+/// A row of choices that share the width evenly (a segmented control).
+fn seg_row<T: PartialEq + Copy>(ui: &mut egui::Ui, current: &mut T, items: &[(T, &str)]) -> egui::Response {
+    let mut out: Option<egui::Response> = None;
+    let labels: Vec<&str> = items.iter().map(|i| i.1).collect();
+    let min_w = label_w(ui, &labels);
+    even_grid(ui, items.len(), min_w, |ui, i, size| {
+        let (v, label) = items[i];
+        let mut r = ui.add_sized(size, sel_btn(egui::Button::new(label).truncate(), *current == v));
+        if r.clicked() && *current != v {
+            *current = v;
+            r.mark_changed();
+        }
+        out = Some(match out.take() {
+            Some(o) => o | r,
+            None => r,
+        });
+    });
+    out.unwrap_or_else(|| ui.label(""))
+}
+
+/// Lay `n` controls out in rows that fill the width. Every cell is the same
+/// size and rows are balanced, so no row ends up ragged or odd-sized.
+/// `min_w` is the narrowest a cell may get (0 = all in one row).
+fn even_grid(ui: &mut egui::Ui, n: usize, min_w: f32, mut add: impl FnMut(&mut egui::Ui, usize, Vec2)) {
+    if n == 0 {
+        return;
     }
-    r
+    let gap = 4.0;
+    let avail = ui.available_width();
+    let max_cols = if min_w <= 0.0 { n } else { (((avail + gap) / (min_w + gap)).floor() as usize).clamp(1, n) };
+    let rows = n.div_ceil(max_cols);
+    let cols = n.div_ceil(rows);
+    let w = ((avail - gap * (cols - 1) as f32) / cols as f32).floor().max(8.0);
+    let size = vec2(w, CHIP_H);
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing = vec2(gap, gap);
+        for r in 0..rows {
+            ui.horizontal(|ui| {
+                for i in r * cols..((r + 1) * cols).min(n) {
+                    add(ui, i, size);
+                }
+            });
+        }
+    });
 }
 
-/// Square outlined icon button (panels, playback bar).
-fn icon_button(ui: &mut egui::Ui, icon: &str, enabled: bool) -> egui::Response {
-    let pal = p();
-    ui.add_enabled(enabled, egui::Button::new(RichText::new(icon).size(15.0).color(if enabled { pal.fg } else { pal.fg_muted })).min_size(vec2(TOOLBAR_H, TOOLBAR_H)))
+/// Width a button needs for the longest of `labels`.
+fn label_w(ui: &egui::Ui, labels: &[&str]) -> f32 {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let w = labels.iter().map(|l| ui.ctx().fonts_mut(|f| f.layout_no_wrap(l.to_string(), font.clone(), Color32::WHITE).size().x)).fold(0.0, f32::max);
+    w + 2.0 * ui.spacing().button_padding.x + 4.0
 }
 
-/// Flat icon button for the top toolbar (frame only on hover, as in KDE toolbars).
-fn flat_icon(ui: &mut egui::Ui, icon: &str, enabled: bool) -> egui::Response {
-    let pal = p();
-    ui.add_enabled(enabled, egui::Button::new(RichText::new(icon).size(15.0).color(if enabled { pal.fg } else { pal.fg_muted })).frame_when_inactive(false).min_size(vec2(TOOLBAR_H, TOOLBAR_H)))
+/// Toggle buttons in even rows.
+fn toggle_grid(ui: &mut egui::Ui, min_w: f32, items: &mut [(&mut bool, &str, &str)]) {
+    let n = items.len();
+    let labels: Vec<&str> = items.iter().map(|i| i.1).collect();
+    let min_w = min_w.max(label_w(ui, &labels));
+    even_grid(ui, n, min_w, |ui, i, size| {
+        let (v, label, tip) = &mut items[i];
+        let r = ui.add_sized(size, sel_btn(egui::Button::new(*label).truncate(), **v));
+        let r = if tip.is_empty() { r } else { r.on_hover_text(*tip) };
+        if r.clicked() {
+            **v = !**v;
+        }
+    });
 }
 
-/// Outlined icon toggle; returns true when clicked.
-fn toggle_icon(ui: &mut egui::Ui, icon: &str, on: bool, tip: &str) -> bool {
-    let pal = p();
-    ui.add(egui::Button::new(RichText::new(icon).size(15.0).color(if on { pal.fg } else { pal.fg_muted })).selected(on).min_size(vec2(TOOLBAR_H, TOOLBAR_H))).on_hover_text(tip).clicked()
+/// Colour swatch button at the normal swatch size (value boxes are wider).
+fn colour_btn(ui: &mut egui::Ui, c: &mut [u8; 3]) -> egui::Response {
+    ui.scope(|ui| {
+        ui.spacing_mut().interact_size.x = 40.0;
+        ui.color_edit_button_srgb(c)
+    })
+    .inner
 }
 
-/// One segment of a segmented control.
-fn segment(ui: &mut egui::Ui, text: &str, selected: bool, tip: &str) -> bool {
-    let pal = p();
-    ui.add(egui::Button::new(RichText::new(text).size(15.0).color(if selected { pal.fg } else { pal.fg_muted })).selected(selected).min_size(vec2(30.0, TOOLBAR_H))).on_hover_text(tip).clicked()
+fn colour_btn_a(ui: &mut egui::Ui, c: &mut [u8; 4]) -> egui::Response {
+    ui.scope(|ui| {
+        ui.spacing_mut().interact_size.x = 40.0;
+        ui.color_edit_button_srgba_unmultiplied(c)
+    })
+    .inner
+}
+
+/// A subsection label inside a group.
+fn subhead(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(4.0);
+    ui.label(RichText::new(text).font(theme::medium(12.5)).color(p().fg_muted));
+    ui.add_space(1.0);
+}
+
+/// Breeze checkbox: accent fill with a white tick when on.
+fn check(ui: &mut egui::Ui, on: &mut bool, text: impl Into<egui::WidgetText>) -> egui::Response {
+    let pal = *p();
+    let text: egui::WidgetText = text.into();
+    let box_s = 16.0;
+    let gap = 7.0;
+    let galley = text.into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body);
+    let size = vec2(box_s + gap + galley.size().x, galley.size().y.max(box_s).max(22.0));
+    let (rect, mut resp) = ui.allocate_exact_size(size, Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    if ui.is_rect_visible(rect) {
+        let en = ui.is_enabled();
+        let b = Rect::from_center_size(pos2(rect.left() + box_s / 2.0, rect.center().y), vec2(box_s, box_s));
+        let hov = resp.hovered() && en;
+        let painter = ui.painter();
+        if *on {
+            let fill = if en { pal.highlight } else { mix(pal.button, pal.highlight, 0.4) };
+            painter.rect_filled(b, 3.0, fill);
+            let st = Stroke::new(1.8, Color32::WHITE);
+            let pts = vec![b.left_top() + vec2(3.8, 8.4), b.left_top() + vec2(6.8, 11.3), b.left_top() + vec2(12.3, 5.0)];
+            painter.add(egui::Shape::line(pts, st));
+        } else {
+            painter.rect_filled(b, 3.0, pal.view);
+            painter.rect_stroke(b, 3.0, Stroke::new(1.0, if hov { pal.highlight } else { theme::outline(&pal) }), egui::StrokeKind::Inside);
+        }
+        if hov && *on {
+            painter.rect_stroke(b.expand(1.0), 4.0, Stroke::new(1.0, mix(pal.highlight, pal.fg, 0.3)), egui::StrokeKind::Inside);
+        }
+        let col = if en { pal.fg } else { pal.fg_muted };
+        painter.galley(pos2(b.right() + gap, rect.center().y - galley.size().y / 2.0), galley, col);
+    }
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, ui.is_enabled(), *on, ""));
+    resp
+}
+
+/// Slider with the Breeze look: thin groove, solid accent fill, round handle.
+fn slider(ui: &mut egui::Ui, s: egui::Slider<'_>) -> egui::Response {
+    let pal = *p();
+    ui.scope(|ui| {
+        let v = ui.visuals_mut();
+        v.selection.bg_fill = pal.highlight;
+        let groove = mix(pal.button, pal.fg, 0.16);
+        v.widgets.inactive.bg_fill = groove;
+        v.widgets.hovered.bg_fill = mix(groove, pal.fg, 0.1);
+        v.widgets.active.bg_fill = mix(groove, pal.highlight, 0.4);
+        ui.add(s)
+    })
+    .inner
+}
+
+/// Flat toolbar button with a Breeze icon (frame only on hover, as in KDE toolbars).
+fn icon_tool(ui: &mut egui::Ui, icon: &str, tip: &str, enabled: bool) -> egui::Response {
+    let pal = *p();
+    let r = ui.add_enabled(enabled, egui::Button::new("").frame_when_inactive(false).min_size(vec2(TOOLBAR_H, TOOLBAR_H)));
+    crate::icons::paint(ui.painter(), icon, r.rect.center(), 16.0, if enabled { pal.fg } else { mix(pal.window, pal.fg, 0.35) });
+    if tip.is_empty() { r } else { r.on_hover_text(tip) }
+}
+
+/// Toolbar toggle with a Breeze icon; returns true when clicked.
+fn icon_toggle(ui: &mut egui::Ui, icon: &str, on: bool, tip: &str) -> bool {
+    let pal = *p();
+    let b = egui::Button::new("").frame_when_inactive(on).min_size(vec2(TOOLBAR_H, TOOLBAR_H));
+    let r = ui.add(sel_btn(b, on));
+    crate::icons::paint(ui.painter(), icon, r.rect.center(), 16.0, pal.fg);
+    r.on_hover_text(tip).clicked()
+}
+
+/// Outlined square button with a Breeze icon (playback bar).
+fn icon_button(ui: &mut egui::Ui, icon: &str, tip: &str, enabled: bool) -> egui::Response {
+    let pal = *p();
+    let r = ui.add_enabled(enabled, egui::Button::new("").min_size(vec2(TOOLBAR_H, TOOLBAR_H)));
+    crate::icons::paint(ui.painter(), icon, r.rect.center(), 16.0, if enabled { pal.fg } else { mix(pal.window, pal.fg, 0.35) });
+    r.on_hover_text(tip)
+}
+
+/// A menu entry with a Breeze icon and an optional shortcut.
+fn menu_item(ui: &mut egui::Ui, icon: &str, text: &str, shortcut: &str, enabled: bool) -> bool {
+    let pal = *p();
+    let img = crate::icons::image(ui.ctx(), if icon.is_empty() { "list-add" } else { icon }, 16.0, if enabled { pal.fg } else { pal.fg_muted });
+    let img = if icon.is_empty() { img.tint(Color32::TRANSPARENT) } else { img };
+    let mut b = egui::Button::image_and_text(img, text);
+    if !shortcut.is_empty() {
+        b = b.shortcut_text(RichText::new(shortcut).color(pal.fg_muted));
+    }
+    let r = ui.add_enabled(enabled, b);
+    if r.clicked() {
+        ui.close();
+        true
+    } else {
+        false
+    }
+}
+
+/// A checkable menu entry: a tick in the icon column when on.
+fn menu_check(ui: &mut egui::Ui, on: bool, text: &str, shortcut: &str) -> bool {
+    let pal = *p();
+    let img = crate::icons::image(ui.ctx(), "dialog-ok-apply", 16.0, pal.fg);
+    let img = if on { img } else { img.tint(Color32::TRANSPARENT) };
+    let mut b = egui::Button::image_and_text(img, text);
+    if !shortcut.is_empty() {
+        b = b.shortcut_text(RichText::new(shortcut).color(pal.fg_muted));
+    }
+    if ui.add(b).clicked() {
+        ui.close();
+        true
+    } else {
+        false
+    }
+}
+
+/// A submenu whose title lines up with the icon column.
+fn sub_menu(ui: &mut egui::Ui, text: &str, add: impl FnOnce(&mut egui::Ui)) {
+    let img = crate::icons::image(ui.ctx(), "dialog-ok-apply", 16.0, Color32::TRANSPARENT).tint(Color32::TRANSPARENT);
+    ui.menu_image_text_button(img, text, add);
 }
 
 /// Shorten to `max` characters with an ellipsis.
@@ -1189,12 +1327,21 @@ fn elide(s: &str, max: usize) -> String {
 /// Breeze "default" button.
 fn primary(ui: &mut egui::Ui, text: &str) -> bool {
     let pal = p();
-    ui.add(egui::Button::new(RichText::new(text).font(theme::medium(13.5)).color(pal.fg)).fill(mix(pal.button, pal.highlight, 0.28)).stroke(Stroke::new(1.0, pal.highlight)).min_size(vec2(120.0, 28.0))).clicked()
+    ui.add(egui::Button::new(RichText::new(text).font(theme::medium(13.5)).color(pal.fg)).fill(theme::checked_fill(pal)).stroke(Stroke::new(1.0, pal.highlight)).min_size(vec2(120.0, 28.0))).clicked()
+}
+
+/// The full-width "Add New … Layer" button at the top of a layer tool.
+fn add_layer_button(ui: &mut egui::Ui, text: &str) -> bool {
+    let pal = *p();
+    let b = egui::Button::image_and_text(crate::icons::image(ui.ctx(), "list-add", 16.0, pal.fg), RichText::new(text).font(theme::medium(13.5)).color(pal.fg))
+        .fill(theme::checked_fill(&pal))
+        .stroke(Stroke::new(1.0, pal.highlight));
+    ui.add_sized(vec2(ui.available_width(), 32.0), b).clicked()
 }
 
 fn tinted(ui: &mut egui::Ui, text: &str, tint: Color32) -> bool {
     let pal = p();
-    ui.add(egui::Button::new(RichText::new(text).size(12.0).color(pal.fg)).fill(mix(pal.button, tint, 0.3)).stroke(Stroke::new(1.0, mix(pal.border_strong, tint, 0.6)))).clicked()
+    ui.add(egui::Button::new(RichText::new(text).color(pal.fg)).fill(mix(pal.button, tint, 0.3)).stroke(Stroke::new(1.0, mix(theme::outline(pal), tint, 0.6))).min_size(vec2(0.0, CHIP_H))).clicked()
 }
 
 fn hint(ui: &mut egui::Ui, text: &str) -> egui::Response {
@@ -1206,16 +1353,11 @@ fn soft_slider<'a>(v: &'a mut f32, r: std::ops::RangeInclusive<f32>, text: &str)
     egui::Slider::new(v, r).text(text).clamping(egui::SliderClamping::Never)
 }
 
-/// Flat toolbar button (frame only on hover), as in KDE toolbars.
-fn tool_button(ui: &mut egui::Ui, icon: &str, text: &str, enabled: bool) -> egui::Response {
-    let pal = p();
-    let txt = RichText::new(format!("{icon}  {text}")).color(if enabled { pal.fg } else { pal.fg_muted });
-    ui.add_enabled(enabled, egui::Button::new(txt).frame_when_inactive(false).min_size(vec2(0.0, TOOLBAR_H)))
-}
-
-fn small_flat(ui: &mut egui::Ui, text: &str, tip: &str) -> bool {
-    let pal = p();
-    ui.add(egui::Button::new(RichText::new(text).size(11.5).color(pal.fg_muted)).frame_when_inactive(false).min_size(vec2(18.0, 20.0))).on_hover_text(tip).clicked()
+fn small_icon(ui: &mut egui::Ui, icon: &str, tip: &str) -> bool {
+    let pal = *p();
+    let r = ui.add(egui::Button::new("").frame_when_inactive(false).min_size(vec2(22.0, 22.0)));
+    crate::icons::paint(ui.painter(), icon, r.rect.center(), 16.0, if r.hovered() { pal.fg } else { pal.fg_muted });
+    r.on_hover_text(tip).clicked()
 }
 
 impl GifKitApp {
@@ -1312,13 +1454,12 @@ impl GifKitApp {
             fr_thumb: 96.0,
             video_bg: [255, 255, 255],
             view_single: ViewSource::Edit,
-            sidebar_compact: theme::get_setting("sidebar_compact").as_deref() == Some("1"),
+            sidebar_compact: theme::get_setting("sidebar_compact").as_deref() != Some("0"),
             layers_collapsed: false,
             layer_drag: None,
             export_open: false,
             export_fmt: ExportFormat::Gif,
             frames_zip: false,
-            presets_open: false,
             presets: Vec::new(),
             preset_problems: Vec::new(),
             preset_name: std::env::var("GIFKIT_PRESET_NAME").unwrap_or_default(),
@@ -1350,7 +1491,8 @@ impl GifKitApp {
             open_after_save: theme::get_setting("open_after_save").as_deref() == Some("1"),
             last_dir: theme::get_setting("last_dir").map(PathBuf::from).filter(|d| d.is_dir()),
             pending_open: None,
-            transport_right_w: 430.0,
+            play_speed: 1.0,
+            shortcuts_open: false,
             project_path: None,
             shape_tpl: ShapeSettings::default(),
             emoji_tex: HashMap::new(),
@@ -1381,6 +1523,11 @@ impl GifKitApp {
         if let Ok(t) = std::env::var("GIFKIT_TOOL") {
             if let Some(tool) = Tool::ALL.iter().find(|x| x.label().to_lowercase().starts_with(&t.to_lowercase())) {
                 app.tool = *tool;
+                if app.tool == Tool::Presets {
+                    let (l, pr) = crate::presets::list_with_problems();
+                    app.presets = l;
+                    app.preset_problems = pr;
+                }
             }
         }
         if let Ok(f) = std::env::var("GIFKIT_FORMAT") {
@@ -1474,7 +1621,8 @@ impl GifKitApp {
         let mut stack = self.stack.clone();
         let fonts = self.fonts.clone();
         let total = self.plan.len();
-        self.spawn(ctx, if transform_only { "Bake frame edits" } else { "Bake everything" }, total, move |p| {
+        // the user is waiting on this, so it doesn't queue behind preview renders
+        self.spawn_in(ctx, if transform_only { "Collapse frame edits" } else { "Collapse all" }, total, false, move |p| {
             let mut to_flatten = stack.clone();
             if transform_only {
                 to_flatten.layers.clear();
@@ -1805,8 +1953,8 @@ impl GifKitApp {
         if self.split_fmt == SplitFormat::Png {
             Self::png_colours_ui(ui, &mut self.frames_png);
         } else {
-            ui.add(egui::Slider::new(&mut self.gif_opts.colors, 2..=256).text("colours"));
-            ui.checkbox(&mut self.gif_opts.dither, "Dither");
+            slider(ui, egui::Slider::new(&mut self.gif_opts.colors, 2..=256).text("Colours"));
+            check(ui, &mut self.gif_opts.dither, "Dither");
         }
     }
 
@@ -1831,7 +1979,7 @@ impl GifKitApp {
             ui.add(egui::DragValue::new(&mut s.padding).range(0..=256).suffix(" px"));
             ui.end_row();
         });
-        ui.checkbox(&mut s.pow2, "Power-of-two size").on_hover_text("Pads the sheet to sizes like 512, 1024 or 2048 as most game engines expect. Automatic columns then pick the smallest such sheet.");
+        check(ui, &mut s.pow2, "Power-of-two size").on_hover_text("Pads the sheet to sizes like 512, 1024 or 2048 as most game engines expect. Automatic columns then pick the smallest such sheet.");
         let h = self.sheet_hint();
         hint(ui, &h);
     }
@@ -1842,7 +1990,7 @@ impl GifKitApp {
         egui::Grid::new("saveopts").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
             if self.export_fmt.can_tag() {
                 ui.label("Tag");
-                ui.checkbox(&mut self.gif_opts.noai_tag, "Add “noai” tag").on_hover_text(noai_tip);
+                check(ui, &mut self.gif_opts.noai_tag, "Add “noai” tag").on_hover_text(noai_tip);
                 ui.end_row();
             }
             match self.export_fmt {
@@ -1864,8 +2012,8 @@ impl GifKitApp {
                     let s = &mut self.sheet;
                     ui.label("Also write");
                     ui.vertical(|ui| {
-                        ui.checkbox(&mut s.write_json, "JSON metadata");
-                        ui.checkbox(&mut s.write_godot, "Godot SpriteFrames (.tres)").on_hover_text("Assign the .tres to an AnimatedSprite2D/3D. Frame delays are kept.");
+                        check(ui, &mut s.write_json, "JSON metadata");
+                        check(ui, &mut s.write_godot, "Godot SpriteFrames (.tres)").on_hover_text("Assign the .tres to an AnimatedSprite2D/3D. Frame delays are kept.");
                     });
                     ui.end_row();
                     if s.write_godot {
@@ -1891,7 +2039,7 @@ impl GifKitApp {
                 ui.end_row();
             }
             ui.label("");
-            if ui.checkbox(&mut self.open_after_save, "Open the folder after saving").changed() {
+            if check(ui, &mut self.open_after_save, "Open the folder after saving").changed() {
                 theme::set_setting("open_after_save", if self.open_after_save { "1" } else { "0" });
             }
             ui.end_row();
@@ -2015,6 +2163,7 @@ impl GifKitApp {
                 hint(ui, "Video and AVIF via ffmpeg (optional)");
                 hint(ui, "Fonts: Noto Sans (OFL) and DejaVu");
                 hint(ui, "Emoji: Twemoji (CC-BY 4.0) with names from emojibase (MIT)");
+                hint(ui, "Icons: KDE Breeze (LGPL 3)");
                 ui.add_space(4.0);
                 hint(ui, "Licensed under Apache 2.0");
             });
@@ -2259,6 +2408,16 @@ impl GifKitApp {
         if self.busy() {
             return;
         }
+        let (new, quit, hist) = ctx.input(|i| (i.modifiers.command && i.key_pressed(egui::Key::N), i.modifiers.command && i.key_pressed(egui::Key::Q), i.modifiers.command && i.key_pressed(egui::Key::H)));
+        if new {
+            self.new_project();
+        }
+        if quit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if hist {
+            self.history_open = !self.history_open;
+        }
         if open {
             self.open_dialog(ctx);
         }
@@ -2270,7 +2429,7 @@ impl GifKitApp {
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.export_open = false;
-            self.presets_open = false;
+            self.shortcuts_open = false;
             self.font_picker_open = false;
             self.about_open = false;
         }
@@ -2389,7 +2548,7 @@ impl GifKitApp {
             None => 0.0,
         };
         self.last_tick = Some(now);
-        self.elapsed += dt;
+        self.elapsed += dt * self.play_speed as f64;
         let n = self.plan.len();
         if !self.plan[self.cur].enabled {
             self.cur = self.next_enabled(self.cur);
@@ -2403,7 +2562,7 @@ impl GifKitApp {
             self.cur = self.next_enabled(self.cur);
         }
         let d = effective_delay(self.plan[self.cur].delay) as f64 / 100.0;
-        let remain = (d - self.elapsed).max(0.004);
+        let remain = ((d - self.elapsed) / self.play_speed.max(0.05) as f64).max(0.004);
         ctx.request_repaint_after(std::time::Duration::from_secs_f64(remain));
     }
 
@@ -2801,53 +2960,67 @@ impl eframe::App for GifKitApp {
         self.load_preview_fonts(&ctx);
         let pal = *p();
 
+        // KDE layout: menu bar, then the main toolbar, both on the header colour
+        egui::Panel::top("menubar")
+            .frame(egui::Frame::new().fill(pal.header).inner_margin(egui::Margin { left: 4, right: 4, top: 2, bottom: 0 }))
+            .show(ui, |ui| self.menubar(ui, &ctx));
         egui::Panel::top("toolbar")
-            .frame(egui::Frame::new().fill(pal.header).inner_margin(egui::Margin { left: 8, right: 8, top: 4, bottom: 4 }))
+            .frame(egui::Frame::new().fill(pal.header).inner_margin(egui::Margin { left: 6, right: 8, top: 3, bottom: 4 }))
             .show(ui, |ui| self.toolbar(ui, &ctx));
 
         egui::Panel::bottom("status").frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin::symmetric(10, 3))).show(ui, |ui| self.status_bar(ui));
 
-        let side_w = if self.sidebar_compact { 46.0 } else { 168.0 };
-        egui::Panel::left("sidebar")
-            .resizable(false)
-            .exact_size(side_w)
-            .frame(egui::Frame::new().fill(pal.view).inner_margin(egui::Margin { left: 5, right: 5, top: 8, bottom: 6 }))
-            .show(ui, |ui| self.sidebar(ui));
-
+        let rail_w = if self.sidebar_compact { 40.0 } else { 140.0 };
         if self.base.is_some() {
             egui::Panel::right("inspector")
                 .resizable(true)
-                .default_size(350.0)
-                .size_range(290.0..=(ctx.content_rect().width() - side_w - 440.0).clamp(290.0, 620.0))
+                .default_size(360.0)
+                .size_range(300.0..=(ctx.content_rect().width() - rail_w - 440.0).clamp(300.0, 640.0))
                 .frame(egui::Frame::new().fill(pal.window))
                 .show(ui, |ui| {
                     egui::Panel::bottom("layers_panel")
                         .resizable(!self.layers_collapsed)
                         .default_size(230.0)
                         .size_range(if self.layers_collapsed { 34.0..=34.0 } else { 120.0..=700.0 })
-                        .frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin { left: 8, right: 8, top: 6, bottom: 6 }))
+                        .frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin { left: 8, right: 8, top: 6, bottom: 8 }))
                         .show(ui, |ui| self.layer_panel(ui, &ctx));
                     egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin { left: 10, right: 8, top: 8, bottom: 4 })).show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            let (ir, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
-                            paint_tool_icon(ui.painter(), self.tool, ir.center(), 18.0, pal.highlight);
+                            let (ir, _) = ui.allocate_exact_size(vec2(22.0, 24.0), Sense::hover());
+                            paint_tool_icon(ui.painter(), self.tool, ir.center(), 22.0, pal.fg);
                             ui.label(RichText::new(self.tool.title()).font(theme::medium(16.0)).color(pal.fg));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if small_flat(ui, "⊟", "Collapse all sections") {
+                                ui.spacing_mut().item_spacing.x = 2.0;
+                                if small_icon(ui, "collapse-all", "Collapse all sections") {
                                     set_all_groups(ui.ctx(), false);
                                 }
-                                if small_flat(ui, "⊞", "Expand all sections") {
+                                if small_icon(ui, "expand-all", "Expand all sections") {
                                     set_all_groups(ui.ctx(), true);
                                 }
                             });
                         });
-                        ui.add_space(4.0);
+                        ui.add_space(8.0);
                         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                             ui.add_enabled_ui(!self.busy(), |ui| self.tool_panel(ui, &ctx));
+                            ui.add_space(8.0);
                         });
                     });
                 });
+        }
 
+        // the tool rail sits right beside the inspector so the pointer travels less
+        egui::Panel::right("rail")
+            .resizable(false)
+            .exact_size(rail_w)
+            .frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin { left: 4, right: 4, top: 6, bottom: 6 }))
+            .show(ui, |ui| {
+                let r = ui.max_rect();
+                ui.painter().vline(r.right() + 4.0, r.y_range().expand(6.0), Stroke::new(1.0, pal.border));
+                ui.painter().vline(r.left() - 4.0, r.y_range().expand(6.0), Stroke::new(1.0, pal.border));
+                self.rail(ui);
+            });
+
+        if self.base.is_some() {
             egui::Panel::bottom("transport")
                 .frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin::symmetric(8, 5)))
                 .show(ui, |ui| self.transport(ui));
@@ -2879,7 +3052,7 @@ impl eframe::App for GifKitApp {
         self.history_window(&ctx);
         self.about_window(&ctx);
         self.track_live_edits(&ctx, now);
-        self.presets_window(&ctx);
+        self.shortcuts_window(&ctx);
         clear_group_command(&ctx);
         if std::env::var_os("GIFKIT_PERF").is_some() {
             let ms = perf_t0.elapsed().as_secs_f64() * 1000.0;
@@ -2902,43 +3075,252 @@ impl eframe::App for GifKitApp {
 }
 
 impl GifKitApp {
+    /// KWrite-style menu bar.
+    fn menubar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let idle = !self.busy();
+        let has = self.base.is_some();
+        let theme_before = self.theme;
+        let backdrop_before = (self.backdrop, self.backdrop_col);
+        egui::MenuBar::new().ui(ui, |ui| {
+            ui.menu_button("File", |ui| {
+                ui.set_min_width(240.0);
+                if menu_item(ui, "document-new", "New Project", "Ctrl+N", idle) {
+                    self.new_project();
+                }
+                if menu_item(ui, "document-open", "Open…", "Ctrl+O", idle) {
+                    self.open_dialog(ctx);
+                }
+                if menu_item(ui, "document-open-recent", "Open Image Sequence…", "", idle) {
+                    self.open_sequence_dialog(ctx);
+                }
+                ui.separator();
+                if menu_item(ui, "document-save", "Save", "Ctrl+S", idle && has) {
+                    self.save_project(ctx, false);
+                }
+                if menu_item(ui, "document-save-as", "Save As…", "Ctrl+Shift+S", idle && has) {
+                    self.save_project(ctx, true);
+                }
+                ui.separator();
+                if menu_item(ui, "document-export", "Export…", "Ctrl+E", idle && has) {
+                    self.export_open = true;
+                }
+                ui.separator();
+                if menu_item(ui, "application-exit", "Quit", "Ctrl+Q", true) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+            ui.menu_button("Edit", |ui| {
+                ui.set_min_width(240.0);
+                let pending = self.committed.as_ref().map(|c| c.0 != self.live_sig()).unwrap_or(false);
+                let undo = self.undo.last().map(|u| format!("Undo {}", elide(&u.label, 28))).unwrap_or_else(|| "Undo".into());
+                if menu_item(ui, "edit-undo", &undo, "Ctrl+Z", idle && (pending || !self.undo.is_empty())) {
+                    self.do_undo();
+                }
+                let redo = self.redo.last().map(|u| format!("Redo {}", elide(&u.label, 28))).unwrap_or_else(|| "Redo".into());
+                if menu_item(ui, "edit-redo", &redo, "Ctrl+Y", idle && !self.redo.is_empty()) {
+                    self.do_redo();
+                }
+                ui.separator();
+                if menu_item(ui, "view-history", "History", "Ctrl+H", true) {
+                    self.history_open = !self.history_open;
+                }
+                if menu_item(ui, "bookmarks", "Presets", "", has) {
+                    self.open_tool(Tool::Presets);
+                }
+                ui.separator();
+                if menu_item(ui, "merge", "Collapse All", "", idle && has && !self.stack.is_empty()) {
+                    self.bake(ctx, false);
+                }
+                if menu_item(ui, "dialog-ok-apply", "Collapse Frame Edits", "", idle && has && !self.stack.transform.is_identity()) {
+                    self.bake(ctx, true);
+                }
+            });
+            ui.menu_button("View", |ui| {
+                ui.set_min_width(240.0);
+                if menu_check(ui, !self.compare, "Single View", "C") {
+                    self.compare = false;
+                }
+                if menu_check(ui, self.compare, "Split View", "C") {
+                    self.compare = true;
+                }
+                if menu_check(ui, self.link_views, "Link Both Views", "") {
+                    self.link_views = !self.link_views;
+                }
+                ui.separator();
+                if menu_item(ui, "zoom-in", "Zoom In", "+", has) {
+                    self.zoom_to(self.cur_scale() * 1.25);
+                }
+                if menu_item(ui, "zoom-out", "Zoom Out", "−", has) {
+                    self.zoom_to(self.cur_scale() / 1.25);
+                }
+                if menu_item(ui, "zoom-fit-best", "Fit to View", "F", has) {
+                    self.zoom_fit();
+                }
+                if menu_item(ui, "zoom-original", "Actual Size", "1", has) {
+                    self.zoom_to(1.0);
+                }
+                ui.separator();
+                sub_menu(ui, "Transparency", |ui| {
+                    ui.set_min_width(200.0);
+                    if menu_check(ui, self.backdrop == Backdrop::Checker, "Checkerboard", "") {
+                        self.backdrop = Backdrop::Checker;
+                    }
+                    if menu_check(ui, self.backdrop == Backdrop::Solid, "Solid Colour", "") {
+                        self.backdrop = Backdrop::Solid;
+                    }
+                    if menu_check(ui, self.backdrop == Backdrop::Canvas, "Viewport Background", "") {
+                        self.backdrop = Backdrop::Canvas;
+                    }
+                });
+                if menu_check(ui, self.pixelated, "Pixelated Preview", "") {
+                    self.pixelated = !self.pixelated;
+                }
+                ui.separator();
+                if menu_check(ui, !self.sidebar_compact, "Show Tool Names", "") {
+                    self.set_rail_compact(!self.sidebar_compact);
+                }
+                sub_menu(ui, "Colour Scheme", |ui| {
+                    ui.set_min_width(160.0);
+                    for t in [ThemeChoice::System, ThemeChoice::Dark, ThemeChoice::Light] {
+                        if menu_check(ui, self.theme == t, if t == ThemeChoice::System { "Follow System" } else { t.label() }, "") {
+                            self.theme = t;
+                        }
+                    }
+                });
+                if cfg!(all(unix, not(target_os = "macos"))) {
+                    let native = theme::get_setting("wayland").as_deref() == Some("native");
+                    if menu_check(ui, native, "Native Wayland", "") {
+                        theme::set_setting("wayland", if native { "xwayland" } else { "native" });
+                        self.info("Applies after a restart");
+                    }
+                }
+            });
+            ui.menu_button("Help", |ui| {
+                ui.set_min_width(240.0);
+                if menu_item(ui, "configure-shortcuts", "Keyboard Shortcuts", "", true) {
+                    self.shortcuts_open = true;
+                }
+                ui.separator();
+                if menu_item(ui, "", "GitHub Page", "", true) {
+                    open_external(REPO_URL);
+                }
+                if menu_item(ui, "view-refresh", "Check for Updates", "", true) {
+                    open_external(&format!("{REPO_URL}/releases"));
+                }
+                if menu_item(ui, "tools-report-bug", "Report a Bug", "", true) {
+                    open_external(&format!("{REPO_URL}/issues"));
+                }
+                ui.separator();
+                if menu_item(ui, "help-about", "About GIFkit", "", true) {
+                    self.about_open = true;
+                }
+            });
+        });
+        if theme_before != self.theme {
+            self.theme.apply(ctx);
+            theme::save_theme_choice(self.theme);
+        }
+        if backdrop_before != (self.backdrop, self.backdrop_col) {
+            self.save_backdrop();
+        }
+    }
+
+    fn save_backdrop(&self) {
+        theme::set_setting("backdrop", match self.backdrop {
+            Backdrop::Checker => "checker",
+            Backdrop::Solid => "solid",
+            Backdrop::Canvas => "canvas",
+        });
+        let c = self.backdrop_col;
+        theme::set_setting("backdrop_col", &format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]));
+    }
+
+    fn set_rail_compact(&mut self, compact: bool) {
+        self.sidebar_compact = compact;
+        theme::set_setting("sidebar_compact", if compact { "1" } else { "0" });
+    }
+
+    /// Switch tools (the rail, the menus and the layer list all use this).
+    fn open_tool(&mut self, t: Tool) {
+        if t == Tool::Presets && self.tool != Tool::Presets {
+            let (l, pr) = crate::presets::list_with_problems();
+            self.presets = l;
+            self.preset_problems = pr;
+        }
+        self.tool = t;
+        self.drag = None;
+    }
+
+    /// Close the current file and start over (asks first when there are unsaved changes).
+    fn new_project(&mut self) {
+        if self.base.is_none() {
+            return;
+        }
+        if self.modified {
+            let ok = rfd::MessageDialog::new()
+                .set_title("New Project")
+                .set_description("Discard the unsaved changes to this project?")
+                .set_buttons(rfd::MessageButtons::OkCancelCustom("Discard".into(), "Cancel".into()))
+                .show();
+            if !matches!(ok, rfd::MessageDialogResult::Custom(ref s) if s == "Discard") && ok != rfd::MessageDialogResult::Ok {
+                return;
+            }
+        }
+        self.base = None;
+        self.original = None;
+        self.orig_gen += 1;
+        self.path = None;
+        self.project_path = None;
+        self.file_size = None;
+        self.stack = Stack::default();
+        self.undo.clear();
+        self.redo.clear();
+        self.committed = None;
+        self.cmp = None;
+        self.plan.clear();
+        self.plan_times.clear();
+        self.sel.clear();
+        self.edit_labels.clear();
+        self.edit_rows_shown.clear();
+        self.modified = false;
+        self.export_open = false;
+        self.cur = 0;
+        self.bump();
+        self.info("New project");
+    }
+
+    /// Main toolbar: file actions, undo, and the view controls, each as its own button.
     fn toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let pal = *p();
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             let idle = !self.busy();
             let has = self.base.is_some();
-            if tool_button(ui, "⏏", "Open", idle).on_hover_text("Open a GIF, image or video (Ctrl+O)").clicked() {
+            if icon_tool(ui, "document-new", "New project (Ctrl+N)", idle && has).clicked() {
+                self.new_project();
+            }
+            if icon_tool(ui, "document-open", "Open a GIF, image, video or project (Ctrl+O)", idle).clicked() {
                 self.open_dialog(ctx);
             }
-            if tool_button(ui, "⊞", "Sequence", idle).on_hover_text("Make an animation from a set of images").clicked() {
-                self.open_sequence_dialog(ctx);
-            }
-            if tool_button(ui, "▣", "Save", idle && self.base.is_some()).on_hover_text("Save the project with all edits and layers (Ctrl+S)").clicked() {
+            if icon_tool(ui, "document-save", "Save the project (Ctrl+S)", idle && has).clicked() {
                 self.save_project(ctx, false);
+            }
+            if icon_tool(ui, "document-save-as", "Save the project as (Ctrl+Shift+S)", idle && has).clicked() {
+                self.save_project(ctx, true);
             }
             toolbar_sep(ui);
             let pending = self.committed.as_ref().map(|c| c.0 != self.live_sig()).unwrap_or(false);
             let undo_tip = self.undo.last().map(|u| format!("Undo {} (Ctrl+Z)", u.label)).unwrap_or_else(|| "Undo (Ctrl+Z)".into());
-            if flat_icon(ui, "↶", idle && (pending || !self.undo.is_empty())).on_hover_text(undo_tip).clicked() {
+            if icon_tool(ui, "edit-undo", &undo_tip, idle && (pending || !self.undo.is_empty())).clicked() {
                 self.do_undo();
             }
             let redo_tip = self.redo.last().map(|u| format!("Redo {} (Ctrl+Y)", u.label)).unwrap_or_else(|| "Redo (Ctrl+Y)".into());
-            if flat_icon(ui, "↷", idle && !self.redo.is_empty()).on_hover_text(redo_tip).clicked() {
+            if icon_tool(ui, "edit-redo", &redo_tip, idle && !self.redo.is_empty()).clicked() {
                 self.do_redo();
             }
-            let hr = ui.add(egui::Button::new("").selected(self.history_open).frame_when_inactive(self.history_open).min_size(vec2(28.0, 28.0))).on_hover_text("History");
-            paint_history_icon(ui.painter(), hr.rect.center(), 15.0, if self.history_open { pal.fg } else if hr.hovered() { pal.fg } else { pal.fg_muted });
-            if hr.clicked() {
-                self.history_open = !self.history_open;
-            }
-            toolbar_sep(ui);
-            let pr = ui.add_enabled(has, egui::Button::new(RichText::new("❖  Presets").color(if self.presets_open { Color32::WHITE } else { pal.fg })).selected(self.presets_open).frame_when_inactive(self.presets_open).min_size(vec2(0.0, TOOLBAR_H)));
-            if pr.on_hover_text("Save edits to reuse on other files").clicked() {
-                self.presets_open = !self.presets_open;
-                if self.presets_open {
-                    { let (l, pr) = crate::presets::list_with_problems(); self.presets = l; self.preset_problems = pr; }
-                }
+            if has {
+                toolbar_sep(ui);
+                self.view_controls(ui);
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2946,7 +3328,10 @@ impl GifKitApp {
                 let export = ui
                     .add_enabled(
                         has && idle,
-                        egui::Button::new(RichText::new("⬇  Export").font(theme::medium(14.0)).color(Color32::WHITE)).fill(pal.highlight).stroke(Stroke::new(1.0, mix(pal.highlight, Color32::BLACK, 0.25))).min_size(vec2(96.0, TOOLBAR_H)),
+                        egui::Button::image_and_text(crate::icons::image(ctx, "document-export", 16.0, Color32::WHITE), RichText::new("Export…").font(theme::medium(13.5)).color(Color32::WHITE))
+                            .fill(pal.highlight)
+                            .stroke(Stroke::new(1.0, mix(pal.highlight, Color32::BLACK, 0.25)))
+                            .min_size(vec2(96.0, TOOLBAR_H)),
                     )
                     .on_hover_text("Save the result as an image or video (Ctrl+E)");
                 if export.clicked() {
@@ -2954,76 +3339,6 @@ impl GifKitApp {
                 }
                 if has {
                     ui.add_enabled_ui(idle, |ui| self.format_menu(ui, TOOLBAR_H));
-                }
-                let before = self.theme;
-                let mut about = false;
-                let mr = flat_icon(ui, "⋮", true).on_hover_text("Theme, links and About");
-                egui::Popup::menu(&mr).show(|ui| {
-                    ui.set_min_width(190.0);
-                    ui.label(RichText::new("Theme").size(11.5).color(pal.fg_muted));
-                    for t in [ThemeChoice::System, ThemeChoice::Dark, ThemeChoice::Light] {
-                        ui.selectable_value(&mut self.theme, t, t.label());
-                    }
-                    if cfg!(all(unix, not(target_os = "macos"))) {
-                        ui.separator();
-                        let mut native = theme::get_setting("wayland").as_deref() == Some("native");
-                        if ui.checkbox(&mut native, "Native Wayland").on_hover_text("Applies after a restart. When off the app runs through XWayland so drag and drop works.").changed() {
-                            theme::set_setting("wayland", if native { "native" } else { "xwayland" });
-                        }
-                    }
-                    ui.separator();
-                    if ui.button("GitHub page").clicked() {
-                        open_external(REPO_URL);
-                        ui.close();
-                    }
-                    if ui.button("Check for updates").on_hover_text("Opens the Releases page").clicked() {
-                        open_external(&format!("{REPO_URL}/releases"));
-                        ui.close();
-                    }
-                    if ui.button("Report a problem").clicked() {
-                        open_external(&format!("{REPO_URL}/issues"));
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.add_enabled(self.base.is_some(), egui::Button::new("Save project as…")).on_hover_text("Ctrl+Shift+S").clicked() {
-                        self.save_project(ctx, true);
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button("About GIFkit").clicked() {
-                        about = true;
-                        ui.close();
-                    }
-                });
-                if about {
-                    self.about_open = true;
-                }
-                if before != self.theme {
-                    self.theme.apply(ctx);
-                    theme::save_theme_choice(self.theme);
-                }
-                // file info
-                if let Some(a) = &self.base {
-                    let m = |s: String| RichText::new(s).size(12.0).color(pal.fg_muted);
-                    let dur: f32 = self.plan.iter().filter(|f| f.enabled).map(|f| effective_delay(f.delay) as f32 / 100.0).sum();
-                    let (ow, oh) = self.out_size;
-                    ui.add_space(8.0);
-                    // drop details from the left as the window gets narrow
-                    let info = format!("{}×{} · {} frames · {:.2}s", ow as u32, oh as u32, self.plan.len(), dur);
-                    if ui.available_width() > 360.0 {
-                        ui.label(m(info));
-                    }
-                    if let Some(s) = self.file_size.filter(|_| ui.available_width() > 170.0) {
-                        ui.label(m(fmt_size(s)));
-                    }
-                    let room = ((ui.available_width() - 16.0) / 7.5) as usize;
-                    if room < 6 {
-                        return;
-                    }
-                    let name = self.project_path.as_ref().or(self.path.as_ref()).and_then(|p| p.file_name()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "untitled".into());
-                    let name = elide(&name, room.min(28));
-                    ui.label(RichText::new(if self.modified { format!("{name} •") } else { name }).font(theme::medium(13.0)).color(pal.fg)).on_hover_text(if self.modified { "Unsaved changes" } else { "" });
-                    let _ = a;
                 }
             });
         });
@@ -3046,96 +3361,152 @@ impl GifKitApp {
             } else {
                 ui.label(RichText::new("Ready").size(12.5).color(pal.fg_muted));
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new("?").size(12.5).color(pal.fg_muted)).on_hover_text(
-                    "Mouse wheel zooms. Middle or right drag pans.\nAlt+drag pans in drawing tools.\nShift+drag moves in straight lines.\nWhen resizing, Shift keeps or frees the proportions and Ctrl scales one way. Edge handles stretch one side.\nF fits the view. 1 shows actual size.\nSpace plays or pauses. ← and → step.\nC switches single and split view.\nCtrl+S saves the project and Ctrl+Shift+S saves a copy. Ctrl+E exports.\nCtrl+Z and Ctrl+Y undo and redo.\nCtrl+V opens copied files.",
-                );
+            if self.base.is_some() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let name = self.project_path.as_ref().or(self.path.as_ref()).and_then(|p| p.file_name()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Untitled".into());
+                    let room = ((ui.available_width() - 200.0) / 7.0).max(6.0) as usize;
+                    ui.label(RichText::new(if self.modified { format!("{} •", elide(&name, room.min(40))) } else { elide(&name, room.min(40)) }).size(12.5).color(pal.fg_muted)).on_hover_text(if self.modified { "Unsaved changes" } else { "" });
+                });
+            }
+        });
+    }
+
+    fn shortcuts_window(&mut self, ctx: &egui::Context) {
+        if !self.shortcuts_open {
+            return;
+        }
+        let pal = *p();
+        let mut open = true;
+        egui::Window::new(RichText::new("Keyboard Shortcuts").font(theme::medium(15.0))).open(&mut open).collapsible(false).resizable(false).default_width(420.0).show(ctx, |ui| {
+            let rows: [(&str, &str); 21] = [
+                ("Ctrl+N", "New project"),
+                ("Ctrl+O", "Open"),
+                ("Ctrl+S", "Save the project"),
+                ("Ctrl+Shift+S", "Save the project as"),
+                ("Ctrl+E", "Export"),
+                ("Ctrl+Z / Ctrl+Y", "Undo and redo"),
+                ("Ctrl+H", "History"),
+                ("Ctrl+V", "Open copied files"),
+                ("Ctrl+Q", "Quit"),
+                ("Space", "Play or pause"),
+                ("← / →", "Previous and next frame"),
+                ("C", "Single or split view"),
+                ("F", "Fit to view"),
+                ("1", "Actual size"),
+                ("+ / −", "Zoom in and out"),
+                ("Mouse wheel", "Zoom"),
+                ("Middle or right drag", "Pan"),
+                ("Alt+drag", "Pan in drawing tools"),
+                ("Shift+drag", "Move in straight lines"),
+                ("Shift while resizing", "Keep or free the proportions"),
+                ("Ctrl while resizing", "Scale one way. Edge handles stretch one side."),
+            ];
+            egui::Grid::new("keys").num_columns(2).spacing([18.0, 6.0]).striped(false).show(ui, |ui| {
+                for (k, what) in rows {
+                    ui.label(RichText::new(k).font(theme::medium(13.0)).color(pal.fg));
+                    ui.label(RichText::new(what).color(pal.fg_muted));
+                    ui.end_row();
+                }
             });
         });
+        if !open {
+            self.shortcuts_open = false;
+        }
     }
 
-    fn sidebar(&mut self, ui: &mut egui::Ui) {
+    /// The tool rail: layer tools, frame edits, output, then presets and history.
+    fn rail(&mut self, ui: &mut egui::Ui) {
         let pal = *p();
         let compact = self.sidebar_compact;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        egui::ScrollArea::vertical().auto_shrink([false, false]).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
-            let section = |ui: &mut egui::Ui, s: &str| {
-                if compact {
-                    ui.add_space(4.0);
-                    let r = ui.available_rect_before_wrap();
-                    ui.painter().hline(r.x_range().shrink(6.0), r.top() + 2.0, Stroke::new(1.0, pal.border));
-                    ui.add_space(6.0);
-                } else {
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(s.to_uppercase()).size(10.5).color(pal.fg_muted));
-                    ui.add_space(1.0);
-                }
+            let divider = |ui: &mut egui::Ui| {
+                ui.add_space(4.0);
+                let r = ui.available_rect_before_wrap();
+                ui.painter().hline(r.x_range().shrink(4.0), r.top() + 1.0, Stroke::new(1.0, pal.border));
+                ui.add_space(6.0);
             };
             for t in Tool::ALL {
-                match t {
-                    Tool::Effects => section(ui, "Layers"),
-                    Tool::Resize => section(ui, "Frame edits"),
-                    Tool::Frames => section(ui, "Frames & output"),
-                    _ => {}
+                if matches!(t, Tool::Resize | Tool::Frames | Tool::Presets) {
+                    divider(ui);
                 }
-                self.sidebar_row(ui, t, compact);
+                self.rail_row(ui, Some(t), compact);
             }
-            ui.add_space(8.0);
-            let tip = if compact { "Expand sidebar" } else { "Collapse sidebar" };
-            if small_flat(ui, if compact { "»" } else { "«" }, tip) {
-                self.sidebar_compact = !compact;
-                theme::set_setting("sidebar_compact", if compact { "0" } else { "1" });
+            self.rail_row(ui, None, compact);
+            divider(ui);
+            let (icon, tip) = if compact { ("sidebar-collapse-right", "Show tool names") } else { ("sidebar-collapse-left", "Hide tool names") };
+            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
+            if resp.hovered() {
+                ui.painter().rect_filled(r, 4.0, mix(pal.window, pal.highlight, 0.12));
+            }
+            crate::icons::paint(ui.painter(), icon, if compact { r.center() } else { pos2(r.left() + 16.0, r.center().y) }, 16.0, pal.fg_muted);
+            if resp.on_hover_text(tip).clicked() {
+                self.set_rail_compact(!compact);
             }
         });
     }
 
-    fn sidebar_row(&mut self, ui: &mut egui::Ui, t: Tool, compact: bool) {
+    /// One rail entry. `None` is the History window toggle.
+    fn rail_row(&mut self, ui: &mut egui::Ui, t: Option<Tool>, compact: bool) {
         let pal = *p();
-        let sel = self.tool == t;
-        let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
+        let has = self.base.is_some();
+        let sel = match t {
+            Some(t) => self.tool == t && has,
+            None => self.history_open,
+        };
+        let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
         let painter = ui.painter();
         if sel {
-            painter.rect_filled(r, 3.0, pal.highlight_soft);
-            painter.rect_stroke(r, 3.0, Stroke::new(1.0, pal.highlight), egui::StrokeKind::Inside);
+            painter.rect_filled(r, 4.0, theme::checked_fill(&pal));
+            painter.rect_stroke(r, 4.0, Stroke::new(1.0, pal.highlight), egui::StrokeKind::Inside);
         } else if resp.hovered() {
-            painter.rect_filled(r, 3.0, mix(pal.view, pal.highlight_soft, 0.5));
+            painter.rect_filled(r, 4.0, mix(pal.window, pal.highlight, 0.12));
         }
-        let icon_col = if sel { pal.highlight } else { pal.fg };
-        let icon_x = if compact { r.center().x } else { r.left() + 16.0 };
-        paint_tool_icon(painter, t, pos2(icon_x, r.center().y), 15.0, icon_col);
-        if !compact {
-            painter.text(r.left_center() + vec2(32.0, 0.0), egui::Align2::LEFT_CENTER, t.label(), egui::FontId::proportional(13.5), pal.fg);
-        }
-        let tr = &self.stack.transform;
-        let badge: Option<String> = match t {
-            _ if t.layer_kind().is_some() => {
-                let n = self.stack.count(t.layer_kind().unwrap());
-                (n > 0).then(|| n.to_string())
-            }
-            Tool::Resize => tr.resize_on.then(|| "●".into()),
-            Tool::Crop => tr.crop_on.then(|| "●".into()),
-            Tool::Rotate => tr.rotates().then(|| "●".into()),
-            Tool::Reverse => (tr.reverse || tr.boomerang || tr.set_loop).then(|| "●".into()),
-            Tool::Speed => tr.speed_on.then(|| "●".into()),
-            Tool::Cut => tr.cut_on.then(|| "●".into()),
-            _ => None,
+        let (icon, label, tip) = match t {
+            Some(t) => (t.breeze(), t.label(), t.tip()),
+            None => ("view-history", "History", "Every change, with jumps back and forth (Ctrl+H)"),
         };
+        let icon_col = if has || t.is_none() { pal.fg } else { pal.fg_muted };
+        let icon_size = if compact { 22.0 } else { 16.0 };
+        let icon_x = if compact { r.center().x } else { r.left() + 15.0 };
+        crate::icons::paint(painter, icon, pos2(icon_x, r.center().y), icon_size, icon_col);
+        if !compact {
+            painter.text(r.left_center() + vec2(30.0, 0.0), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(13.0), icon_col);
+        }
+        let badge: Option<String> = t.and_then(|t| {
+            let tr = &self.stack.transform;
+            match t {
+                _ if t.layer_kind().is_some() => {
+                    let n = self.stack.count(t.layer_kind().unwrap());
+                    (n > 0).then(|| n.to_string())
+                }
+                Tool::Resize => tr.resize_on.then(|| "●".into()),
+                Tool::Crop => tr.crop_on.then(|| "●".into()),
+                Tool::Rotate => tr.rotates().then(|| "●".into()),
+                Tool::Reverse => (tr.reverse || tr.boomerang || tr.set_loop).then(|| "●".into()),
+                Tool::Speed => tr.speed_on.then(|| "●".into()),
+                Tool::Cut => tr.cut_on.then(|| "●".into()),
+                _ => None,
+            }
+        });
         if let Some(b) = badge {
-            let c = if compact { r.right_top() + vec2(-7.0, 7.0) } else { r.right_center() - vec2(12.0, 0.0) };
+            let c = if compact { r.right_top() + vec2(-5.0, 6.0) } else { r.right_center() - vec2(12.0, 0.0) };
             if b == "●" {
-                painter.circle_filled(c, 3.5, pal.positive);
+                painter.circle_filled(c, 3.0, pal.positive);
             } else if compact {
-                painter.circle_filled(c, 3.5, pal.highlight);
+                painter.circle_filled(c, 3.0, pal.highlight);
             } else {
                 painter.circle_filled(c, 7.5, pal.highlight);
                 painter.text(c, egui::Align2::CENTER_CENTER, b, egui::FontId::proportional(10.0), Color32::WHITE);
             }
         }
         let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-        let resp = if compact { resp.on_hover_text(format!("{} – {}", t.label(), t.tip())) } else { resp.on_hover_text(t.tip()) };
+        let resp = if compact { resp.on_hover_text(format!("{label}\n{tip}")) } else { resp.on_hover_text(tip) };
         if resp.clicked() {
-            self.tool = t;
-            self.drag = None;
+            match t {
+                Some(t) => self.open_tool(t),
+                None => self.history_open = !self.history_open,
+            }
         }
     }
 
@@ -3147,33 +3518,14 @@ impl GifKitApp {
         ui.horizontal(|ui| {
             let arrow = if self.layers_collapsed { "▸" } else { "▾" };
             let h = ui.add(egui::Button::new(RichText::new(format!("{arrow}  Layers")).font(theme::medium(14.0)).color(pal.fg)).frame(false));
-            if h.clicked() {
+            if h.on_hover_text("Right-click a layer for more").clicked() {
                 self.layers_collapsed = !self.layers_collapsed;
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                ui.add_enabled_ui(!self.busy() && !self.stack.is_empty(), |ui| {
-                    if icon_button(ui, "⬇", true).on_hover_text("Make all layers and frame edits permanent").clicked() {
-                        self.bake(ctx, false);
-                    }
-                });
-                let add = icon_button(ui, "+", true).on_hover_text("Add layer");
-                egui::Popup::menu(&add).show(|ui| {
-                    for (t, label) in [(Tool::Effects, "Effects"), (Tool::Text, "Text"), (Tool::Shapes, "Shape"), (Tool::Emoji, "Emoji"), (Tool::Markup, "Markup"), (Tool::Censor, "Censor"), (Tool::AddImage, "Image…"), (Tool::Watermark, "Watermark"), (Tool::Shield, "AI shield")] {
-                        let b = ui.add(egui::Button::new(format!("      {label}")).min_size(vec2(150.0, 0.0)));
-                        paint_tool_icon(ui.painter(), t, pos2(b.rect.left() + 16.0, b.rect.center().y), 13.0, pal.fg);
-                        if b.clicked() {
-                            self.new_layer_of(t, ctx);
-                            ui.close();
-                        }
-                    }
-                });
-            });
         });
         if self.layers_collapsed {
             return;
         }
-        ui.add_space(2.0);
+        ui.add_space(4.0);
         let rect = ui.available_rect_before_wrap();
         ui.painter().rect_filled(rect, 3.0, pal.view);
         ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
@@ -3188,6 +3540,9 @@ impl GifKitApp {
         let mut edit_rename_done: Option<Option<(Tool, String)>> = None;
         let mut edit_toggle: Option<Tool> = None;
         let mut edit_remove: Option<Tool> = None;
+        let mut menu_act: Option<LayerAct> = None;
+        let idle = !self.busy();
+        let frame_edits = !self.stack.transform.is_identity();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             let mut rows: Vec<(usize, Rect)> = Vec::new();
@@ -3210,7 +3565,7 @@ impl GifKitApp {
                 // eye
                 let eye_r = Rect::from_center_size(pos2(r.left() + 16.0, r.center().y), vec2(22.0, 22.0));
                 let eye = ui.interact(eye_r, egui::Id::unique(("layer-eye", id)), Sense::click()).on_hover_text("Show / hide");
-                painter.text(eye_r.center(), egui::Align2::CENTER_CENTER, if visible { "◉" } else { "○" }, egui::FontId::proportional(14.0), if visible { pal.highlight } else { pal.fg_muted });
+                crate::icons::paint(&painter, if visible { "view-visible" } else { "view-hidden" }, eye_r.center(), 16.0, if visible { pal.fg } else { pal.fg_muted });
                 if eye.clicked() {
                     toggle = Some(li);
                 }
@@ -3239,16 +3594,55 @@ impl GifKitApp {
                         rename_done = Some(Some((li, buf.clone())));
                     }
                 }
-                let resp = resp.on_hover_text("Click to edit. Double-click to rename. Drag to reorder.");
+                let resp = resp.on_hover_text("Click to edit. Double-click to rename. Drag to reorder. Right-click for more.");
                 if resp.double_clicked() && !eye.hovered() {
                     self.renaming = Some((id, name.clone()));
                     self.rename_fresh = true;
                 }
+                resp.context_menu(|ui| {
+                    ui.set_min_width(230.0);
+                    let top = li + 1 == n;
+                    let bottom = li == 0;
+                    let mut act = |a: LayerAct| menu_act = Some(a);
+                    if menu_item(ui, "edit-rename", "Rename", "", true) {
+                        act(LayerAct::Rename(li));
+                    }
+                    if menu_item(ui, "edit-duplicate", "Duplicate Layer", "", true) {
+                        act(LayerAct::Duplicate(li));
+                    }
+                    if menu_item(ui, if visible { "view-hidden" } else { "view-visible" }, if visible { "Hide Layer" } else { "Show Layer" }, "", true) {
+                        act(LayerAct::Toggle(li));
+                    }
+                    ui.separator();
+                    if menu_item(ui, "go-top", "Bring to Front", "", !top) {
+                        act(LayerAct::Move(li, n - 1));
+                    }
+                    if menu_item(ui, "go-up", "Move Up", "", !top) {
+                        act(LayerAct::Move(li, li + 1));
+                    }
+                    if menu_item(ui, "go-down", "Move Down", "", !bottom) {
+                        act(LayerAct::Move(li, li.saturating_sub(1)));
+                    }
+                    if menu_item(ui, "go-bottom", "Send to Back", "", !bottom) {
+                        act(LayerAct::Move(li, 0));
+                    }
+                    ui.separator();
+                    if menu_item(ui, "merge", "Collapse Down", "", idle) {
+                        act(LayerAct::CollapseTo(li));
+                    }
+                    if menu_item(ui, "merge", "Collapse All", "", idle) {
+                        act(LayerAct::CollapseAll);
+                    }
+                    ui.separator();
+                    if menu_item(ui, "edit-delete", "Delete Layer", "", true) {
+                        act(LayerAct::Delete(li));
+                    }
+                });
                 // delete (pointer anywhere over the row – the ✕ itself takes the hover)
                 if ui.rect_contains_pointer(r) || selected {
                     let del_r = Rect::from_center_size(pos2(r.right() - 14.0, r.center().y), vec2(20.0, 20.0));
                     let del = ui.interact(del_r, egui::Id::unique(("layer-del", id)), Sense::click()).on_hover_text("Delete layer");
-                    painter.text(del_r.center(), egui::Align2::CENTER_CENTER, "✕", egui::FontId::proportional(11.5), if del.hovered() { pal.negative } else { pal.fg_muted });
+                    crate::icons::paint(&painter, "window-close", del_r.center(), 16.0, if del.hovered() { pal.negative } else { pal.fg_muted });
                     if del.clicked() {
                         remove = Some(li);
                     }
@@ -3282,7 +3676,7 @@ impl GifKitApp {
                 if let Some(on) = enabled {
                     let eye_r = Rect::from_center_size(pos2(r.left() + 16.0, r.center().y), vec2(22.0, 22.0));
                     let eye = ui.interact(eye_r, egui::Id::unique(("edit-eye", t)), Sense::click()).on_hover_text("Turn this edit on or off");
-                    painter.text(eye_r.center(), egui::Align2::CENTER_CENTER, if on { "◉" } else { "○" }, egui::FontId::proportional(13.0), if on { pal.highlight } else { pal.fg_muted });
+                    crate::icons::paint(painter, if on { "view-visible" } else { "view-hidden" }, eye_r.center(), 16.0, if on { pal.fg } else { pal.fg_muted });
                     if eye.clicked() {
                         edit_toggle = Some(t);
                     }
@@ -3290,7 +3684,7 @@ impl GifKitApp {
                     if ui.rect_contains_pointer(r) || sel {
                         let del_r = Rect::from_center_size(pos2(r.right() - 14.0, r.center().y), vec2(20.0, 20.0));
                         let del = ui.interact(del_r, egui::Id::unique(("edit-del", t)), Sense::click()).on_hover_text("Remove this edit");
-                        painter.text(del_r.center(), egui::Align2::CENTER_CENTER, "✕", egui::FontId::proportional(11.5), if del.hovered() { pal.negative } else { pal.fg_muted });
+                        crate::icons::paint(painter, "window-close", del_r.center(), 16.0, if del.hovered() { pal.negative } else { pal.fg_muted });
                         if del.clicked() {
                             edit_remove = Some(t);
                         }
@@ -3324,6 +3718,30 @@ impl GifKitApp {
                     self.edit_renaming = Some((t, custom.clone().unwrap_or_else(|| t.label().to_string())));
                     self.rename_fresh = true;
                 }
+                resp.context_menu(|ui| {
+                    ui.set_min_width(230.0);
+                    if let Some(on) = enabled {
+                        if menu_item(ui, "edit-rename", "Rename", "", true) {
+                            menu_act = Some(LayerAct::RenameEdit(t));
+                        }
+                        if menu_item(ui, if on { "view-hidden" } else { "view-visible" }, if on { "Turn Off" } else { "Turn On" }, "", true) {
+                            edit_toggle = Some(t);
+                        }
+                        ui.separator();
+                    }
+                    if menu_item(ui, "dialog-ok-apply", "Collapse Frame Edits", "", idle && frame_edits) {
+                        menu_act = Some(LayerAct::CollapseEdits);
+                    }
+                    if menu_item(ui, "merge", "Collapse All", "", idle && n > 0) {
+                        menu_act = Some(LayerAct::CollapseAll);
+                    }
+                    if enabled.is_some() {
+                        ui.separator();
+                        if menu_item(ui, "edit-delete", "Remove Edit", "", true) {
+                            edit_remove = Some(t);
+                        }
+                    }
+                });
                 let tip = if t == Tool::Frames {
                     "Source frames".to_string()
                 } else if custom.is_some() {
@@ -3368,7 +3786,7 @@ impl GifKitApp {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
-                    hint(ui, "No layers yet. Add one with +");
+                    hint(ui, "No layers yet. Pick a tool to add one.");
                 });
             }
         });
@@ -3431,6 +3849,67 @@ impl GifKitApp {
         if to_frames {
             self.tool = Tool::Frames;
         }
+        match menu_act {
+            Some(LayerAct::Rename(li)) => {
+                let l = &self.stack.layers[li];
+                self.renaming = Some((l.id, l.name()));
+                self.rename_fresh = true;
+            }
+            Some(LayerAct::RenameEdit(t)) => {
+                self.edit_renaming = Some((t, self.edit_labels.get(&t).cloned().unwrap_or_else(|| t.label().to_string())));
+                self.rename_fresh = true;
+            }
+            Some(LayerAct::Duplicate(li)) => {
+                self.snapshot(&format!("duplicate{now}"), now);
+                let src = self.stack.layers[li].clone();
+                let id = self.stack.push(src.kind.clone());
+                if let Some(mut l) = self.stack.layers.pop() {
+                    l.label = src.label.as_ref().map(|s| format!("{s} copy"));
+                    l.visible = src.visible;
+                    self.stack.layers.insert(li + 1, l);
+                }
+                self.select(src.kind(), id);
+                self.modified = true;
+            }
+            Some(LayerAct::Toggle(li)) => {
+                self.stack.layers[li].visible = !self.stack.layers[li].visible;
+                self.modified = true;
+            }
+            Some(LayerAct::Move(from, to)) => {
+                if from != to && to < n {
+                    self.snapshot(&format!("reorder{now}"), now);
+                    let l = self.stack.layers.remove(from);
+                    self.stack.layers.insert(to, l);
+                }
+            }
+            Some(LayerAct::Delete(li)) => {
+                self.snapshot(&format!("del{now}"), now);
+                self.stack.layers.remove(li);
+            }
+            Some(LayerAct::CollapseTo(li)) => self.collapse_down(ctx, li),
+            Some(LayerAct::CollapseAll) => self.bake(ctx, false),
+            Some(LayerAct::CollapseEdits) => self.bake(ctx, true),
+            None => {}
+        }
+    }
+
+    /// Make one layer and every visible layer below it part of the frames.
+    /// Layers above stay editable and frame edits stay live.
+    fn collapse_down(&mut self, ctx: &egui::Context, li: usize) {
+        let Some(base) = self.base.clone() else { return };
+        if li >= self.stack.layers.len() {
+            return;
+        }
+        let lower = Stack { transform: Transform::default(), layers: self.stack.layers[..=li].iter().filter(|l| l.visible).cloned().collect(), next_id: self.stack.next_id };
+        let mut keep = self.stack.clone();
+        // hidden layers in the merged part stay as they are
+        keep.layers = self.stack.layers[..=li].iter().filter(|l| !l.visible).cloned().chain(self.stack.layers[li + 1..].iter().cloned()).collect();
+        let fonts = self.fonts.clone();
+        let total = base.len();
+        self.spawn_in(ctx, "Collapse down", total, false, move |p| {
+            let out = lower.flatten(&base, &fonts, Some(p));
+            JobOutput::Baked(Ok((out, keep)))
+        });
     }
 
     /// Is a frame edit switched on?
@@ -3564,46 +4043,6 @@ impl GifKitApp {
         v
     }
 
-    /// "+" menu / sidebar shortcut for creating a layer of a kind.
-    fn new_layer_of(&mut self, t: Tool, ctx: &egui::Context) {
-        let (w, h) = self.dims();
-        match t {
-            Tool::Effects => {
-                self.add_layer(LayerKind::Effects(Box::default()));
-            }
-            Tool::Text => {
-                self.add_layer(LayerKind::Text(Annotation { text: "Your text".into(), x: (w as i32 / 2 - 80).max(0), y: (h as i32 - 60).max(0), ..Default::default() }));
-            }
-            Tool::Censor => {
-                self.add_layer(LayerKind::Censor(CensorSettings { x: (w / 4) as i32, y: (h / 4) as i32, w: w / 2, h: h / 2, ..Default::default() }));
-            }
-            Tool::AddImage => {
-                if let Some(path) = rfd::FileDialog::new().add_filter("Images", &["png", "gif", "jpg", "jpeg", "webp", "bmp"]).pick_file() {
-                    self.load_overlay(path, ctx);
-                }
-            }
-            Tool::Watermark => {
-                self.add_layer(LayerKind::Watermark(Box::default()));
-            }
-            Tool::Shield => {
-                self.add_layer(LayerKind::Shield(ShieldSettings::default()));
-            }
-            Tool::Shapes => {
-                let s = self.default_shape(w, h);
-                self.add_layer(LayerKind::Shape(Box::new(s)));
-            }
-            Tool::Markup => {
-                self.add_layer(LayerKind::Markup(MarkupSettings::default()));
-            }
-            Tool::Emoji => {
-                let e = self.default_emoji(w, h, None);
-                self.add_layer(LayerKind::Emoji(Box::new(e)));
-            }
-            _ => {}
-        }
-        self.tool = t;
-    }
-
     fn empty_state(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let pal = *p();
         let r = ui.available_rect_before_wrap();
@@ -3614,7 +4053,7 @@ impl GifKitApp {
         let dash = egui::Shape::dashed_line(&[inner.left_top(), inner.right_top(), inner.right_bottom(), inner.left_bottom(), inner.left_top()], Stroke::new(1.5, stroke_col), 8.0, 6.0);
         ui.painter().extend(dash);
         let c = inner.center();
-        ui.painter().text(c - vec2(0.0, 40.0), egui::Align2::CENTER_CENTER, "▤", egui::FontId::proportional(56.0), pal.fg_muted);
+        crate::icons::paint(ui.painter(), "document-open", c - vec2(0.0, 40.0), 64.0, pal.fg_muted);
         ui.painter().text(c + vec2(0.0, 18.0), egui::Align2::CENTER_CENTER, "Drop a GIF here or click to open", theme::medium(19.0), pal.fg);
         ui.painter().text(c + vec2(0.0, 46.0), egui::Align2::CENTER_CENTER, if self.ffmpeg { "GIF · APNG · WebP · videos · image sequences" } else { "GIF · APNG · WebP · image sequences" }, egui::FontId::proportional(13.5), pal.fg_muted);
         if resp.clicked() && !self.busy() {
@@ -3622,117 +4061,116 @@ impl GifKitApp {
         }
     }
 
+    /// The timeline bar: playback, position, time and playback speed. Nothing else.
     fn transport(&mut self, ui: &mut egui::Ui) {
         let pal = *p();
         let r = ui.max_rect();
         ui.painter().hline(r.x_range(), r.top() - 5.0, Stroke::new(1.0, pal.border));
         let n = self.plan.len();
         let (delay, enabled) = self.plan.get(self.cur).map(|f| (f.delay, f.enabled)).unwrap_or((0, true));
-        // playback (~120) + slider (min 100) + frame counter (~60) on the left
-        let right_w = self.transport_right_w;
-        let one_row = ui.available_width() >= 290.0 + right_w;
+        let total: f32 = self.plan.iter().filter(|f| f.enabled).map(|f| effective_delay(f.delay) as f32 / 100.0).sum();
+        let now_t = self.play_time().min(total);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            if icon_button(ui, "|◀", true).on_hover_text("Previous frame (←)").clicked() {
+            if icon_button(ui, "media-skip-backward", "Previous frame (←)", true).clicked() {
                 self.step(-1);
             }
-            if ui.add(egui::Button::new(if self.playing { "❚❚" } else { "▶" }).min_size(vec2(36.0, TOOLBAR_H))).on_hover_text("Play or pause (Space)").clicked() {
+            let (icon, tip) = if self.playing { ("media-playback-pause", "Pause (Space)") } else { ("media-playback-start", "Play (Space)") };
+            let pr = ui.add(sel_btn(egui::Button::new("").min_size(vec2(36.0, TOOLBAR_H)), self.playing));
+            crate::icons::paint(ui.painter(), icon, pr.rect.center(), 16.0, pal.fg);
+            if pr.on_hover_text(tip).clicked() {
                 self.playing = !self.playing;
             }
-            if icon_button(ui, "▶|", true).on_hover_text("Next frame (→)").clicked() {
+            if icon_button(ui, "media-skip-forward", "Next frame (→)", true).clicked() {
                 self.step(1);
             }
-            ui.add_space(4.0);
-            let counter = format!("{}/{}", self.cur + 1, n);
-            let counter_w = 8.0 * counter.len() as f32 + 12.0;
-            let reserve = if one_row { right_w + 12.0 } else { 0.0 };
-            ui.spacing_mut().slider_width = (ui.available_width() - reserve - counter_w).max(60.0);
+            ui.add_space(6.0);
+            // fixed-width readouts so the slider never jumps as the numbers change
+            let digits = n.max(1).to_string().len();
+            let time_w = 112.0;
+            let frame_w = 30.0 + 16.0 * digits as f32;
+            let speed_w = 74.0;
+            let reserve = time_w + frame_w + speed_w + 3.0 * 10.0;
+            ui.spacing_mut().slider_width = (ui.available_width() - reserve).max(60.0);
             let mut f = self.cur + 1;
-            if ui.add(egui::Slider::new(&mut f, 1..=n.max(1)).show_value(false)).changed() {
+            if slider(ui, egui::Slider::new(&mut f, 1..=n.max(1)).show_value(false)).changed() {
                 self.cur = f - 1;
                 self.playing = false;
                 self.elapsed = 0.0;
             }
-            ui.label(RichText::new(counter).size(12.5)).on_hover_text(format!("Delay {delay} cs{}", if enabled { "" } else { " · skipped" }));
-            if one_row {
-                ui.add_space((ui.available_width() - right_w).max(0.0));
-                self.view_controls(ui);
-            }
+            ui.add_space(6.0);
+            let mono = |s: String| RichText::new(s).font(egui::FontId::monospace(12.5)).color(pal.fg);
+            ui.add_sized(vec2(time_w, TOOLBAR_H), egui::Label::new(mono(format!("{now_t:.2} / {total:.2} s")))).on_hover_text("Time and length in seconds");
+            ui.add_sized(vec2(frame_w, TOOLBAR_H), egui::Label::new(mono(format!("{:>w$} / {}", self.cur + 1, n, w = digits))))
+                .on_hover_text(format!("Frame. Delay {delay} cs{}", if enabled { "" } else { " · skipped" }));
+            let speeds = [0.25f32, 0.5, 0.75, 1.0, 1.5, 2.0, 4.0];
+            let label = |v: f32| if v == 1.0 { "1×".to_string() } else { format!("{v}×") };
+            egui::ComboBox::from_id_salt("play_speed")
+                .width(speed_w)
+                .selected_text(label(self.play_speed))
+                .show_ui(ui, |ui| {
+                    for v in speeds {
+                        if ui.selectable_label(self.play_speed == v, label(v)).clicked() {
+                            self.play_speed = v;
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Playback speed of the preview. Exports keep their own timing.");
         });
-        if !one_row {
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                ui.add_space((ui.available_width() - right_w).max(0.0));
-                self.view_controls(ui);
-            });
-        }
     }
 
-    /// View mode, zoom and display toggles (right side of the transport bar).
+    /// View mode, zoom and display toggles (in the main toolbar).
     fn view_controls(&mut self, ui: &mut egui::Ui) {
-        let start = ui.cursor().min.x;
-        ui.spacing_mut().item_spacing.x = 3.0;
-        if segment(ui, "▭", !self.compare, "Single view (C)") {
+        if icon_toggle(ui, "view-fullscreen", !self.compare, "Single view (C)") {
             self.compare = false;
         }
-        if segment(ui, "◫", self.compare, "Split view (C)") {
+        if icon_toggle(ui, "view-split-left-right", self.compare, "Split view (C)") {
             self.compare = true;
         }
-        toolbar_sep(ui);
-        if icon_button(ui, "−", true).on_hover_text("Zoom out").clicked() {
-            self.zoom_to(self.cur_scale() / 1.25);
-        }
-        let mut pct = self.cur_scale() * 100.0;
-        if ui.add(egui::DragValue::new(&mut pct).range(2.0..=6400.0).speed(1.0).suffix("%").max_decimals(0)).on_hover_text("Zoom").changed() {
-            self.zoom_to(pct / 100.0);
-        }
-        if icon_button(ui, "+", true).on_hover_text("Zoom in").clicked() {
-            self.zoom_to(self.cur_scale() * 1.25);
-        }
-        if ui.add(egui::Button::new("Fit").selected(self.views[self.active()].zoom.is_none()).min_size(vec2(0.0, TOOLBAR_H))).on_hover_text("Fit (F)").clicked() {
-            self.zoom_fit();
-        }
-        if icon_button(ui, "1:1", true).on_hover_text("Actual size (1)").clicked() {
-            self.zoom_to(1.0);
-        }
-        if self.compare && toggle_icon(ui, "⚭", self.link_views, "Link zoom and pan of both views") {
+        if self.compare && icon_toggle(ui, "link", self.link_views, "Link zoom and pan of both views") {
             self.link_views = !self.link_views;
         }
         toolbar_sep(ui);
-        let (icon, tip) = match self.backdrop {
-            Backdrop::Checker => ("▦", "Transparency: checkerboard"),
-            Backdrop::Solid => ("■", "Transparency: solid colour"),
-            Backdrop::Canvas => ("□", "Transparency: viewport background"),
-        };
-        let br = ui.add(egui::Button::new(RichText::new(icon).size(15.0).color(p().fg)).min_size(vec2(TOOLBAR_H, TOOLBAR_H))).on_hover_text(tip);
+        if icon_tool(ui, "zoom-out", "Zoom out (−)", true).clicked() {
+            self.zoom_to(self.cur_scale() / 1.25);
+        }
+        let mut pct = self.cur_scale() * 100.0;
+        if ui.add_sized(vec2(64.0, 24.0), egui::DragValue::new(&mut pct).range(2.0..=6400.0).speed(1.0).suffix("%").max_decimals(0)).on_hover_text("Zoom").changed() {
+            self.zoom_to(pct / 100.0);
+        }
+        if icon_tool(ui, "zoom-in", "Zoom in (+)", true).clicked() {
+            self.zoom_to(self.cur_scale() * 1.25);
+        }
+        if icon_toggle(ui, "zoom-fit-best", self.views[self.active()].zoom.is_none(), "Fit to view (F)") {
+            self.zoom_fit();
+        }
+        if icon_tool(ui, "zoom-original", "Actual size (1)", true).clicked() {
+            self.zoom_to(1.0);
+        }
+        toolbar_sep(ui);
         let before = (self.backdrop, self.backdrop_col);
-        egui::Popup::menu(&br).show(|ui| {
-            ui.set_min_width(200.0);
-            ui.label(RichText::new("Show transparency on").size(11.5).color(p().fg_muted));
-            ui.selectable_value(&mut self.backdrop, Backdrop::Checker, "▦  Checkerboard");
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.backdrop, Backdrop::Solid, "■  Solid colour");
-                if ui.color_edit_button_srgb(&mut self.backdrop_col).changed() {
-                    self.backdrop = Backdrop::Solid;
-                }
+        if icon_toggle(ui, "grid-rectangular", self.backdrop == Backdrop::Checker, "Show transparency as a checkerboard") {
+            self.backdrop = Backdrop::Checker;
+        }
+        if icon_toggle(ui, "format-fill-color", self.backdrop == Backdrop::Solid, "Show transparency as a solid colour") {
+            self.backdrop = Backdrop::Solid;
+        }
+        if self.backdrop == Backdrop::Solid {
+            ui.scope(|ui| {
+                ui.spacing_mut().interact_size = vec2(22.0, 22.0);
+                colour_btn(ui, &mut self.backdrop_col).on_hover_text("Backdrop colour");
             });
-            ui.selectable_value(&mut self.backdrop, Backdrop::Canvas, "□  Viewport background");
-        });
+        }
+        if icon_toggle(ui, "markasblank", self.backdrop == Backdrop::Canvas, "Show transparency as the viewport background") {
+            self.backdrop = Backdrop::Canvas;
+        }
         if before != (self.backdrop, self.backdrop_col) {
-            theme::set_setting("backdrop", match self.backdrop {
-                Backdrop::Checker => "checker",
-                Backdrop::Solid => "solid",
-                Backdrop::Canvas => "canvas",
-            });
-            let c = self.backdrop_col;
-            theme::set_setting("backdrop_col", &format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]));
+            self.save_backdrop();
         }
-        if toggle_icon(ui, "▩", self.pixelated, "Pixelated preview (nearest neighbour)") {
+        toolbar_sep(ui);
+        if icon_toggle(ui, "view-grid", self.pixelated, "Pixelated preview (nearest neighbour)") {
             self.pixelated = !self.pixelated;
-        }
-        let w = ui.min_rect().right() - start;
-        if w > 50.0 {
-            self.transport_right_w = w.ceil();
         }
     }
 
@@ -4198,71 +4636,56 @@ impl GifKitApp {
 
     // ------------------------------------------------------------ presets
 
-    fn presets_window(&mut self, ctx: &egui::Context) {
-        if !self.presets_open || self.base.is_none() {
-            return;
-        }
+    fn ui_presets(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let pal = *p();
-        let mut open = true;
         let mut apply: Option<crate::presets::Preset> = None;
         let mut delete: Option<String> = None;
         let mut save = false;
-        egui::Window::new(RichText::new("Presets").font(theme::medium(15.0)))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(320.0)
-            .default_pos(ctx.content_rect().left_top() + vec2(260.0, 70.0))
-            .show(ctx, |ui| {
-                ui.set_width(320.0);
-                ui.label(RichText::new("Save current").font(theme::medium(13.0)));
-                ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.preset_name).hint_text("Name").desired_width(220.0));
-                    save = ui.add_enabled(!self.preset_name.trim().is_empty(), egui::Button::new("Save")).clicked();
-                });
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.preset_inc.0, "Frame edits");
-                    ui.checkbox(&mut self.preset_inc.1, "Layers");
-                    ui.checkbox(&mut self.preset_inc.2, "Compression");
-                });
-                ui.horizontal(|ui| {
-                    if let Some(dir) = crate::presets::folder() {
-                        if chip(ui, "Open folder").on_hover_text(dir.display().to_string()).clicked() {
-                            let _ = std::fs::create_dir_all(&dir);
-                            open_in_file_manager(&dir);
-                        }
-                    }
-                });
-                ui.add_space(6.0);
-                ui.separator();
-                if self.presets.is_empty() {
-                    hint(ui, "No presets yet");
-                }
-                if !self.preset_problems.is_empty() {
-                    ui.label(RichText::new(format!("⚠ {} problem(s) reading presets", self.preset_problems.len())).color(pal.neutral).size(12.0)).on_hover_text(self.preset_problems.join("\n"));
-                }
-                egui::ScrollArea::vertical().max_height(260.0).auto_shrink([false, true]).show(ui, |ui| {
-                    for pr in &self.presets {
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.label(RichText::new(elide(&pr.name, 30)).color(pal.fg));
-                                hint(ui, &pr.summary());
-                            });
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if small_flat(ui, "✕", "Delete preset") {
-                                    delete = Some(pr.name.clone());
-                                }
-                                if ui.button("Apply").clicked() {
-                                    apply = Some(pr.clone());
-                                }
-                            });
-                        });
-                        ui.add_space(2.0);
-                    }
-                });
+        group(ui, "Save Current Edits", |ui| {
+            ui.horizontal(|ui| {
+                let w = ui.available_width() - 70.0;
+                ui.add(egui::TextEdit::singleline(&mut self.preset_name).hint_text("Preset name").desired_width(w));
+                save = ui.add_enabled(!self.preset_name.trim().is_empty(), egui::Button::new("Save").min_size(vec2(64.0, CHIP_H))).clicked();
             });
-        if !open {
-            self.presets_open = false;
+            ui.add_space(2.0);
+            subhead(ui, "Include");
+            check(ui, &mut self.preset_inc.0, "Frame edits");
+            check(ui, &mut self.preset_inc.1, "Layers");
+            check(ui, &mut self.preset_inc.2, "Compression");
+        });
+        group(ui, "Saved Presets", |ui| {
+            if !self.preset_problems.is_empty() {
+                ui.label(RichText::new(format!("⚠ {} problem(s) reading presets", self.preset_problems.len())).color(pal.neutral).size(12.0)).on_hover_text(self.preset_problems.join("\n"));
+            }
+            if self.presets.is_empty() {
+                hint(ui, "No presets yet");
+            }
+            for (i, pr) in self.presets.iter().enumerate() {
+                if i > 0 {
+                    ui.separator();
+                }
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width((ui.available_width() - 110.0).max(60.0));
+                        ui.label(RichText::new(elide(&pr.name, 30)).font(theme::medium(13.0)).color(pal.fg));
+                        hint(ui, &pr.summary());
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if small_icon(ui, "edit-delete", "Delete preset") {
+                            delete = Some(pr.name.clone());
+                        }
+                        if ui.add(egui::Button::new("Apply").min_size(vec2(64.0, CHIP_H))).clicked() {
+                            apply = Some(pr.clone());
+                        }
+                    });
+                });
+            }
+        });
+        if let Some(dir) = crate::presets::folder() {
+            if ui.add(egui::Button::image_and_text(crate::icons::image(ctx, "document-open", 16.0, pal.fg), "Open Presets Folder").min_size(vec2(0.0, CHIP_H))).on_hover_text(dir.display().to_string()).clicked() {
+                let _ = std::fs::create_dir_all(&dir);
+                open_in_file_manager(&dir);
+            }
         }
         if save {
             let pr = self.make_preset(self.preset_name.trim().to_string());
@@ -4273,11 +4696,15 @@ impl GifKitApp {
                 }
                 Err(e) => self.error(format!("Could not save preset: {e:#}")),
             }
-            { let (l, pr) = crate::presets::list_with_problems(); self.presets = l; self.preset_problems = pr; }
+            let (l, pr) = crate::presets::list_with_problems();
+            self.presets = l;
+            self.preset_problems = pr;
         }
         if let Some(name) = delete {
             crate::presets::delete(&name);
-            { let (l, pr) = crate::presets::list_with_problems(); self.presets = l; self.preset_problems = pr; }
+            let (l, pr) = crate::presets::list_with_problems();
+            self.presets = l;
+            self.preset_problems = pr;
         }
         if let Some(pr) = apply {
             self.apply_preset(&pr, ctx);
@@ -5287,7 +5714,7 @@ impl GifKitApp {
             ui.label(RichText::new(format!("{n} source frames")).font(theme::medium(14.0)).color(pal.fg));
             ui.label(RichText::new("ℹ").color(pal.fg_muted)).on_hover_text("Changes here apply under all live edits. Skipped frames are left out of playback and export.");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add(egui::Slider::new(&mut self.fr_thumb, 56.0..=200.0).show_value(false));
+                slider(ui, egui::Slider::new(&mut self.fr_thumb, 56.0..=200.0).show_value(false));
                 ui.label("Size");
             });
         });
@@ -5425,6 +5852,7 @@ impl GifKitApp {
             Tool::Emoji => self.ui_emoji(ui, ctx),
             Tool::Cut => self.ui_cut(ui, ctx),
             Tool::Frames => self.ui_frames(ui, ctx),
+            Tool::Presets => self.ui_presets(ui, ctx),
         }
     }
 
@@ -5434,9 +5862,9 @@ impl GifKitApp {
         let mut do_reset = false;
         let mut do_bake = false;
         ui.horizontal(|ui| {
-            ui.checkbox(&mut enabled, "Enabled");
+            check(ui, &mut enabled, "Enabled");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                do_bake = ui.button("⬇ Bake").on_hover_text("Make frame edits permanent. Layers stay editable.").clicked();
+                do_bake = ui.button("Collapse").on_hover_text("Make frame edits permanent. Layers stay editable.").clicked();
                 do_reset = ui.button("Reset").clicked();
             });
         });
@@ -5493,16 +5921,15 @@ impl GifKitApp {
             ui.add_space(2.0);
             if *by_pct {
                 let mut pct = if tr.rs_pct > 0.0 { tr.rs_pct } else { 100.0 };
-                let r1 = ui.add(egui::Slider::new(&mut pct, 1.0..=400.0).suffix(" %").max_decimals(1).clamping(egui::SliderClamping::Never).logarithmic(true))
+                let r1 = slider(ui, egui::Slider::new(&mut pct, 1.0..=400.0).suffix(" %").max_decimals(1).clamping(egui::SliderClamping::Never).logarithmic(true))
                     .on_hover_text("Drag or type any value such as 37.5 or 1200");
                 if r1.changed() {
                     tr.rs_pct = pct.clamp(0.1, 6400.0);
                 }
-                ui.horizontal_wrapped(|ui| {
-                    for pc in [10.0, 25.0, 33.3, 50.0, 75.0, 150.0, 200.0, 400.0] {
-                        if chip(ui, format!("{pc}%")).clicked() {
-                            tr.rs_pct = pc;
-                        }
+                const PCTS: [f32; 8] = [10.0, 25.0, 33.3, 50.0, 75.0, 150.0, 200.0, 400.0];
+                even_grid(ui, PCTS.len(), 56.0, |ui, i, size| {
+                    if ui.add_sized(size, sel_btn(egui::Button::new(format!("{}%", PCTS[i])), tr.rs_pct == PCTS[i])).clicked() {
+                        tr.rs_pct = PCTS[i];
                     }
                 });
             } else {
@@ -5551,12 +5978,10 @@ impl GifKitApp {
     fn ui_crop(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.transform_header(ui, ctx, |t| &mut t.crop_on, |_| {});
         let (w, h) = self.dims();
-        ui.horizontal(|ui| {
-            ui.label("Show");
-            seg(ui, &mut self.crop_live, true, "With edits").on_hover_text("Show effects and layers on the whole frame");
-            seg(ui, &mut self.crop_live, false, "Original").on_hover_text("Show the source frames only");
+        group(ui, "Show", |ui| {
+            seg_row(ui, &mut self.crop_live, &[(true, "With Edits"), (false, "Original")]);
+            hint(ui, "Drag on the image to set the crop");
         });
-        hint(ui, "Drag on the image to set the crop");
         let tr = &mut self.stack.transform;
         let before = tr.crop;
         group(ui, "Area", |ui| {
@@ -5588,7 +6013,7 @@ impl GifKitApp {
             });
         });
         let mut detect = false;
-        group(ui, "Auto-trim", |ui| {
+        group(ui, "Auto-Trim", |ui| {
             ui.horizontal(|ui| {
                 ui.label("Tolerance");
                 ui.add(egui::DragValue::new(&mut self.trim_tol).range(0..=255));
@@ -5618,34 +6043,25 @@ impl GifKitApp {
         let tr = &mut self.stack.transform;
         let before = format!("{} {} {} {} {} {} {} {:?}", tr.flip_v, tr.flip_h, tr.rot, tr.rot_any, tr.rot_deg, tr.rot_expand, tr.rot_bg_transparent, tr.rot_bg);
         group(ui, "Flip", |ui| {
-            ui.horizontal(|ui| {
-                toggle_btn(ui, &mut tr.flip_h, "↔ Horizontal");
-                toggle_btn(ui, &mut tr.flip_v, "↕ Vertical");
-            });
+            toggle_grid(ui, 0.0, &mut [(&mut tr.flip_h, "↔ Horizontal", ""), (&mut tr.flip_v, "↕ Vertical", "")]);
         });
         group(ui, "Rotate", |ui| {
+            seg_row(ui, &mut tr.rot, &[(0u16, "0°"), (90, "↻ 90°"), (180, "180°"), (270, "↺ 90°")]);
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
-                for (deg, label) in [(0u16, "0°"), (90, "↻ 90°"), (180, "180°"), (270, "↺ 90°")] {
-                    if seg_label(ui, tr.rot == deg, label).clicked() {
-                        tr.rot = deg;
-                    }
-                }
-            });
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut tr.rot_any, "Free");
+                check(ui, &mut tr.rot_any, "Free");
                 if ui.add(egui::DragValue::new(&mut tr.rot_deg).speed(0.5).suffix("°")).changed() {
                     tr.rot_any = true;
                 }
             });
-            if ui.add(egui::Slider::new(&mut tr.rot_deg, -180.0..=180.0).show_value(false).clamping(egui::SliderClamping::Never)).changed() {
+            if slider(ui, egui::Slider::new(&mut tr.rot_deg, -180.0..=180.0).show_value(false).clamping(egui::SliderClamping::Never)).changed() {
                 tr.rot_any = true;
             }
-            ui.checkbox(&mut tr.rot_expand, "Expand canvas");
+            check(ui, &mut tr.rot_expand, "Expand canvas");
             ui.horizontal(|ui| {
-                ui.checkbox(&mut tr.rot_bg_transparent, "Transparent fill");
+                check(ui, &mut tr.rot_bg_transparent, "Transparent fill");
                 if !tr.rot_bg_transparent {
-                    ui.color_edit_button_srgb(&mut tr.rot_bg);
+                    colour_btn(ui, &mut tr.rot_bg);
                 }
             });
         });
@@ -5657,16 +6073,16 @@ impl GifKitApp {
     fn ui_reverse(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let tr = &mut self.stack.transform;
         group(ui, "Playback", |ui| {
-            ui.checkbox(&mut tr.reverse, "⟲ Reverse");
-            ui.checkbox(&mut tr.boomerang, "⇄ Boomerang").on_hover_text("Play forward and then backward");
+            check(ui, &mut tr.reverse, "⟲ Reverse");
+            check(ui, &mut tr.boomerang, "⇄ Boomerang").on_hover_text("Play forward and then backward");
             ui.horizontal(|ui| {
-                ui.checkbox(&mut tr.set_loop, "Loop count");
+                check(ui, &mut tr.set_loop, "Loop count");
                 if tr.set_loop {
                     ui.add(egui::DragValue::new(&mut tr.loop_count).range(0..=65535)).on_hover_text("0 loops forever");
                 }
             });
         });
-        if ui.button("⬇ Bake").on_hover_text("Make frame edits permanent. Layers stay editable.").clicked() {
+        if ui.button("Collapse").on_hover_text("Make frame edits permanent. Layers stay editable.").clicked() {
             self.bake(ctx, true);
         }
     }
@@ -5696,12 +6112,11 @@ impl GifKitApp {
                     });
             });
             if tr.speed_mode == SpeedMode::Percent {
-                ui.add(soft_slider(&mut tr.speed_val, 10.0..=400.0, "%"));
-                ui.horizontal(|ui| {
-                    for pc in [25.0, 50.0, 100.0, 150.0, 200.0, 300.0] {
-                        if chip(ui, format!("{pc:.0}%")).clicked() {
-                            tr.speed_val = pc;
-                        }
+                slider(ui, soft_slider(&mut tr.speed_val, 10.0..=400.0, "%"));
+                const PCTS: [f32; 6] = [25.0, 50.0, 100.0, 150.0, 200.0, 300.0];
+                even_grid(ui, PCTS.len(), 52.0, |ui, i, size| {
+                    if ui.add_sized(size, sel_btn(egui::Button::new(format!("{:.0}%", PCTS[i])), tr.speed_val == PCTS[i])).clicked() {
+                        tr.speed_val = PCTS[i];
                     }
                 });
             } else {
@@ -5730,10 +6145,8 @@ impl GifKitApp {
         let tr = &mut self.stack.transform;
         let before = format!("{} {} {} {} {}", tr.cut_by_time, tr.cut_start, tr.cut_end, tr.cut_t0, tr.cut_t1);
         group(ui, "Range", |ui| {
-            ui.horizontal(|ui| {
-                seg(ui, &mut tr.cut_by_time, false, "Frames");
-                seg(ui, &mut tr.cut_by_time, true, "Seconds");
-            });
+            seg_row(ui, &mut tr.cut_by_time, &[(false, "Frames"), (true, "Seconds")]);
+            ui.add_space(4.0);
             if tr.cut_by_time {
                 ui.horizontal(|ui| {
                     ui.add(egui::DragValue::new(&mut tr.cut_t0).range(0.0..=dur).speed(0.01).suffix(" s"));
@@ -5748,12 +6161,14 @@ impl GifKitApp {
                     ui.add(egui::DragValue::new(&mut end).range(1..=n));
                 });
                 tr.cut_end = if end >= n { 0 } else { end };
-                ui.horizontal(|ui| {
-                    if chip(ui, "Start here").on_hover_text("Use the current frame").clicked() {
-                        tr.cut_start = src;
-                    }
-                    if chip(ui, "End here").on_hover_text("Use the current frame").clicked() {
-                        tr.cut_end = src;
+                even_grid(ui, 2, 0.0, |ui, i, size| {
+                    let r = ui.add_sized(size, egui::Button::new(if i == 0 { "Start Here" } else { "End Here" })).on_hover_text("Use the current frame");
+                    if r.clicked() {
+                        if i == 0 {
+                            tr.cut_start = src;
+                        } else {
+                            tr.cut_end = src;
+                        }
                     }
                 });
             }
@@ -5801,13 +6216,13 @@ impl GifKitApp {
         let mut reset = false;
         let idle = !self.busy();
         if self.export_fmt.can_target() {
-            group(ui, "Target size", |ui| {
+            group(ui, "Target Size", |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Limit");
                     ui.add(egui::DragValue::new(&mut self.target_val).range(0.01..=10000.0).speed(0.1).max_decimals(2));
                     seg(ui, &mut self.target_mb, true, "MiB");
                     seg(ui, &mut self.target_mb, false, "KiB");
-                    let r = ui.add(egui::Button::new("Presets  ▾").min_size(vec2(0.0, 26.0))).on_hover_text("Common upload limits");
+                    let r = ui.add(egui::Button::new("Presets ▾").min_size(vec2(0.0, 26.0))).on_hover_text("Common upload limits");
                     egui::Popup::menu(&r).show(|ui| {
                         ui.set_min_width(170.0);
                         for (lbl, v, mb) in TARGET_PRESETS {
@@ -5818,13 +6233,17 @@ impl GifKitApp {
                         }
                     });
                 });
-                if ui.checkbox(&mut self.fit_keep_size, "Keep frame size").on_hover_text("Only change compression and never shrink the frames").changed() {
+                if check(ui, &mut self.fit_keep_size, "Keep frame size").on_hover_text("Only change compression and never shrink the frames").changed() {
                     theme::set_setting("fit_keep_size", if self.fit_keep_size { "1" } else { "0" });
                 }
                 ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    find = ui.add_enabled(idle, egui::Button::new(RichText::new("Find settings").font(theme::medium(13.5))).min_size(vec2(130.0, 28.0))).on_hover_text("Finds the best quality under the limit and applies it. Quality drops first and size only if needed.").clicked();
-                    reset = ui.add_enabled(idle, egui::Button::new("Reset").min_size(vec2(0.0, 28.0))).on_hover_text("Back to lossless settings. Also undoes any downscale from Find settings.").clicked();
+                even_grid(ui, 2, 0.0, |ui, i, size| {
+                    let size = vec2(size.x, 28.0);
+                    if i == 0 {
+                        find = ui.add_enabled_ui(idle, |ui| ui.add_sized(size, egui::Button::new(RichText::new("Find Settings").font(theme::medium(13.5))).fill(theme::checked_fill(p())).stroke(Stroke::new(1.0, p().highlight)))).inner.on_hover_text("Finds the best quality under the limit and applies it. Quality drops first and size only if needed.").clicked();
+                    } else {
+                        reset = ui.add_enabled_ui(idle, |ui| ui.add_sized(size, egui::Button::new("Reset"))).inner.on_hover_text("Back to lossless settings. Also undoes any downscale from Find Settings.").clicked();
+                    }
                 });
             });
         }
@@ -5864,20 +6283,17 @@ impl GifKitApp {
             ExportFormat::Webp => {
                 let o = &mut self.webp_opts;
                 group(ui, "WebP", |ui| {
-                    ui.horizontal(|ui| {
-                        seg(ui, &mut o.lossless, false, "Lossy");
-                        seg(ui, &mut o.lossless, true, "Lossless");
-                    });
+                    seg_row(ui, &mut o.lossless, &[(false, "Lossy"), (true, "Lossless")]);
                     if !o.lossless {
-                        ui.add(egui::Slider::new(&mut o.quality, 0.0..=100.0).text("quality")).on_hover_text("75–90 looks like the original for most GIFs");
+                        slider(ui, egui::Slider::new(&mut o.quality, 0.0..=100.0).text("Quality")).on_hover_text("75–90 looks like the original for most GIFs");
                     }
-                    ui.add(egui::Slider::new(&mut o.method, 0..=6).text("effort")).on_hover_text("Higher makes smaller files but takes longer");
+                    slider(ui, egui::Slider::new(&mut o.method, 0..=6).text("Effort")).on_hover_text("Higher makes smaller files but takes longer");
                 });
                 return;
             }
             ExportFormat::Avif => {
                 group(ui, "AVIF", |ui| {
-                    ui.add(egui::Slider::new(&mut self.avif_quality, 0..=100).text("quality")).on_hover_text("50–70 is a good balance");
+                    slider(ui, egui::Slider::new(&mut self.avif_quality, 0..=100).text("Quality")).on_hover_text("50–70 is a good balance");
                     hint(ui, "Slow to encode so the preview takes a while");
                 });
                 return;
@@ -5886,7 +6302,7 @@ impl GifKitApp {
                 group(ui, "MP4", |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Background");
-                        ui.color_edit_button_srgb(&mut self.video_bg).on_hover_text("MP4 has no transparency. This colour fills it.");
+                        colour_btn(ui, &mut self.video_bg).on_hover_text("MP4 has no transparency. This colour fills it.");
                     });
                 });
                 return;
@@ -5911,37 +6327,35 @@ impl GifKitApp {
             }
         }
         group(ui, "Presets", |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if chip(ui, "Best").clicked() {
-                    self.gif_opts = GifOptions { quant_speed: 1, ..GifOptions::default() };
-                }
-                if chip(ui, "Balanced").clicked() {
-                    self.gif_opts = GifOptions { lossy: 30, ..GifOptions::default() };
-                }
-                if chip(ui, "Small").clicked() {
-                    self.gif_opts = GifOptions { lossy: 60, colors: 128, global_palette: true, ..GifOptions::default() };
-                }
-                if chip(ui, "Tiny").clicked() {
-                    self.gif_opts = GifOptions { lossy: 120, colors: 48, global_palette: true, ..GifOptions::default() };
+            let tag = self.gif_opts.noai_tag;
+            let opts = [
+                ("Best", GifOptions { quant_speed: 1, noai_tag: tag, ..GifOptions::default() }),
+                ("Balanced", GifOptions { lossy: 30, noai_tag: tag, ..GifOptions::default() }),
+                ("Small", GifOptions { lossy: 60, colors: 128, global_palette: true, noai_tag: tag, ..GifOptions::default() }),
+                ("Tiny", GifOptions { lossy: 120, colors: 48, global_palette: true, noai_tag: tag, ..GifOptions::default() }),
+            ];
+            even_grid(ui, opts.len(), 0.0, |ui, i, size| {
+                if ui.add_sized(size, sel_btn(egui::Button::new(opts[i].0), self.gif_opts == opts[i].1)).clicked() {
+                    self.gif_opts = opts[i].1.clone();
                 }
             });
         });
         let o = &mut self.gif_opts;
         group(ui, "Lossy", |ui| {
-            ui.add(egui::Slider::new(&mut o.lossy, 0..=200).text("level").clamping(egui::SliderClamping::Never)).on_hover_text("Lets similar colours merge. 30–80 is usually invisible.");
+            slider(ui, egui::Slider::new(&mut o.lossy, 0..=200).text("Level").clamping(egui::SliderClamping::Never)).on_hover_text("Lets similar colours merge. 30–80 is usually invisible.");
         });
         group(ui, "Colours", |ui| {
-            ui.add(egui::Slider::new(&mut o.colors, 2..=256).text("max"));
-            ui.checkbox(&mut o.global_palette, "One palette for all frames").on_hover_text("Smaller files but may show banding on varied footage");
-            ui.checkbox(&mut o.dither, "Dither");
-            ui.add(egui::Slider::new(&mut o.quant_speed, 1..=30).text("quantizer speed")).on_hover_text("1 gives the best palette and 30 is fastest");
+            slider(ui, egui::Slider::new(&mut o.colors, 2..=256).text("Max"));
+            check(ui, &mut o.global_palette, "One palette for all frames").on_hover_text("Smaller files but may show banding on varied footage");
+            check(ui, &mut o.dither, "Dither");
+            slider(ui, egui::Slider::new(&mut o.quant_speed, 1..=30).text("Quantizer speed")).on_hover_text("1 gives the best palette and 30 is fastest");
         });
         let drop_nth = &mut self.opt_drop_nth;
         let mut drop_go = false;
         group(ui, "Frames", |ui| {
-            ui.checkbox(&mut o.frame_diff, "Store only changed pixels");
-            ui.checkbox(&mut o.merge_duplicates, "Merge identical frames");
-            ui.add(egui::Slider::new(&mut o.alpha_threshold, 1..=255).text("alpha cut-off")).on_hover_text("Pixels below this opacity become transparent");
+            check(ui, &mut o.frame_diff, "Store only changed pixels");
+            check(ui, &mut o.merge_duplicates, "Merge identical frames");
+            slider(ui, egui::Slider::new(&mut o.alpha_threshold, 1..=255).text("Alpha cut-off")).on_hover_text("Pixels below this opacity become transparent");
             ui.horizontal(|ui| {
                 ui.label("Drop every");
                 ui.add(egui::DragValue::new(drop_nth).range(0..=100));
@@ -5956,27 +6370,15 @@ impl GifKitApp {
     }
 
     fn ui_effects(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let fx_layers: Vec<(usize, u64)> = self.stack.layers.iter().enumerate().filter(|(_, l)| l.kind() == Kind::Effects).map(|(i, l)| (i, l.id)).collect();
-        let sel = self.sel_index(Kind::Effects);
-        if fx_layers.len() > 1 {
-            ui.horizontal_wrapped(|ui| {
-                for (n, (i, id)) in fx_layers.iter().enumerate() {
-                    if seg_label(ui, Some(*i) == sel, format!("Effects {}", n + 1)).clicked() {
-                        self.select(Kind::Effects, *id);
-                    }
-                }
-            });
+        if add_layer_button(ui, "Add New Effects Layer") {
+            self.add_layer(LayerKind::Effects(Box::default()));
         }
+        ui.add_space(GROUP_GAP);
         let sel = self.sel_index(Kind::Effects);
         ui.horizontal(|ui| {
-            if let Some(i) = sel {
-                ui.checkbox(&mut self.stack.layers[i].visible, "Visible");
-            }
+            hint(ui, if sel.is_some() { "Editing the selected effects layer" } else { "Changes start a new effects layer" });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if !fx_layers.is_empty() && ui.button("+ Layer").on_hover_text("Add another effects layer to place effects above or below other layers").clicked() {
-                    self.add_layer(LayerKind::Effects(Box::default()));
-                }
-                if ui.button("Reset").clicked() {
+                if ui.add(egui::Button::new("Reset").min_size(vec2(0.0, CHIP_H))).on_hover_text("Clear every effect on this layer").clicked() {
                     match sel {
                         Some(i) => self.stack.layers[i].kind = LayerKind::Effects(Box::default()),
                         None => self.fx_draft = EffectSettings::default(),
@@ -5984,6 +6386,7 @@ impl GifKitApp {
                 }
             });
         });
+        ui.add_space(4.0);
         let _ = ctx;
         let Stack { transform, layers, .. } = &mut self.stack;
         let fx: &mut EffectSettings = match sel {
@@ -6138,39 +6541,18 @@ impl GifKitApp {
     }
 
     /// Layer chips for a kind (when there is more than one) + add/remove row.
+    /// The big "Add New … Layer" button, then the selected layer of this kind
+    /// (picked in the layer list, so no chooser is needed here).
     fn layer_chooser(&mut self, ui: &mut egui::Ui, kind: Kind, add_label: &str, mut add: impl FnMut(&mut Self)) -> Option<usize> {
-        let items: Vec<(usize, u64, String)> = self.stack.layers.iter().enumerate().filter(|(_, l)| l.kind() == kind).map(|(i, l)| (i, l.id, elide(&l.name(), 16))).collect();
-        let sel = self.sel_index(kind);
-        ui.horizontal_wrapped(|ui| {
-            if items.len() > 1 {
-                for (i, id, name) in &items {
-                    if seg_label(ui, Some(*i) == sel, name).clicked() {
-                        self.select(kind, *id);
-                    }
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            if ui.button(add_label).clicked() {
-                add(self);
-            }
-            if let Some(i) = self.sel_index(kind) {
-                ui.checkbox(&mut self.stack.layers[i].visible, "Visible");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if small_flat(ui, "✕", "Delete layer") {
-                        self.stack.layers.remove(i);
-                    }
-                });
-            }
-        });
-        if items.is_empty() {
-            return None;
+        if add_layer_button(ui, add_label) {
+            add(self);
         }
+        ui.add_space(GROUP_GAP);
         self.sel_index(kind)
     }
 
     fn ui_text(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
-        let Some(sel) = self.layer_chooser(ui, Kind::Text, "+ Text", |s| {
+        let Some(sel) = self.layer_chooser(ui, Kind::Text, "Add New Text Layer", |s| {
             let (w, h) = s.dims();
             s.add_layer(LayerKind::Text(Annotation { text: "Your text".into(), x: (w as i32 / 2 - 80).max(0), y: (h as i32 - 60).max(0), ..Default::default() }));
         }) else {
@@ -6189,7 +6571,7 @@ impl GifKitApp {
         let mut load_file = false;
         group(ui, "Font", |ui| {
             picked = self.font_picker(ui, cur_font);
-            load_file = chip(ui, "Load font file…").clicked();
+            load_file = chip(ui, "Load Font File…").clicked();
         });
         if load_file {
             if let Some(path) = rfd::FileDialog::new().add_filter("Fonts", &["ttf", "otf", "ttc"]).pick_file() {
@@ -6216,7 +6598,7 @@ impl GifKitApp {
                 ui.label("Size");
                 ui.horizontal(|ui| {
                     ui.add(egui::DragValue::new(&mut a.size).range(4.0..=4000.0).suffix(" px"));
-                    ui.color_edit_button_srgba_unmultiplied(&mut a.color);
+                    colour_btn_a(ui, &mut a.color);
                 });
                 ui.end_row();
                 ui.label("Stretch");
@@ -6236,7 +6618,7 @@ impl GifKitApp {
                     if ui.add(egui::DragValue::new(&mut w).range(0.0..=200.0).speed(0.2).suffix(" px")).on_hover_text("0 turns the outline off").changed() {
                         a.border_width = Some(w.round());
                     }
-                    ui.color_edit_button_srgba_unmultiplied(&mut a.border_color);
+                    colour_btn_a(ui, &mut a.border_color);
                 });
                 ui.end_row();
                 ui.label("Align");
@@ -6283,7 +6665,7 @@ impl GifKitApp {
     fn ui_censor(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
         let (w, h) = self.dims();
         let n = self.base.as_ref().map(|b| b.len()).unwrap_or(1).max(1);
-        let Some(sel) = self.layer_chooser(ui, Kind::Censor, "+ Region", |s| {
+        let Some(sel) = self.layer_chooser(ui, Kind::Censor, "Add New Censor Layer", |s| {
             s.add_layer(LayerKind::Censor(CensorSettings { x: (w / 4) as i32, y: (h / 4) as i32, w: w / 2, h: h / 2, ..Default::default() }));
         }) else {
             hint(ui, "Drag on the image to draw a region");
@@ -6291,11 +6673,8 @@ impl GifKitApp {
         };
         let LayerKind::Censor(c) = &mut self.stack.layers[sel].kind else { return };
         group(ui, "Method", |ui| {
-            ui.horizontal(|ui| {
-                seg(ui, &mut c.method, CensorMethod::Pixelate, "Pixelate");
-                seg(ui, &mut c.method, CensorMethod::Blur, "Blur");
-                seg(ui, &mut c.method, CensorMethod::Solid, "Solid");
-            });
+            seg_row(ui, &mut c.method, &[(CensorMethod::Pixelate, "Pixelate"), (CensorMethod::Blur, "Blur"), (CensorMethod::Solid, "Solid")]);
+            ui.add_space(4.0);
             match c.method {
                 CensorMethod::Pixelate => {
                     ui.horizontal(|ui| {
@@ -6304,12 +6683,12 @@ impl GifKitApp {
                     });
                 }
                 CensorMethod::Blur => {
-                    ui.add(soft_slider(&mut c.sigma, 1.0..=40.0, "radius"));
+                    slider(ui, soft_slider(&mut c.sigma, 1.0..=40.0, "Radius"));
                 }
                 CensorMethod::Solid => {
                     ui.horizontal(|ui| {
                         ui.label("Colour");
-                        ui.color_edit_button_srgb(&mut c.color);
+                        colour_btn(ui, &mut c.color);
                     });
                 }
             }
@@ -6333,7 +6712,7 @@ impl GifKitApp {
     }
 
     fn ui_add_image(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let Some(sel) = self.layer_chooser(ui, Kind::Overlay, "+ Image…", |s| {
+        let Some(sel) = self.layer_chooser(ui, Kind::Overlay, "Add New Image Layer…", |s| {
             if let Some(path) = rfd::FileDialog::new().add_filter("Images", &["png", "gif", "jpg", "jpeg", "webp", "bmp"]).pick_file() {
                 s.load_overlay(path, ctx);
             }
@@ -6350,7 +6729,7 @@ impl GifKitApp {
         let nframes = o.src.frames.len();
         group(ui, "Image", |ui| {
             hint(ui, &format!("{}×{} · {} frame{}", native.0, native.1, nframes, if nframes == 1 { "" } else { "s" }));
-            ui.add(egui::Slider::new(&mut o.opacity, 0.0..=100.0).text("opacity %"));
+            slider(ui, egui::Slider::new(&mut o.opacity, 0.0..=100.0).text("Opacity %"));
         });
         if o.placements.is_empty() {
             return;
@@ -6379,24 +6758,29 @@ impl GifKitApp {
                 ui.end_row();
             });
             Self::angle_row(ui, &mut pl.angle);
-            ui.horizontal_wrapped(|ui| {
-                if chip(ui, "Native").on_hover_text("Original image size").clicked() {
-                    pl.w = native.0;
-                    pl.h = native.1;
-                }
-                if chip(ui, "Center").clicked() {
-                    pl.x = (aw as i32 - pl.w as i32) / 2;
-                    pl.y = (ah as i32 - pl.h as i32) / 2;
-                }
-                if chip(ui, "Fill").on_hover_text("Cover the whole frame").clicked() {
-                    pl.x = 0;
-                    pl.y = 0;
-                    pl.w = aw;
-                    pl.h = ah;
+            even_grid(ui, 3, 0.0, |ui, i, size| {
+                let (label, tip) = [("Native Size", "Original image size"), ("Centre", "Centre on the frame"), ("Fill", "Cover the whole frame")][i];
+                if ui.add_sized(size, egui::Button::new(label)).on_hover_text(tip).clicked() {
+                    match i {
+                        0 => {
+                            pl.w = native.0;
+                            pl.h = native.1;
+                        }
+                        1 => {
+                            pl.x = (aw as i32 - pl.w as i32) / 2;
+                            pl.y = (ah as i32 - pl.h as i32) / 2;
+                        }
+                        _ => {
+                            pl.x = 0;
+                            pl.y = 0;
+                            pl.w = aw;
+                            pl.h = ah;
+                        }
+                    }
                 }
             });
             let mut hidden = !pl.enabled;
-            ui.checkbox(&mut hidden, format!("Hide on frame {}", cur + 1));
+            check(ui, &mut hidden, format!("Hide on frame {}", cur + 1));
             pl.enabled = !hidden;
             if pl != o.placements[cur] {
                 let n = o.placements.len();
@@ -6412,7 +6796,7 @@ impl GifKitApp {
                     o.placements[cur].enabled = pl.enabled;
                 }
             }
-            if chip(ui, "Show on all frames").clicked() {
+            if chip(ui, "Show on All Frames").clicked() {
                 for q in &mut o.placements {
                     q.enabled = true;
                 }
@@ -6422,7 +6806,7 @@ impl GifKitApp {
     }
 
     fn ui_watermark(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
-        let Some(sel) = self.layer_chooser(ui, Kind::Watermark, "+ Watermark", |s| {
+        let Some(sel) = self.layer_chooser(ui, Kind::Watermark, "Add New Watermark Layer", |s| {
             s.add_layer(LayerKind::Watermark(Box::default()));
         }) else {
             hint(ui, "Add text or a logo that stays in place");
@@ -6436,13 +6820,11 @@ impl GifKitApp {
         let mut browse = false;
         if let LayerKind::Watermark(w) = &mut self.stack.layers[sel].kind {
             group(ui, "Content", |ui| {
-                ui.horizontal(|ui| {
-                    seg(ui, &mut w.use_image, false, "Text");
-                    seg(ui, &mut w.use_image, true, "Image");
-                });
+                seg_row(ui, &mut w.use_image, &[(false, "Text"), (true, "Image")]);
+                ui.add_space(4.0);
                 if w.use_image {
                     ui.horizontal(|ui| {
-                        browse = ui.button("Choose image…").clicked();
+                        browse = ui.button("Choose Image…").clicked();
                         if let Some(p) = &w.image_path {
                             hint(ui, &elide(&p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(), 24));
                         }
@@ -6450,8 +6832,8 @@ impl GifKitApp {
                 } else {
                     ui.add(egui::TextEdit::singleline(&mut w.text).desired_width(f32::INFINITY));
                     ui.horizontal(|ui| {
-                        ui.color_edit_button_srgba_unmultiplied(&mut w.color);
-                        ui.checkbox(&mut w.outline, "Outline");
+                        colour_btn_a(ui, &mut w.color);
+                        check(ui, &mut w.outline, "Outline");
                         if w.outline {
                             let mut px = w.outline_px.unwrap_or(0.0);
                             let r = ui.add(egui::DragValue::new(&mut px).range(0.0..=100.0).speed(0.2).suffix(" px")).on_hover_text("0 picks a width from the text size");
@@ -6486,15 +6868,12 @@ impl GifKitApp {
             w.font_idx = fi;
         }
         group(ui, "Placement", |ui| {
-            ui.add(soft_slider(&mut w.size, 1.0..=40.0, "size %")).on_hover_text("Size as a share of the frame's shorter side");
-            ui.add(egui::Slider::new(&mut w.opacity, 0.0..=100.0).text("opacity %"));
-            ui.horizontal(|ui| {
-                seg(ui, &mut w.tiled, false, "Single");
-                seg(ui, &mut w.tiled, true, "Tiled");
-            });
+            slider(ui, soft_slider(&mut w.size, 1.0..=40.0, "Size %")).on_hover_text("Size as a share of the frame's shorter side");
+            slider(ui, egui::Slider::new(&mut w.opacity, 0.0..=100.0).text("Opacity %"));
+            seg_row(ui, &mut w.tiled, &[(false, "Single"), (true, "Tiled")]);
             if w.tiled {
-                ui.add(egui::Slider::new(&mut w.angle, -90.0..=90.0).text("angle °"));
-                ui.add(soft_slider(&mut w.spacing, 0.8..=4.0, "spacing"));
+                slider(ui, egui::Slider::new(&mut w.angle, -90.0..=90.0).text("Angle °"));
+                slider(ui, soft_slider(&mut w.spacing, 0.8..=4.0, "Spacing"));
             } else {
                 ui.horizontal(|ui| {
                     egui::Grid::new("anchor").spacing([2.0, 2.0]).show(ui, |ui| {
@@ -6553,7 +6932,7 @@ impl GifKitApp {
         const SW: [[u8; 3]; 9] = [[255, 255, 255], [34, 38, 44], [255, 59, 48], [255, 122, 26], [255, 204, 0], [52, 199, 89], [61, 174, 233], [175, 82, 222], [255, 105, 180]];
         ui.horizontal(|ui| {
             ui.label(label);
-            ui.color_edit_button_srgb(c);
+            colour_btn(ui, c);
             ui.spacing_mut().item_spacing.x = 3.0;
             for s in SW {
                 let (r, resp) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::click());
@@ -6571,7 +6950,7 @@ impl GifKitApp {
     fn ui_shapes(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
         let (w, h) = self.dims();
         let n = self.base.as_ref().map(|b| b.len()).unwrap_or(1).max(1);
-        let sel = self.layer_chooser(ui, Kind::Shape, "+ Shape", |s| {
+        let sel = self.layer_chooser(ui, Kind::Shape, "Add New Shape Layer", |s| {
             let sh = s.default_shape(w, h);
             s.add_layer(LayerKind::Shape(Box::new(sh)));
         });
@@ -6585,10 +6964,12 @@ impl GifKitApp {
         };
         let before = st.clone();
         group(ui, "Shape", |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
-                for k in ShapeKind::ALL {
-                    seg(ui, &mut st.kind, k, k.label());
+            let kinds: Vec<ShapeKind> = ShapeKind::ALL.iter().copied().filter(|k| *k != ShapeKind::Emoji || st.kind == ShapeKind::Emoji).collect();
+            let labels: Vec<&str> = kinds.iter().map(|k| k.label()).collect();
+            even_grid(ui, kinds.len(), label_w(ui, &labels), |ui, i, size| {
+                let k = kinds[i];
+                if ui.add_sized(size, sel_btn(egui::Button::new(k.label()).truncate(), st.kind == k)).clicked() {
+                    st.kind = k;
                 }
             });
             if st.kind.is_linear() {
@@ -6600,30 +6981,30 @@ impl GifKitApp {
         } else {
             group(ui, "Style", |ui| {
                 if st.kind != ShapeKind::Line {
-                    ui.checkbox(&mut st.fill_on, "Fill");
+                    check(ui, &mut st.fill_on, "Fill");
                     if st.fill_on {
                         Self::colour_row(ui, "Colour", &mut st.fill);
                     }
                 }
-                ui.checkbox(&mut st.stroke_on, if st.kind == ShapeKind::Line { "Line" } else { "Outline" });
+                check(ui, &mut st.stroke_on, if st.kind == ShapeKind::Line { "Line" } else { "Outline" });
                 if st.stroke_on || st.kind == ShapeKind::Line {
                     Self::colour_row(ui, "Colour", &mut st.stroke);
-                    ui.add(egui::Slider::new(&mut st.stroke_w, 1.0..=60.0).text("width").clamping(egui::SliderClamping::Never));
+                    slider(ui, egui::Slider::new(&mut st.stroke_w, 1.0..=60.0).text("Width").clamping(egui::SliderClamping::Never));
                 }
                 match st.kind {
                     ShapeKind::Rounded | ShapeKind::Speech => {
-                        ui.add(egui::Slider::new(&mut st.corner, 0.0..=50.0).text("corners").suffix("%"));
+                        slider(ui, egui::Slider::new(&mut st.corner, 0.0..=50.0).text("Corners").suffix("%"));
                     }
                     ShapeKind::Star | ShapeKind::Burst => {
-                        ui.add(egui::Slider::new(&mut st.points, 3..=24).text("points"));
+                        slider(ui, egui::Slider::new(&mut st.points, 3..=24).text("Points"));
                     }
                     _ => {}
                 }
             });
         }
         group(ui, "Look", |ui| {
-            ui.add(egui::Slider::new(&mut st.opacity, 0.0..=100.0).text("opacity").suffix("%"));
-            ui.checkbox(&mut st.shadow, "Drop shadow");
+            slider(ui, egui::Slider::new(&mut st.opacity, 0.0..=100.0).text("Opacity").suffix("%"));
+            check(ui, &mut st.shadow, "Drop shadow");
         });
         if let Some(i) = sel {
             group(ui, "Placement", |ui| {
@@ -6674,7 +7055,7 @@ impl GifKitApp {
         let pal = *p();
         let (w, h) = self.dims();
         let n = self.base.as_ref().map(|b| b.len()).unwrap_or(1).max(1);
-        let sel = self.layer_chooser(ui, Kind::Emoji, "+ Emoji", |s| {
+        let sel = self.layer_chooser(ui, Kind::Emoji, "Add New Emoji Layer", |s| {
             let e = s.default_emoji(w, h, None);
             s.add_layer(LayerKind::Emoji(Box::new(e)));
         });
@@ -6682,13 +7063,19 @@ impl GifKitApp {
         ui.add(egui::TextEdit::singleline(&mut self.emoji_search).hint_text("Search emoji").desired_width(full - 4.0));
         let searching = !self.emoji_search.trim().is_empty();
         if !searching {
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
-                if !self.emoji_recent.is_empty() {
-                    seg(ui, &mut self.emoji_tab, EmojiTab::Recent, "Recent");
-                }
-                for (g, name) in crate::emoji::GROUP_SHORT.iter().enumerate() {
-                    seg(ui, &mut self.emoji_tab, EmojiTab::Group(g as u8), *name).on_hover_text(crate::emoji::GROUPS[g]);
+            let mut tabs: Vec<(EmojiTab, &str, &str)> = Vec::new();
+            if !self.emoji_recent.is_empty() {
+                tabs.push((EmojiTab::Recent, "Recent", "Recently used"));
+            }
+            for (g, name) in crate::emoji::GROUP_SHORT.iter().enumerate() {
+                tabs.push((EmojiTab::Group(g as u8), name, crate::emoji::GROUPS[g]));
+            }
+            ui.add_space(2.0);
+            let labels: Vec<&str> = tabs.iter().map(|t| t.1).collect();
+            even_grid(ui, tabs.len(), label_w(ui, &labels), |ui, i, size| {
+                let (t, label, tip) = tabs[i];
+                if ui.add_sized(size, sel_btn(egui::Button::new(label).truncate(), self.emoji_tab == t)).on_hover_text(tip).clicked() {
+                    self.emoji_tab = t;
                 }
             });
         }
@@ -6763,11 +7150,8 @@ impl GifKitApp {
             hint(ui, if searching { "Nothing matches. Try another word." } else { "Nothing here yet" });
         }
         if sel.is_some() {
-            ui.horizontal(|ui| {
-                ui.label("Clicking an emoji");
-                seg(ui, &mut self.emoji_replace, false, "Adds one");
-                seg(ui, &mut self.emoji_replace, true, "Swaps selected");
-            });
+            subhead(ui, "Clicking an Emoji");
+            seg_row(ui, &mut self.emoji_replace, &[(false, "Adds a Layer"), (true, "Swaps the Selected")]);
         } else {
             hint(ui, "Click an emoji to add it, or drag on the image to place the current one");
         }
@@ -6792,8 +7176,8 @@ impl GifKitApp {
         let Some(i) = self.sel_index(Kind::Emoji) else { return };
         let LayerKind::Emoji(e) = &mut self.stack.layers[i].kind else { return };
         group(ui, "Look", |ui| {
-            ui.add(egui::Slider::new(&mut e.opacity, 0.0..=100.0).text("opacity").suffix("%"));
-            ui.checkbox(&mut e.shadow, "Drop shadow");
+            slider(ui, egui::Slider::new(&mut e.opacity, 0.0..=100.0).text("Opacity").suffix("%"));
+            check(ui, &mut e.shadow, "Drop shadow");
         });
         group(ui, "Placement", |ui| {
             egui::Grid::new("emojipos").num_columns(4).spacing([8.0, 6.0]).show(ui, |ui| {
@@ -6816,15 +7200,12 @@ impl GifKitApp {
     }
 
     fn ui_markup(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
-        let sel = self.layer_chooser(ui, Kind::Markup, "+ Markup", |s| {
+        let sel = self.layer_chooser(ui, Kind::Markup, "Add New Markup Layer", |s| {
             s.add_layer(LayerKind::Markup(MarkupSettings::default()));
         });
         group(ui, "Brush", |ui| {
-            ui.horizontal(|ui| {
-                seg(ui, &mut self.pen_tool, PenTool::Pen, "Pen");
-                seg(ui, &mut self.pen_tool, PenTool::Highlighter, "Highlighter");
-                seg(ui, &mut self.pen_tool, PenTool::Eraser, "Eraser").on_hover_text("Removes whole strokes you drag over");
-            });
+            seg_row(ui, &mut self.pen_tool, &[(PenTool::Pen, "Pen"), (PenTool::Highlighter, "Highlighter"), (PenTool::Eraser, "Eraser")]).on_hover_text("The eraser removes whole strokes you drag over");
+            ui.add_space(4.0);
             let b = match self.pen_tool {
                 PenTool::Pen => Some(&mut self.pen),
                 PenTool::Highlighter => Some(&mut self.highlighter),
@@ -6832,19 +7213,15 @@ impl GifKitApp {
             };
             if let Some(b) = b {
                 Self::colour_row(ui, "Colour", &mut b.color);
-                ui.add(egui::Slider::new(&mut b.width, 1.0..=80.0).text("size").suffix(" px").clamping(egui::SliderClamping::Never));
-                ui.add(egui::Slider::new(&mut b.opacity, 5.0..=100.0).text("opacity").suffix("%"));
+                slider(ui, egui::Slider::new(&mut b.width, 1.0..=80.0).text("Size").suffix(" px").clamping(egui::SliderClamping::Never));
+                slider(ui, egui::Slider::new(&mut b.opacity, 5.0..=100.0).text("Opacity").suffix("%"));
             } else {
-                ui.add(egui::Slider::new(&mut self.pen.width, 1.0..=80.0).text("eraser size").suffix(" px"));
+                slider(ui, egui::Slider::new(&mut self.pen.width, 1.0..=80.0).text("Eraser size").suffix(" px"));
             }
             hint(ui, "Drag on the image to draw. Hold Shift for a straight line.");
         });
-        group(ui, "Draw on", |ui| {
-            ui.horizontal(|ui| {
-                seg(ui, &mut self.pen_scope, PenScope::All, "All frames");
-                seg(ui, &mut self.pen_scope, PenScope::FromHere, "From here");
-                seg(ui, &mut self.pen_scope, PenScope::ThisFrame, "This frame").on_hover_text("Step through frames to draw a little animation");
-            });
+        group(ui, "Draw On", |ui| {
+            seg_row(ui, &mut self.pen_scope, &[(PenScope::All, "All Frames"), (PenScope::FromHere, "From Here"), (PenScope::ThisFrame, "This Frame")]).on_hover_text("This Frame lets you step through frames to draw a little animation");
         });
         if let Some(i) = sel {
             let count = match &self.stack.layers[i].kind {
@@ -6853,10 +7230,19 @@ impl GifKitApp {
             };
             let mut undo = false;
             let mut clear = false;
-            ui.horizontal(|ui| {
-                undo = ui.add_enabled(count > 0, egui::Button::new("Remove last stroke")).clicked();
-                clear = ui.add_enabled(count > 0, egui::Button::new("Clear")).clicked();
-                hint(ui, &format!("{count} stroke{}", if count == 1 { "" } else { "s" }));
+            group(ui, "Strokes", |ui| {
+                hint(ui, &format!("{count} stroke{} on this layer", if count == 1 { "" } else { "s" }));
+                even_grid(ui, 2, 0.0, |ui, i, size| {
+                    let b = egui::Button::new(if i == 0 { "Remove Last Stroke" } else { "Clear All" }).truncate();
+                    let r = ui.add_enabled_ui(count > 0, |ui| ui.add_sized(size, b)).inner;
+                    if r.clicked() {
+                        if i == 0 {
+                            undo = true;
+                        } else {
+                            clear = true;
+                        }
+                    }
+                });
             });
             if let LayerKind::Markup(m) = &mut self.stack.layers[i].kind {
                 if undo {
@@ -6870,7 +7256,7 @@ impl GifKitApp {
     }
 
     fn ui_shield(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
-        let Some(sel) = self.layer_chooser(ui, Kind::Shield, "+ AI shield", |s| {
+        let Some(sel) = self.layer_chooser(ui, Kind::Shield, "Add New AI Shield Layer", |s| {
             s.add_layer(LayerKind::Shield(ShieldSettings::default()));
         }) else {
             hint(ui, "Faint noise that spoils frames for AI training");
@@ -6881,11 +7267,11 @@ impl GifKitApp {
         );
         let LayerKind::Shield(s) = &mut self.stack.layers[sel].kind else { return };
         group(ui, "Perturbation", |ui| {
-            ui.add(soft_slider(&mut s.strength, 0.0..=20.0, "strength")).on_hover_text("How strong the noise is. 4 to 8 is hard to see.");
-            ui.checkbox(&mut s.pattern, "High-frequency pattern");
-            ui.checkbox(&mut s.noise, "Colour noise");
-            ui.checkbox(&mut s.jitter, "Sub-pixel jitter").on_hover_text("Warps the image by tiny amounts");
-            ui.checkbox(&mut s.per_frame, "Vary every frame").on_hover_text("Stronger protection but much larger GIFs");
+            slider(ui, soft_slider(&mut s.strength, 0.0..=20.0, "Strength")).on_hover_text("How strong the noise is. 4 to 8 is hard to see.");
+            check(ui, &mut s.pattern, "High-frequency pattern");
+            check(ui, &mut s.noise, "Colour noise");
+            check(ui, &mut s.jitter, "Sub-pixel jitter").on_hover_text("Warps the image by tiny amounts");
+            check(ui, &mut s.per_frame, "Vary every frame").on_hover_text("Stronger protection but much larger GIFs");
             ui.horizontal(|ui| {
                 ui.label("Seed");
                 ui.add(egui::DragValue::new(&mut s.seed));
@@ -6900,7 +7286,7 @@ impl GifKitApp {
         let pal = *p();
         let n = self.base.as_ref().map(|a| a.len()).unwrap_or(1);
         let now = ctx.input(|i| i.time);
-        if ui.button("+ Add frames…").on_hover_text("Add images to the end as new frames").clicked() {
+        if ui.button("Add Frames…").on_hover_text("Add images to the end as new frames").clicked() {
             if let Some(mut ps) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "bmp"]).pick_files() {
                 ps.sort();
                 let d = self.fr_delay;
@@ -6912,7 +7298,7 @@ impl GifKitApp {
         }
         ui.add_space(4.0);
         let mut range_act: Option<(bool, bool)> = None;
-        group(ui, "Skip / enable", |ui| {
+        group(ui, "Skip / Enable", |ui| {
             ui.horizontal(|ui| {
                 ui.label("Frames");
                 ui.add(egui::DragValue::new(&mut self.fr_from).range(1..=n));
@@ -6953,7 +7339,7 @@ impl GifKitApp {
             ui.horizontal(|ui| {
                 ui.label("Delay");
                 ui.add(egui::DragValue::new(&mut self.fr_delay).range(1..=65535).suffix(" cs")).on_hover_text(format!("{:.2} fps", 100.0 / self.fr_delay.max(1) as f32));
-                if ui.button("Set all").clicked() {
+                if ui.button("Set All").clicked() {
                     let d = self.fr_delay;
                     self.run_anim(ctx, "Set delays", move |a, _| Ok(ops::set_all_delays(a, d)));
                 }
@@ -6963,7 +7349,7 @@ impl GifKitApp {
             let mut changed = false;
             ui.horizontal(|ui| {
                 ui.label("Loop");
-                changed |= ui.checkbox(&mut forever, "forever").changed();
+                changed |= check(ui, &mut forever, "forever").changed();
                 if !forever {
                     changed |= ui.add(egui::DragValue::new(&mut count).range(1..=65535).suffix("×")).changed();
                 }
@@ -6977,14 +7363,14 @@ impl GifKitApp {
             ui.horizontal(|ui| {
                 ui.label("Crossfade");
                 ui.add(egui::DragValue::new(&mut self.fr_crossfade).range(1..=30)).on_hover_text("Number of in-between frames");
-                ui.checkbox(&mut self.fr_crossfade_wrap, "loop").on_hover_text("Also blend the last frame into the first");
+                check(ui, &mut self.fr_crossfade_wrap, "loop").on_hover_text("Also blend the last frame into the first");
                 if ui.button("Apply").clicked() {
                     let (s, w) = (self.fr_crossfade, self.fr_crossfade_wrap);
                     self.run_anim(ctx, "Crossfade", move |a, _| Ok(ops::crossfade(a, s, w)));
                 }
             });
-            if ui.button("First frame as background").on_hover_text("Draw every frame over frame 1").clicked() {
-                self.run_anim(ctx, "First frame as background", move |a, _| Ok(ops::first_frame_as_background(a)));
+            if ui.button("First Frame as Background").on_hover_text("Draw every frame over frame 1").clicked() {
+                self.run_anim(ctx, "First Frame as Background", move |a, _| Ok(ops::first_frame_as_background(a)));
             }
         });
         let skipped = self.base.as_ref().map(|a| a.len() - a.enabled_count()).unwrap_or(0);
@@ -7022,11 +7408,11 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
     let d = EffectSettings::default();
     let colour_changed = fx.hue != d.hue || fx.saturation != d.saturation || fx.lightness != d.lightness || fx.brightness != d.brightness || fx.contrast != d.contrast;
     group_ex(ui, "Colour", true, colour_changed.then(|| "●".to_string()), |ui| {
-        ui.add(soft_slider(&mut fx.hue, 0.0..=200.0, "Hue"));
-        ui.add(soft_slider(&mut fx.saturation, 0.0..=200.0, "Saturation"));
-        ui.add(soft_slider(&mut fx.lightness, 0.0..=200.0, "Lightness"));
-        ui.add(soft_slider(&mut fx.brightness, -100.0..=100.0, "Brightness"));
-        ui.add(soft_slider(&mut fx.contrast, -100.0..=100.0, "Contrast"));
+        slider(ui, soft_slider(&mut fx.hue, 0.0..=200.0, "Hue"));
+        slider(ui, soft_slider(&mut fx.saturation, 0.0..=200.0, "Saturation"));
+        slider(ui, soft_slider(&mut fx.lightness, 0.0..=200.0, "Lightness"));
+        slider(ui, soft_slider(&mut fx.brightness, -100.0..=100.0, "Brightness"));
+        slider(ui, soft_slider(&mut fx.contrast, -100.0..=100.0, "Contrast"));
         if chip(ui, "Reset").clicked() {
             fx.hue = 100.0;
             fx.saturation = 100.0;
@@ -7036,23 +7422,19 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
         }
     });
     group_ex(ui, "Looks", true, on(&[fx.grayscale, fx.sepia, fx.monochrome, fx.negative, fx.tint, fx.change_bg]), |ui| {
-        ui.horizontal_wrapped(|ui| {
-            toggle_btn(ui, &mut fx.grayscale, "Grayscale");
-            toggle_btn(ui, &mut fx.sepia, "Sepia");
-            toggle_btn(ui, &mut fx.monochrome, "Mono").on_hover_text("Black and white only");
-            toggle_btn(ui, &mut fx.negative, "Invert").on_hover_text("Negative colours");
-        });
+        toggle_grid(ui, 72.0, &mut [(&mut fx.grayscale, "Grayscale", ""), (&mut fx.sepia, "Sepia", ""), (&mut fx.monochrome, "Mono", "Black and white only"), (&mut fx.negative, "Invert", "Negative colours")]);
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.checkbox(&mut fx.tint, "Tint");
+            check(ui, &mut fx.tint, "Tint");
             if fx.tint {
-                ui.color_edit_button_srgb(&mut fx.tint_color);
+                colour_btn(ui, &mut fx.tint_color);
                 ui.add(egui::DragValue::new(&mut fx.tint_amount).range(0.0..=100.0).suffix("%"));
             }
         });
         ui.horizontal(|ui| {
-            ui.checkbox(&mut fx.change_bg, "Background");
+            check(ui, &mut fx.change_bg, "Background");
             if fx.change_bg {
-                ui.color_edit_button_srgb(&mut fx.bg_color).on_hover_text("Fills transparent areas");
+                colour_btn(ui, &mut fx.bg_color).on_hover_text("Fills transparent areas");
             }
         });
     });
@@ -7060,24 +7442,25 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
     group_ex(ui, "Photo Booth", true, booth_on.then(|| "●".to_string()), |ui| {
         use crate::booth::BoothFx;
         let pick = |ui: &mut egui::Ui, list: &[BoothFx], fx: &mut EffectSettings| {
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
-                for &b in list {
-                    if seg_label(ui, fx.booth == b, b.label()).on_hover_text(b.tip()).clicked() {
-                        fx.booth = if fx.booth == b { BoothFx::None } else { b };
-                    }
+            let labels: Vec<&str> = list.iter().map(|b| b.label()).collect();
+            even_grid(ui, list.len(), label_w(ui, &labels).max(84.0), |ui, i, size| {
+                let b = list[i];
+                if ui.add_sized(size, sel_btn(egui::Button::new(b.label()).truncate(), fx.booth == b)).on_hover_text(b.tip()).clicked() {
+                    fx.booth = if fx.booth == b { BoothFx::None } else { b };
                 }
             });
         };
-        hint(ui, "Looks");
+        subhead(ui, "Looks");
         pick(ui, &BoothFx::LOOKS, fx);
-        hint(ui, "Distortions");
+        ui.add_space(6.0);
+        subhead(ui, "Distortions");
         pick(ui, &BoothFx::DISTORT, fx);
         if fx.booth != BoothFx::None {
-            ui.add(egui::Slider::new(&mut fx.booth_amount, 0.0..=100.0).text("strength").suffix("%"));
+            ui.add_space(8.0);
+            slider(ui, egui::Slider::new(&mut fx.booth_amount, 0.0..=100.0).text("Strength").suffix("%"));
             if fx.booth.has_centre() {
-                ui.add(egui::Slider::new(&mut fx.booth_cx, 0.0..=100.0).text("centre X").suffix("%"));
-                ui.add(egui::Slider::new(&mut fx.booth_cy, 0.0..=100.0).text("centre Y").suffix("%"));
+                slider(ui, egui::Slider::new(&mut fx.booth_cx, 0.0..=100.0).text("Centre X").suffix("%"));
+                slider(ui, egui::Slider::new(&mut fx.booth_cy, 0.0..=100.0).text("Centre Y").suffix("%"));
                 if chip(ui, "Centre").clicked() {
                     fx.booth_cx = 50.0;
                     fx.booth_cy = 50.0;
@@ -7086,27 +7469,24 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
         }
     });
     group_ex(ui, "Transparency", false, on(&[fx.rc_white, fx.rc_black, fx.rc_custom]), |ui| {
-        ui.horizontal(|ui| {
-            ui.label("Remove");
-            toggle_btn(ui, &mut fx.rc_white, "White");
-            toggle_btn(ui, &mut fx.rc_black, "Black");
-            toggle_btn(ui, &mut fx.rc_custom, "Colour");
-            if fx.rc_custom {
-                ui.color_edit_button_srgb(&mut fx.rc_color);
-            }
-        });
+        subhead(ui, "Remove");
+        toggle_grid(ui, 0.0, &mut [(&mut fx.rc_white, "White", ""), (&mut fx.rc_black, "Black", ""), (&mut fx.rc_custom, "Colour", "")]);
         if fx.rc_custom {
-            let mut hex = format!("#{:02x}{:02x}{:02x}", fx.rc_color[0], fx.rc_color[1], fx.rc_color[2]);
-            if ui.add(egui::TextEdit::singleline(&mut hex).desired_width(80.0)).changed() {
-                if let Some(c) = parse_hex(&hex) {
-                    fx.rc_color = c;
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                colour_btn(ui, &mut fx.rc_color);
+                let mut hex = format!("#{:02x}{:02x}{:02x}", fx.rc_color[0], fx.rc_color[1], fx.rc_color[2]);
+                if ui.add(egui::TextEdit::singleline(&mut hex).desired_width(80.0)).changed() {
+                    if let Some(c) = parse_hex(&hex) {
+                        fx.rc_color = c;
+                    }
                 }
-            }
+            });
         }
         if fx.rc_white || fx.rc_black || fx.rc_custom {
-            ui.add(soft_slider(&mut fx.rc_fuzz, 0.0..=60.0, "fuzz %")).on_hover_text("How close a colour must be to count");
+            slider(ui, soft_slider(&mut fx.rc_fuzz, 0.0..=60.0, "Fuzz %")).on_hover_text("How close a colour must be to count");
             ui.horizontal(|ui| {
-                ui.checkbox(&mut fx.rc_clean_edges, "Clean edges").on_hover_text("Removes leftover fringe around cut-out areas");
+                check(ui, &mut fx.rc_clean_edges, "Clean edges").on_hover_text("Removes leftover fringe around cut-out areas");
                 if fx.rc_clean_edges {
                     ui.add(egui::DragValue::new(&mut fx.rc_edge_px).range(1..=50).suffix(" px"));
                 }
@@ -7115,95 +7495,88 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
     });
     // reverse, boomerang and looping live in the Reverse frame edit
     let _ = tr;
-    group_ex(ui, "Fades & timer", false, on(&[fx.counter, fx.fade_in, fx.fade_out]), |ui| {
-        toggle_btn(ui, &mut fx.counter, "Timer").on_hover_text("Shows a running seconds counter");
-        ui.horizontal(|ui| {
-            toggle_btn(ui, &mut fx.fade_in, "Fade in");
-            toggle_btn(ui, &mut fx.fade_out, "Fade out");
-            if fx.fade_in || fx.fade_out {
+    group_ex(ui, "Fades & Timer", false, on(&[fx.counter, fx.fade_in, fx.fade_out]), |ui| {
+        toggle_grid(ui, 0.0, &mut [(&mut fx.fade_in, "Fade In", ""), (&mut fx.fade_out, "Fade Out", ""), (&mut fx.counter, "Timer", "Shows a running seconds counter")]);
+        if fx.fade_in || fx.fade_out {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Length");
                 ui.add(egui::DragValue::new(&mut fx.fade_frames).range(1..=10000).suffix(" fr"));
-                ui.checkbox(&mut fx.fade_to_transparent, "to clear").on_hover_text("Fade to transparent instead of black");
-            }
-        });
-    });
-    group_ex(ui, "Blur & sharpen", false, on(&[fx.blur, fx.sharpen]), |ui| {
-        ui.checkbox(&mut fx.blur, "Blur");
-        if fx.blur {
-            ui.add(soft_slider(&mut fx.blur_sigma, 0.3..=20.0, "σ"));
+                check(ui, &mut fx.fade_to_transparent, "Fade to transparent").on_hover_text("Instead of black");
+            });
         }
-        ui.checkbox(&mut fx.sharpen, "Sharpen");
+    });
+    group_ex(ui, "Blur & Sharpen", false, on(&[fx.blur, fx.sharpen]), |ui| {
+        check(ui, &mut fx.blur, "Blur");
+        if fx.blur {
+            slider(ui, soft_slider(&mut fx.blur_sigma, 0.3..=20.0, "σ"));
+        }
+        check(ui, &mut fx.sharpen, "Sharpen");
         if fx.sharpen {
-            ui.add(soft_slider(&mut fx.sharpen_sigma, 0.3..=10.0, "σ"));
+            slider(ui, soft_slider(&mut fx.sharpen_sigma, 0.3..=10.0, "σ"));
         }
     });
     group_ex(ui, "Dither", false, on(&[fx.ordered_dither, fx.error_dither]), |ui| {
-        ui.horizontal(|ui| {
-            toggle_btn(ui, &mut fx.ordered_dither, "Ordered").on_hover_text("Regular pattern dithering");
-            toggle_btn(ui, &mut fx.error_dither, "Diffusion").on_hover_text("Error diffusion dithering");
-        });
+        toggle_grid(ui, 0.0, &mut [(&mut fx.ordered_dither, "Ordered", "Regular pattern dithering"), (&mut fx.error_dither, "Diffusion", "Error diffusion dithering")]);
         if fx.ordered_dither || fx.error_dither {
-            ui.add(egui::Slider::new(&mut fx.dither_levels, 2..=16).text("levels").clamping(egui::SliderClamping::Never));
+            slider(ui, egui::Slider::new(&mut fx.dither_levels, 2..=16).text("Levels").clamping(egui::SliderClamping::Never));
         }
     });
     group_ex(ui, "Artistic", false, on(&[fx.oil, fx.emboss, fx.posterize, fx.solarize, fx.noise]), |ui| {
-        ui.horizontal_wrapped(|ui| {
-            toggle_btn(ui, &mut fx.oil, "Oil paint").on_hover_text("Smooths detail into brush-like patches");
-            toggle_btn(ui, &mut fx.emboss, "Emboss").on_hover_text("Raised relief look");
-            toggle_btn(ui, &mut fx.posterize, "Posterize").on_hover_text("Fewer colour steps");
-            toggle_btn(ui, &mut fx.solarize, "Solarize").on_hover_text("Inverts the brightest tones");
-            toggle_btn(ui, &mut fx.noise, "Noise").on_hover_text("Adds random grain");
-        });
+        toggle_grid(ui, 92.0, &mut [
+            (&mut fx.oil, "Oil Paint", "Smooths detail into brush-like patches"),
+            (&mut fx.emboss, "Emboss", "Raised relief look"),
+            (&mut fx.posterize, "Posterize", "Fewer colour steps"),
+            (&mut fx.solarize, "Solarize", "Inverts the brightest tones"),
+            (&mut fx.noise, "Noise", "Adds random grain"),
+        ]);
         if fx.oil {
-            ui.add(egui::Slider::new(&mut fx.oil_radius, 1..=8).text("oil radius").clamping(egui::SliderClamping::Never));
+            slider(ui, egui::Slider::new(&mut fx.oil_radius, 1..=8).text("Oil radius").clamping(egui::SliderClamping::Never));
         }
         if fx.posterize {
-            ui.add(egui::Slider::new(&mut fx.posterize_levels, 2..=16).text("levels").clamping(egui::SliderClamping::Never));
+            slider(ui, egui::Slider::new(&mut fx.posterize_levels, 2..=16).text("Levels").clamping(egui::SliderClamping::Never));
         }
         if fx.noise {
-            ui.add(soft_slider(&mut fx.noise_amount, 1.0..=128.0, "noise"));
+            slider(ui, soft_slider(&mut fx.noise_amount, 1.0..=128.0, "Noise"));
         }
     });
     group_ex(ui, "Distort", false, on(&[fx.swirl, fx.implode, fx.wave]), |ui| {
-        ui.horizontal(|ui| {
-            toggle_btn(ui, &mut fx.swirl, "Swirl").on_hover_text("Twists the image around the centre");
-            toggle_btn(ui, &mut fx.implode, "Implode").on_hover_text("Pulls the image toward the centre");
-            toggle_btn(ui, &mut fx.wave, "Wave").on_hover_text("Ripples the image sideways");
-        });
+        toggle_grid(ui, 0.0, &mut [(&mut fx.swirl, "Swirl", "Twists the image around the centre"), (&mut fx.implode, "Implode", "Pulls the image toward the centre"), (&mut fx.wave, "Wave", "Ripples the image sideways")]);
         if fx.swirl {
-            ui.add(soft_slider(&mut fx.swirl_deg, -720.0..=720.0, "swirl °"));
+            slider(ui, soft_slider(&mut fx.swirl_deg, -720.0..=720.0, "Swirl °"));
         }
         if fx.implode {
-            ui.add(soft_slider(&mut fx.implode_amount, -2.0..=2.0, "implode"));
+            slider(ui, soft_slider(&mut fx.implode_amount, -2.0..=2.0, "Implode"));
         }
         if fx.wave {
-            ui.add(soft_slider(&mut fx.wave_amp, 1.0..=100.0, "amplitude"));
-            ui.add(soft_slider(&mut fx.wave_len, 4.0..=500.0, "wavelength"));
+            slider(ui, soft_slider(&mut fx.wave_amp, 1.0..=100.0, "Amplitude"));
+            slider(ui, soft_slider(&mut fx.wave_len, 4.0..=500.0, "Wavelength"));
         }
     });
     group_ex(ui, "Filters", false, on(&[fx.gotham, fx.lomo, fx.nashville, fx.toaster, fx.vignette, fx.polaroid]), |ui| {
-        ui.horizontal_wrapped(|ui| {
-            toggle_btn(ui, &mut fx.gotham, "Gotham").on_hover_text("Cool and gritty high contrast");
-            toggle_btn(ui, &mut fx.lomo, "Lomo").on_hover_text("Saturated with dark corners");
-            toggle_btn(ui, &mut fx.nashville, "Nashville").on_hover_text("Warm pink vintage tint");
-            toggle_btn(ui, &mut fx.toaster, "Toaster").on_hover_text("Warm faded film look");
-            toggle_btn(ui, &mut fx.vignette, "Vignette").on_hover_text("Darkens the corners");
-            toggle_btn(ui, &mut fx.polaroid, "Polaroid").on_hover_text("White instant-photo frame");
-        });
+        toggle_grid(ui, 92.0, &mut [
+            (&mut fx.gotham, "Gotham", "Cool and gritty high contrast"),
+            (&mut fx.lomo, "Lomo", "Saturated with dark corners"),
+            (&mut fx.nashville, "Nashville", "Warm pink vintage tint"),
+            (&mut fx.toaster, "Toaster", "Warm faded film look"),
+            (&mut fx.vignette, "Vignette", "Darkens the corners"),
+            (&mut fx.polaroid, "Polaroid", "White instant-photo frame"),
+        ]);
     });
     group_ex(ui, "Frame", false, on(&[fx.frame_camera, fx.frame_fuzzy, fx.frame_rounded, fx.frame_border]), |ui| {
-        ui.horizontal_wrapped(|ui| {
-            toggle_btn(ui, &mut fx.frame_camera, "Camera").on_hover_text("Viewfinder frame");
-            toggle_btn(ui, &mut fx.frame_fuzzy, "Fuzzy").on_hover_text("Soft blurred edges");
-            toggle_btn(ui, &mut fx.frame_rounded, "Rounded").on_hover_text("Rounded corners");
-            toggle_btn(ui, &mut fx.frame_border, "Border").on_hover_text("Solid border");
-        });
+        toggle_grid(ui, 72.0, &mut [
+            (&mut fx.frame_camera, "Camera", "Viewfinder frame"),
+            (&mut fx.frame_fuzzy, "Fuzzy", "Soft blurred edges"),
+            (&mut fx.frame_rounded, "Rounded", "Rounded corners"),
+            (&mut fx.frame_border, "Border", "Solid border"),
+        ]);
         if fx.frame_rounded {
-            ui.add(soft_slider(&mut fx.rounded_radius, 1.0..=200.0, "radius px"));
+            slider(ui, soft_slider(&mut fx.rounded_radius, 1.0..=200.0, "Radius px"));
         }
         if fx.frame_border {
             ui.horizontal(|ui| {
                 ui.add(egui::DragValue::new(&mut fx.border_px).range(1..=2000).suffix(" px"));
-                ui.color_edit_button_srgb(&mut fx.border_color);
+                colour_btn(ui, &mut fx.border_color);
             });
         }
     });
@@ -7213,14 +7586,9 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
     }
     group_ex(ui, "Transform (old)", true, on(&[fx.flip_v, fx.flip_h, fx.rot90, fx.rot270, fx.rot_any]), |ui| {
         hint(ui, "Use the Rotate frame edit instead. These stay for older projects.");
-        ui.horizontal_wrapped(|ui| {
-            toggle_btn(ui, &mut fx.flip_h, "↔ Flip");
-            toggle_btn(ui, &mut fx.flip_v, "↕ Flip");
-            toggle_btn(ui, &mut fx.rot90, "↻ 90°");
-            toggle_btn(ui, &mut fx.rot270, "↺ 90°");
-        });
+        toggle_grid(ui, 64.0, &mut [(&mut fx.flip_h, "↔ Flip", ""), (&mut fx.flip_v, "↕ Flip", ""), (&mut fx.rot90, "↻ 90°", ""), (&mut fx.rot270, "↺ 90°", "")]);
         ui.horizontal(|ui| {
-            ui.checkbox(&mut fx.rot_any, "Rotate");
+            check(ui, &mut fx.rot_any, "Rotate");
             ui.add(egui::DragValue::new(&mut fx.rot_deg).speed(0.5).suffix("°"));
         });
     });

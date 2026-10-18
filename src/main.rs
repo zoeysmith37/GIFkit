@@ -6,6 +6,7 @@ mod booth;
 mod effects;
 mod encode;
 mod geo;
+mod icons;
 mod io;
 mod lzw;
 mod noai;
@@ -46,7 +47,7 @@ fn main() -> eframe::Result {
     let initial = std::env::args_os().nth(1).map(std::path::PathBuf::from);
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("GIFkit – local GIF editor")
+            .with_title("GIFkit")
             .with_app_id("gifkit")
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([960.0, 600.0])
