@@ -12,6 +12,7 @@ mod noai;
 mod ops;
 mod overlay;
 mod presets;
+mod project;
 mod stack;
 mod target;
 mod shapes;
@@ -28,6 +29,9 @@ fn app_icon() -> eframe::egui::IconData {
 }
 
 fn main() -> eframe::Result {
+    // leave a core free for the compositor and the rest of the desktop
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
+    let _ = rayon::ThreadPoolBuilder::new().num_threads(cores.saturating_sub(1).max(1)).build_global();
     // winit 0.30 (used by eframe) has no file drag-and-drop on native Wayland.
     // On Wayland sessions with XWayland available we therefore run through
     // XWayland, where drag-and-drop works. Opt out with GIFKIT_WAYLAND=1 or

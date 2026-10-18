@@ -26,6 +26,9 @@ webp-animation = "0.10.0"
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
 resvg = { version = "0.45", default-features = false }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 

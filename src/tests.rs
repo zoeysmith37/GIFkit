@@ -1036,3 +1036,58 @@ fn text_stretch_changes_width_only() {
     let sp = crate::text::render_sprite(&fonts, &t2);
     assert_eq!(sp.dimensions(), (w2, h2));
 }
+
+
+#[test]
+fn project_round_trip() {
+    use crate::project::{load, save, ProjLayer, ProjLayerEntry, ProjectFile};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    let base = synth(true);
+    // an "original" that differs (frames were edited since opening)
+    let mut original = base.clone();
+    original.frames.truncate(5);
+    let overlay: Vec<image::RgbaImage> = (0..3).map(|i| image::RgbaImage::from_pixel(8, 6, image::Rgba([i * 80, 10, 200, 255]))).collect();
+    let wm = Arc::new(image::RgbaImage::from_pixel(5, 5, image::Rgba([1, 2, 3, 128])));
+    let layers = vec![
+        ProjLayerEntry { visible: true, label: Some("Caption".into()), layer: ProjLayer::Text { text: crate::text::Annotation { text: "hi".into(), stretch: 0.7, ..Default::default() }, font: Some(("builtin".into(), "Sans Bold".into())) } },
+        ProjLayerEntry { visible: false, label: None, layer: ProjLayer::Image { id: 1, name: "ov.png".into(), path: None, delays: vec![5, 5, 5], placements: vec![Default::default(); base.len()], opacity: 80.0 } },
+        ProjLayerEntry { visible: true, label: None, layer: ProjLayer::Watermark { id: 2, watermark: Default::default(), has_image: true } },
+        ProjLayerEntry { visible: true, label: None, layer: ProjLayer::Emoji { emoji: crate::shapes::EmojiSettings { emoji: "1f525".into(), w: 20, h: 20, ..Default::default() } } },
+        ProjLayerEntry { visible: true, label: None, layer: ProjLayer::Markup { markup: crate::shapes::MarkupSettings { strokes: vec![crate::shapes::PenStroke { points: vec![[1.0, 2.0], [3.0, 4.0]], ..Default::default() }] } } },
+    ];
+    let mut transform = crate::stack::Transform::default();
+    transform.reverse = true;
+    let file = ProjectFile { source_name: "test.gif".into(), transform, layers, settings: serde_json::json!({"format": "WebP"}), ..Default::default() };
+    let dir = std::env::temp_dir().join(format!("gf_proj_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("a.gifkit");
+    let ov: HashMap<usize, Vec<image::RgbaImage>> = [(1, overlay.clone())].into();
+    let wms: HashMap<usize, Arc<image::RgbaImage>> = [(2, wm.clone())].into();
+    save(&path, file, &base, Some(&original), &ov, &wms).unwrap();
+    let pr = load(&path).unwrap();
+    assert_eq!(pr.base.len(), base.len());
+    assert_eq!(pr.base.loop_count, base.loop_count);
+    for (a, b) in pr.base.frames.iter().zip(&base.frames) {
+        assert_eq!(a.image.as_raw(), b.image.as_raw(), "frames are lossless");
+        assert_eq!((a.delay_cs, a.enabled), (b.delay_cs, b.enabled));
+    }
+    assert_eq!(pr.original.as_ref().map(|o| o.len()), Some(5));
+    assert_eq!(pr.overlays[&1].len(), 3);
+    assert_eq!(pr.overlays[&1][2].as_raw(), overlay[2].as_raw());
+    assert_eq!(pr.watermarks[&2].as_raw(), wm.as_raw());
+    assert!(pr.file.transform.reverse);
+    assert_eq!(pr.file.layers.len(), 5);
+    assert_eq!(pr.file.layers[0].label.as_deref(), Some("Caption"));
+    assert!(!pr.file.layers[1].visible);
+    assert!(matches!(&pr.file.layers[0].layer, ProjLayer::Text { text, .. } if (text.stretch - 0.7).abs() < 1e-6));
+    assert_eq!(pr.file.settings["format"], "WebP");
+    // an unchanged original isn't stored twice
+    let f2 = ProjectFile::default();
+    save(&path, f2, &base, Some(&base.clone()), &HashMap::new(), &HashMap::new()).unwrap();
+    assert!(load(&path).unwrap().original.is_none());
+    // not a project
+    std::fs::write(dir.join("bad.gifkit"), b"nope").unwrap();
+    assert!(load(&dir.join("bad.gifkit")).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}

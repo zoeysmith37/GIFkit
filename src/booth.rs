@@ -135,7 +135,11 @@ pub fn apply(src: &RgbaImage, fx: BoothFx, amount: f32, cx: f32, cy: f32) -> Rgb
         BoothFx::None => src.clone(),
         BoothFx::Glow => {
             // soft focus: a wide blur screened over a slightly brighter image
-            let blur = imageops::blur(src, (w.min(h) as f32 * 0.035).max(1.0));
+            // blur a quarter-size copy: same look, a fraction of the work
+            let (sw, sh) = ((w / 2).max(1), (h / 2).max(1));
+            let small = imageops::resize(src, sw, sh, imageops::FilterType::Triangle);
+            let small = imageops::blur(&small, (sw.min(sh) as f32 * 0.035).max(0.5));
+            let blur = imageops::resize(&small, w, h, imageops::FilterType::Triangle);
             let mut out = src.clone();
             out.par_chunks_mut(4).zip(blur.par_chunks(4)).for_each(|(o, b)| {
                 for c in 0..3 {

@@ -1035,6 +1035,7 @@ dependencies = [
  "fontdb",
  "gif",
  "image",
+ "libc",
  "png 0.18.1",
  "rayon",
  "resvg",

@@ -239,6 +239,8 @@ enum JobOutput {
     Overlay(anyhow::Result<OverlaySource>),
     /// target-size search result to apply
     Fit(anyhow::Result<crate::target::Fit>),
+    ProjectLoaded(anyhow::Result<(crate::project::Project, PathBuf)>),
+    ProjectSaved(anyhow::Result<PathBuf>),
 }
 
 struct Job {
@@ -628,6 +630,8 @@ pub struct GifKitApp {
     pending_open: Option<PathBuf>,
     /// measured width of the transport's view controls (last frame)
     transport_right_w: f32,
+    /// where the project was last saved (None = never)
+    project_path: Option<PathBuf>,
     /// style for the next shape drawn
     shape_tpl: ShapeSettings,
     emoji_tex: HashMap<String, TextureHandle>,
@@ -644,6 +648,27 @@ pub struct GifKitApp {
     pen_scope: PenScope,
     /// stroke being drawn: (layer id, points in the viewport's image space, space)
     pen_live: Option<(u64, Vec<Pos2>, Space)>,
+}
+
+/// Output and tool settings stored in a project file. Every field is
+/// optional so projects from other versions still open.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct ProjSettings {
+    gif: Option<GifOptions>,
+    webp: Option<io::WebpOptions>,
+    avif: Option<u8>,
+    format: String,
+    video_bg: Option<[u8; 3]>,
+    frames_png: Option<io::PngOptions>,
+    split_fmt: Option<SplitFormat>,
+    frames_zip: Option<bool>,
+    split_prefix: Option<String>,
+    sheet: Option<SheetOptions>,
+    target_val: Option<f32>,
+    target_mb: Option<bool>,
+    tool: String,
+    edit_labels: Vec<(String, String)>,
 }
 
 /// Behind transparent pixels in the viewports.
@@ -1326,6 +1351,7 @@ impl GifKitApp {
             last_dir: theme::get_setting("last_dir").map(PathBuf::from).filter(|d| d.is_dir()),
             pending_open: None,
             transport_right_w: 430.0,
+            project_path: None,
             shape_tpl: ShapeSettings::default(),
             emoji_tex: HashMap::new(),
             emoji_pick: "1f600".into(),
@@ -1362,6 +1388,10 @@ impl GifKitApp {
                 app.export_fmt = *f;
             }
         }
+        // scripting hook: where Ctrl+S saves the project without asking
+        if let Ok(p) = std::env::var("GIFKIT_PROJECT_PATH") {
+            app.project_path = Some(PathBuf::from(p));
+        }
         if let Ok(q) = std::env::var("GIFKIT_EMOJI_SEARCH") {
             app.emoji_search = q;
         }
@@ -1394,6 +1424,12 @@ impl GifKitApp {
     }
 
     fn spawn(&mut self, ctx: &egui::Context, label: &str, total: usize, f: impl FnOnce(&AtomicUsize) -> JobOutput + Send + 'static) {
+        self.spawn_in(ctx, label, total, true, f);
+    }
+
+    /// `bg`: run in the background pool (shared with previews). Saving and
+    /// opening projects don't, so they never wait behind a preview render.
+    fn spawn_in(&mut self, ctx: &egui::Context, label: &str, total: usize, bg: bool, f: impl FnOnce(&AtomicUsize) -> JobOutput + Send + 'static) {
         if self.busy() {
             return;
         }
@@ -1402,7 +1438,7 @@ impl GifKitApp {
         let p2 = progress.clone();
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
-            let out = stack::bg_pool().install(|| f(&p2));
+            let out = if bg { stack::bg_pool().install(|| f(&p2)) } else { f(&p2) };
             let _ = tx.send(out);
             ctx2.request_repaint();
         });
@@ -1492,6 +1528,7 @@ impl GifKitApp {
                 self.edit_labels.clear();
                 self.edit_rows_shown.clear();
                 self.export_name_edited = false;
+                self.project_path = std::env::var("GIFKIT_PROJECT_PATH").ok().map(PathBuf::from);
                 self.sel.clear();
                 self.cur = 0;
                 self.elapsed = 0.0;
@@ -1554,7 +1591,13 @@ impl GifKitApp {
                 self.add_overlay(src);
                 self.info("Overlay added – drag it on the preview to position it");
             }
-            JobOutput::Anim(Err(e)) | JobOutput::Baked(Err(e)) | JobOutput::Loaded(Err(e)) | JobOutput::Overlay(Err(e)) | JobOutput::Fit(Err(e)) => self.error(format!("{label} failed: {e:#}")),
+            JobOutput::Anim(Err(e)) | JobOutput::Baked(Err(e)) | JobOutput::Loaded(Err(e)) | JobOutput::Overlay(Err(e)) | JobOutput::Fit(Err(e)) | JobOutput::ProjectLoaded(Err(e)) | JobOutput::ProjectSaved(Err(e)) => self.error(format!("{label} failed: {e:#}")),
+            JobOutput::ProjectLoaded(Ok((pr, path))) => self.apply_project(pr, path),
+            JobOutput::ProjectSaved(Ok(path)) => {
+                self.modified = false;
+                self.info(format!("Saved project {}", path.display()));
+                self.project_path = Some(path);
+            }
         }
     }
 
@@ -2111,7 +2154,8 @@ impl GifKitApp {
 
     fn open_dialog(&mut self, ctx: &egui::Context) {
         if let Some(p) = rfd::FileDialog::new()
-            .add_filter("Animations, images & videos", &["gif", "png", "apng", "webp", "jpg", "jpeg", "bmp", "mp4", "m4v", "mov", "webm", "mkv", "avi", "wmv", "flv", "mpg", "mpeg", "ts", "ogv", "3gp"])
+            .add_filter("Animations, images, videos & projects", &["gif", "png", "apng", "webp", "jpg", "jpeg", "bmp", "mp4", "m4v", "mov", "webm", "mkv", "avi", "wmv", "flv", "mpg", "mpeg", "ts", "ogv", "3gp", crate::project::EXT])
+            .add_filter("GIFkit projects", &[crate::project::EXT])
             .add_filter("All files", &["*"])
             .pick_file()
         {
@@ -2127,6 +2171,10 @@ impl GifKitApp {
     }
 
     fn open_path(&mut self, p: PathBuf, ctx: &egui::Context) {
+        if crate::project::is_project(&p) {
+            self.spawn_in(ctx, "Open project", 1, false, move |_| JobOutput::ProjectLoaded(crate::project::load(&p).map(|pr| (pr, p.clone()))));
+            return;
+        }
         let label = if io::is_video(&p) { "Importing video" } else { "Open" };
         self.spawn(ctx, label, 1, move |_| {
             // a video's size says nothing about GIF sizes, so don't compare against it
@@ -2190,13 +2238,14 @@ impl GifKitApp {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let typing = ctx.egui_wants_keyboard_input();
+        let (save_proj, save_as) = ctx.input(|i| (i.modifiers.command && i.key_pressed(egui::Key::S), i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::S)));
         let (undo, redo, open, save, space, left, right, fit, one, zin, zout, cmp) = ctx.input(|i| {
             let cmd = i.modifiers.command;
             (
                 cmd && !i.modifiers.shift && i.key_pressed(egui::Key::Z),
                 cmd && (i.key_pressed(egui::Key::Y) || (i.modifiers.shift && i.key_pressed(egui::Key::Z))),
                 cmd && i.key_pressed(egui::Key::O),
-                cmd && (i.key_pressed(egui::Key::S) || i.key_pressed(egui::Key::E)),
+                cmd && i.key_pressed(egui::Key::E),
                 i.key_pressed(egui::Key::Space),
                 i.key_pressed(egui::Key::ArrowLeft),
                 i.key_pressed(egui::Key::ArrowRight),
@@ -2215,6 +2264,9 @@ impl GifKitApp {
         }
         if save && self.base.is_some() {
             self.export_open = true;
+        }
+        if save_proj && self.base.is_some() {
+            self.save_project(ctx, save_as);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.export_open = false;
@@ -2569,7 +2621,8 @@ impl GifKitApp {
                             if tx.send((key, i, img)).is_err() {
                                 break;
                             }
-                            ctx2.request_repaint();
+                            // batch repaints instead of one per finished frame
+                            ctx2.request_repaint_after(std::time::Duration::from_millis(40));
                         });
                     }
                 });
@@ -2861,6 +2914,9 @@ impl GifKitApp {
             if tool_button(ui, "⊞", "Sequence", idle).on_hover_text("Make an animation from a set of images").clicked() {
                 self.open_sequence_dialog(ctx);
             }
+            if tool_button(ui, "▣", "Save", idle && self.base.is_some()).on_hover_text("Save the project with all edits and layers (Ctrl+S)").clicked() {
+                self.save_project(ctx, false);
+            }
             toolbar_sep(ui);
             let pending = self.committed.as_ref().map(|c| c.0 != self.live_sig()).unwrap_or(false);
             let undo_tip = self.undo.last().map(|u| format!("Undo {} (Ctrl+Z)", u.label)).unwrap_or_else(|| "Undo (Ctrl+Z)".into());
@@ -2892,7 +2948,7 @@ impl GifKitApp {
                         has && idle,
                         egui::Button::new(RichText::new("⬇  Export").font(theme::medium(14.0)).color(Color32::WHITE)).fill(pal.highlight).stroke(Stroke::new(1.0, mix(pal.highlight, Color32::BLACK, 0.25))).min_size(vec2(96.0, TOOLBAR_H)),
                     )
-                    .on_hover_text("Save the result (Ctrl+S)");
+                    .on_hover_text("Save the result as an image or video (Ctrl+E)");
                 if export.clicked() {
                     self.export_open = true;
                 }
@@ -2929,6 +2985,11 @@ impl GifKitApp {
                         ui.close();
                     }
                     ui.separator();
+                    if ui.add_enabled(self.base.is_some(), egui::Button::new("Save project as…")).on_hover_text("Ctrl+Shift+S").clicked() {
+                        self.save_project(ctx, true);
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui.button("About GIFkit").clicked() {
                         about = true;
                         ui.close();
@@ -2959,7 +3020,7 @@ impl GifKitApp {
                     if room < 6 {
                         return;
                     }
-                    let name = self.path.as_ref().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "untitled".into());
+                    let name = self.project_path.as_ref().or(self.path.as_ref()).and_then(|p| p.file_name()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "untitled".into());
                     let name = elide(&name, room.min(28));
                     ui.label(RichText::new(if self.modified { format!("{name} •") } else { name }).font(theme::medium(13.0)).color(pal.fg)).on_hover_text(if self.modified { "Unsaved changes" } else { "" });
                     let _ = a;
@@ -2987,7 +3048,7 @@ impl GifKitApp {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(RichText::new("?").size(12.5).color(pal.fg_muted)).on_hover_text(
-                    "Mouse wheel zooms. Middle or right drag pans.\nAlt+drag pans in drawing tools.\nShift+drag moves in straight lines.\nWhen resizing, Shift keeps or frees the proportions and Ctrl scales one way. Edge handles stretch one side.\nF fits the view. 1 shows actual size.\nSpace plays or pauses. ← and → step.\nC switches single and split view.\nCtrl+S exports. Ctrl+Z and Ctrl+Y undo and redo.\nCtrl+V opens copied files.",
+                    "Mouse wheel zooms. Middle or right drag pans.\nAlt+drag pans in drawing tools.\nShift+drag moves in straight lines.\nWhen resizing, Shift keeps or frees the proportions and Ctrl scales one way. Edge handles stretch one side.\nF fits the view. 1 shows actual size.\nSpace plays or pauses. ← and → step.\nC switches single and split view.\nCtrl+S saves the project and Ctrl+Shift+S saves a copy. Ctrl+E exports.\nCtrl+Z and Ctrl+Y undo and redo.\nCtrl+V opens copied files.",
                 );
             });
         });
@@ -3939,6 +4000,200 @@ impl GifKitApp {
                 }
             }
         }
+    }
+
+    // ------------------------------------------------------------ project files
+
+    fn proj_settings(&self) -> ProjSettings {
+        ProjSettings {
+            gif: Some(self.gif_opts.clone()),
+            webp: Some(self.webp_opts),
+            avif: Some(self.avif_quality),
+            format: self.export_fmt.label().into(),
+            video_bg: Some(self.video_bg),
+            frames_png: Some(self.frames_png),
+            split_fmt: Some(self.split_fmt),
+            frames_zip: Some(self.frames_zip),
+            split_prefix: Some(self.split_prefix.clone()),
+            sheet: Some(self.sheet.clone()),
+            target_val: Some(self.target_val),
+            target_mb: Some(self.target_mb),
+            tool: self.tool.label().into(),
+            edit_labels: self.edit_labels.iter().map(|(t, l)| (t.label().to_string(), l.clone())).collect(),
+        }
+    }
+
+    /// Save to the project's file, or ask where (always with `save_as`).
+    fn save_project(&mut self, ctx: &egui::Context, save_as: bool) {
+        use crate::project::{ProjLayer, ProjLayerEntry, ProjectFile, EXT};
+        let Some(base) = self.base.clone() else { return };
+        if self.busy() {
+            return;
+        }
+        let path = match (&self.project_path, save_as) {
+            (Some(p), false) => p.clone(),
+            _ => {
+                let mut d = rfd::FileDialog::new().add_filter("GIFkit project", &[EXT]).set_file_name(format!("{}.{EXT}", self.base_name()));
+                if let Some(dir) = self.project_path.as_ref().and_then(|p| p.parent()).or(self.last_dir.as_deref()) {
+                    d = d.set_directory(dir);
+                }
+                let Some(mut p) = d.save_file() else { return };
+                if !crate::project::is_project(&p) {
+                    p.set_extension(EXT);
+                }
+                p
+            }
+        };
+        let mut overlays = HashMap::new();
+        let mut watermarks = HashMap::new();
+        let layers = self
+            .stack
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let layer = match &l.kind {
+                    LayerKind::Effects(fx) => ProjLayer::Effects { fx: (**fx).clone() },
+                    LayerKind::Text(t) => ProjLayer::Text { text: t.clone(), font: self.font_key_of(t.font_idx) },
+                    LayerKind::Censor(c) => ProjLayer::Censor { censor: c.clone() },
+                    LayerKind::Overlay(o) => {
+                        overlays.insert(i, o.src.frames.clone());
+                        ProjLayer::Image { id: i, name: o.src.name.clone(), path: o.src.path.clone(), delays: o.src.delays.clone(), placements: o.placements.clone(), opacity: o.opacity }
+                    }
+                    LayerKind::Watermark(w) => {
+                        let mut w2 = (**w).clone();
+                        w2.font_key = self.font_key_of(w.font_idx);
+                        if let Some(img) = &w.image {
+                            watermarks.insert(i, img.clone());
+                        }
+                        ProjLayer::Watermark { id: i, watermark: w2, has_image: w.image.is_some() }
+                    }
+                    LayerKind::Shield(sh) => ProjLayer::Shield { shield: sh.clone() },
+                    LayerKind::Shape(sh) => ProjLayer::Shape { shape: (**sh).clone() },
+                    LayerKind::Markup(m) => ProjLayer::Markup { markup: m.clone() },
+                    LayerKind::Emoji(e) => ProjLayer::Emoji { emoji: (**e).clone() },
+                };
+                ProjLayerEntry { visible: l.visible, label: l.label.clone(), layer }
+            })
+            .collect();
+        let file = ProjectFile {
+            source_name: self.path.as_ref().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+            source_path: self.path.clone(),
+            source_size: self.file_size,
+            transform: self.stack.transform.clone(),
+            layers,
+            settings: serde_json::to_value(self.proj_settings()).unwrap_or_default(),
+            ..Default::default()
+        };
+        let original = self.original.clone();
+        self.spawn_in(ctx, "Save project", 1, false, move |_| JobOutput::ProjectSaved(crate::project::save(&path, file, &base, original.as_ref(), &overlays, &watermarks).map(|_| path.clone())));
+    }
+
+    fn apply_project(&mut self, pr: crate::project::Project, path: PathBuf) {
+        use crate::project::ProjLayer;
+        let crate::project::Project { file, base, original, mut overlays, mut watermarks } = pr;
+        self.undo.clear();
+        self.redo.clear();
+        self.committed = None;
+        self.path = file.source_path.clone();
+        self.file_size = file.source_size;
+        self.cmp = None;
+        self.original = Some(original.unwrap_or_else(|| base.clone()));
+        self.orig_gen += 1;
+        let n = base.len();
+        self.base = Some(base);
+        self.stack = Stack::default();
+        self.edit_labels.clear();
+        self.edit_rows_shown.clear();
+        self.export_name_edited = false;
+        self.sel.clear();
+        self.cur = 0;
+        self.elapsed = 0.0;
+        self.views = [ViewState::default(); 3];
+        self.stack.transform = file.transform.clone();
+        for e in file.layers {
+            let kind = match e.layer {
+                ProjLayer::Effects { fx } => LayerKind::Effects(Box::new(fx)),
+                ProjLayer::Text { mut text, font } => {
+                    text.font_idx = self.resolve_font(&font);
+                    LayerKind::Text(text)
+                }
+                ProjLayer::Censor { censor } => LayerKind::Censor(censor),
+                ProjLayer::Image { id, name, path, delays, placements, opacity } => {
+                    let frames = overlays.remove(&id).unwrap_or_else(|| vec![RgbaImage::new(1, 1)]);
+                    let delays = if delays.len() == frames.len() { delays } else { vec![10; frames.len()] };
+                    LayerKind::Overlay(OverlayLayer { src: Arc::new(OverlaySource { name, path, frames, delays }), placements, opacity })
+                }
+                ProjLayer::Watermark { id, mut watermark, .. } => {
+                    watermark.font_idx = self.resolve_font(&watermark.font_key);
+                    watermark.image = watermarks.remove(&id).map(Arc::new);
+                    LayerKind::Watermark(Box::new(watermark))
+                }
+                ProjLayer::Shield { shield } => LayerKind::Shield(shield),
+                ProjLayer::Shape { shape } => LayerKind::Shape(Box::new(shape)),
+                ProjLayer::Markup { markup } => LayerKind::Markup(markup),
+                ProjLayer::Emoji { emoji } => LayerKind::Emoji(Box::new(emoji)),
+            };
+            let id = self.stack.push(kind);
+            if let Some(l) = self.stack.layers.iter_mut().find(|l| l.id == id) {
+                l.visible = e.visible;
+                l.label = e.label;
+            }
+        }
+        self.stack.sync_len(n);
+        if let Ok(st) = serde_json::from_value::<ProjSettings>(file.settings) {
+            if let Some(v) = st.gif {
+                self.gif_opts = v;
+            }
+            if let Some(v) = st.webp {
+                self.webp_opts = v;
+            }
+            if let Some(v) = st.avif {
+                self.avif_quality = v;
+            }
+            if let Some(f) = ExportFormat::ALL.iter().find(|f| f.label() == st.format) {
+                self.export_fmt = *f;
+            }
+            if let Some(v) = st.video_bg {
+                self.video_bg = v;
+            }
+            if let Some(v) = st.frames_png {
+                self.frames_png = v;
+            }
+            if let Some(v) = st.split_fmt {
+                self.split_fmt = v;
+            }
+            if let Some(v) = st.frames_zip {
+                self.frames_zip = v;
+            }
+            if let Some(v) = st.split_prefix {
+                self.split_prefix = v;
+            }
+            if let Some(v) = st.sheet {
+                self.sheet = v;
+            }
+            if let Some(v) = st.target_val {
+                self.target_val = v;
+            }
+            if let Some(v) = st.target_mb {
+                self.target_mb = v;
+            }
+            if let Some(t) = Tool::ALL.iter().find(|t| t.label() == st.tool) {
+                self.tool = *t;
+            }
+            for (t, l) in st.edit_labels {
+                if let Some(t) = Tool::ALL.iter().find(|x| x.label() == t) {
+                    self.edit_labels.insert(*t, l);
+                }
+            }
+        }
+        // show the frame edit rows that are in use
+        self.bump();
+        self.after_base_change(false);
+        self.modified = false;
+        let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        self.project_path = Some(path);
+        self.info(format!("Opened project {name}"));
     }
 
     // ------------------------------------------------------------ presets

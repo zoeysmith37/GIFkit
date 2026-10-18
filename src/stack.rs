@@ -442,6 +442,17 @@ pub struct Prepared {
     stamps: Vec<Vec<StrokeSprite>>,
 }
 
+/// Run the calling thread at a lower priority, so long background renders
+/// never starve the desktop compositor or the app's own UI.
+pub fn lower_thread_priority() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        // on Linux the nice value is per thread
+        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+        libc::setpriority(libc::PRIO_PROCESS, tid, 10);
+    }
+}
+
 /// Thread pool for background work (pre-rendering, compression, exports) so
 /// it never competes with preview rendering on the UI thread's pool.
 pub fn bg_pool() -> &'static rayon::ThreadPool {
@@ -451,6 +462,7 @@ pub fn bg_pool() -> &'static rayon::ThreadPool {
         rayon::ThreadPoolBuilder::new()
             .num_threads(n.saturating_sub(1).max(1))
             .thread_name(|i| format!("gifkit-bg-{i}"))
+            .start_handler(|_| lower_thread_priority())
             .build()
             .expect("thread pool")
     })
