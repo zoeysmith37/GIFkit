@@ -609,3 +609,97 @@ pub fn encode_gif(anim: &Animation, opt: &GifOptions, progress: Option<&AtomicUs
     }
     Ok(buf)
 }
+
+/// What a GIF file was saved with, read from its blocks without decoding.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GifInfo {
+    /// largest colour table used
+    pub colors: u16,
+    /// every frame uses the file's one palette
+    pub global_only: bool,
+    pub has_comment: bool,
+    pub frames: usize,
+}
+
+/// Walk a GIF's blocks. None when it isn't a readable GIF.
+pub fn gif_info(b: &[u8]) -> Option<GifInfo> {
+    if b.len() < 13 || &b[..3] != b"GIF" {
+        return None;
+    }
+    let mut info = GifInfo { global_only: true, ..Default::default() };
+    let table = |packed: u8| if packed & 0x80 != 0 { Some(2usize << (packed & 7)) } else { None };
+    let mut p = 13;
+    let global = table(b[10]);
+    if let Some(n) = global {
+        p += n * 3;
+        info.colors = n as u16;
+    }
+    // skip a chain of sub-blocks
+    let skip = |mut p: usize| -> Option<usize> {
+        loop {
+            let n = *b.get(p)? as usize;
+            p += 1 + n;
+            if n == 0 {
+                return Some(p);
+            }
+        }
+    };
+    loop {
+        match *b.get(p)? {
+            0x21 => {
+                if *b.get(p + 1)? == 0xFE {
+                    info.has_comment = true;
+                }
+                p = skip(p + 2)?;
+            }
+            0x2C => {
+                let packed = *b.get(p + 9)?;
+                p += 10;
+                match table(packed) {
+                    Some(n) => {
+                        p += n * 3;
+                        info.global_only = false;
+                        info.colors = info.colors.max(n as u16);
+                    }
+                    None if global.is_none() => info.global_only = false,
+                    None => {}
+                }
+                p = skip(p + 1)?;
+                info.frames += 1;
+            }
+            0x3B => break,
+            _ => return None,
+        }
+    }
+    (info.frames > 0).then_some(info)
+}
+
+impl GifOptions {
+    /// Settings close to how a GIF was saved, so saving it again stays near
+    /// its size.
+    pub fn like(info: &GifInfo) -> GifOptions {
+        GifOptions { colors: info.colors.clamp(2, 256), global_palette: info.global_only, ..GifOptions::default() }
+    }
+}
+
+/// Add the "noai" comment to GIF bytes, right after the header.
+pub fn tag_gif(b: Vec<u8>) -> Vec<u8> {
+    let Some(info) = gif_info(&b) else { return b };
+    if info.has_comment && b.windows(NOAI_COMMENT.len()).any(|w| w == NOAI_COMMENT.as_bytes()) {
+        return b;
+    }
+    let mut p = 13;
+    if b[10] & 0x80 != 0 {
+        p += (2usize << (b[10] & 7)) * 3;
+    }
+    let mut out = Vec::with_capacity(b.len() + NOAI_COMMENT.len() + 8);
+    out.extend_from_slice(&b[..p]);
+    out.extend_from_slice(&[0x21, 0xFE]);
+    for c in NOAI_COMMENT.as_bytes().chunks(255) {
+        out.push(c.len() as u8);
+        out.extend_from_slice(c);
+    }
+    out.push(0);
+    out.extend_from_slice(&b[p..]);
+    out
+}

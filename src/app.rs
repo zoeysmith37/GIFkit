@@ -626,6 +626,8 @@ pub struct GifKitApp {
     trim_tol: u8,
     drag: Option<DragMode>,
     gif_opts: GifOptions,
+    /// the settings picked to match the opened GIF
+    gif_opts_open: GifOptions,
     opt_drop_nth: usize,
     place_scope: PlaceScope,
     split_fmt: SplitFormat,
@@ -716,6 +718,10 @@ pub struct GifKitApp {
     tl_reorder: Option<usize>,
     /// frames the GIF will grow by when the drag past its end lets go
     tl_extend: usize,
+    /// changing a motion value at a frame without a keyframe adds one
+    tl_autokey: bool,
+    /// while trimming the GIF's outer ends: the output frames that stay
+    tl_trim: Option<(usize, usize)>,
     keymap: crate::keys::Keymap,
     /// the action whose new key is being waited for (shortcuts window)
     key_capture: Option<crate::keys::Action>,
@@ -734,6 +740,8 @@ pub struct GifKitApp {
     emoji_drag: Option<String>,
     /// views that take drops this frame: where they are and how they map
     drop_views: Vec<(Rect, Mapper)>,
+    /// where the edited views were last frame (for keys over them)
+    views_last: Vec<Rect>,
     show_toolbar: bool,
     show_statusbar: bool,
     /// recently opened files, newest first
@@ -2025,6 +2033,7 @@ impl GifKitApp {
             trim_tol: 8,
             drag: None,
             gif_opts: GifOptions::default(),
+            gif_opts_open: GifOptions::default(),
             opt_drop_nth: 0,
             place_scope: PlaceScope::All,
             split_fmt: SplitFormat::Png,
@@ -2095,6 +2104,8 @@ impl GifKitApp {
             tl_head_drag: false,
             tl_reorder: None,
             tl_extend: 0,
+            tl_autokey: theme::get_setting("auto_key").map(|v| v != "0").unwrap_or(true),
+            tl_trim: None,
             keymap: crate::keys::Keymap::load(),
             key_capture: None,
             preview_max: theme::get_setting("preview_max").and_then(|v| v.parse().ok()).unwrap_or(1280),
@@ -2104,6 +2115,7 @@ impl GifKitApp {
             last_render_ms: 0.0,
             emoji_drag: None,
             drop_views: Vec::new(),
+            views_last: Vec::new(),
             show_toolbar: theme::get_setting("show_toolbar").as_deref() != Some("0"),
             show_statusbar: theme::get_setting("show_statusbar").as_deref() != Some("0"),
             recent: theme::get_setting("recent").unwrap_or_default().split('\n').filter(|l| !l.is_empty()).map(PathBuf::from).collect(),
@@ -2293,6 +2305,11 @@ impl GifKitApp {
                 self.path = path;
                 self.file_size = size;
                 self.modified = false;
+                // save it again the way it was saved, so the size stays close
+                let like = self.path.as_ref().filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("gif"))).and_then(|p| std::fs::read(p).ok()).and_then(|b| crate::encode::gif_info(&b));
+                let opts = like.map(|i| GifOptions::like(&i)).unwrap_or_default();
+                self.gif_opts = GifOptions { noai_tag: self.gif_opts.noai_tag, ..opts.clone() };
+                self.gif_opts_open = self.gif_opts.clone();
                 self.cmp = None;
                 self.original = Some(a.clone());
                 self.orig_gen += 1;
@@ -3175,6 +3192,18 @@ impl GifKitApp {
         if undo {
             self.do_undo();
         }
+        // Delete over the picture removes the selected text, shape, emoji…
+        let over_view = ctx.pointer_hover_pos().is_some_and(|p| self.views_last.iter().any(|r| r.contains(p)));
+        if over_view && hit(A::DeleteObject) {
+            if let Some(li) = self.tool.layer_kind().and_then(|k| self.sel_index(k)) {
+                let now = ctx.input(|i| i.time);
+                self.snapshot(&format!("del{now}"), now);
+                let name = self.stack.layers[li].name();
+                self.stack.layers.remove(li);
+                self.modified = true;
+                self.info(format!("Deleted {name}"));
+            }
+        }
         if redo {
             self.do_redo();
         }
@@ -3702,6 +3731,19 @@ impl GifKitApp {
 
     // ------------------------------------------------------------ compare / compressed output
 
+    /// The opened GIF, when saving it as GIF would change nothing: no layers,
+    /// edits, timeline changes or new settings. It's then kept as it is.
+    fn untouched_gif(&self) -> Option<PathBuf> {
+        if self.export_fmt != ExportFormat::Gif || self.gif_opts.clone() != (GifOptions { noai_tag: self.gif_opts.noai_tag, ..self.gif_opts_open.clone() }) {
+            return None;
+        }
+        let path = self.path.as_ref().filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("gif")))?;
+        let (base, orig) = (self.base.as_ref()?, self.original.as_ref()?);
+        let same = base.len() == orig.len() && base.frames.iter().zip(&orig.frames).all(|(a, b)| a.enabled && Arc::ptr_eq(&a.image, &b.image) && a.delay_cs == b.delay_cs);
+        let plain = self.stack.layers.iter().all(|l| !l.visible) && self.stack.transform.is_identity() && self.stack.loop_count(base) == orig.loop_count;
+        (same && plain).then(|| path.clone())
+    }
+
     fn cmp_key(&self) -> u64 {
         hash_parts(&[self.stack.signature(), self.version, self.timing_rev, hash_str(&format!("{:?}", self.preview_format())), self.stack.plan_signature()])
     }
@@ -3770,6 +3812,31 @@ impl GifKitApp {
         // half a second after the last change, so quick tweaks don't each start an encode
         if now - self.cmp_key_since < 0.5 || busy_input {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
+            return;
+        }
+        // nothing changed: the preview is the file itself
+        if let Some(path) = self.untouched_gif() {
+            let (orig, noai) = (self.original.clone().unwrap(), self.gif_opts.noai_tag);
+            let (tx, rx) = channel();
+            let ctx2 = ctx.clone();
+            std::thread::spawn(move || {
+                let res = std::fs::read(&path).map_err(anyhow::Error::from).map(|b| {
+                    let b = if noai { crate::encode::tag_gif(b) } else { b };
+                    let full = (orig.width(), orig.height());
+                    let side = full.0.max(full.1);
+                    let anim = if side > TEX_MAX_SIDE {
+                        let (w, h) = stack::proxy_size(full.0, full.1, TEX_MAX_SIDE as f32 / side as f32);
+                        Animation { frames: orig.frames.iter().map(|f| crate::anim::Frame { image: Arc::new(image::imageops::resize(&*f.image, w, h, image::imageops::FilterType::Triangle)), ..f.clone() }).collect(), loop_count: orig.loop_count }
+                    } else {
+                        orig
+                    };
+                    let n = b.len() as u64;
+                    (anim, b, None, n, full)
+                });
+                let _ = tx.send(res);
+                ctx2.request_repaint();
+            });
+            self.cmp_job = Some(CmpJob { key, sheet: false, rx });
             return;
         }
         let base = self.base.clone().unwrap();
@@ -3922,7 +3989,7 @@ impl eframe::App for GifKitApp {
         // a dialog of ours having focus still counts as the app being active
         let dialog_open = self.export_open || self.history_open || self.about_open || self.shortcuts_open || self.video_import.is_some();
         theme::set_focused(&ctx, focused || dialog_open, self.theme);
-        self.drop_views.clear();
+        self.views_last = self.drop_views.drain(..).map(|v| v.0).collect();
         // text that follows the canvas (wrapping, centring, caption bars)
         if self.base.is_some() {
             let (w, h) = self.dims();
@@ -4455,6 +4522,7 @@ impl GifKitApp {
                 // exporting lives in File ▸ Export… (Ctrl+E)
                 if has {
                     ui.add_enabled_ui(idle, |ui| self.format_menu(ui, tb_h));
+                    ui.label(RichText::new("Export as").color(p().fg_muted)).on_hover_text("The format the compressed preview shows and File ▸ Export saves");
                 }
             });
         });
@@ -5317,42 +5385,45 @@ impl GifKitApp {
             let time_w = 112.0;
             let frame_w = 30.0 + 16.0 * digits as f32;
             let speed_w = 74.0;
-            let reserve = time_w + frame_w + speed_w + TOOLBAR_H + 4.0 * 10.0;
-            ui.spacing_mut().slider_width = (ui.available_width() - reserve).max(60.0);
-            let mut f = self.cur + 1;
-            if slider(ui, egui::Slider::new(&mut f, 1..=n.max(1)).show_value(false)).changed() {
-                self.cur = f - 1;
-                self.playing = false;
-                self.elapsed = 0.0;
-            }
-            ui.add_space(6.0);
-            let mono = |s: String| RichText::new(s).font(egui::FontId::monospace(12.5)).color(pal.fg);
-            ui.add_sized(vec2(time_w, TOOLBAR_H), egui::Label::new(mono(format!("{now_t:.2} / {total:.2} s")))).on_hover_text("Time and length in seconds");
-            ui.add_sized(vec2(frame_w, TOOLBAR_H), egui::Label::new(mono(format!("{:>w$} / {}", self.cur + 1, n, w = digits))))
-                .on_hover_text(format!("Frame. Delay {delay} cs{}", if enabled { "" } else { " · skipped" }));
-            let speeds = [0.25f32, 0.5, 0.75, 1.0, 1.5, 2.0, 4.0];
-            let label = |v: f32| if v == 1.0 { "1×".to_string() } else { format!("{v}×") };
-            egui::ComboBox::from_id_salt("play_speed").icon(chevron)
-                .width(speed_w)
-                .selected_text(label(self.play_speed))
-                .show_ui(ui, |ui| {
-                    for v in speeds {
-                        if ui.selectable_label(self.play_speed == v, label(v)).clicked() {
-                            self.play_speed = v;
+            // the readouts and buttons sit on the right; the slider takes what's left
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                // show or hide the timeline dock
+                let on = self.show_timeline;
+                let b = ui.add(sel_btn(egui::Button::new("").frame_when_inactive(on).min_size(vec2(TOOLBAR_H, TOOLBAR_H)), on)).on_hover_text(if on { "Hide the timeline" } else { "Show the timeline" });
+                crate::icons::paint(ui.painter(), "player-time", b.rect.center(), 16.0, pal.fg);
+                if b.clicked() {
+                    self.show_timeline = !on;
+                    theme::set_setting("show_timeline", if self.show_timeline { "1" } else { "0" });
+                }
+                let speeds = [0.25f32, 0.5, 0.75, 1.0, 1.5, 2.0, 4.0];
+                let label = |v: f32| if v == 1.0 { "1×".to_string() } else { format!("{v}×") };
+                egui::ComboBox::from_id_salt("play_speed")
+                    .icon(chevron)
+                    .width(speed_w)
+                    .selected_text(label(self.play_speed))
+                    .show_ui(ui, |ui| {
+                        for v in speeds {
+                            if ui.selectable_label(self.play_speed == v, label(v)).clicked() {
+                                self.play_speed = v;
+                            }
                         }
-                    }
-                })
-                .response
-                .on_hover_text("Playback speed of the preview. Exports keep their own timing.");
-            // show or hide the timeline dock
-            let pal = *p();
-            let on = self.show_timeline;
-            let b = ui.add(sel_btn(egui::Button::new("").frame_when_inactive(on).min_size(vec2(TOOLBAR_H, TOOLBAR_H)), on)).on_hover_text(if on { "Hide the timeline" } else { "Show the timeline" });
-            crate::icons::paint(ui.painter(), "player-time", b.rect.center(), 16.0, pal.fg);
-            if b.clicked() {
-                self.show_timeline = !on;
-                theme::set_setting("show_timeline", if self.show_timeline { "1" } else { "0" });
-            }
+                    })
+                    .response
+                    .on_hover_text("Playback speed of the preview. Exports keep their own timing.");
+                let mono = |s: String| RichText::new(s).font(egui::FontId::monospace(12.5)).color(pal.fg);
+                ui.add_sized(vec2(frame_w, TOOLBAR_H), egui::Label::new(mono(format!("{:>w$} / {}", self.cur + 1, n, w = digits))))
+                    .on_hover_text(format!("Frame. Delay {delay} cs{}", if enabled { "" } else { " · skipped" }));
+                ui.add_sized(vec2(time_w, TOOLBAR_H), egui::Label::new(mono(format!("{now_t:.2} / {total:.2} s")))).on_hover_text("Time and length in seconds");
+                ui.add_space(6.0);
+                ui.spacing_mut().slider_width = (ui.available_width() - 4.0).max(60.0);
+                let mut f = self.cur + 1;
+                if slider(ui, egui::Slider::new(&mut f, 1..=n.max(1)).show_value(false)).changed() {
+                    self.cur = f - 1;
+                    self.playing = false;
+                    self.elapsed = 0.0;
+                }
+            });
         });
     }
 
@@ -5575,6 +5646,13 @@ impl GifKitApp {
             }
         }
         match self.export_fmt {
+            ExportFormat::Gif if self.untouched_gif().is_some() => {
+                let src = self.untouched_gif().unwrap();
+                if let Some(path) = self.save_path("GIF", &["gif"]) {
+                    let r = std::fs::read(&src).map(|b| if noai { crate::encode::tag_gif(b) } else { b }).and_then(|b| std::fs::write(&path, &b).map(|_| b.len())).map(|n| format!("Saved {} ({}, unchanged)", path.display(), fmt_size(n as u64))).map_err(anyhow::Error::from);
+                    self.saved(r);
+                }
+            }
             ExportFormat::Gif => {
                 if let Some(path) = self.save_path("GIF", &["gif"]) {
                     let opts = self.gif_opts.clone();
@@ -6197,14 +6275,22 @@ impl GifKitApp {
         (resp, Mapper { rect: img_rect, scale })
     }
 
-    /// Zoom controls floating in the corner of a view, for that view.
+    /// Width the zoom controls take at the top right of a view (0 when the
+    /// view is too small for them).
+    fn zoom_bar_w(rect: Rect) -> f32 {
+        let w = 4.0 * 26.0 + 58.0 + 14.0;
+        if rect.width() < w + 200.0 || rect.height() < 120.0 { 0.0 } else { w }
+    }
+
+    /// Zoom controls at the top right of a view, in line with its source
+    /// picker, for that view.
     fn view_zoom_overlay(&mut self, ui: &mut egui::Ui, vi: usize, rect: Rect) {
         let (b, pct_w) = (26.0, 58.0);
-        let w = 4.0 * b + pct_w + 14.0;
-        if rect.width() < w + 40.0 || rect.height() < 120.0 {
+        let w = Self::zoom_bar_w(rect);
+        if w == 0.0 {
             return;
         }
-        let bar = Rect::from_min_size(pos2(rect.right() - w - 10.0, rect.bottom() - b - 16.0), vec2(w, b + 6.0));
+        let bar = Rect::from_min_size(pos2(rect.right() - w - 10.0, rect.top() + 7.0), vec2(w, b + 6.0));
         let hovered = ui.rect_contains_pointer(bar);
         ui.painter().rect_filled(bar, 4.0, Color32::from_black_alpha(if hovered { 200 } else { 150 }));
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(bar.shrink2(vec2(5.0, 3.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
@@ -6300,7 +6386,8 @@ impl GifKitApp {
     fn view_picker(&mut self, ui: &mut egui::Ui, rect: Rect, src: ViewSource, vi: usize) {
         let pal = *p();
         let info = self.view_info(src);
-        let area = Rect::from_min_size(rect.min + vec2(10.0, 10.0), vec2((rect.width() - 20.0).max(40.0), 28.0));
+        let zoom_w = Self::zoom_bar_w(rect);
+        let area = Rect::from_min_size(rect.min + vec2(10.0, 10.0), vec2((rect.width() - 20.0 - if zoom_w > 0.0 { zoom_w + 10.0 } else { 0.0 }).max(40.0), 28.0));
         // drop detail from the label until it fits the view
         let font = theme::medium(12.5);
         let fits = |t: &String| ui.painter().layout_no_wrap(t.clone(), font.clone(), Color32::WHITE).size().x + 24.0 <= area.width();
@@ -7620,7 +7707,7 @@ impl GifKitApp {
         }
         if reset {
             self.undo_last_fit();
-            self.gif_opts = GifOptions { noai_tag: self.gif_opts.noai_tag, ..GifOptions::default() };
+            self.gif_opts = GifOptions { noai_tag: self.gif_opts.noai_tag, ..self.gif_opts_open.clone() };
             self.webp_opts = io::WebpOptions::default();
             self.avif_quality = 60;
             self.info("Compression reset");
@@ -8061,7 +8148,8 @@ impl GifKitApp {
             ui.add_space(6.0);
         }
         group(ui, "Text", |ui| {
-            ui.add(egui::TextEdit::multiline(&mut a.text).desired_rows(2).desired_width(f32::INFINITY));
+            // a fixed id keeps the focus when the first letter adds the layer
+            ui.add(egui::TextEdit::multiline(&mut a.text).id_salt("text_body").desired_rows(2).desired_width(f32::INFINITY));
         });
         group(ui, "Layout", |ui| {
             use text::Caption;
@@ -8188,7 +8276,7 @@ impl GifKitApp {
             self.place_text(&mut a);
         }
         // the next text takes this style, but not its caption bar
-        self.text_tpl = Annotation { text: if sel.is_none() { a.text.clone() } else { self.text_tpl.text.clone() }, x: 0, y: 0, angle: 0.0, from: 1, to: 0, caption: text::Caption::None, bar_h: 0, ..a.clone() };
+        self.text_tpl = Annotation { text: self.text_tpl.text.clone(), x: 0, y: 0, angle: 0.0, from: 1, to: 0, caption: text::Caption::None, bar_h: 0, ..a.clone() };
         self.commit_layer(sel, changed, LayerKind::Text(a));
     }
 

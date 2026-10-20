@@ -4,17 +4,33 @@
 
 A GIF editor and optimiser that runs on your own machine. Runs on Linux, Windows and macOS.
 
-![GIFkit with the original on the left and the compressed result on the right](docs/img/app.png)
+![GIFkit with layers on the timeline and the original next to the compressed result](docs/img/app.png)
 
 ## What it does
 
 - Crop, resize, rotate, cut, change speed, reverse and more
-- Effects, text, censor boxes, image overlays, watermarks and more 
+- Effects, text, captions, emoji, shapes, censor boxes, image overlays, watermarks and more 
+- Timeline with clips and keyframes, so layers can come and go and move over time
 - Everything is non-destructive, with full undo history and layer stack
-- Side-by-side preview
+- Side-by-side preview of the original and the compressed result
+- Opened GIFs stay the same size if you change nothing
 - Export to GIF, WebP, AVIF, APNG, MP4/WebM
 - Export with arbitrary file size target
 - Presets you can reuse
+
+![Compression settings with the original and compressed result side by side](docs/img/compress.png)
+
+## Compared to other tools
+
+| | GIFkit | ezgif | ScreenToGif | gifski | GIMP | Photoshop |
+|---|---|---|---|---|---|---|
+| Price | Free | Free | Free | Free | Free | Paid |
+| Works offline | ✓ | — | ✓ | ✓ | ✓ | ✓ |
+| Platforms | Linux, Windows, macOS | Browser | Windows | Linux, Windows, macOS | Linux, Windows, macOS | Windows, macOS |
+| Layers you can still change | ✓ | — | — | — | ✓ | ✓ |
+| Timeline with keyframes | ✓ | — | — | — | — | ✓ |
+| Export to a file size | ✓ | — | — | — | — | ✓ |
+| Made for GIFs | ✓ | ✓ | ✓ | ✓ | — | — |
 
 ## Examples 
 

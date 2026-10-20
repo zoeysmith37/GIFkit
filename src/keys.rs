@@ -25,6 +25,7 @@ pub enum Action {
     SplitView,
     FullScreen,
     Handbook,
+    DeleteObject,
     TlSplit,
     TlKey,
     TlRazor,
@@ -32,7 +33,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 23] = [
+    pub const ALL: [Action; 24] = [
         Action::New,
         Action::Open,
         Action::Save,
@@ -52,6 +53,7 @@ impl Action {
         Action::SplitView,
         Action::FullScreen,
         Action::Handbook,
+        Action::DeleteObject,
         Action::TlSplit,
         Action::TlKey,
         Action::TlRazor,
@@ -79,6 +81,7 @@ impl Action {
             Action::SplitView => "Single or split view",
             Action::FullScreen => "Full screen",
             Action::Handbook => "Handbook",
+            Action::DeleteObject => "Delete the selected object in the view",
             Action::TlSplit => "Timeline: split at the playhead",
             Action::TlKey => "Timeline: add a keyframe",
             Action::TlRazor => "Timeline: selection or razor tool",
@@ -108,6 +111,7 @@ impl Action {
             Action::SplitView => "split",
             Action::FullScreen => "full",
             Action::Handbook => "help",
+            Action::DeleteObject => "delete",
             Action::TlSplit => "tl_split",
             Action::TlKey => "tl_key",
             Action::TlRazor => "tl_razor",
@@ -139,6 +143,7 @@ impl Action {
             Action::SplitView => k(Key::C),
             Action::FullScreen => cs(Key::F),
             Action::Handbook => k(Key::F1),
+            Action::DeleteObject => k(Key::Delete),
             Action::TlSplit => k(Key::S),
             Action::TlKey => k(Key::K),
             Action::TlRazor => k(Key::X),

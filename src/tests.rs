@@ -1328,3 +1328,29 @@ fn preview_proxy_matches_a_shrunk_full_render() {
     }
     assert!(same as f32 / total as f32 > 0.97, "{same} of {total}");
 }
+
+#[test]
+fn gif_info_reads_palettes_and_tags_once() {
+    let mut buf = Vec::new();
+    {
+        let mut e = gif::Encoder::new(&mut buf, 2, 2, &[0, 0, 0, 255, 255, 255]).unwrap();
+        for _ in 0..3 {
+            let mut f = gif::Frame::default();
+            (f.width, f.height, f.buffer) = (2, 2, std::borrow::Cow::Owned(vec![0, 1, 1, 0]));
+            e.write_frame(&f).unwrap();
+        }
+    }
+    let i = crate::encode::gif_info(&buf).unwrap();
+    assert_eq!((i.frames, i.colors, i.global_only, i.has_comment), (3, 2, true, false));
+    let t = crate::encode::tag_gif(buf.clone());
+    assert!(t.len() > buf.len());
+    assert!(crate::encode::gif_info(&t).unwrap().has_comment);
+    assert_eq!(crate::encode::tag_gif(t.clone()).len(), t.len());
+    // still a GIF that decodes to the same frames
+    let mut d = gif::DecodeOptions::new().read_info(std::io::Cursor::new(&t)).unwrap();
+    let mut n = 0;
+    while d.read_next_frame().unwrap().is_some() {
+        n += 1;
+    }
+    assert_eq!(n, 3);
+}
