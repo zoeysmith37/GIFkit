@@ -1046,6 +1046,7 @@ dependencies = [
  "tiny-skia",
  "unicode-bidi",
  "webp-animation",
+ "windows-sys 0.59.0",
  "winresource",
  "zip",
 ]

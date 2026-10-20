@@ -451,6 +451,18 @@ pub fn lower_thread_priority() {
         let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
         libc::setpriority(libc::PRIO_PROCESS, tid, 10);
     }
+    #[cfg(windows)]
+    unsafe {
+        // Windows runs normal priority threads round-robin, so a pool of busy
+        // workers would otherwise take turns with the UI thread and stall playback
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        // "utility" quality of service: runs on efficiency cores first and yields to the UI
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
+    }
 }
 
 /// Thread pool for background work (pre-rendering, compression, exports) so
@@ -709,11 +721,12 @@ impl Stack {
         let frames: Vec<Frame> = (0..plan.len())
             .into_par_iter()
             .map(|i| {
-                let img = if render { self.render_frame(base, &plan, &times, i, fonts, &prep) } else { (*base.frames[plan[i].src].image).clone() };
+                // untouched frames share the source image rather than copying it
+                let image = if render { Arc::new(self.render_frame(base, &plan, &times, i, fonts, &prep)) } else { base.frames[plan[i].src].image.clone() };
                 if let Some(p) = progress {
                     p.fetch_add(1, Ordering::Relaxed);
                 }
-                Frame { image: Arc::new(img), delay_cs: plan[i].delay, enabled: plan[i].enabled }
+                Frame { image, delay_cs: plan[i].delay, enabled: plan[i].enabled }
             })
             .collect();
         let mut out = Animation { frames, loop_count: self.loop_count(base) };

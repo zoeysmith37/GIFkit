@@ -28,6 +28,8 @@ pub struct Palette {
     pub positive: Color32,
     pub neutral: Color32,
     pub canvas: Color32,
+    /// toolbar / header area while the window is inactive
+    pub header_inactive: Color32,
 }
 
 pub const DARK: Palette = Palette {
@@ -47,6 +49,7 @@ pub const DARK: Palette = Palette {
     positive: Color32::from_rgb(0x27, 0xae, 0x60),
     neutral: Color32::from_rgb(0xf6, 0x74, 0x00),
     canvas: Color32::from_rgb(0x10, 0x12, 0x14),
+    header_inactive: Color32::from_rgb(0x20, 0x23, 0x26),
 };
 
 pub const LIGHT: Palette = Palette {
@@ -66,6 +69,7 @@ pub const LIGHT: Palette = Palette {
     positive: Color32::from_rgb(0x27, 0xae, 0x60),
     neutral: Color32::from_rgb(0xf6, 0x74, 0x00),
     canvas: Color32::from_rgb(0xd8, 0xdb, 0xde),
+    header_inactive: Color32::from_rgb(0xef, 0xf0, 0xf1),
 };
 
 static IS_DARK: AtomicBool = AtomicBool::new(true);
@@ -217,11 +221,116 @@ fn parse_kdeglobals(text: &str) -> Kde {
                 positive: get("Colors:Window", "ForegroundPositive").unwrap_or(base.positive),
                 neutral: get("Colors:Window", "ForegroundNeutral").unwrap_or(base.neutral),
                 canvas: if dark { lerp(view, Color32::BLACK, 0.2) } else { lerp(window, fg, 0.1) },
+                header_inactive: get("Colors:Header][Inactive", "BackgroundNormal").unwrap_or(window),
             },
             dark,
         ))
     })();
     Kde { accent, scheme }
+}
+
+/// A value from kdeglobals (Linux), cached until the file changes.
+pub fn kde_value(section: &str, key: &str) -> Option<String> {
+    static CACHE: std::sync::Mutex<Option<Vec<(String, String, String)>>> = std::sync::Mutex::new(None);
+    let mut g = CACHE.lock().ok()?;
+    if DIRTY_VALUES.swap(false, Ordering::AcqRel) {
+        *g = None;
+    }
+    if g.is_none() {
+        let text = kdeglobals_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+        let mut sec = String::new();
+        let mut v = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.starts_with('[') {
+                sec = line.trim_matches(|c| c == '[' || c == ']').to_string();
+            } else if let Some((k, val)) = line.split_once('=') {
+                v.push((sec.clone(), k.trim().to_string(), val.trim().to_string()));
+            }
+        }
+        *g = Some(v);
+    }
+    g.as_ref()?.iter().find(|(s, k, _)| s == section && k == key).map(|x| x.2.clone())
+}
+
+static DIRTY_VALUES: AtomicBool = AtomicBool::new(false);
+
+/// Name of the user's icon theme (KDE), if set.
+pub fn icon_theme() -> Option<String> {
+    kde_value("Icons", "Theme")
+}
+
+/// The desktop's UI font: (family, size in pixels). KDE stores
+/// "Noto Sans,10,-1,5,400,…" with the size in points.
+pub fn ui_font() -> Option<(String, f32)> {
+    let v = kde_value("General", "font")?;
+    let mut parts = v.split(',');
+    let family = parts.next()?.trim().to_string();
+    let pt: f32 = parts.next()?.trim().parse().ok()?;
+    (!family.is_empty() && (6.0..=24.0).contains(&pt)).then(|| (family, pt * 96.0 / 72.0))
+}
+
+/// How toolbars show their buttons: (show text beside the icon, icon size).
+/// KDE's defaults are text beside icons and 22 px icons.
+pub fn toolbar_style() -> (bool, f32) {
+    let text = match kde_value("Toolbar style", "ToolButtonStyle").as_deref() {
+        Some("IconOnly") => false,
+        Some(_) => true,
+        // off the KDE desktop, keep the compact icon-only toolbar
+        None => kdeglobals_path().is_some_and(|p| p.exists()),
+    };
+    let size = kde_value("MainToolbarIcons", "Size").or_else(|| kde_value("ToolbarIcons", "Size")).and_then(|v| v.parse::<f32>().ok()).filter(|s| (12.0..=48.0).contains(s));
+    let size = size.unwrap_or(if kdeglobals_path().is_some_and(|p| p.exists()) { 22.0 } else { 16.0 });
+    (text, size)
+}
+
+/// Find the file of a system font (fontconfig), for the UI font.
+fn font_file(family: &str, weight: &str) -> Option<Vec<u8>> {
+    if !cfg!(all(unix, not(target_os = "macos"))) {
+        return None;
+    }
+    let out = std::process::Command::new("fc-match").args(["-f", "%{family}|%{file}", &format!("{family}:weight={weight}")]).output().ok()?;
+    let txt = String::from_utf8_lossy(&out.stdout).to_string();
+    let (fam, file) = txt.split_once('|')?;
+    // fc-match always answers; only use it when it found the family asked for
+    if !fam.split(',').any(|f| f.trim().eq_ignore_ascii_case(family)) {
+        return None;
+    }
+    let file = file.trim();
+    (file.ends_with(".ttf") || file.ends_with(".otf") || file.ends_with(".ttc")).then(|| std::fs::read(file).ok()).flatten()
+}
+
+/// Whether the window has focus (KDE colour schemes have inactive colours).
+static FOCUSED: AtomicBool = AtomicBool::new(true);
+
+/// Follow window focus: dim the header and selection colours while inactive,
+/// as Qt apps do with the scheme's inactive colours.
+pub fn set_focused(ctx: &egui::Context, focused: bool, choice: ThemeChoice) {
+    if FOCUSED.swap(focused, Ordering::AcqRel) == focused {
+        return;
+    }
+    let (d, l) = palettes();
+    ctx.set_visuals_of(Theme::Dark, visuals(&for_focus(d), true));
+    ctx.set_visuals_of(Theme::Light, visuals(&for_focus(l), false));
+    choice.apply(ctx);
+    ctx.request_repaint();
+}
+
+fn for_focus(p: &Palette) -> Palette {
+    if FOCUSED.load(Ordering::Relaxed) {
+        return *p;
+    }
+    for_focus_off(p)
+}
+
+fn for_focus_off(p: &Palette) -> Palette {
+    let mut q = *p;
+    q.header = p.header_inactive;
+    // inactive selections lose their colour, like Breeze's
+    let grey = lerp(p.window, p.fg, 0.35);
+    q.highlight = lerp(p.highlight, grey, 0.55);
+    q.highlight_soft = lerp(p.highlight_soft, p.window, 0.5);
+    q
 }
 
 /// Watch kdeglobals so colour scheme and accent changes show up live.
@@ -237,6 +346,7 @@ pub fn watch(ctx: &egui::Context) {
             if now != last {
                 last = now;
                 DIRTY.store(true, Ordering::Release);
+                DIRTY_VALUES.store(true, Ordering::Release);
                 ctx.request_repaint();
             }
         }
@@ -250,8 +360,8 @@ pub fn refresh(ctx: &egui::Context, choice: ThemeChoice) {
     }
     let new = Box::leak(Box::new(build_palettes()));
     PALS.store(new, Ordering::Release);
-    ctx.set_visuals_of(Theme::Dark, visuals(&new.0, true));
-    ctx.set_visuals_of(Theme::Light, visuals(&new.1, false));
+    ctx.set_visuals_of(Theme::Dark, visuals(&for_focus(&new.0), true));
+    ctx.set_visuals_of(Theme::Light, visuals(&for_focus(&new.1), false));
     choice.apply(ctx);
     ctx.request_repaint();
 }
@@ -259,7 +369,31 @@ pub fn refresh(ctx: &egui::Context, choice: ThemeChoice) {
 /// Palette of the theme currently in use (set every frame by the app).
 pub fn p() -> &'static Palette {
     let (d, l) = palettes();
+    if !FOCUSED.load(Ordering::Relaxed) {
+        let (di, li) = inactive_palettes();
+        return if IS_DARK.load(Ordering::Relaxed) { di } else { li };
+    }
     if IS_DARK.load(Ordering::Relaxed) { d } else { l }
+}
+
+/// Inactive-window versions of the palettes. Rebuilt (the old one leaked)
+/// only when the desktop colours change.
+static INACTIVE: AtomicPtr<(usize, (Palette, Palette))> = AtomicPtr::new(std::ptr::null_mut());
+
+fn inactive_palettes() -> &'static (Palette, Palette) {
+    let src = palettes();
+    let id = src as *const _ as usize;
+    let ptr = INACTIVE.load(Ordering::Acquire);
+    if !ptr.is_null() {
+        // SAFETY: pointers stored in INACTIVE come from Box::leak and are never freed
+        let cur = unsafe { &*ptr };
+        if cur.0 == id {
+            return &cur.1;
+        }
+    }
+    let new: &'static (usize, (Palette, Palette)) = Box::leak(Box::new((id, (for_focus_off(&src.0), for_focus_off(&src.1)))));
+    INACTIVE.store(new as *const _ as *mut _, Ordering::Release);
+    &new.1
 }
 
 pub fn set_current(ctx: &egui::Context) {
@@ -309,6 +443,8 @@ fn visuals(pal: &Palette, dark: bool) -> egui::Visuals {
     v.window_shadow = Shadow { offset: [0, 3], blur: 14, spread: 0, color: Color32::from_black_alpha(if dark { 110 } else { 40 }) };
     v.popup_shadow = Shadow { offset: [0, 2], blur: 8, spread: 0, color: Color32::from_black_alpha(if dark { 100 } else { 35 }) };
     v.slider_trailing_fill = true;
+    // Breeze greys disabled controls out rather than making them see-through
+    v.disabled_alpha = 0.62;
     v.handle_shape = egui::style::HandleShape::Circle;
     v.striped = false;
     v.indent_has_left_vline = false;
@@ -360,7 +496,24 @@ pub fn install(ctx: &egui::Context) {
     prop.insert(0, "noto".into());
     prop.push("dejavu".into());
     fonts.families.entry(FontFamily::Monospace).or_default().push("dejavu".into());
+    // the desktop's UI font, when KDE says which (Noto Sans stays as fallback)
+    let mut body = 13.5;
+    let mut medium_first: Option<String> = None;
+    if let Some((family, px)) = ui_font() {
+        if let Some(reg) = font_file(&family, "regular") {
+            fonts.font_data.insert("kde-ui".into(), Arc::new(egui::FontData::from_owned(reg)));
+            fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "kde-ui".into());
+            body = px.clamp(11.0, 18.0);
+            if let Some(med) = font_file(&family, "medium").or_else(|| font_file(&family, "demibold")) {
+                fonts.font_data.insert("kde-ui-medium".into(), Arc::new(egui::FontData::from_owned(med)));
+                medium_first = Some("kde-ui-medium".into());
+            }
+        }
+    }
     let mut medium = vec!["noto-medium".to_string(), "noto".to_string()];
+    if let Some(m) = medium_first {
+        medium.insert(0, m);
+    }
     medium.extend(fonts.families[&FontFamily::Proportional].iter().skip(1).cloned());
     fonts.families.insert(FontFamily::Name("medium".into()), medium);
     // built-in text fonts, so the font picker can show each in its own face
@@ -375,9 +528,10 @@ pub fn install(ctx: &egui::Context) {
     ctx.all_styles_mut(|s| {
         // Kirigami units: 4 px inside a group, 6 px between controls, 8 px between groups
         s.spacing.item_spacing = Vec2::new(6.0, 6.0);
-        s.spacing.button_padding = Vec2::new(10.0, 3.0);
+        // Breeze controls are about 30 px tall with roomy padding
+        s.spacing.button_padding = Vec2::new(12.0, 5.0);
         // value boxes keep one width as their numbers grow
-        s.spacing.interact_size = Vec2::new(72.0, 26.0);
+        s.spacing.interact_size = Vec2::new(72.0, 30.0);
         s.spacing.slider_width = 150.0;
         s.spacing.slider_rail_height = 4.0;
         s.spacing.menu_margin = egui::Margin::same(4);
@@ -386,8 +540,8 @@ pub fn install(ctx: &egui::Context) {
         s.spacing.icon_width_inner = 10.0;
         s.text_styles = [
             (TextStyle::Small, FontId::new(11.5, FontFamily::Proportional)),
-            (TextStyle::Body, FontId::new(13.5, FontFamily::Proportional)),
-            (TextStyle::Button, FontId::new(13.5, FontFamily::Proportional)),
+            (TextStyle::Body, FontId::new(body, FontFamily::Proportional)),
+            (TextStyle::Button, FontId::new(body, FontFamily::Proportional)),
             (TextStyle::Heading, FontId::new(17.0, FontFamily::Name("medium".into()))),
             (TextStyle::Monospace, FontId::new(12.5, FontFamily::Monospace)),
         ]

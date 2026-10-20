@@ -264,12 +264,35 @@ struct CmpResult {
     anim: Animation,
     bytes: Arc<Vec<u8>>,
     gen: u64,
+    /// for long animations: the plan frames that were encoded (the rest is estimated)
+    sample: Option<Vec<usize>>,
+    /// file size: exact, or estimated from the sample
+    size: u64,
 }
+
+impl CmpResult {
+    /// The encoded frame to show for plan frame `cur` at time `t`.
+    fn frame_for(&self, cur: usize, t: f32) -> usize {
+        match &self.sample {
+            Some(s) => s.iter().enumerate().min_by_key(|(_, i)| (**i as i64 - cur as i64).unsigned_abs()).map(|(j, _)| j).unwrap_or(0),
+            None => stack::frame_at_time(&self.anim, t),
+        }
+    }
+
+    fn size_text(&self) -> String {
+        if self.sample.is_some() { format!("≈ {}", fmt_size(self.size)) } else { fmt_size(self.size) }
+    }
+}
+
+/// Above this many pixels (frames × width × height) the compressed preview
+/// encodes a sample of the animation and estimates the size, so editing long
+/// clips stays quick. "Compress Fully" does the real thing on request.
+const SAMPLE_PIXELS: u64 = 60_000_000;
 
 struct CmpJob {
     key: u64,
     sheet: bool,
-    rx: Receiver<anyhow::Result<(Animation, Vec<u8>)>>,
+    rx: Receiver<anyhow::Result<(Animation, Vec<u8>, Option<Vec<usize>>, u64)>>,
 }
 
 struct Prerender {
@@ -635,6 +658,12 @@ pub struct GifKitApp {
     pending_open: Option<PathBuf>,
     /// measured width of the transport's view controls (last frame)
     play_speed: f32,
+    /// a video waiting for its import settings
+    video_import: Option<(PathBuf, io::VideoInfo, io::VideoImport)>,
+    /// estimate long animations' compressed size from a sample (setting)
+    sample_preview: bool,
+    /// the settings the user asked to compress fully once
+    cmp_full_key: u64,
     shortcuts_open: bool,
     /// where the project was last saved (None = never)
     project_path: Option<PathBuf>,
@@ -732,6 +761,15 @@ fn fmt_size(b: u64) -> String {
         format!("{:.1} KiB", b as f64 / 1024.0)
     } else {
         format!("{b} B")
+    }
+}
+
+/// "1:05.3" or "12.4 s".
+fn fmt_secs(t: f64) -> String {
+    if t >= 60.0 {
+        format!("{}:{:04.1}", (t / 60.0).floor() as u64, t % 60.0)
+    } else {
+        format!("{t:.1} s")
     }
 }
 
@@ -994,18 +1032,10 @@ fn clear_group_command(ctx: &egui::Context) {
 
 /// Collapsible group with a default state and an optional badge (e.g. number of active options).
 fn group_ex<R>(ui: &mut egui::Ui, title: &str, default_open: bool, badge: Option<String>, add: impl FnOnce(&mut egui::Ui) -> R) -> Option<R> {
+    // KDE settings pages are flat: a heading with a thin line under it, then the form
     let pal = *p();
     if title.is_empty() {
-        let r = egui::Frame::new()
-            .fill(mix(pal.window, pal.view, 0.35))
-            .stroke(Stroke::new(1.0, pal.border))
-            .corner_radius(theme::RADIUS)
-            .inner_margin(egui::Margin { left: 12, right: 12, top: 10, bottom: 12 })
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                add(ui)
-            })
-            .inner;
+        let r = add(ui);
         ui.add_space(GROUP_GAP);
         return Some(r);
     }
@@ -1016,37 +1046,29 @@ fn group_ex<R>(ui: &mut egui::Ui, title: &str, default_open: bool, badge: Option
         open = c;
     }
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
-    let hovered = resp.hovered();
     if resp.clicked() {
         open = !open;
     }
     ui.ctx().data_mut(|d| d.insert_persisted(id, open));
     let painter = ui.painter();
-    if hovered {
-        painter.rect_filled(rect, theme::RADIUS, mix(pal.window, pal.highlight, 0.12));
+    let col = if resp.hovered() { pal.fg } else { pal.fg_muted };
+    crate::icons::paint(painter, if open { "go-down" } else { "go-next" }, pos2(rect.left() + 8.0, rect.center().y), 16.0, col);
+    let galley = painter.layout_no_wrap(title.to_string(), theme::medium(14.0), pal.fg);
+    let tw = galley.size().x;
+    painter.galley(pos2(rect.left() + 20.0, rect.center().y - galley.size().y / 2.0), galley, pal.fg);
+    if badge.is_some() {
+        painter.circle_filled(pos2(rect.left() + 20.0 + tw + 8.0, rect.center().y), 3.0, pal.highlight);
     }
-    crate::icons::paint(painter, if open { "arrow-down" } else { "arrow-right" }, pos2(rect.left() + 11.0, rect.center().y), 16.0, pal.fg_muted);
-    painter.text(pos2(rect.left() + 24.0, rect.center().y), egui::Align2::LEFT_CENTER, title, theme::medium(13.5), pal.fg);
-    if let Some(b) = badge {
-        painter.circle_filled(pos2(rect.right() - 10.0, rect.center().y), 3.5, pal.highlight);
-        let _ = b;
-    }
+    painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, pal.border));
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let _ = resp;
     if !open {
-        ui.add_space(4.0);
+        ui.add_space(6.0);
         return None;
     }
-    ui.add_space(2.0);
-    let r = egui::Frame::new()
-        .fill(mix(pal.window, pal.view, 0.35))
-        .stroke(Stroke::new(1.0, pal.border))
-        .corner_radius(theme::RADIUS)
-        .inner_margin(egui::Margin { left: 12, right: 12, top: 10, bottom: 12 })
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            add(ui)
-        })
-        .inner;
-    ui.add_space(GROUP_GAP);
+    ui.add_space(8.0);
+    let r = add(ui);
+    ui.add_space(GROUP_GAP + 4.0);
     Some(r)
 }
 
@@ -1057,9 +1079,9 @@ fn toolbar_sep(ui: &mut egui::Ui) {
 }
 
 /// Height of toolbar / transport controls.
-const TOOLBAR_H: f32 = 28.0;
+const TOOLBAR_H: f32 = 30.0;
 /// Height of quick-pick chips and choice buttons.
-const CHIP_H: f32 = 26.0;
+const CHIP_H: f32 = 30.0;
 /// Space between the boxes of the inspector (Kirigami largeSpacing + a bit).
 const GROUP_GAP: f32 = 12.0;
 
@@ -1092,15 +1114,6 @@ fn chip(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::Response 
     ui.add(egui::Button::new(text.into()).wrap_mode(egui::TextWrapMode::Extend).min_size(vec2(28.0, CHIP_H)))
 }
 
-/// Choice button (one of several). Selected = Breeze checked look.
-fn seg<T: PartialEq>(ui: &mut egui::Ui, current: &mut T, value: T, text: impl Into<egui::WidgetText>) -> egui::Response {
-    let mut r = ui.add(sel_btn(egui::Button::new(text.into()).wrap_mode(egui::TextWrapMode::Extend).min_size(vec2(0.0, CHIP_H)), *current == value));
-    if r.clicked() && *current != value {
-        *current = value;
-        r.mark_changed();
-    }
-    r
-}
 
 /// A row of choices that share the width evenly (a segmented control).
 fn seg_row<T: PartialEq + Copy>(ui: &mut egui::Ui, current: &mut T, items: &[(T, &str)]) -> egui::Response {
@@ -1110,7 +1123,8 @@ fn seg_row<T: PartialEq + Copy>(ui: &mut egui::Ui, current: &mut T, items: &[(T,
     let min_w = label_w(ui, &labels);
     even_grid(ui, items.len(), min_w, |ui, i, size| {
         let (v, label) = items[i];
-        let mut r = ui.add_sized(size, sel_btn(egui::Button::new(label).truncate(), *current == v));
+        // KDE uses radio buttons for one-of-several choices
+        let mut r = cell(ui, size, |ui| radio(ui, *current == v, label));
         if r.clicked() && *current != v {
             *current = v;
             r.mark_changed();
@@ -1155,7 +1169,8 @@ fn even_grid(ui: &mut egui::Ui, n: usize, min_w: f32, mut add: impl FnMut(&mut e
 fn label_w(ui: &egui::Ui, labels: &[&str]) -> f32 {
     let font = egui::TextStyle::Button.resolve(ui.style());
     let w = labels.iter().map(|l| ui.ctx().fonts_mut(|f| f.layout_no_wrap(l.to_string(), font.clone(), Color32::WHITE).size().x)).fold(0.0, f32::max);
-    w + 2.0 * ui.spacing().button_padding.x + 4.0
+    // room for a button's padding, or a radio / checkbox indicator
+    w + (2.0 * ui.spacing().button_padding.x).max(16.0 + 7.0) + 6.0
 }
 
 /// Toggle buttons in even rows.
@@ -1165,10 +1180,10 @@ fn toggle_grid(ui: &mut egui::Ui, min_w: f32, items: &mut [(&mut bool, &str, &st
     let min_w = min_w.max(label_w(ui, &labels));
     even_grid(ui, n, min_w, |ui, i, size| {
         let (v, label, tip) = &mut items[i];
-        let r = ui.add_sized(size, sel_btn(egui::Button::new(*label).truncate(), **v));
-        let r = if tip.is_empty() { r } else { r.on_hover_text(*tip) };
-        if r.clicked() {
-            **v = !**v;
+        // on/off settings are checkboxes in KDE
+        let r = cell(ui, size, |ui| check(ui, v, *label));
+        if !tip.is_empty() {
+            r.on_hover_text(*tip);
         }
     });
 }
@@ -1362,8 +1377,10 @@ fn form_row<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -
     ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
         let (r, _) = ui.allocate_exact_size(vec2(FORM_LABEL_W, CHIP_H), Sense::hover());
         if !label.is_empty() {
+            // KDE form labels end with a colon
+            let text = if label.ends_with(':') { label.to_string() } else { format!("{label}:") };
             let col = if ui.is_enabled() { p().fg } else { p().fg_muted };
-            ui.painter().text(r.right_center() - vec2(2.0, 0.0), egui::Align2::RIGHT_CENTER, label, egui::FontId::proportional(13.5), col);
+            ui.painter().text(r.right_center() - vec2(2.0, 0.0), egui::Align2::RIGHT_CENTER, text, egui::TextStyle::Body.resolve(ui.style()), col);
         }
         let w = (ui.available_width() - 1.0).max(40.0);
         ui.vertical(|ui| {
@@ -1421,12 +1438,26 @@ fn opt_row<R>(ui: &mut egui::Ui, label: &str, on: &mut bool, add: impl FnOnce(&m
     })
 }
 
+/// A button that opens a menu: its text, then Breeze's down chevron on the right.
+fn drop_button<'a>(ui: &egui::Ui, text: impl Into<egui::WidgetText>, col: Color32) -> egui::Button<'a> {
+    egui::Button::new(text.into()).right_text(crate::icons::image(ui.ctx(), "go-down", 16.0, col))
+}
+
+/// Breeze's thin down chevron for combo boxes, in place of egui's triangle.
+fn chevron(ui: &egui::Ui, rect: Rect, visuals: &egui::style::WidgetVisuals, _open: bool) {
+    let c = rect.center();
+    let col = visuals.fg_stroke.color;
+    let s = 3.5;
+    ui.painter().add(egui::Shape::line(vec![c + vec2(-s, -s * 0.5), c + vec2(0.0, s * 0.5), c + vec2(s, -s * 0.5)], Stroke::new(1.3, col)));
+}
+
 /// A full-width combo box in the field column.
 fn combo<T: PartialEq + Copy>(ui: &mut egui::Ui, id: &str, current: &mut T, items: &[(T, &str)]) -> egui::Response {
     let text = items.iter().find(|i| i.0 == *current).map(|i| i.1).unwrap_or("");
     let w = ui.available_width();
     egui::ComboBox::from_id_salt(id)
         .width(w.max(40.0))
+        .icon(chevron)
         .truncate()
         .selected_text(text)
         .show_ui(ui, |ui| {
@@ -1444,13 +1475,45 @@ fn subhead(ui: &mut egui::Ui, text: &str) {
     ui.add_space(1.0);
 }
 
+/// Breeze radio button: an accent ring with a dot when chosen.
+fn radio(ui: &mut egui::Ui, on: bool, text: impl Into<egui::WidgetText>) -> egui::Response {
+    let pal = *p();
+    let text: egui::WidgetText = text.into();
+    let d = 16.0;
+    let gap = 7.0;
+    let wrap_w = (ui.available_width() - d - gap).max(10.0);
+    let galley = text.into_galley(ui, Some(egui::TextWrapMode::Truncate), wrap_w, egui::TextStyle::Body);
+    let size = vec2(d + gap + galley.size().x, galley.size().y.max(d).max(22.0));
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    if ui.is_rect_visible(rect) {
+        let en = ui.is_enabled();
+        let c = pos2(rect.left() + d / 2.0, rect.center().y);
+        let hov = resp.hovered() && en;
+        let painter = ui.painter();
+        if on {
+            let fill = if en { pal.highlight } else { mix(pal.button, pal.highlight, 0.4) };
+            painter.circle_filled(c, d / 2.0, fill);
+            painter.circle_filled(c, 3.2, Color32::WHITE);
+        } else {
+            painter.circle_filled(c, d / 2.0, pal.view);
+            painter.circle_stroke(c, d / 2.0 - 0.5, Stroke::new(1.0, if hov { pal.highlight } else { theme::outline(&pal) }));
+        }
+        let col = if en { pal.fg } else { pal.fg_muted };
+        painter.galley(pos2(c.x + d / 2.0 + gap, rect.center().y - galley.size().y / 2.0), galley, col);
+    }
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::RadioButton, ui.is_enabled(), on, ""));
+    resp
+}
+
 /// Breeze checkbox: accent fill with a white tick when on.
 fn check(ui: &mut egui::Ui, on: &mut bool, text: impl Into<egui::WidgetText>) -> egui::Response {
     let pal = *p();
     let text: egui::WidgetText = text.into();
     let box_s = 16.0;
     let gap = 7.0;
-    let galley = text.into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body);
+    // long labels are cut short rather than pushing the panel wider
+    let wrap_w = (ui.available_width() - box_s - gap).max(10.0);
+    let galley = text.into_galley(ui, Some(egui::TextWrapMode::Truncate), wrap_w, egui::TextStyle::Body);
     let size = vec2(box_s + gap + galley.size().x, galley.size().y.max(box_s).max(22.0));
     let (rect, mut resp) = ui.allocate_exact_size(size, Sense::click());
     if resp.clicked() {
@@ -1525,14 +1588,27 @@ fn icon_tool(ui: &mut egui::Ui, icon: &str, tip: &str, enabled: bool) -> egui::R
     if tip.is_empty() { r } else { r.on_hover_text(tip) }
 }
 
-/// Toolbar toggle with a Breeze icon; returns true when clicked.
-fn icon_toggle(ui: &mut egui::Ui, icon: &str, on: bool, tip: &str) -> bool {
+/// Main toolbar button: KDE's toolbar icon size, and text beside the icon
+/// for the main actions when the desktop asks for it.
+fn tb_tool(ui: &mut egui::Ui, icon: &str, text: &str, tip: &str, enabled: bool) -> egui::Response {
     let pal = *p();
-    let b = egui::Button::new("").frame_when_inactive(on).min_size(vec2(TOOLBAR_H, TOOLBAR_H));
-    let r = ui.add(sel_btn(b, on));
-    crate::icons::paint(ui.painter(), icon, r.rect.center(), 16.0, pal.fg);
-    r.on_hover_text(tip).clicked()
+    let (with_text, size) = theme::toolbar_style();
+    let col = if enabled { pal.fg } else { mix(pal.window, pal.fg, 0.35) };
+    let img = crate::icons::image(ui.ctx(), icon, size, col);
+    let b = if with_text && !text.is_empty() { egui::Button::image_and_text(img, RichText::new(text).color(col)) } else { egui::Button::image(img) };
+    let r = ui.add_enabled(enabled, b.frame_when_inactive(false).min_size(vec2(size + 10.0, size + 10.0)));
+    if tip.is_empty() { r } else { r.on_hover_text(tip) }
 }
+
+/// Main toolbar toggle (checked look when on).
+fn tb_toggle(ui: &mut egui::Ui, icon: &str, on: bool, tip: &str) -> bool {
+    let pal = *p();
+    let (_, size) = theme::toolbar_style();
+    let col = if ui.is_enabled() { pal.fg } else { mix(pal.window, pal.fg, 0.35) };
+    let b = egui::Button::image(crate::icons::image(ui.ctx(), icon, size, col)).frame_when_inactive(on).min_size(vec2(size + 10.0, size + 10.0));
+    ui.add(sel_btn(b, on)).on_hover_text(tip).clicked()
+}
+
 
 /// Outlined square button with a Breeze icon (playback bar).
 fn icon_button(ui: &mut egui::Ui, icon: &str, tip: &str, enabled: bool) -> egui::Response {
@@ -1547,7 +1623,8 @@ fn menu_item(ui: &mut egui::Ui, icon: &str, text: &str, shortcut: &str, enabled:
     let pal = *p();
     let img = crate::icons::image(ui.ctx(), if icon.is_empty() { "list-add" } else { icon }, 16.0, if enabled { pal.fg } else { pal.fg_muted });
     let img = if icon.is_empty() { img.tint(Color32::TRANSPARENT) } else { img };
-    let mut b = egui::Button::image_and_text(img, text);
+    // Breeze menu rows are taller, with more room after the icon
+    let mut b = egui::Button::image_and_text(img, text).min_size(vec2(0.0, 28.0)).gap(10.0);
     if !shortcut.is_empty() {
         b = b.shortcut_text(RichText::new(shortcut).color(pal.fg_muted));
     }
@@ -1565,7 +1642,7 @@ fn menu_check(ui: &mut egui::Ui, on: bool, text: &str, shortcut: &str) -> bool {
     let pal = *p();
     let img = crate::icons::image(ui.ctx(), "dialog-ok-apply", 16.0, pal.fg);
     let img = if on { img } else { img.tint(Color32::TRANSPARENT) };
-    let mut b = egui::Button::image_and_text(img, text);
+    let mut b = egui::Button::image_and_text(img, text).min_size(vec2(0.0, 28.0)).gap(10.0);
     if !shortcut.is_empty() {
         b = b.shortcut_text(RichText::new(shortcut).color(pal.fg_muted));
     }
@@ -1583,6 +1660,40 @@ fn sub_menu(ui: &mut egui::Ui, text: &str, add: impl FnOnce(&mut egui::Ui)) {
     ui.menu_image_text_button(img, text, add);
 }
 
+/// A dialog in a window of its own, as KDE dialogs are, centred over the main
+/// window the first time it opens. Sets `open` to false when the user closes
+/// it from the title bar or with Esc.
+fn dialog(ctx: &egui::Context, id: &str, title: &str, size: Vec2, resizable: bool, open: &mut bool, mut add: impl FnMut(&mut egui::Ui)) {
+    let pal = *p();
+    let vid = egui::ViewportId::from_hash_of(("gifkit-dialog", id));
+    let pos_id = egui::Id::unique(("dialog-pos", id));
+    let pos = ctx.data_mut(|d| d.get_temp::<Pos2>(pos_id)).or_else(|| {
+        let main = ctx.input(|i| i.viewport().outer_rect)?;
+        let p = main.center() - size / 2.0 - vec2(0.0, 30.0);
+        ctx.data_mut(|d| d.insert_temp(pos_id, p));
+        Some(p)
+    });
+    let mut b = egui::ViewportBuilder::default().with_title(title).with_app_id("gifkit").with_inner_size(size).with_resizable(resizable).with_minimize_button(false).with_active(true);
+    if !resizable {
+        b = b.with_maximize_button(false);
+    }
+    if let Some(pos) = pos {
+        b = b.with_position(pos);
+    }
+    let close = ctx.show_viewport_immediate(vid, b, |ui, class| {
+        if class == egui::ViewportClass::EmbeddedWindow {
+            add(ui);
+        } else {
+            egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin::same(14))).show(ui, |ui| add(ui));
+        }
+        ui.ctx().input(|i| i.viewport().close_requested() || i.key_pressed(egui::Key::Escape))
+    });
+    if close {
+        *open = false;
+        ctx.data_mut(|d| d.remove::<Pos2>(pos_id));
+    }
+}
+
 /// Shorten to `max` characters with an ellipsis.
 fn elide(s: &str, max: usize) -> String {
     let s = s.lines().next().unwrap_or("");
@@ -1595,19 +1706,13 @@ fn elide(s: &str, max: usize) -> String {
     }
 }
 
-/// Breeze "default" button.
-fn primary(ui: &mut egui::Ui, text: &str) -> bool {
-    let pal = p();
-    ui.add(egui::Button::new(RichText::new(text).font(theme::medium(13.5)).color(pal.fg)).fill(theme::checked_fill(pal)).stroke(Stroke::new(1.0, pal.highlight)).min_size(vec2(120.0, 28.0))).clicked()
-}
 
 /// The full-width "Add New … Layer" button at the top of a layer tool.
 fn add_layer_button(ui: &mut egui::Ui, text: &str) -> bool {
     let pal = *p();
-    let b = egui::Button::image_and_text(crate::icons::image(ui.ctx(), "list-add", 16.0, pal.fg), RichText::new(text).font(theme::medium(13.5)).color(pal.fg))
-        .fill(theme::checked_fill(&pal))
-        .stroke(Stroke::new(1.0, pal.highlight));
-    ui.add_sized(vec2(ui.available_width(), 32.0), b).clicked()
+    // a plain Breeze button; the icon carries the emphasis
+    let b = egui::Button::image_and_text(crate::icons::image(ui.ctx(), "list-add", 16.0, pal.fg), RichText::new(text).color(pal.fg));
+    ui.add_sized(vec2(ui.available_width(), CHIP_H), b).clicked()
 }
 
 fn tinted(ui: &mut egui::Ui, text: &str, tint: Color32) -> bool {
@@ -1763,6 +1868,9 @@ impl GifKitApp {
             last_dir: theme::get_setting("last_dir").map(PathBuf::from).filter(|d| d.is_dir()),
             pending_open: None,
             play_speed: 1.0,
+            video_import: None,
+            sample_preview: theme::get_setting("sample_preview").as_deref() != Some("0"),
+            cmp_full_key: 0,
             shortcuts_open: false,
             project_path: None,
             shape_tpl: ShapeSettings::default(),
@@ -1820,6 +1928,12 @@ impl GifKitApp {
         }
         if std::env::var("GIFKIT_ABOUT").is_ok() {
             app.about_open = true;
+        }
+        if std::env::var("GIFKIT_HISTORY").is_ok() {
+            app.history_open = true;
+        }
+        if std::env::var("GIFKIT_SHORTCUTS").is_ok() {
+            app.shortcuts_open = true;
         }
         if std::env::var("GIFKIT_EXPORT").is_ok() {
             app.export_open = true;
@@ -2263,7 +2377,7 @@ impl GifKitApp {
         let noai_tip = "Marks the file as not for AI training. Adds a “noai” note and the standard XMP “data mining prohibited” field where the format allows it. Some sites and scrapers respect it.";
         egui::Grid::new("saveopts").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
             if self.export_fmt.can_tag() {
-                ui.label("Tag");
+                ui.label("Tag:");
                 check(ui, &mut self.gif_opts.noai_tag, "Add “noai” tag").on_hover_text(noai_tip);
                 ui.end_row();
             }
@@ -2272,29 +2386,36 @@ impl GifKitApp {
                     if self.split_fmt == SplitFormat::Gif {
                         self.frames_zip = false;
                     }
-                    ui.label("Save to");
+                    ui.label("Save to:");
                     ui.horizontal(|ui| {
-                        seg(ui, &mut self.frames_zip, false, "Folder");
-                        ui.add_enabled_ui(self.split_fmt == SplitFormat::Png, |ui| seg(ui, &mut self.frames_zip, true, "ZIP").on_disabled_hover_text("ZIP holds PNG frames. Pick PNG in Optimize."));
+                        if radio(ui, !self.frames_zip, "Folder").clicked() {
+                            self.frames_zip = false;
+                        }
+                        ui.add_space(12.0);
+                        ui.add_enabled_ui(self.split_fmt == SplitFormat::Png, |ui| {
+                            if radio(ui, self.frames_zip, "ZIP file").on_disabled_hover_text("ZIP holds PNG frames. Pick PNG in Optimize.").clicked() {
+                                self.frames_zip = true;
+                            }
+                        });
                     });
                     ui.end_row();
-                    ui.label("Prefix");
+                    ui.label("Prefix:");
                     ui.add(egui::TextEdit::singleline(&mut self.split_prefix).desired_width(160.0)).on_hover_text("Files are named prefix_000, prefix_001 and so on");
                     ui.end_row();
                 }
                 ExportFormat::Sheet => {
                     let s = &mut self.sheet;
-                    ui.label("Also write");
+                    ui.label("Also write:");
                     ui.vertical(|ui| {
                         check(ui, &mut s.write_json, "JSON metadata");
                         check(ui, &mut s.write_godot, "Godot SpriteFrames (.tres)").on_hover_text("Assign the .tres to an AnimatedSprite2D/3D. Frame delays are kept.");
                     });
                     ui.end_row();
                     if s.write_godot {
-                        ui.label("Godot path");
+                        ui.label("Godot path:");
                         ui.add(egui::TextEdit::singleline(&mut s.godot_res_dir).desired_width(170.0)).on_hover_text("Where the PNG will sit in your Godot project");
                         ui.end_row();
-                        ui.label("Animation");
+                        ui.label("Animation:");
                         ui.add(egui::TextEdit::singleline(&mut s.anim_name).desired_width(130.0));
                         ui.end_row();
                     }
@@ -2303,7 +2424,7 @@ impl GifKitApp {
             }
             let folder = self.export_fmt == ExportFormat::Frames && !self.frames_zip;
             if !folder {
-                ui.label("Name");
+                ui.label("Name:");
                 ui.horizontal(|ui| {
                     if ui.add(egui::TextEdit::singleline(&mut self.export_name).desired_width(170.0)).changed() {
                         self.export_name_edited = !self.export_name.trim().is_empty();
@@ -2312,11 +2433,6 @@ impl GifKitApp {
                 });
                 ui.end_row();
             }
-            ui.label("");
-            if check(ui, &mut self.open_after_save, "Open the folder after saving").changed() {
-                theme::set_setting("open_after_save", if self.open_after_save { "1" } else { "0" });
-            }
-            ui.end_row();
         });
     }
 
@@ -2341,7 +2457,7 @@ impl GifKitApp {
 
     /// Format picker as a compact drop-down button.
     fn format_menu(&mut self, ui: &mut egui::Ui, h: f32) -> egui::Response {
-        let r = ui.add(egui::Button::new(format!("{}  ▾", self.export_fmt.label())).min_size(vec2(0.0, h))).on_hover_text("Output format");
+        let r = ui.add(drop_button(ui, self.export_fmt.label(), p().fg).min_size(vec2(0.0, h))).on_hover_text("Output format");
         let mut pick = None;
         egui::Popup::menu(&r).show(|ui| {
             ui.set_min_width(200.0);
@@ -2394,12 +2510,7 @@ impl GifKitApp {
         }
         let pal = *p();
         let mut open = true;
-        egui::Window::new(RichText::new("About").font(theme::medium(15.0)))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, -30.0))
-            .show(ctx, |ui| {
+        dialog(ctx, "about", "About GIFkit", vec2(400.0, 470.0), false, &mut open, |ui| {
                 ui.set_width(340.0);
                 ui.horizontal(|ui| {
                     let (r, _) = ui.allocate_exact_size(vec2(72.0, 72.0), Sense::hover());
@@ -2455,14 +2566,7 @@ impl GifKitApp {
         let mut open = true;
         let mut jump: Option<i64> = None;
         let n_undo = self.undo.len();
-        egui::Window::new(RichText::new("History").font(theme::medium(15.0)))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .default_width(260.0)
-            .default_height(360.0)
-            .default_pos(ctx.content_rect().right_top() + vec2(-640.0, 70.0))
-            .show(ctx, |ui| {
+        dialog(ctx, "history", "History", vec2(300.0, 440.0), true, &mut open, |ui| {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
                     ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
@@ -2599,12 +2703,90 @@ impl GifKitApp {
             self.spawn_in(ctx, "Open project", 1, false, move |_| JobOutput::ProjectLoaded(crate::project::load(&p).map(|pr| (pr, p.clone()))));
             return;
         }
-        let label = if io::is_video(&p) { "Importing video" } else { "Open" };
-        self.spawn(ctx, label, 1, move |_| {
-            // a video's size says nothing about GIF sizes, so don't compare against it
-            let size = if io::is_video(&p) { None } else { std::fs::metadata(&p).ok().map(|m| m.len()) };
+        if io::is_video(&p) {
+            // ask about range, frame rate and size first
+            match io::probe_video(&p) {
+                Ok(info) => {
+                    let opt = io::VideoImport::defaults(&info);
+                    self.video_import = Some((p, info, opt));
+                }
+                Err(e) => self.error(format!("{e:#}")),
+            }
+            return;
+        }
+        self.spawn(ctx, "Open", 1, move |_| {
+            let size = std::fs::metadata(&p).ok().map(|m| m.len());
             JobOutput::Loaded(io::load_animation(&p).map(|a| (a, Some(p.clone()), size)))
         });
+    }
+
+    /// Import a video with the chosen range, frame rate and size.
+    fn import_video(&mut self, ctx: &egui::Context, p: PathBuf, opt: io::VideoImport) {
+        let total = opt.frames();
+        self.spawn_in(ctx, "Importing video", total, false, move |pr| {
+            // a video's size says nothing about GIF sizes, so don't compare against it
+            JobOutput::Loaded(io::load_video_range(&p, &opt, Some(pr)).map(|a| (a, Some(p.clone()), None)))
+        });
+    }
+
+    fn video_import_window(&mut self, ctx: &egui::Context) {
+        let Some((path, info, mut opt)) = self.video_import.clone() else { return };
+        let pal = *p();
+        let mut open = true;
+        let mut go = false;
+        let mut cancel = false;
+        let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        dialog(ctx, "video", "Import Video", vec2(460.0, 350.0), false, &mut open, |ui| {
+            ui.label(RichText::new(elide(&name, 48)).font(theme::medium(15.0)).color(pal.fg));
+            hint(ui, &format!("{}×{} · {:.2} fps · {}", info.width, info.height, info.fps, fmt_secs(info.duration)));
+            ui.add_space(10.0);
+            form_row(ui, "Start:", |ui| num_fill(ui, egui::DragValue::new(&mut opt.start).range(0.0..=info.duration).speed(0.05).max_decimals(2).suffix(" s")));
+            form_row(ui, "End:", |ui| num_fill(ui, egui::DragValue::new(&mut opt.end).range(0.0..=info.duration).speed(0.05).max_decimals(2).suffix(" s")));
+            if opt.end <= opt.start {
+                opt.end = (opt.start + 0.1).min(info.duration);
+            }
+            let rates: Vec<(u16, String)> = io::VIDEO_DELAYS.iter().map(|d| (*d, format!("{:.1} fps", 100.0 / *d as f64).replace(".0 ", " "))).collect();
+            let items: Vec<(u16, &str)> = rates.iter().map(|(d, l)| (*d, l.as_str())).collect();
+            form_row(ui, "Frame rate:", |ui| combo(ui, "vid-fps", &mut opt.delay_cs, &items)).on_hover_text("GIFs can only show these rates exactly");
+            let sizes: Vec<(u32, String)> = [240u32, 320, 480, 640, 800, 1080, 0]
+                .iter()
+                .filter(|m| **m == 0 || **m < info.width.max(info.height))
+                .map(|m| {
+                    let o = io::VideoImport { max_side: *m, ..opt.clone() };
+                    let (w, h) = o.size(&info);
+                    (*m, if *m == 0 { format!("Original ({w}×{h})") } else { format!("{w}×{h}") })
+                })
+                .collect();
+            let items: Vec<(u32, &str)> = sizes.iter().map(|(m, l)| (*m, l.as_str())).collect();
+            form_row(ui, "Size:", |ui| combo(ui, "vid-size", &mut opt.max_side, &items));
+            ui.add_space(8.0);
+            let gb = opt.bytes(&info) as f64 / 1e9;
+            let frames = opt.frames();
+            form_row(ui, "Result:", |ui| hint(ui, &format!("{frames} frames · {} in memory", if gb >= 1.0 { format!("{gb:.1} GB") } else { format!("{:.0} MB", gb * 1000.0) })));
+            if gb > 4.0 {
+                form_row(ui, "", |ui| ui.label(RichText::new("⚠ That's a lot of memory. A shorter range, a lower frame rate or a smaller size will be much quicker to edit.").color(pal.neutral)));
+            }
+            ui.add_space(12.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::image_and_text(crate::icons::image(ui.ctx(), "dialog-cancel", 16.0, pal.fg), "Cancel").min_size(vec2(96.0, 30.0))).clicked() {
+                        cancel = true;
+                    }
+                    if ui.add(egui::Button::image_and_text(crate::icons::image(ui.ctx(), "document-import", 16.0, pal.fg), "Import").stroke(Stroke::new(1.0, pal.highlight)).min_size(vec2(96.0, 30.0))).clicked() {
+                        go = true;
+                    }
+                });
+            });
+        });
+        if go {
+            self.video_import = None;
+            self.import_video(ctx, path, opt);
+        } else if !open || cancel {
+            self.video_import = None;
+        } else if let Some(v) = self.video_import.as_mut() {
+            v.2 = opt;
+        }
     }
 
     fn open_sequence(&mut self, ps: Vec<PathBuf>, ctx: &egui::Context) {
@@ -3017,7 +3199,7 @@ impl GifKitApp {
             self.prerender = None;
             self.comp_key_since = f64::INFINITY;
         }
-        let stable = now - self.comp_key_since > 0.25;
+        let stable = now - self.comp_key_since > 0.5;
         if self.prerender.is_none() && stable && self.stack.needs_render() && !self.plan.is_empty() {
             let cached = self.comp_tex.key == key && self.comp_tex.map.len() >= self.plan.len();
             if cached {
@@ -3105,9 +3287,9 @@ impl GifKitApp {
                     let (key, sheet) = (j.key, j.sheet);
                     self.cmp_job = None;
                     match res {
-                        Ok((anim, bytes)) => {
+                        Ok((anim, bytes, sample, size)) => {
                             self.cmp_gen += 1;
-                            self.cmp = Some(CmpResult { key, sheet, anim, bytes: Arc::new(bytes), gen: self.cmp_gen });
+                            self.cmp = Some(CmpResult { key, sheet, anim, bytes: Arc::new(bytes), gen: self.cmp_gen, sample, size });
                         }
                         Err(e) => self.error(format!("Compression preview failed: {e:#}")),
                     }
@@ -3134,7 +3316,8 @@ impl GifKitApp {
         if busy_input {
             self.cmp_key_since = now;
         }
-        if now - self.cmp_key_since < 1.0 || busy_input {
+        // half a second after the last change, so quick tweaks don't each start an encode
+        if now - self.cmp_key_since < 0.5 || busy_input {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
             return;
         }
@@ -3143,19 +3326,61 @@ impl GifKitApp {
         let fonts = self.fonts.clone();
         let Some(pf) = self.preview_format() else { return };
         let is_sheet = matches!(pf, io::PreviewFormat::Sheet(_));
+        // long or large animations: encode a few stretches and estimate the rest
+        let n = self.plan.len();
+        let pixels = n as u64 * self.out_size.0 as u64 * self.out_size.1 as u64;
+        let sample: Option<Vec<usize>> = (self.sample_preview && !is_sheet && self.cmp_full_key != key && pixels > SAMPLE_PIXELS && n > 60).then(|| {
+            const RUNS: usize = 6;
+            const LEN: usize = 8;
+            let mut v: Vec<usize> = (0..RUNS).flat_map(|k| {
+                let start = k * (n - LEN) / (RUNS - 1);
+                start..start + LEN
+            }).collect();
+            v.dedup();
+            v
+        });
         let (tx, rx) = channel();
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
+            stack::lower_thread_priority();
             let res = stack::bg_pool().install(|| {
                 let t0 = std::time::Instant::now();
-                let out = stack.flatten(&base, &fonts, None);
+                let out = match &sample {
+                    None => stack.flatten(&base, &fonts, None),
+                    Some(idx) => {
+                        use rayon::prelude::*;
+                        let plan = stack.plan(&base);
+                        let times = stack::plan_times(&plan);
+                        let prep = stack.prepare(&base, &fonts);
+                        let frames: Vec<crate::anim::Frame> = idx
+                            .par_iter()
+                            .map(|&i| {
+                                let image = if stack.needs_render() { Arc::new(stack.render_frame(&base, &plan, &times, i, &fonts, &prep)) } else { base.frames[plan[i].src].image.clone() };
+                                crate::anim::Frame { image, delay_cs: plan[i].delay, enabled: plan[i].enabled }
+                            })
+                            .collect();
+                        let mut a = Animation { frames, loop_count: stack.loop_count(&base) };
+                        crate::effects::normalize_sizes(&mut a);
+                        a
+                    }
+                };
                 let t1 = t0.elapsed();
                 let (anim, bytes) = io::encode_preview(&out, &pf)?;
                 let t2 = t0.elapsed();
                 if std::env::var_os("GIFKIT_PERF").is_some() {
-                    eprintln!("compress: flatten {:.1}s encode {:.1}s decode {:.1}s", t1.as_secs_f32(), (t2 - t1).as_secs_f32(), (t0.elapsed() - t2).as_secs_f32());
+                    eprintln!("compress: flatten {:.1}s encode {:.1}s decode {:.1}s sampled {}", t1.as_secs_f32(), (t2 - t1).as_secs_f32(), (t0.elapsed() - t2).as_secs_f32(), sample.is_some());
                 }
-                Ok((anim, bytes))
+                // scale the sample's size up by the share of shown time it covers
+                let size = match &sample {
+                    None => bytes.len() as u64,
+                    Some(_) => {
+                        let plan = stack.plan(&base);
+                        let total: u64 = plan.iter().filter(|f| f.enabled).map(|f| f.delay.max(1) as u64).sum();
+                        let part: u64 = out.frames.iter().filter(|f| f.enabled).map(|f| f.delay_cs.max(1) as u64).sum();
+                        (bytes.len() as f64 * total as f64 / part.max(1) as f64) as u64
+                    }
+                };
+                Ok((anim, bytes, sample, size))
             });
             let _ = tx.send(res);
             ctx2.request_repaint();
@@ -3222,6 +3447,10 @@ impl eframe::App for GifKitApp {
         let ctx = ui.ctx().clone();
         let perf_t0 = std::time::Instant::now();
         theme::refresh(&ctx, self.theme);
+        let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true) || std::env::var_os("GIFKIT_ASSUME_FOCUS").is_some();
+        // a dialog of ours having focus still counts as the app being active
+        let dialog_open = self.export_open || self.history_open || self.about_open || self.shortcuts_open || self.video_import.is_some();
+        theme::set_focused(&ctx, focused || dialog_open, self.theme);
         theme::set_current(&ctx);
         let now = ctx.input(|i| i.time);
         self.poll_job(&ctx);
@@ -3327,6 +3556,7 @@ impl eframe::App for GifKitApp {
         self.about_window(&ctx);
         self.track_live_edits(&ctx, now);
         self.shortcuts_window(&ctx);
+        self.video_import_window(&ctx);
         eyedropper(&ctx);
         clear_group_command(&ctx);
         if std::env::var_os("GIFKIT_PERF").is_some() {
@@ -3452,10 +3682,26 @@ impl GifKitApp {
                 }
             });
             ui.menu_button("Settings", |ui| {
-                ui.set_min_width(240.0);
+                ui.set_min_width(280.0);
                 if menu_check(ui, !self.sidebar_compact, "Show Tool Names", "") {
                     self.set_rail_compact(!self.sidebar_compact);
                 }
+                ui.separator();
+                if menu_check(ui, self.open_after_save, "Open Folder After Exporting", "") {
+                    self.open_after_save = !self.open_after_save;
+                    theme::set_setting("open_after_save", if self.open_after_save { "1" } else { "0" });
+                }
+                if menu_check(ui, self.sample_preview, "Estimate Size of Long Animations", "") {
+                    self.sample_preview = !self.sample_preview;
+                    theme::set_setting("sample_preview", if self.sample_preview { "1" } else { "0" });
+                }
+                if menu_item(ui, "document-open", "Open Presets Folder", "", true) {
+                    if let Some(dir) = crate::presets::folder() {
+                        let _ = std::fs::create_dir_all(&dir);
+                        open_in_file_manager(&dir);
+                    }
+                }
+                ui.separator();
                 sub_menu(ui, "Colour Scheme", |ui| {
                     ui.set_min_width(160.0);
                     for t in [ThemeChoice::System, ThemeChoice::Dark, ThemeChoice::Light] {
@@ -3569,30 +3815,32 @@ impl GifKitApp {
     /// Main toolbar: file actions, undo, and the view controls, each as its own button.
     fn toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let pal = *p();
+        let (_, tb_icon) = theme::toolbar_style();
+        let tb_h = tb_icon + 10.0;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             let idle = !self.busy();
             let has = self.base.is_some();
-            if icon_tool(ui, "document-new", "New project (Ctrl+N)", idle && has).clicked() {
+            if tb_tool(ui, "document-new", "New", "New project (Ctrl+N)", idle && has).clicked() {
                 self.new_project();
             }
-            if icon_tool(ui, "document-open", "Open a GIF, image, video or project (Ctrl+O)", idle).clicked() {
+            if tb_tool(ui, "document-open", "Open…", "Open a GIF, image, video or project (Ctrl+O)", idle).clicked() {
                 self.open_dialog(ctx);
             }
-            if icon_tool(ui, "document-save", "Save the project (Ctrl+S)", idle && has).clicked() {
+            if tb_tool(ui, "document-save", "Save", "Save the project (Ctrl+S)", idle && has).clicked() {
                 self.save_project(ctx, false);
             }
-            if icon_tool(ui, "document-save-as", "Save the project as (Ctrl+Shift+S)", idle && has).clicked() {
+            if tb_tool(ui, "document-save-as", "", "Save the project as (Ctrl+Shift+S)", idle && has).clicked() {
                 self.save_project(ctx, true);
             }
             toolbar_sep(ui);
             let pending = self.committed.as_ref().map(|c| c.0 != self.live_sig()).unwrap_or(false);
             let undo_tip = self.undo.last().map(|u| format!("Undo {} (Ctrl+Z)", u.label)).unwrap_or_else(|| "Undo (Ctrl+Z)".into());
-            if icon_tool(ui, "edit-undo", &undo_tip, idle && (pending || !self.undo.is_empty())).clicked() {
+            if tb_tool(ui, "edit-undo", "", &undo_tip, idle && (pending || !self.undo.is_empty())).clicked() {
                 self.do_undo();
             }
             let redo_tip = self.redo.last().map(|u| format!("Redo {} (Ctrl+Y)", u.label)).unwrap_or_else(|| "Redo (Ctrl+Y)".into());
-            if icon_tool(ui, "edit-redo", &redo_tip, idle && !self.redo.is_empty()).clicked() {
+            if tb_tool(ui, "edit-redo", "", &redo_tip, idle && !self.redo.is_empty()).clicked() {
                 self.do_redo();
             }
             if has {
@@ -3605,17 +3853,16 @@ impl GifKitApp {
                 let export = ui
                     .add_enabled(
                         has && idle,
-                        egui::Button::image_and_text(crate::icons::image(ctx, "document-export", 16.0, Color32::WHITE), RichText::new("Export…").font(theme::medium(13.5)).color(Color32::WHITE))
-                            .fill(pal.highlight)
-                            .stroke(Stroke::new(1.0, mix(pal.highlight, Color32::BLACK, 0.25)))
-                            .min_size(vec2(96.0, TOOLBAR_H)),
+                        egui::Button::image_and_text(crate::icons::image(ctx, "document-export", tb_icon, pal.fg), RichText::new("Export…").color(pal.fg))
+                            .frame_when_inactive(false)
+                            .min_size(vec2(0.0, tb_h)),
                     )
                     .on_hover_text("Save the result as an image or video (Ctrl+E)");
                 if export.clicked() {
                     self.export_open = true;
                 }
                 if has {
-                    ui.add_enabled_ui(idle, |ui| self.format_menu(ui, TOOLBAR_H));
+                    ui.add_enabled_ui(idle, |ui| self.format_menu(ui, tb_h));
                 }
             });
         });
@@ -3654,7 +3901,7 @@ impl GifKitApp {
         }
         let pal = *p();
         let mut open = true;
-        egui::Window::new(RichText::new("Keyboard Shortcuts").font(theme::medium(15.0))).open(&mut open).collapsible(false).resizable(false).default_width(420.0).show(ctx, |ui| {
+        dialog(ctx, "shortcuts", "Keyboard Shortcuts", vec2(480.0, 660.0), true, &mut open, |ui| {
             let rows: [(&str, &str); 21] = [
                 ("Ctrl+N", "New project"),
                 ("Ctrl+O", "Open"),
@@ -3733,48 +3980,29 @@ impl GifKitApp {
         };
         let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
         let painter = ui.painter();
+        // the colour scheme's selection colours, like a Qt item view
         if sel {
-            painter.rect_filled(r, 4.0, theme::checked_fill(&pal));
-            painter.rect_stroke(r, 4.0, Stroke::new(1.0, pal.highlight), egui::StrokeKind::Inside);
+            painter.rect_filled(r, 4.0, pal.highlight);
         } else if resp.hovered() {
-            painter.rect_filled(r, 4.0, mix(pal.window, pal.highlight, 0.12));
+            painter.rect_filled(r, 4.0, mix(pal.window, pal.highlight, 0.18));
+            painter.rect_stroke(r, 4.0, Stroke::new(1.0, mix(pal.window, pal.highlight, 0.6)), egui::StrokeKind::Inside);
         }
         let (icon, label, tip) = match t {
             Some(t) => (t.breeze(), t.label(), t.tip()),
             None => ("view-history", "History", "Every change, with jumps back and forth (Ctrl+H)"),
         };
-        let icon_col = if has || t.is_none() { pal.fg } else { pal.fg_muted };
+        let icon_col = if sel { Color32::WHITE } else if has || t.is_none() { pal.fg } else { pal.fg_muted };
         let icon_size = if compact { 22.0 } else { 16.0 };
         let icon_x = if compact { r.center().x } else { r.left() + 15.0 };
         crate::icons::paint(painter, icon, pos2(icon_x, r.center().y), icon_size, icon_col);
         if !compact {
             painter.text(r.left_center() + vec2(30.0, 0.0), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(13.0), icon_col);
         }
-        let badge: Option<String> = t.and_then(|t| {
-            let tr = &self.stack.transform;
-            match t {
-                _ if t.layer_kind().is_some() => {
-                    let n = self.stack.count(t.layer_kind().unwrap());
-                    (n > 0).then(|| n.to_string())
-                }
-                Tool::Resize => tr.resize_on.then(|| "●".into()),
-                Tool::Crop => tr.crop_on.then(|| "●".into()),
-                Tool::Rotate => tr.rotates().then(|| "●".into()),
-                Tool::Reverse => (tr.reverse || tr.boomerang || tr.set_loop).then(|| "●".into()),
-                Tool::Speed => tr.speed_on.then(|| "●".into()),
-                Tool::Cut => tr.cut_on.then(|| "●".into()),
-                _ => None,
-            }
-        });
-        if let Some(b) = badge {
-            let c = if compact { r.right_top() + vec2(-5.0, 6.0) } else { r.right_center() - vec2(12.0, 0.0) };
-            if b == "●" {
-                painter.circle_filled(c, 3.0, pal.positive);
-            } else if compact {
-                painter.circle_filled(c, 3.0, pal.highlight);
-            } else {
-                painter.circle_filled(c, 7.5, pal.highlight);
-                painter.text(c, egui::Align2::CENTER_CENTER, b, egui::FontId::proportional(10.0), Color32::WHITE);
+        // how many layers of this kind there are, in muted text when the names show
+        if let (false, Some(k)) = (compact, t.and_then(|t| t.layer_kind())) {
+            let n = self.stack.count(k);
+            if n > 0 {
+                painter.text(r.right_center() - vec2(8.0, 0.0), egui::Align2::RIGHT_CENTER, n.to_string(), egui::FontId::proportional(12.0), if sel { Color32::WHITE } else { pal.fg_muted });
             }
         }
         let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -3793,8 +4021,8 @@ impl GifKitApp {
         let now = ctx.input(|i| i.time);
         // header
         ui.horizontal(|ui| {
-            let arrow = if self.layers_collapsed { "▸" } else { "▾" };
-            let h = ui.add(egui::Button::new(RichText::new(format!("{arrow}  Layers")).font(theme::medium(14.0)).color(pal.fg)).frame(false));
+            let arrow = crate::icons::image(ui.ctx(), if self.layers_collapsed { "go-next" } else { "go-down" }, 16.0, pal.fg_muted);
+            let h = ui.add(egui::Button::image_and_text(arrow, RichText::new("Layers").font(theme::medium(14.0)).color(pal.fg)).frame(false));
             if h.on_hover_text("Right-click a layer for more").clicked() {
                 self.layers_collapsed = !self.layers_collapsed;
             }
@@ -3837,11 +4065,13 @@ impl GifKitApp {
                 let selected = self.sel.get(kind_key(kind)) == Some(&id) && self.tool == kind_tool(kind);
                 let dragging_me = self.layer_drag == Some(id);
                 let painter = ui.painter().clone();
+                // selection in the scheme's selection colours, as Qt item views draw it
                 if selected {
-                    painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 2.0, pal.highlight_soft);
+                    painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 3.0, pal.highlight);
                 } else if resp.hovered() {
-                    painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 2.0, mix(pal.view, pal.highlight_soft, 0.45));
+                    painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 3.0, mix(pal.view, pal.highlight, 0.18));
                 }
+                let pal = if selected { theme::Palette { fg: Color32::WHITE, fg_muted: mix(Color32::WHITE, pal.highlight, 0.35), ..pal } } else { pal };
                 painter.hline(r.x_range().shrink(4.0), r.bottom(), Stroke::new(1.0, mix(pal.view, pal.border, 0.5)));
                 // eye
                 let eye_r = Rect::from_center_size(pos2(r.left() + 16.0, r.center().y), vec2(22.0, 22.0));
@@ -3947,10 +4177,11 @@ impl GifKitApp {
                 let painter = ui.painter();
                 let sel = self.tool == t;
                 if sel {
-                    painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 2.0, pal.highlight_soft);
+                    painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 3.0, pal.highlight);
                 } else if resp.hovered() {
-                    painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 2.0, mix(pal.view, pal.highlight_soft, 0.45));
+                    painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 3.0, mix(pal.view, pal.highlight, 0.18));
                 }
+                let pal = if sel { theme::Palette { fg: Color32::WHITE, fg_muted: mix(Color32::WHITE, pal.highlight, 0.35), ..pal } } else { pal };
                 let on = enabled.unwrap_or(true);
                 let col = if t == Tool::Frames || !on { pal.fg_muted } else { pal.fg };
                 let mut eye_hit = false;
@@ -4356,20 +4587,21 @@ impl GifKitApp {
         v
     }
 
+    /// KDE placeholder message: a big grey icon, a heading, a line of help and
+    /// a button. The whole area also takes dropped files.
     fn empty_state(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let pal = *p();
         let r = ui.available_rect_before_wrap();
-        let inner = r.shrink(48.0);
-        let resp = ui.allocate_rect(inner, Sense::click());
-        let stroke_col = if resp.hovered() { pal.highlight } else { pal.border_strong };
-        ui.painter().rect_filled(inner, 6.0, mix(pal.canvas, pal.view, 0.4));
-        let dash = egui::Shape::dashed_line(&[inner.left_top(), inner.right_top(), inner.right_bottom(), inner.left_bottom(), inner.left_top()], Stroke::new(1.5, stroke_col), 8.0, 6.0);
-        ui.painter().extend(dash);
-        let c = inner.center();
-        crate::icons::paint(ui.painter(), "document-open", c - vec2(0.0, 40.0), 64.0, pal.fg_muted);
-        ui.painter().text(c + vec2(0.0, 18.0), egui::Align2::CENTER_CENTER, "Drop a GIF here or click to open", theme::medium(19.0), pal.fg);
-        ui.painter().text(c + vec2(0.0, 46.0), egui::Align2::CENTER_CENTER, if self.ffmpeg { "GIF · APNG · WebP · videos · image sequences" } else { "GIF · APNG · WebP · image sequences" }, egui::FontId::proportional(13.5), pal.fg_muted);
-        if resp.clicked() && !self.busy() {
+        let resp = ui.allocate_rect(r, Sense::click());
+        let c = r.center();
+        crate::icons::paint(ui.painter(), "document-open", c - vec2(0.0, 70.0), 64.0, mix(pal.canvas, pal.fg, 0.4));
+        ui.painter().text(c + vec2(0.0, -6.0), egui::Align2::CENTER_CENTER, "No Animation Open", theme::medium(20.0), mix(pal.canvas, pal.fg, 0.75));
+        let help = if self.ffmpeg { "Open or drop a GIF, APNG, WebP, video or a set of images" } else { "Open or drop a GIF, APNG, WebP or a set of images" };
+        ui.painter().text(c + vec2(0.0, 22.0), egui::Align2::CENTER_CENTER, help, egui::TextStyle::Body.resolve(ui.style()), mix(pal.canvas, pal.fg, 0.55));
+        let br = Rect::from_center_size(c + vec2(0.0, 66.0), vec2(120.0, CHIP_H));
+        let b = egui::Button::image_and_text(crate::icons::image(ctx, "document-open", 16.0, pal.fg), "Open…");
+        let clicked = ui.put(br, b).clicked();
+        if (clicked || resp.double_clicked()) && !self.busy() {
             self.open_dialog(ctx);
         }
     }
@@ -4418,7 +4650,7 @@ impl GifKitApp {
                 .on_hover_text(format!("Frame. Delay {delay} cs{}", if enabled { "" } else { " · skipped" }));
             let speeds = [0.25f32, 0.5, 0.75, 1.0, 1.5, 2.0, 4.0];
             let label = |v: f32| if v == 1.0 { "1×".to_string() } else { format!("{v}×") };
-            egui::ComboBox::from_id_salt("play_speed")
+            egui::ComboBox::from_id_salt("play_speed").icon(chevron)
                 .width(speed_w)
                 .selected_text(label(self.play_speed))
                 .show_ui(ui, |ui| {
@@ -4435,52 +4667,52 @@ impl GifKitApp {
 
     /// View mode, zoom and display toggles (in the main toolbar).
     fn view_controls(&mut self, ui: &mut egui::Ui) {
-        if icon_toggle(ui, "view-fullscreen", !self.compare, "Single view (C)") {
+        if tb_toggle(ui, "view-fullscreen", !self.compare, "Single view (C)") {
             self.compare = false;
         }
-        if icon_toggle(ui, "view-split-left-right", self.compare, "Split view (C)") {
+        if tb_toggle(ui, "view-split-left-right", self.compare, "Split view (C)") {
             self.compare = true;
         }
         // always there, greyed out in single view, so the toolbar never shifts
         let split = self.compare;
-        if ui.add_enabled_ui(split, |ui| icon_toggle(ui, "link", self.link_views && split, "Link zoom and pan of both views")).inner {
+        if ui.add_enabled_ui(split, |ui| tb_toggle(ui, "link", self.link_views && split, "Link zoom and pan of both views")).inner {
             self.link_views = !self.link_views;
         }
         toolbar_sep(ui);
-        if icon_tool(ui, "zoom-out", "Zoom out (−)", true).clicked() {
+        if tb_tool(ui, "zoom-out", "", "Zoom out (−)", true).clicked() {
             self.zoom_to(self.cur_scale() / 1.25);
         }
         let mut pct = self.cur_scale() * 100.0;
-        if ui.add_sized(vec2(64.0, 24.0), egui::DragValue::new(&mut pct).range(2.0..=6400.0).speed(1.0).suffix("%").max_decimals(0)).on_hover_text("Zoom").changed() {
+        if ui.add_sized(vec2(68.0, CHIP_H), egui::DragValue::new(&mut pct).range(2.0..=6400.0).speed(1.0).suffix("%").max_decimals(0)).on_hover_text("Zoom").changed() {
             self.zoom_to(pct / 100.0);
         }
-        if icon_tool(ui, "zoom-in", "Zoom in (+)", true).clicked() {
+        if tb_tool(ui, "zoom-in", "", "Zoom in (+)", true).clicked() {
             self.zoom_to(self.cur_scale() * 1.25);
         }
-        if icon_toggle(ui, "zoom-fit-best", self.views[self.active()].zoom.is_none(), "Fit to view (F)") {
+        if tb_toggle(ui, "zoom-fit-best", self.views[self.active()].zoom.is_none(), "Fit to view (F)") {
             self.zoom_fit();
         }
-        if icon_tool(ui, "zoom-original", "Actual size (1)", true).clicked() {
+        if tb_tool(ui, "zoom-original", "", "Actual size (1)", true).clicked() {
             self.zoom_to(1.0);
         }
         toolbar_sep(ui);
         let before = (self.backdrop, self.backdrop_col);
-        if icon_toggle(ui, "grid-rectangular", self.backdrop == Backdrop::Checker, "Show transparency as a checkerboard") {
+        if tb_toggle(ui, "grid-rectangular", self.backdrop == Backdrop::Checker, "Show transparency as a checkerboard") {
             self.backdrop = Backdrop::Checker;
         }
-        if icon_toggle(ui, "format-fill-color", self.backdrop == Backdrop::Solid, "Show transparency as a solid colour") {
+        if tb_toggle(ui, "format-fill-color", self.backdrop == Backdrop::Solid, "Show transparency as a solid colour") {
             self.backdrop = Backdrop::Solid;
         }
         let solid = self.backdrop == Backdrop::Solid;
         ui.add_enabled_ui(solid, |ui| colour_btn(ui, &mut self.backdrop_col).on_hover_text("Backdrop colour").on_disabled_hover_text("Backdrop colour, used with the solid colour backdrop"));
-        if icon_toggle(ui, "markasblank", self.backdrop == Backdrop::Canvas, "Show transparency as the viewport background") {
+        if tb_toggle(ui, "markasblank", self.backdrop == Backdrop::Canvas, "Show transparency as the viewport background") {
             self.backdrop = Backdrop::Canvas;
         }
         if before != (self.backdrop, self.backdrop_col) {
             self.save_backdrop();
         }
         toolbar_sep(ui);
-        if icon_toggle(ui, "view-grid", self.pixelated, "Pixelated preview (nearest neighbour)") {
+        if tb_toggle(ui, "view-grid", self.pixelated, "Pixelated preview (nearest neighbour)") {
             self.pixelated = !self.pixelated;
         }
     }
@@ -4498,12 +4730,7 @@ impl GifKitApp {
         if !self.export_name_edited {
             self.export_name = self.default_stem();
         }
-        egui::Window::new(RichText::new("Export").font(theme::medium(15.0)))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, -30.0))
-            .show(ctx, |ui| {
+        dialog(ctx, "export", "Export", vec2(660.0, 400.0), false, &mut open, |ui| {
                 ui.set_width(600.0);
                 ui.horizontal_top(|ui| {
                     // ---- preview of the file as it will be saved
@@ -4516,9 +4743,9 @@ impl GifKitApp {
                         let fresh = self.cmp.as_ref().filter(|c| c.key == self.cmp_key());
                         match fresh {
                             Some(c) => {
-                                let n = c.bytes.len() as u64;
+                                let n = c.size;
                                 ui.horizontal(|ui| {
-                                    ui.label(RichText::new(fmt_size(n)).font(theme::medium(22.0)).color(pal.positive));
+                                    ui.label(RichText::new(c.size_text()).font(theme::medium(22.0)).color(pal.positive));
                                     if let Some(o) = self.file_size {
                                         hint(ui, &format!("{:+.0}% vs original", (n as f64 / o as f64 - 1.0) * 100.0));
                                     }
@@ -4551,9 +4778,12 @@ impl GifKitApp {
                             }
                         });
                         ui.add_space(10.0);
-                        ui.label(RichText::new("Save options").font(theme::medium(13.5)).color(pal.fg));
-                        ui.add_space(2.0);
-                        egui::Frame::new().fill(mix(pal.window, pal.view, 0.35)).stroke(Stroke::new(1.0, pal.border)).corner_radius(3.0).inner_margin(10.0).show(ui, |ui| {
+                        // a flat section: heading, thin line, then the rows
+                        ui.label(RichText::new("Save Options").font(theme::medium(13.5)).color(pal.fg));
+                        let r = ui.available_rect_before_wrap();
+                        ui.painter().hline(r.x_range(), r.top() + 3.0, Stroke::new(1.0, pal.border));
+                        ui.add_space(10.0);
+                        ui.scope(|ui| {
                             ui.set_width(ui.available_width());
                             self.save_options_ui(ui);
                         });
@@ -4567,10 +4797,11 @@ impl GifKitApp {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // KDE order: the main action first, then Cancel
-                        if ui.add(egui::Button::new("Cancel").min_size(vec2(80.0, 28.0))).clicked() {
+                        if ui.add(egui::Button::image_and_text(crate::icons::image(ui.ctx(), "dialog-cancel", 16.0, pal.fg), "Cancel").min_size(vec2(96.0, CHIP_H))).clicked() {
                             cancel = true;
                         }
-                        go = primary(ui, if folder { "Choose Folder…" } else { "Save…" });
+                        let icon = crate::icons::image(ui.ctx(), if folder { "document-open" } else { "document-save" }, 16.0, pal.fg);
+                        go = ui.add(egui::Button::image_and_text(icon, if folder { "Choose Folder…" } else { "Save…" }).stroke(Stroke::new(1.0, pal.highlight)).min_size(vec2(96.0, CHIP_H))).clicked();
                     });
                 });
             });
@@ -4593,7 +4824,7 @@ impl GifKitApp {
         let (tex, size) = if fresh {
             let (i, size) = {
                 let c = self.cmp.as_ref().unwrap();
-                (stack::frame_at_time(&c.anim, self.play_time()), vec2(c.anim.width() as f32, c.anim.height() as f32))
+                (c.frame_for(self.cur, self.play_time()), vec2(c.anim.width() as f32, c.anim.height() as f32))
             };
             (self.cmp_texture(ctx, i), size)
         } else {
@@ -4673,7 +4904,7 @@ impl GifKitApp {
         // video tags are written by ffmpeg, so a tagged video is encoded again
         let reuse = !matches!(self.export_fmt, ExportFormat::Frames | ExportFormat::Sheet) && !(noai && matches!(self.export_fmt, ExportFormat::Mp4 | ExportFormat::Webm));
         if reuse && self.preview_format().is_some() {
-            if let Some(bytes) = self.cmp.as_ref().filter(|c| c.key == self.cmp_key()).map(|c| c.bytes.clone()) {
+            if let Some(bytes) = self.cmp.as_ref().filter(|c| c.key == self.cmp_key() && c.sample.is_none()).map(|c| c.bytes.clone()) {
                 let bytes: Arc<Vec<u8>> = match self.export_fmt {
                     ExportFormat::Webp if noai => Arc::new(crate::noai::tag_webp((*bytes).clone())),
                     ExportFormat::Apng if noai => Arc::new(crate::noai::tag_png((*bytes).clone())),
@@ -5342,13 +5573,14 @@ impl GifKitApp {
                 match &self.cmp {
                     Some(c) if c.key == self.cmp_key() && c.sheet => {
                         let (w, h) = (c.anim.width(), c.anim.height());
-                        format!("{f} · {w}×{h} · {}", fmt_size(c.bytes.len() as u64))
+                        format!("{f} · {w}×{h} · {}", c.size_text())
                     }
                     Some(c) if c.key == self.cmp_key() => {
-                        let n = c.bytes.len() as u64;
+                        let n = c.size;
+                        let sampled = if c.sample.is_some() { " · sampled" } else { "" };
                         match self.file_size {
-                            Some(o) => format!("{f} · {} ({:+.0}%)", fmt_size(n), (n as f64 / o as f64 - 1.0) * 100.0),
-                            None => format!("{f} · {}", fmt_size(n)),
+                            Some(o) => format!("{f} · {} ({:+.0}%){sampled}", c.size_text(), (n as f64 / o as f64 - 1.0) * 100.0),
+                            None => format!("{f} · {}{sampled}", c.size_text()),
                         }
                     }
                     _ => format!("{f} · …"),
@@ -5366,9 +5598,9 @@ impl GifKitApp {
         let font = theme::medium(12.5);
         let fits = |t: &String| ui.painter().layout_no_wrap(t.clone(), font.clone(), Color32::WHITE).size().x + 24.0 <= area.width();
         let short = info.split(" (").next().unwrap_or("").to_string();
-        let mut text = format!("{}  ▾", src.label());
+        let mut text = src.label().to_string();
         for cand in [info.clone(), short] {
-            let t = format!("{}  ·  {}  ▾", src.label(), cand);
+            let t = format!("{}  ·  {}", src.label(), cand);
             if !cand.is_empty() && fits(&t) {
                 text = t;
                 break;
@@ -5378,6 +5610,7 @@ impl GifKitApp {
         ui.scope_builder(egui::UiBuilder::new().max_rect(area).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
             let r = ui.add(
                 egui::Button::new(RichText::new(text).font(theme::medium(12.5)).color(Color32::WHITE))
+                    .right_text(crate::icons::image(ui.ctx(), "go-down", 16.0, Color32::WHITE))
                     .fill(Color32::from_black_alpha(170))
                     .stroke(Stroke::new(1.0, Color32::from_white_alpha(30)))
                     .corner_radius(4.0)
@@ -5450,7 +5683,7 @@ impl GifKitApp {
                 if fresh {
                     let (i, size, n) = {
                         let c = self.cmp.as_ref().unwrap();
-                        (stack::frame_at_time(&c.anim, t), vec2(c.anim.width() as f32, c.anim.height() as f32), c.bytes.len() as u64)
+                        (c.frame_for(self.cur, t), vec2(c.anim.width() as f32, c.anim.height() as f32), c.size)
                     };
                     let _ = n;
                     let sheet = self.cmp.as_ref().map(|c| c.sheet).unwrap_or(false);
@@ -6353,10 +6586,13 @@ impl GifKitApp {
         let tr = &mut self.stack.transform;
         let before = format!("{} {} {} {} {} {} {} {:?}", tr.flip_v, tr.flip_h, tr.rot, tr.rot_any, tr.rot_deg, tr.rot_expand, tr.rot_bg_transparent, tr.rot_bg);
         group(ui, "Flip", |ui| {
-            form_row(ui, "Flip", |ui| toggle_grid(ui, 0.0, &mut [(&mut tr.flip_h, "↔ Horizontal", ""), (&mut tr.flip_v, "↕ Vertical", "")]));
+            form_row(ui, "Flip", |ui| {
+                check(ui, &mut tr.flip_h, "Horizontally");
+                check(ui, &mut tr.flip_v, "Vertically");
+            });
         });
         group(ui, "Rotate", |ui| {
-            form_row(ui, "Turn", |ui| seg_row(ui, &mut tr.rot, &[(0u16, "0°"), (90, "↻ 90°"), (180, "180°"), (270, "↺ 90°")]));
+            form_row(ui, "Turn", |ui| seg_row(ui, &mut tr.rot, &[(0u16, "None"), (90, "90° clockwise"), (180, "180°"), (270, "90° anticlockwise")]));
             let changed = opt_row(ui, "Free angle", &mut tr.rot_any, |ui| fill_slider(ui, egui::Slider::new(&mut tr.rot_deg, -180.0..=180.0).suffix("°").max_decimals(1).clamping(egui::SliderClamping::Never)).changed());
             if changed {
                 tr.rot_any = true;
@@ -6493,12 +6729,13 @@ impl GifKitApp {
         ui.add_space(8.0);
         let cur_key = self.cmp_key();
         let busy = self.cmp_job.is_some();
+        let mut full = false;
         group(ui, "Result", |ui| match &self.cmp {
             Some(c) => {
-                let n = c.bytes.len() as u64;
+                let n = c.size;
                 let stale = c.key != cur_key;
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(fmt_size(n)).font(theme::medium(16.0)).color(if stale { pal.fg_muted } else { pal.positive }));
+                    ui.label(RichText::new(c.size_text()).font(theme::medium(16.0)).color(if stale { pal.fg_muted } else { pal.positive }));
                     if let Some(orig) = self.file_size {
                         hint(ui, &format!("{:+.0}% vs original", (n as f64 / orig as f64 - 1.0) * 100.0));
                     }
@@ -6506,6 +6743,10 @@ impl GifKitApp {
                         ui.spinner();
                     }
                 });
+                if let Some(smp) = &c.sample {
+                    hint(ui, &format!("Estimated from {} of {} frames to keep editing quick", smp.len(), self.plan.len()));
+                    full = ui.add_enabled(!busy, egui::Button::new("Compress Fully").min_size(vec2(0.0, CHIP_H))).on_hover_text("Encode every frame for the exact size and preview. Takes a while on long clips.").clicked();
+                }
             }
             None => {
                 ui.horizontal(|ui| {
@@ -6514,6 +6755,10 @@ impl GifKitApp {
                 });
             }
         });
+        if full {
+            self.cmp_full_key = cur_key;
+            self.cmp = None;
+        }
         let mut find = false;
         let mut reset = false;
         let idle = !self.busy();
@@ -6537,7 +6782,7 @@ impl GifKitApp {
                     })
                 });
                 form_row(ui, "", |ui| {
-                    let r = wide_button(ui, egui::Button::new("Common Limits ▾")).on_hover_text("Upload limits of popular sites");
+                    let r = wide_button(ui, drop_button(ui, "Common Limits", p().fg)).on_hover_text("Upload limits of popular sites");
                     egui::Popup::menu(&r).show(|ui| {
                         ui.set_min_width(170.0);
                         for (lbl, v, mb) in TARGET_PRESETS {
@@ -6556,7 +6801,7 @@ impl GifKitApp {
                 form_row(ui, "", |ui| {
                     even_grid(ui, 2, 0.0, |ui, i, size| {
                         if i == 0 {
-                            find = ui.add_enabled_ui(idle, |ui| ui.add_sized(size, egui::Button::new(RichText::new("Find Settings").font(theme::medium(13.5))).fill(theme::checked_fill(p())).stroke(Stroke::new(1.0, p().highlight)))).inner.on_hover_text("Finds the best quality under the limit and applies it. Quality drops first and size only if needed.").clicked();
+                            find = ui.add_enabled_ui(idle, |ui| ui.add_sized(size, egui::Button::new("Find Settings").stroke(Stroke::new(1.0, p().highlight)))).inner.on_hover_text("Finds the best quality under the limit and applies it. Quality drops first and size only if needed.").clicked();
                         } else {
                             reset = ui.add_enabled_ui(idle, |ui| ui.add_sized(size, egui::Button::new("Reset"))).inner.on_hover_text("Back to lossless settings. Also undoes any downscale from Find Settings.").clicked();
                         }
@@ -6798,7 +7043,7 @@ impl GifKitApp {
             None if cur_idx < self.builtin_font_count => Self::builtin_preview_font(cur_idx, 15.0),
             None => egui::FontId::proportional(15.0),
         };
-        let r = ui.add(egui::Button::new(RichText::new(format!("{}  ▾", elide(&cur_name, 30))).font(cur_font).color(pal.fg)).min_size(vec2(ui.available_width(), 30.0)));
+        let r = ui.add(drop_button(ui, RichText::new(elide(&cur_name, 30)).font(cur_font).color(pal.fg), pal.fg).min_size(vec2(ui.available_width(), 32.0)));
         if r.clicked() {
             self.font_search.clear();
         }
@@ -6810,7 +7055,7 @@ impl GifKitApp {
             if styles.len() > 1 {
                 ui.add_space(2.0);
                 form_row(ui, "Style", |ui| {
-                    egui::ComboBox::from_id_salt("fontstyle").width(ui.available_width()).truncate().selected_text(&style).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt("fontstyle").icon(chevron).width(ui.available_width()).truncate().selected_text(&style).show_ui(ui, |ui| {
                         for st in &styles {
                             if ui.selectable_label(*st == style, st).clicked() {
                                 pick_sys = Some((fam.clone(), st.clone()));
@@ -7072,7 +7317,7 @@ impl GifKitApp {
             form_row(ui, "Align", |ui| seg_row(ui, &mut a.align, &[(Align::Left, "Left"), (Align::Center, "Centre"), (Align::Right, "Right")]));
             slider_row(ui, "Opacity", egui::Slider::new(&mut a.opacity, 0..=100).suffix("%"));
             form_row(ui, "Colours", |ui| {
-                let r = wide_button(ui, egui::Button::new("Quick Colours ▾"));
+                let r = wide_button(ui, drop_button(ui, "Quick Colours", p().fg));
                 egui::Popup::menu(&r).show(|ui| {
                     ui.set_min_width(170.0);
                     let presets: [(&str, [u8; 4], [u8; 4]); 5] = [
@@ -7984,11 +8229,14 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
             let labels: Vec<&str> = list.iter().map(|b| b.label()).collect();
             even_grid(ui, list.len(), label_w(ui, &labels).max(84.0), |ui, i, size| {
                 let b = list[i];
-                if ui.add_sized(size, sel_btn(egui::Button::new(b.label()).truncate(), fx.booth == b)).on_hover_text(b.tip()).clicked() {
-                    fx.booth = if fx.booth == b { BoothFx::None } else { b };
+                if cell(ui, size, |ui| radio(ui, fx.booth == b, b.label())).on_hover_text(b.tip()).clicked() {
+                    fx.booth = b;
                 }
             });
         };
+        if radio(ui, fx.booth == BoothFx::None, "None").clicked() {
+            fx.booth = BoothFx::None;
+        }
         subhead(ui, "Looks");
         pick(ui, &BoothFx::LOOKS, fx);
         ui.add_space(6.0);
@@ -8108,7 +8356,7 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
     }
     group_ex(ui, "Transform (Old)", true, on(&[fx.flip_v, fx.flip_h, fx.rot90, fx.rot270, fx.rot_any]), |ui| {
         hint(ui, "Use the Rotate frame edit instead. These stay for older projects.");
-        toggle_grid(ui, 64.0, &mut [(&mut fx.flip_h, "↔ Flip", ""), (&mut fx.flip_v, "↕ Flip", ""), (&mut fx.rot90, "↻ 90°", ""), (&mut fx.rot270, "↺ 90°", "")]);
+        toggle_grid(ui, 64.0, &mut [(&mut fx.flip_h, "Flip horizontally", ""), (&mut fx.flip_v, "Flip vertically", ""), (&mut fx.rot90, "Turn 90° clockwise", ""), (&mut fx.rot270, "Turn 90° anticlockwise", "")]);
         opt_row(ui, "Rotate", &mut fx.rot_any, |ui| num_fill(ui, egui::DragValue::new(&mut fx.rot_deg).speed(0.5).suffix("°")));
     });
 }

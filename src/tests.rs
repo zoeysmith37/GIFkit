@@ -1152,3 +1152,18 @@ fn bundled_font_sheet() {
     }
     out.save("target/font_sheet.png").unwrap();
 }
+
+#[test]
+fn long_gif_encodes_in_runs() {
+    // more frames than one run, so the encoder splits and joins them
+    let one = synth(false);
+    let mut a = Animation { frames: Vec::new(), loop_count: None };
+    for k in 0..25 {
+        a.frames.extend(one.frames.iter().map(|f| Frame::new((*f.image).clone(), f.delay_cs + (k % 2) as u16)));
+    }
+    assert!(a.len() > 200);
+    let bytes = encode_gif(&a, &GifOptions::default(), None).unwrap();
+    let b = io::load_animation_bytes(&bytes).unwrap();
+    assert_eq!(b.len(), a.len());
+    assert!(max_diff(&a, &b) < 200);
+}

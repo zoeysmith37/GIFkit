@@ -41,7 +41,8 @@ fn read_gif_loop(bytes: &[u8]) -> Option<u16> {
 /// Load any supported file: animated GIF / APNG / WebP, or a still image (1 frame).
 pub fn load_animation(path: &Path) -> Result<Animation> {
     if is_video(path) {
-        return load_video(path);
+        let info = probe_video(path)?;
+        return load_video_range(path, &VideoImport::defaults(&info), None);
     }
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     load_animation_bytes(&bytes)
@@ -54,10 +55,146 @@ pub fn is_video(path: &Path) -> bool {
     path.extension().map(|e| VIDEO_EXTS.contains(&e.to_string_lossy().to_lowercase().as_str())).unwrap_or(false)
 }
 
-/// Longest side and frame cap used when importing video (GIFs of full-HD
-/// video need gigabytes of memory and make huge files).
+/// Default longest side when importing video (GIFs of full-HD video need
+/// gigabytes of memory and make huge files). The import window can change it.
 pub const VIDEO_MAX_SIDE: u32 = 640;
-pub const VIDEO_MAX_FRAMES: usize = 1500;
+
+/// What ffprobe says about a video.
+#[derive(Clone, Debug)]
+pub struct VideoInfo {
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+    pub duration: f64,
+}
+
+/// How to bring a video in: the time range, frame rate and size.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VideoImport {
+    pub start: f64,
+    pub end: f64,
+    /// GIF delay per frame in 1/100 s (2 = 50 fps … 10 = 10 fps)
+    pub delay_cs: u16,
+    /// longest side, 0 = keep the video's size
+    pub max_side: u32,
+}
+
+/// Frame delays GIFs can show exactly, fastest first.
+pub const VIDEO_DELAYS: [u16; 7] = [2, 3, 4, 5, 6, 8, 10];
+
+impl VideoImport {
+    pub fn defaults(info: &VideoInfo) -> Self {
+        // the fastest exact GIF rate that isn't above the source
+        let delay_cs = VIDEO_DELAYS.into_iter().find(|d| 100.0 / *d as f64 <= info.fps + 0.01).unwrap_or(10);
+        Self { start: 0.0, end: info.duration, delay_cs, max_side: VIDEO_MAX_SIDE }
+    }
+
+    /// Output frame size (even numbers, as video scalers need).
+    pub fn size(&self, info: &VideoInfo) -> (u32, u32) {
+        let (w, h) = (info.width.max(2), info.height.max(2));
+        let long = w.max(h);
+        let s = if self.max_side == 0 || self.max_side >= long { 1.0 } else { self.max_side as f64 / long as f64 };
+        let even = |v: f64| ((v / 2.0).round() as u32 * 2).max(2);
+        (even(w as f64 * s), even(h as f64 * s))
+    }
+
+    pub fn frames(&self) -> usize {
+        ((self.end - self.start).max(0.0) * 100.0 / self.delay_cs as f64).round().max(1.0) as usize
+    }
+
+    /// Memory the frames take once loaded.
+    pub fn bytes(&self, info: &VideoInfo) -> u64 {
+        let (w, h) = self.size(info);
+        self.frames() as u64 * w as u64 * h as u64 * 4
+    }
+}
+
+/// Size, frame rate and length of a video via ffprobe.
+pub fn probe_video(path: &Path) -> Result<VideoInfo> {
+    anyhow::ensure!(ffmpeg_available(), "Opening videos needs ffmpeg installed and on PATH");
+    let out = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,avg_frame_rate,r_frame_rate,duration:stream_tags=rotate:stream_side_data=rotation:format=duration", "-of", "json"])
+        .arg(path)
+        .output()
+        .context("Failed to run ffprobe")?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).context("ffprobe gave no answer")?;
+    let st = v["streams"].get(0).context("No video stream in the file")?;
+    let num = |x: &serde_json::Value| x.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| x.as_f64());
+    let rate = |x: &serde_json::Value| {
+        let (a, b) = x.as_str()?.split_once('/')?;
+        let (a, b): (f64, f64) = (a.parse().ok()?, b.parse().ok()?);
+        (a > 0.0 && b > 0.0).then(|| a / b).filter(|f| *f > 0.5 && *f < 1000.0)
+    };
+    let mut width = st["width"].as_u64().unwrap_or(0) as u32;
+    let mut height = st["height"].as_u64().unwrap_or(0) as u32;
+    anyhow::ensure!(width > 0 && height > 0, "Couldn't read the video size");
+    // phone videos are often stored sideways with a rotation flag; ffmpeg turns them upright
+    let rot = st["tags"]["rotate"].as_str().and_then(|r| r.parse::<i64>().ok()).or_else(|| st["side_data_list"].get(0).and_then(|d| d["rotation"].as_i64())).unwrap_or(0);
+    if rot.rem_euclid(180) == 90 {
+        std::mem::swap(&mut width, &mut height);
+    }
+    let fps = rate(&st["avg_frame_rate"]).or_else(|| rate(&st["r_frame_rate"])).unwrap_or(25.0);
+    let duration = num(&v["format"]["duration"]).or_else(|| num(&st["duration"])).unwrap_or(0.0);
+    anyhow::ensure!(duration > 0.0, "Couldn't read the video length");
+    Ok(VideoInfo { width, height, fps, duration })
+}
+
+/// Import part of a video as frames, streaming raw pixels from ffmpeg (no
+/// temporary files, no length cap). `progress` counts frames as they arrive.
+pub fn load_video_range(path: &Path, opt: &VideoImport, progress: Option<&std::sync::atomic::AtomicUsize>) -> Result<Animation> {
+    use std::io::Read;
+    let info = probe_video(path)?;
+    let (w, h) = opt.size(&info);
+    let fps = 100.0 / opt.delay_cs as f64;
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.args(["-v", "error", "-nostdin"]);
+    if opt.start > 0.0 {
+        cmd.args(["-ss", &format!("{:.3}", opt.start)]);
+    }
+    cmd.arg("-i").arg(path);
+    if opt.end < info.duration {
+        cmd.args(["-t", &format!("{:.3}", (opt.end - opt.start).max(0.01))]);
+    }
+    cmd.args(["-an", "-vf", &format!("fps={fps},scale={w}:{h}:flags=lanczos,format=rgba"), "-f", "rawvideo", "-pix_fmt", "rgba", "-"]);
+    cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // no console window
+    }
+    let mut child = cmd.spawn().context("Failed to run ffmpeg")?;
+    let mut stdout = child.stdout.take().context("ffmpeg output")?;
+    let stderr = child.stderr.take();
+    let err_thread = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(mut e) = stderr {
+            let _ = e.read_to_string(&mut s);
+        }
+        s
+    });
+    let frame_len = (w * h * 4) as usize;
+    let mut frames = Vec::new();
+    loop {
+        let mut buf = vec![0u8; frame_len];
+        match stdout.read_exact(&mut buf) {
+            Ok(()) => {
+                frames.push(Frame::new(RgbaImage::from_raw(w, h, buf).context("frame size")?, opt.delay_cs));
+                if let Some(p) = progress {
+                    p.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let status = child.wait()?;
+    let err = err_thread.join().unwrap_or_default();
+    if !status.success() && frames.is_empty() {
+        bail!("ffmpeg could not read the video: {}", err.lines().last().unwrap_or(""));
+    }
+    anyhow::ensure!(!frames.is_empty(), "The video has no frames in that range");
+    Ok(Animation { frames, loop_count: None })
+}
 
 /// Source frame rate via ffprobe, if available.
 fn probe_fps(path: &Path) -> Option<f64> {
@@ -79,6 +216,7 @@ fn probe_fps(path: &Path) -> Option<f64> {
 /// Import a video as frames (needs ffmpeg). Frame rate is snapped to a rate
 /// GIF delays can represent exactly (50, 33.3, 25, 20 ... fps); large videos are
 /// scaled down to [`VIDEO_MAX_SIDE`].
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn load_video(path: &Path) -> Result<Animation> {
     load_video_opts(path, Some(VIDEO_MAX_SIDE), None)
 }
@@ -117,7 +255,6 @@ fn load_video_dec(path: &Path, max_side: Option<u32>, crop_to: Option<(u32, u32)
         .arg("-i")
         .arg(path)
         .args(["-an", "-vf", &vf])
-        .args(if max_side.is_some() { vec!["-frames:v".to_string(), VIDEO_MAX_FRAMES.to_string()] } else { vec![] })
         .arg(tmp.join("f%06d.png"))
         .output()
         .context("Failed to run ffmpeg")?;

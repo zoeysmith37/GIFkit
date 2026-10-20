@@ -63,7 +63,8 @@ pub const NOAI_COMMENT: &str = "noai, noimageai - not licensed for AI/ML trainin
 
 /// A frame ready for encoding, before quantisation.
 struct Prepared {
-    rgba: RgbaImage,
+    // shared with the source frame, not copied
+    rgba: std::sync::Arc<RgbaImage>,
     delay: u16,
 }
 
@@ -356,7 +357,7 @@ pub fn encode_gif(anim: &Animation, opt: &GifOptions, progress: Option<&AtomicUs
                 }
             }
         }
-        prepared.push(Prepared { rgba: (*f.image).clone(), delay: f.delay_cs });
+        prepared.push(Prepared { rgba: f.image.clone(), delay: f.delay_cs });
     }
 
     let transparent_anim = has_transparency(&frames, thr);
@@ -379,7 +380,7 @@ pub fn encode_gif(anim: &Animation, opt: &GifOptions, progress: Option<&AtomicUs
         // frames written without transparency can use it
         (Some(c), _) if !transparent_anim && c.len() <= opt.colors.clamp(2, 256) as usize => Some(Palette::exact(&c.iter().map(|x| x.0).collect::<Vec<_>>(), false)),
         (_, true) => {
-            let imgs: Vec<&RgbaImage> = prepared.iter().map(|p| &p.rgba).collect();
+            let imgs: Vec<&RgbaImage> = prepared.iter().map(|p| &*p.rgba).collect();
             let samples = collect_samples(&imgs, thr, 600_000);
             Some(Palette::build(&samples, opt.colors, need_transparent_idx, opt.quant_speed))
         }
@@ -403,11 +404,11 @@ pub fn encode_gif(anim: &Animation, opt: &GifOptions, progress: Option<&AtomicUs
         // Source colour last painted at each pixel (RGB + "painted" flag), for differencing.
         // Comparing against the *source* (not the quantised output) avoids re-sending
         // pixels whose only difference is palette error, while bounding lossy drift.
-        let mut canvas: Vec<[u8; 4]> = vec![[0, 0, 0, 0]; (w * h) as usize];
         let tol = (opt.lossy as i32 * opt.lossy as i32) / 4; // squared distance tolerance
         let max_dist = opt.lossy as f32 / 2.0;
 
-        for (fi, pf) in prepared.iter().enumerate() {
+        // One frame, differenced against `canvas` (what earlier frames of its run painted).
+        let encode_one = |fi: usize, pf: &Prepared, canvas: &mut Vec<[u8; 4]>| -> anyhow::Result<gif::Frame<'static>> {
             let img = &pf.rgba;
             let (mut x0, mut y0, mut x1, mut y1) = (0u32, 0u32, w - 1, h - 1);
             let mut mask: Option<Vec<bool>> = None;
@@ -569,7 +570,7 @@ pub fn encode_gif(anim: &Animation, opt: &GifOptions, progress: Option<&AtomicUs
                 }
             }
 
-            let frame = gif::Frame {
+            let frame: gif::Frame<'static> = gif::Frame {
                 delay: pf.delay,
                 dispose: if use_diff { gif::DisposalMethod::Keep } else if transparent_anim { gif::DisposalMethod::Background } else { gif::DisposalMethod::Any },
                 transparent: best.pal.transparent,
@@ -582,9 +583,27 @@ pub fn encode_gif(anim: &Animation, opt: &GifOptions, progress: Option<&AtomicUs
                 palette: if best.local { Some(best.pal.rgb.clone()) } else { None },
                 buffer: Cow::Owned(best.data),
             };
-            enc.write_lzw_pre_encoded_frame(&frame)?;
             if let Some(p) = progress {
                 p.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(frame)
+        };
+
+        // Long animations are split into runs that each start with a whole frame,
+        // so the runs encode in parallel. The run length is fixed so the file is
+        // the same on every machine.
+        const RUN: usize = 120;
+        let runs: Vec<&[Prepared]> = if prepared.len() > RUN * 3 / 2 { prepared.chunks(RUN).collect() } else { vec![&prepared[..]] };
+        let encoded: Vec<anyhow::Result<Vec<gif::Frame<'static>>>> = runs
+            .par_iter()
+            .map(|run| {
+                let mut canvas: Vec<[u8; 4]> = vec![[0, 0, 0, 0]; (w * h) as usize];
+                run.iter().enumerate().map(|(fi, pf)| encode_one(fi, pf, &mut canvas)).collect()
+            })
+            .collect();
+        for run in encoded {
+            for frame in run? {
+                enc.write_lzw_pre_encoded_frame(&frame)?;
             }
         }
     }
