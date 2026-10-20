@@ -1020,7 +1020,7 @@ fn booth_effects_change_pixels() {
     }
     // the effects layer runs it
     let fx = crate::effects::EffectSettings { booth: BoothFx::Thermal, ..Default::default() };
-    let out = crate::effects::apply_frame(src, 0, 1, 0.0, &fx, &[]);
+    let out = crate::effects::apply_frame(src, 0, 1, 0.0, 0.0, &fx, &[]);
     assert_ne!(out.as_raw(), src.as_raw());
 }
 
@@ -1353,4 +1353,47 @@ fn gif_info_reads_palettes_and_tags_once() {
         n += 1;
     }
     assert_eq!(n, 3);
+}
+
+
+/// A still picture made longer, with a fade in and out: whatever the timeline
+/// does (skips, cuts, speed, reverse), the first and last frames that show
+/// are the faintest and match each other.
+#[test]
+fn fades_line_up_with_timeline_changes() {
+    use crate::stack::{LayerKind, Stack};
+    let still = image::RgbaImage::from_pixel(16, 16, image::Rgba([200, 200, 200, 255]));
+    let base = Animation { frames: (0..30).map(|_| crate::anim::Frame::new(still.clone(), 10)).collect(), loop_count: None };
+    let lum = |img: &image::RgbaImage| img.get_pixel(8, 8)[0] as i32;
+    type Tweak = fn(&mut Stack, &mut Animation);
+    let cases: Vec<(&str, Tweak)> = vec![
+        ("plain", |_, _| {}),
+        ("skip end", |_, b| (25..30).for_each(|i| b.frames[i].enabled = false)),
+        ("skip start", |_, b| (0..4).for_each(|i| b.frames[i].enabled = false)),
+        ("cut", |s, _| {
+            let t = &mut s.transform;
+            (t.cut_on, t.cut_start, t.cut_end) = (true, 5, 22);
+        }),
+        ("speed 400%", |s, _| (s.transform.speed_on, s.transform.speed_val) = (true, 400.0)),
+        ("speed 800%", |s, _| (s.transform.speed_on, s.transform.speed_val) = (true, 800.0)),
+        ("speed 50%", |s, _| (s.transform.speed_on, s.transform.speed_val) = (true, 50.0)),
+        ("reverse", |s, _| (s.transform.play_on, s.transform.reverse) = (true, true)),
+        ("boomerang", |s, _| (s.transform.play_on, s.transform.boomerang) = (true, true)),
+    ];
+    for (name, tweak) in cases {
+        let mut b = base.clone();
+        let mut st = Stack::default();
+        let mut fx = crate::effects::EffectSettings::default();
+        fx.intro = crate::motion::Transition::Fade;
+        fx.outro = crate::motion::Transition::Fade;
+        fx.fade_to_transparent = false;
+        st.push(LayerKind::Effects(Box::new(fx)));
+        tweak(&mut st, &mut b);
+        let flat = st.flatten(&b, &[], None);
+        let shown: Vec<i32> = flat.frames.iter().filter(|f| f.enabled).map(|f| lum(&f.image)).collect();
+        let (first, last) = (shown[0], *shown.last().unwrap());
+        let min = *shown.iter().min().unwrap();
+        assert!(first == min && last == min, "{name}: first {first} last {last} min {min} {shown:?}");
+        assert!(first < 40, "{name}: starts too bright {shown:?}");
+    }
 }

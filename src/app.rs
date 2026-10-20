@@ -277,10 +277,16 @@ struct CmpResult {
 
 impl CmpResult {
     /// The encoded frame to show for plan frame `cur` at time `t`.
-    fn frame_for(&self, cur: usize, t: f32) -> usize {
+    fn frame_for(&self, cur: usize, t: f32, plan: &[stack::PlanFrame]) -> usize {
         match &self.sample {
-            // identical neighbours may have been merged, so never point past the end
-            Some(s) => s.iter().enumerate().min_by_key(|(_, i)| (**i as i64 - cur as i64).unsigned_abs()).map(|(j, _)| j).unwrap_or(0).min(self.anim.len().saturating_sub(1)),
+            // the sample's frames play back to back, and identical neighbours
+            // are merged into one longer frame, so find the nearest sampled
+            // frame and look it up by its time within the sample
+            Some(s) => {
+                let Some(j) = s.iter().enumerate().min_by_key(|(_, i)| (**i as i64 - cur as i64).unsigned_abs()).map(|(j, _)| j) else { return 0 };
+                let at: u32 = s[..j].iter().filter_map(|&i| plan.get(i)).map(|f| effective_delay(f.delay) as u32).sum();
+                stack::frame_at_time(&self.anim, at as f32 / 100.0 + 0.001)
+            }
             None => stack::frame_at_time(&self.anim, t),
         }
     }
@@ -3846,7 +3852,9 @@ impl GifKitApp {
         let is_sheet = matches!(pf, io::PreviewFormat::Sheet(_));
         // long or large animations: encode a few stretches and estimate the rest
         let n = self.plan.len();
-        let pixels = n as u64 * self.out_size.0 as u64 * self.out_size.1 as u64;
+        // the output size (not out_size, which only follows the Edit view)
+        let os = self.true_out_size();
+        let pixels = n as u64 * os.x as u64 * os.y as u64;
         // only frames that are shown: skipped ones are left out of the file, so
         // sampling them would leave the preview with gaps
         let shown: Vec<usize> = (0..n).filter(|&i| self.plan[i].enabled).collect();
@@ -5550,7 +5558,7 @@ impl GifKitApp {
         let (tex, size) = if fresh {
             let (i, size) = {
                 let c = self.cmp.as_ref().unwrap();
-                (c.frame_for(self.cur, self.play_time()), vec2(c.full.0 as f32, c.full.1 as f32))
+                (c.frame_for(self.cur, self.play_time(), &self.plan), vec2(c.full.0 as f32, c.full.1 as f32))
             };
             (self.cmp_texture(ctx, i), size)
         } else {
@@ -6479,7 +6487,7 @@ impl GifKitApp {
                 if fresh {
                     let (i, size, n) = {
                         let c = self.cmp.as_ref().unwrap();
-                        (c.frame_for(self.cur, t), vec2(c.full.0 as f32, c.full.1 as f32), c.size)
+                        (c.frame_for(self.cur, t, &self.plan), vec2(c.full.0 as f32, c.full.1 as f32), c.size)
                     };
                     let _ = n;
                     let sheet = self.cmp.as_ref().map(|c| c.sheet).unwrap_or(false);

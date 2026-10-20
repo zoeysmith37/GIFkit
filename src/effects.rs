@@ -782,7 +782,10 @@ fn camera(img: &mut RgbaImage, fonts: &[FontEntry], frame_idx: usize) {
 // ------------------------------------------------------------- pipeline
 
 /// Apply all enabled per-frame effects to one image.
-pub fn apply_frame(src: &RgbaImage, idx: usize, n: usize, elapsed_s: f32, s: &EffectSettings, fonts: &[FontEntry]) -> RgbaImage {
+/// `idx` and `n` count the shown frames of the clip (intros and outros go by
+/// frames); `elapsed_s` and `clip_s` are the time into the clip and its length
+/// (looping motion goes by time, so frames of different lengths keep it even).
+pub fn apply_frame(src: &RgbaImage, idx: usize, n: usize, elapsed_s: f32, clip_s: f32, s: &EffectSettings, fonts: &[FontEntry]) -> RgbaImage {
     let mut img = src.clone();
     let d = EffectSettings::default();
 
@@ -916,7 +919,10 @@ pub fn apply_frame(src: &RgbaImage, idx: usize, n: usize, elapsed_s: f32, s: &Ef
     // looping motion, then the intro and outro on top
     let loops = s.loop_fx();
     if !loops.is_empty() {
-        img = crate::motion::looped(&img, &loops, idx, n, s.loop_amount, s.loop_cycles, s.fade_to_transparent);
+        // position through the clip by time, in steps fine enough to look smooth
+        const STEPS: usize = 3600;
+        let (li, ln) = if clip_s > 0.0 { (((elapsed_s / clip_s).clamp(0.0, 1.0) * STEPS as f32).round() as usize, STEPS) } else { (idx, n) };
+        img = crate::motion::looped(&img, &loops, li, ln, s.loop_amount, s.loop_cycles, s.fade_to_transparent);
     }
     let ff = s.fade_frames.max(1);
     let (intro, outro) = s.transitions();
@@ -1013,13 +1019,14 @@ pub fn apply(anim: &Animation, s: &EffectSettings, fonts: &[FontEntry], progress
     }
     let n = a.len();
     let times = frame_start_times(&a);
+    let total = a.duration_secs();
     // Frames are processed in parallel; individual effects are also parallel inside.
     let frames = a
         .frames
         .par_iter()
         .enumerate()
         .map(|(i, f)| {
-            let img = apply_frame(&f.image, i, n, times[i], s, fonts);
+            let img = apply_frame(&f.image, i, n, times[i], total, s, fonts);
             progress.fetch_add(1, Ordering::Relaxed);
             f.with_image(img)
         })

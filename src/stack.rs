@@ -802,7 +802,11 @@ impl Stack {
                 LayerKind::Effects(fx) => {
                     // effects run over their own clip, so an intro starts where the clip does
                     let (s0, s1) = l.timing.clip_at(i, n).filter(|_| l.timing.clips.is_some()).unwrap_or((0, n.saturating_sub(1)));
-                    img = effects::apply_frame(&img, i - s0, s1 - s0 + 1, times[i] - times[s0], fx, fonts);
+                    // count only frames that show: skipped ones (trims, speed-ups)
+                    // would otherwise swallow the start of an intro or the end of an outro
+                    let shown = |a: usize, b: usize| plan[a..b].iter().filter(|f| f.enabled).count();
+                    let end_t = times[s1] + if plan[s1].enabled { effective_delay(plan[s1].delay) as f32 / 100.0 } else { 0.0 };
+                    img = effects::apply_frame(&img, shown(s0, i), shown(s0, s1 + 1).max(1), times[i] - times[s0], end_t - times[s0], fx, fonts);
                 }
                 LayerKind::Censor(c) => {
                     if c.applies_to(src) {
