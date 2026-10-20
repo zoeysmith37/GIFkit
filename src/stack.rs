@@ -326,6 +326,8 @@ pub struct Layer {
     pub kind: LayerKind,
     /// user-chosen name (None = automatic)
     pub label: Option<String>,
+    /// clips and keyframes from the timeline
+    pub timing: crate::timeline::Timing,
 }
 
 impl Layer {
@@ -424,6 +426,9 @@ pub fn layer_signature(l: &Layer) -> u64 {
         LayerKind::Shape(sh) => format!("{sh:?}").hash(&mut h),
         LayerKind::Markup(m) => format!("{m:?}").hash(&mut h),
         LayerKind::Emoji(e) => format!("{e:?}").hash(&mut h),
+    }
+    if !l.timing.is_default() {
+        format!("{:?}", l.timing).hash(&mut h);
     }
     h.finish()
 }
@@ -527,7 +532,7 @@ impl Stack {
     pub fn push(&mut self, kind: LayerKind) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
-        self.layers.push(Layer { id, visible: true, kind, label: None });
+        self.layers.push(Layer { id, visible: true, kind, label: None, timing: Default::default() });
         id
     }
 
@@ -700,23 +705,45 @@ impl Stack {
         let src = plan[i].src;
         let mut img = self.geometry_frame(base, plan, i);
         for (li, l) in self.layers.iter().enumerate() {
-            if !l.active() {
+            if !l.active() || !l.timing.shows(i, n) {
                 continue;
             }
+            let mo = l.timing.motion(i);
+            if mo.opacity <= 0.001 {
+                continue;
+            }
+            // a keyed fade mixes the layer's result with what was under it
+            let before = (mo.opacity < 0.999).then(|| img.clone());
             let m = &prep.maps[li].m;
+            // sprites drawn ahead of time follow the motion as bitmaps
+            let draw = |img: &mut RgbaImage, sp: &RgbaImage, x: i64, y: i64, alpha: f32| {
+                if mo.moves() {
+                    let centre = l.source_box(src, fonts).map(|b| map_box(m, b, false)).map(|o| (o.cx, o.cy)).unwrap_or((x as f32 + sp.width() as f32 / 2.0, y as f32 + sp.height() as f32 / 2.0));
+                    let d = m.apply_vec(mo.dx, mo.dy);
+                    if let Some((t, tx, ty)) = crate::timeline::transform_sprite(sp, x, y, centre, d, mo.scale, mo.angle * m.det().signum()) {
+                        crate::ops::overlay_with_opacity(img, &t, tx, ty, alpha);
+                    }
+                } else {
+                    crate::ops::overlay_with_opacity(img, sp, x, y, alpha);
+                }
+            };
             match &l.kind {
-                LayerKind::Effects(fx) => img = effects::apply_frame(&img, i, n, times[i], fx, fonts),
+                LayerKind::Effects(fx) => {
+                    // effects run over their own clip, so an intro starts where the clip does
+                    let (s0, s1) = l.timing.clip_at(i, n).filter(|_| l.timing.clips.is_some()).unwrap_or((0, n.saturating_sub(1)));
+                    img = effects::apply_frame(&img, i - s0, s1 - s0 + 1, times[i] - times[s0], fx, fonts);
+                }
                 LayerKind::Censor(c) => {
                     if c.applies_to(src) {
                         if let Some(b) = l.source_box(src, fonts) {
-                            img = effects::censor_obb(&img, map_box(m, b, false), c);
+                            img = effects::censor_obb(&img, map_box(m, mo.apply(b), false), c);
                         }
                     }
                 }
                 LayerKind::Overlay(o) => {
                     if let Some(b) = l.source_box(src, fonts) {
                         let frame = o.src.frame_at(times[i]);
-                        crate::overlay::draw_in_obb(&mut img, frame, map_box(m, b, true), o.opacity / 100.0);
+                        crate::overlay::draw_in_obb(&mut img, frame, map_box(m, mo.apply(b), true), o.opacity / 100.0);
                     }
                 }
                 LayerKind::Watermark(w) => {
@@ -728,14 +755,14 @@ impl Stack {
                 LayerKind::Shape(sh) => {
                     if let Some(st) = prep.stamps.get(li) {
                         for sp in st.iter().filter(|_| sh.applies_to(src)) {
-                            crate::ops::overlay_with_opacity(&mut img, &sp.img, sp.x, sp.y, sh.opacity / 100.0);
+                            draw(&mut img, &sp.img, sp.x, sp.y, sh.opacity / 100.0);
                         }
                     }
                 }
                 LayerKind::Emoji(e) => {
                     if let Some(st) = prep.stamps.get(li) {
                         for sp in st.iter().filter(|_| e.applies_to(src)) {
-                            crate::ops::overlay_with_opacity(&mut img, &sp.img, sp.x, sp.y, e.opacity / 100.0);
+                            draw(&mut img, &sp.img, sp.x, sp.y, e.opacity / 100.0);
                         }
                     }
                 }
@@ -744,7 +771,7 @@ impl Stack {
                         for sp in st {
                             let i = src + 1;
                             if i >= sp.from.max(1) && (sp.to == 0 || i <= sp.to) {
-                                crate::ops::overlay_with_opacity(&mut img, &sp.img, sp.x, sp.y, 1.0);
+                                draw(&mut img, &sp.img, sp.x, sp.y, 1.0);
                             }
                         }
                     }
@@ -752,13 +779,49 @@ impl Stack {
                 LayerKind::Text(t) => {
                     if let Some(Some((s, x, y))) = prep.sprites.get(li) {
                         if t.applies_to(src) {
-                            crate::ops::overlay_with_opacity(&mut img, s, *x, *y, t.opacity as f32 / 100.0);
+                            draw(&mut img, s, *x, *y, t.opacity as f32 / 100.0);
                         }
                     }
                 }
             }
+            if let Some(b) = before {
+                crate::timeline::blend(&mut img, &b, mo.opacity);
+            }
         }
         img
+    }
+
+    /// Whether layer `li` shows on each output frame by its own frame range
+    /// (before it has timeline clips).
+    pub fn legacy_shown(&self, li: usize, plan: &[PlanFrame]) -> Vec<bool> {
+        let l = &self.layers[li];
+        plan.iter()
+            .map(|f| match &l.kind {
+                LayerKind::Text(t) => t.applies_to(f.src),
+                LayerKind::Censor(c) => c.applies_to(f.src),
+                LayerKind::Shape(s) => s.applies_to(f.src),
+                LayerKind::Emoji(e) => e.applies_to(f.src),
+                _ => true,
+            })
+            .collect()
+    }
+
+    /// Give layer `li` explicit clips (from its old frame range), and hand
+    /// the range over to them so the two don't both apply.
+    pub fn ensure_clips(&mut self, li: usize, plan: &[PlanFrame]) {
+        if self.layers[li].timing.clips.is_some() {
+            return;
+        }
+        let shown = self.legacy_shown(li, plan);
+        let l = &mut self.layers[li];
+        l.timing.take_clips(&shown);
+        match &mut l.kind {
+            LayerKind::Text(t) => (t.from, t.to) = (1, 0),
+            LayerKind::Censor(c) => (c.from, c.to) = (1, 0),
+            LayerKind::Shape(s) => (s.from, s.to) = (1, 0),
+            LayerKind::Emoji(e) => (e.from, e.to) = (1, 0),
+            _ => {}
+        }
     }
 
     /// Bake the stack into a new animation.

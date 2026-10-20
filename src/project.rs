@@ -54,6 +54,9 @@ pub struct ProjLayerEntry {
     #[serde(default)]
     pub label: Option<String>,
     pub layer: ProjLayer,
+    /// clips and keyframes (none in older projects)
+    #[serde(default, skip_serializing_if = "crate::timeline::Timing::is_default")]
+    pub timing: crate::timeline::Timing,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]

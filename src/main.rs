@@ -22,6 +22,7 @@ mod shapes;
 mod emoji;
 mod sysfonts;
 mod text;
+mod timeline;
 mod theme;
 #[cfg(test)]
 mod tests;

@@ -1050,11 +1050,11 @@ fn project_round_trip() {
     let overlay: Vec<image::RgbaImage> = (0..3).map(|i| image::RgbaImage::from_pixel(8, 6, image::Rgba([i * 80, 10, 200, 255]))).collect();
     let wm = Arc::new(image::RgbaImage::from_pixel(5, 5, image::Rgba([1, 2, 3, 128])));
     let layers = vec![
-        ProjLayerEntry { visible: true, label: Some("Caption".into()), layer: ProjLayer::Text { text: crate::text::Annotation { text: "hi".into(), stretch: 0.7, ..Default::default() }, font: Some(("builtin".into(), "Sans Bold".into())) } },
-        ProjLayerEntry { visible: false, label: None, layer: ProjLayer::Image { id: 1, name: "ov.png".into(), path: None, delays: vec![5, 5, 5], placements: vec![Default::default(); base.len()], opacity: 80.0 } },
-        ProjLayerEntry { visible: true, label: None, layer: ProjLayer::Watermark { id: 2, watermark: Default::default(), has_image: true } },
-        ProjLayerEntry { visible: true, label: None, layer: ProjLayer::Emoji { emoji: crate::shapes::EmojiSettings { emoji: "1f525".into(), w: 20, h: 20, ..Default::default() } } },
-        ProjLayerEntry { visible: true, label: None, layer: ProjLayer::Markup { markup: crate::shapes::MarkupSettings { strokes: vec![crate::shapes::PenStroke { points: vec![[1.0, 2.0], [3.0, 4.0]], ..Default::default() }] } } },
+        ProjLayerEntry { visible: true, label: Some("Caption".into()), timing: Default::default(), layer: ProjLayer::Text { text: crate::text::Annotation { text: "hi".into(), stretch: 0.7, ..Default::default() }, font: Some(("builtin".into(), "Sans Bold".into())) } },
+        ProjLayerEntry { visible: false, label: None, timing: Default::default(), layer: ProjLayer::Image { id: 1, name: "ov.png".into(), path: None, delays: vec![5, 5, 5], placements: vec![Default::default(); base.len()], opacity: 80.0 } },
+        ProjLayerEntry { visible: true, label: None, timing: Default::default(), layer: ProjLayer::Watermark { id: 2, watermark: Default::default(), has_image: true } },
+        ProjLayerEntry { visible: true, label: None, timing: crate::timeline::Timing { clips: Some(vec![crate::timeline::Clip { start: 2, end: Some(5) }]), keys: vec![crate::timeline::Key { frame: 3, x: 10.0, ..Default::default() }] }, layer: ProjLayer::Emoji { emoji: crate::shapes::EmojiSettings { emoji: "1f525".into(), w: 20, h: 20, ..Default::default() } } },
+        ProjLayerEntry { visible: true, label: None, timing: Default::default(), layer: ProjLayer::Markup { markup: crate::shapes::MarkupSettings { strokes: vec![crate::shapes::PenStroke { points: vec![[1.0, 2.0], [3.0, 4.0]], ..Default::default() }] } } },
     ];
     let mut transform = crate::stack::Transform::default();
     transform.reverse = true;
@@ -1082,6 +1082,10 @@ fn project_round_trip() {
     assert!(!pr.file.layers[1].visible);
     assert!(matches!(&pr.file.layers[0].layer, ProjLayer::Text { text, .. } if (text.stretch - 0.7).abs() < 1e-6));
     assert_eq!(pr.file.settings["format"], "WebP");
+    // clips and keyframes come back
+    assert_eq!(pr.file.layers[3].timing.spans(10), vec![(2, 5)]);
+    assert_eq!(pr.file.layers[3].timing.keys[0].x, 10.0);
+    assert!(pr.file.layers[0].timing.is_default());
     // an unchanged original isn't stored twice
     let f2 = ProjectFile::default();
     save(&path, f2, &base, Some(&base.clone()), &HashMap::new(), &HashMap::new()).unwrap();
@@ -1188,4 +1192,46 @@ fn fast_speed_skips_frames_instead_of_crawling() {
     s.transform.speed_val = 150.0;
     let plan = s.plan(&b);
     assert!(plan.iter().all(|f| f.enabled && f.delay == 2));
+}
+
+#[test]
+fn layer_clips_and_keyframes_render() {
+    use crate::shapes::{ShapeKind, ShapeSettings};
+    use crate::stack::{LayerKind, Stack};
+    use crate::timeline::{Clip, Key};
+    let a = Animation { frames: (0..10).map(|_| Frame::new(RgbaImage::from_pixel(60, 40, Rgba([0, 0, 0, 255])), 5)).collect(), loop_count: None };
+    let mut s = Stack::default();
+    let id = s.push(LayerKind::Shape(Box::new(ShapeSettings { kind: ShapeKind::Rect, x: 5, y: 5, w: 10, h: 10, fill: [255, 0, 0], ..Default::default() })));
+    let li = s.index_of(id).unwrap();
+    s.layers[li].timing.clips = Some(vec![Clip { start: 2, end: Some(7) }]);
+    // moves 30 px right from frame 2 to frame 7, steady speed
+    s.layers[li].timing.keys = vec![Key { frame: 2, smooth: false, ..Default::default() }, Key { frame: 7, x: 30.0, smooth: false, ..Default::default() }];
+    let out = s.flatten(&a, &[], None);
+    let red = |f: usize, x: u32, y: u32| out.frames[f].image.get_pixel(x, y)[0] > 200;
+    assert!(!red(0, 10, 10) && !red(1, 10, 10), "hidden before its clip");
+    assert!(red(2, 10, 10), "shows where placed at the first key");
+    assert!(red(7, 40, 10) && !red(7, 10, 10), "moved 30 px by the last key");
+    assert!(!red(8, 40, 10) && !red(8, 10, 10), "hidden after its clip");
+    // a keyed fade mixes with what's under it
+    s.layers[li].timing.keys = vec![Key { frame: 0, opacity: 50.0, ..Default::default() }];
+    let out = s.flatten(&a, &[], None);
+    let p = out.frames[3].image.get_pixel(10, 10);
+    assert!((110..=145).contains(&p[0]), "half faded: {p:?}");
+}
+
+#[test]
+fn effect_intro_starts_with_its_clip() {
+    use crate::stack::{LayerKind, Stack};
+    use crate::timeline::Clip;
+    let a = Animation { frames: (0..10).map(|_| Frame::new(RgbaImage::from_pixel(8, 8, Rgba([200, 200, 200, 255])), 5)).collect(), loop_count: None };
+    let mut s = Stack::default();
+    let fx = EffectSettings { intro: crate::motion::Transition::Fade, fade_frames: 3, ..Default::default() };
+    let id = s.push(LayerKind::Effects(Box::new(fx)));
+    let li = s.index_of(id).unwrap();
+    s.layers[li].timing.clips = Some(vec![Clip { start: 4, end: Some(8) }]);
+    let out = s.flatten(&a, &[], None);
+    let v = |f: usize| out.frames[f].image.get_pixel(4, 4)[0];
+    assert_eq!(v(2), 200, "outside the clip nothing happens");
+    assert!(v(4) < 80, "the fade starts at the clip: {}", v(4));
+    assert_eq!(v(7), 200, "and is done three frames in");
 }

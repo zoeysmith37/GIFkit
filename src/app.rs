@@ -20,6 +20,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 
+#[path = "timeline_ui.rs"]
+mod timeline_ui;
+
 // ================================================================ tools
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -668,6 +671,19 @@ pub struct GifKitApp {
     shortcuts_open: bool,
     /// the window title last sent, so it's only set when it changes
     win_title: String,
+    // the timeline dock
+    show_timeline: bool,
+    /// pixels per frame (0 fits the whole animation)
+    tl_zoom: f32,
+    /// first frame shown, and how far the tracks are scrolled
+    tl_x0: f32,
+    tl_y0: f32,
+    /// selected track (a layer id, or 0 for the GIF) and clip / key on it
+    tl_track: Option<u64>,
+    tl_clip: Option<usize>,
+    tl_key: Option<usize>,
+    tl_razor: bool,
+    tl_drag: Option<timeline_ui::TlDrag>,
     show_toolbar: bool,
     show_statusbar: bool,
     /// recently opened files, newest first
@@ -1114,11 +1130,6 @@ fn sel_btn<'a>(b: egui::Button<'a>, on: bool) -> egui::Button<'a> {
     } else {
         b
     }
-}
-
-/// Small quick-pick button: same height and padding everywhere.
-fn chip(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::Response {
-    ui.add(egui::Button::new(text.into()).wrap_mode(egui::TextWrapMode::Extend).min_size(vec2(28.0, CHIP_H)))
 }
 
 
@@ -1863,11 +1874,6 @@ fn add_layer_button(ui: &mut egui::Ui, text: &str) -> bool {
     ui.add_sized(vec2(ui.available_width(), CHIP_H), b).clicked()
 }
 
-fn tinted(ui: &mut egui::Ui, text: &str, tint: Color32) -> bool {
-    let pal = p();
-    ui.add(egui::Button::new(RichText::new(text).color(pal.fg)).fill(mix(pal.button, tint, 0.3)).stroke(Stroke::new(1.0, mix(theme::outline(pal), tint, 0.6))).min_size(vec2(0.0, CHIP_H))).clicked()
-}
-
 fn hint(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.label(RichText::new(text).size(12.0).color(p().fg_muted))
 }
@@ -2022,6 +2028,15 @@ impl GifKitApp {
             cmp_full_key: 0,
             shortcuts_open: false,
             win_title: String::new(),
+            show_timeline: theme::get_setting("show_timeline").as_deref() != Some("0"),
+            tl_zoom: 0.0,
+            tl_x0: 0.0,
+            tl_y0: 0.0,
+            tl_track: None,
+            tl_clip: None,
+            tl_key: None,
+            tl_razor: false,
+            tl_drag: None,
             show_toolbar: theme::get_setting("show_toolbar").as_deref() != Some("0"),
             show_statusbar: theme::get_setting("show_statusbar").as_deref() != Some("0"),
             recent: theme::get_setting("recent").unwrap_or_default().split('\n').filter(|l| !l.is_empty()).map(PathBuf::from).collect(),
@@ -3713,6 +3728,15 @@ impl eframe::App for GifKitApp {
             });
 
         if self.base.is_some() {
+            // the timeline at the bottom, the play controls under the view as in Kdenlive
+            if self.show_timeline {
+                egui::Panel::bottom("timeline")
+                    .resizable(true)
+                    .default_size(270.0)
+                    .size_range(150.0..=640.0)
+                    .frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin { left: 6, right: 6, top: 6, bottom: 4 }))
+                    .show(ui, |ui| self.timeline_dock(ui, &ctx));
+            }
             egui::Panel::bottom("transport")
                 .frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin::symmetric(8, 5)))
                 .show(ui, |ui| self.transport(ui));
@@ -3883,6 +3907,10 @@ impl GifKitApp {
                     self.zoom_to(1.0);
                 }
                 ui.separator();
+                if menu_check(ui, self.show_timeline, "Show &Timeline", "") {
+                    self.show_timeline = !self.show_timeline;
+                    theme::set_setting("show_timeline", if self.show_timeline { "1" } else { "0" });
+                }
                 let full = ctx.input(|i| i.viewport().fullscreen).unwrap_or(false);
                 if menu_check(ui, full, "F&ull Screen Mode", "Ctrl+Shift+F") {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!full));
@@ -4178,8 +4206,8 @@ impl GifKitApp {
         }
         let pal = *p();
         let mut open = true;
-        dialog(ctx, "shortcuts", "Keyboard Shortcuts", vec2(480.0, 660.0), true, &mut open, |ui| {
-            let rows: [(&str, &str); 21] = [
+        dialog(ctx, "shortcuts", "Keyboard Shortcuts", vec2(500.0, 700.0), true, &mut open, |ui| {
+            let rows: &[(&str, &str)] = &[
                 ("Ctrl+N", "New project"),
                 ("Ctrl+O", "Open"),
                 ("Ctrl+S", "Save the project"),
@@ -4201,14 +4229,22 @@ impl GifKitApp {
                 ("Shift+drag", "Move in straight lines"),
                 ("Shift while resizing", "Keep or free the proportions"),
                 ("Ctrl while resizing", "Scale one way. Edge handles stretch one side."),
+                ("", ""),
+                ("Timeline", ""),
+                ("S", "Split the selected track at the playhead"),
+                ("K", "Add a keyframe at the playhead"),
+                ("X", "Switch between the selection and razor tools"),
+                ("Delete", "Delete the selected clip or keyframe"),
+                ("Ctrl+wheel", "Zoom the timeline"),
+                ("Shift+wheel", "Scroll the timeline sideways"),
             ];
-            egui::Grid::new("keys").num_columns(2).spacing([18.0, 6.0]).striped(false).show(ui, |ui| {
-                for (k, what) in rows {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| egui::Grid::new("keys").num_columns(2).spacing([18.0, 6.0]).striped(false).show(ui, |ui| {
+                for &(k, what) in rows {
                     ui.label(RichText::new(k).font(theme::medium(13.0)).color(pal.fg));
                     ui.label(RichText::new(what).color(pal.fg_muted));
                     ui.end_row();
                 }
-            });
+            }));
         });
         if !open {
             self.shortcuts_open = false;
@@ -5310,7 +5346,7 @@ impl GifKitApp {
                     LayerKind::Markup(m) => ProjLayer::Markup { markup: m.clone() },
                     LayerKind::Emoji(e) => ProjLayer::Emoji { emoji: (**e).clone() },
                 };
-                ProjLayerEntry { visible: l.visible, label: l.label.clone(), layer }
+                ProjLayerEntry { visible: l.visible, label: l.label.clone(), layer, timing: l.timing.clone() }
             })
             .collect();
         let file = ProjectFile {
@@ -5375,6 +5411,7 @@ impl GifKitApp {
             if let Some(l) = self.stack.layers.iter_mut().find(|l| l.id == id) {
                 l.visible = e.visible;
                 l.label = e.label;
+                l.timing = e.timing;
             }
         }
         self.stack.sync_len(n);
@@ -6052,7 +6089,8 @@ impl GifKitApp {
                 LayerKind::Emoji(e) => e.w == 0 || e.applies_to(src_idx),
                 _ => true,
             };
-            if !applies {
+            // hidden by its clips on the timeline: not there to pick
+            if !applies || !l.timing.shows(self.cur, self.plan.len()) {
                 continue;
             }
             if let Some(b) = l.source_box(src_idx, &self.fonts) {
@@ -6287,8 +6325,20 @@ impl GifKitApp {
                 continue;
             }
             let Some(b) = l.source_box(src_idx, &self.fonts) else { continue };
+            if !l.timing.shows(self.cur, self.plan.len()) {
+                continue;
+            }
             let mp = maps2.as_ref().map(|m| m[li].m).unwrap_or(Affine::IDENTITY);
             let o = map_box(&mp, b, l.readable());
+            // keyframed motion: a dashed outline where it is on this frame,
+            // the handles stay on where it was placed
+            let mo = l.timing.motion(self.cur);
+            if mo.moves() {
+                let o2 = map_box(&mp, mo.apply(b), l.readable());
+                let mut pts2: Vec<Pos2> = o2.corners().iter().map(|c| to_screen(*c)).collect();
+                pts2.push(pts2[0]);
+                painter.extend(egui::Shape::dashed_line(&pts2, Stroke::new(1.2, pal.highlight), 6.0, 4.0));
+            }
             let pts: Vec<Pos2> = o.corners().iter().map(|c| to_screen(*c)).collect();
             if Some(l.id) == sel_id {
                 painter.add(egui::Shape::closed_line(pts.clone(), Stroke::new(2.5, Color32::from_black_alpha(150))));
@@ -6516,19 +6566,27 @@ impl GifKitApp {
         let (cs, ce) = self.base.as_ref().map(|b| self.stack.transform.cut_range(b)).unwrap_or((0, 0));
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("{n} source frames")).font(theme::medium(14.0)).color(pal.fg));
-            ui.label(RichText::new("ℹ").color(pal.fg_muted)).on_hover_text("Changes here apply under all live edits. Skipped frames are left out of playback and export.");
+            ui.label(RichText::new("ℹ").color(pal.fg_muted)).on_hover_text("Changes here apply under all live edits. Skipped frames are left out of playback and export. Right-click a frame for more.");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                slider(ui, egui::Slider::new(&mut self.fr_thumb, 56.0..=200.0).show_value(false));
-                ui.label("Size");
+                ui.spacing_mut().slider_width = 140.0;
+                slider(ui, egui::Slider::new(&mut self.fr_thumb, 32.0..=220.0).show_value(false));
+                ui.label("Size:");
             });
         });
         ui.add_space(6.0);
-        let cell_w = self.fr_thumb + 24.0;
+        // every part of a cell scales with the thumbnail, so cells never
+        // outgrow their column and spill into the preview
+        let s = self.fr_thumb.round();
+        let pad = if s < 60.0 { 3.0 } else { 5.0 };
+        let small = s < 72.0;
+        let foot = if small { 16.0 } else { 22.0 };
+        let cell = vec2(s + pad * 2.0, s + pad * 2.0 + foot);
+        let gap = if small { 4.0 } else { 8.0 };
         let mut action: Option<(usize, &'static str)> = None;
         let mut delay_change: Option<(usize, u16)> = None;
-        let cols = (((ui.available_width() - 16.0) / (cell_w + 8.0)).floor() as usize).max(1);
+        let cols = (((ui.available_width() - 14.0 + gap) / (cell.x + gap)).floor() as usize).max(1);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+            ui.spacing_mut().item_spacing = vec2(gap, gap);
             for row in 0..n.div_ceil(cols) {
                 ui.horizontal(|ui| {
                     for i in row * cols..((row + 1) * cols).min(n) {
@@ -6539,58 +6597,94 @@ impl GifKitApp {
                         let in_cut = i >= cs && i <= ce;
                         let tex = self.thumb_texture(ctx, i);
                         let sel = i == sel_src;
-                        egui::Frame::new()
-                            .fill(if sel { pal.highlight_soft } else { pal.view })
-                            .stroke(Stroke::new(1.0, if sel { pal.highlight } else { pal.border }))
-                            .corner_radius(3.0)
-                            .inner_margin(6.0)
-                            .show(ui, |ui| {
-                                ui.set_width(cell_w - 12.0);
-                                ui.vertical(|ui| {
-                                    ui.label(RichText::new(format!("#{}{}", i + 1, if in_cut { "" } else { " · cut" })).size(11.5).color(pal.fg_muted));
-                                    let box_size = vec2(self.fr_thumb, self.fr_thumb);
-                                    let (r, resp) = ui.allocate_exact_size(box_size, Sense::click());
-                                    ui.painter().rect_filled(r, 2.0, Color32::from_gray(200));
-                                    if let Some(t) = &tex {
-                                        let ts = t.size_vec2();
-                                        let s = (box_size.x / ts.x).min(box_size.y / ts.y);
-                                        let ir = Rect::from_center_size(r.center(), ts * s);
-                                        ui.painter().image(t.id(), ir, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), if enabled && in_cut { Color32::WHITE } else { Color32::from_white_alpha(60) });
-                                    }
-                                    if !enabled {
-                                        ui.painter().line_segment([r.left_top(), r.right_bottom()], Stroke::new(2.0, pal.negative));
-                                        ui.painter().line_segment([r.right_top(), r.left_bottom()], Stroke::new(2.0, pal.negative));
-                                    }
-                                    if resp.clicked() {
-                                        action = Some((i, "select"));
-                                    }
-                                    ui.horizontal(|ui| {
-                                        ui.label(RichText::new("Delay").size(11.5));
-                                        if ui.add(egui::DragValue::new(&mut delay).range(1..=6000).speed(0.2)).changed() {
-                                            delay_change = Some((i, delay));
-                                        }
-                                    });
-                                    ui.horizontal(|ui| {
-                                        if tinted(ui, if enabled { "skip" } else { "enable" }, if enabled { pal.negative } else { pal.highlight }) {
-                                            action = Some((i, "toggle"));
-                                        }
-                                        if tinted(ui, "copy", pal.highlight) {
-                                            action = Some((i, "copy"));
-                                        }
-                                    });
-                                    ui.horizontal(|ui| {
-                                        if chip(ui, "◀").on_hover_text("Move left").clicked() {
-                                            action = Some((i, "left"));
-                                        }
-                                        if chip(ui, "▶").on_hover_text("Move right").clicked() {
-                                            action = Some((i, "right"));
-                                        }
-                                        if chip(ui, "✕").on_hover_text("Delete frame").clicked() {
-                                            action = Some((i, "delete"));
-                                        }
-                                    });
-                                });
-                            });
+                        let (r, resp) = ui.allocate_exact_size(cell, Sense::click());
+                        let hovered = ui.rect_contains_pointer(r);
+                        let painter = ui.painter_at(r);
+                        painter.rect_filled(r, 3.0, if sel { pal.highlight_soft } else if hovered { mix(pal.view, pal.highlight, 0.08) } else { pal.view });
+                        painter.rect_stroke(r, 3.0, Stroke::new(1.0, if sel { pal.highlight } else { pal.border }), egui::StrokeKind::Inside);
+                        let tr = Rect::from_min_size(r.min + vec2(pad, pad), vec2(s, s));
+                        painter.rect_filled(tr, 2.0, Color32::from_gray(200));
+                        if let Some(t) = &tex {
+                            let ts = t.size_vec2();
+                            let k = (s / ts.x).min(s / ts.y);
+                            let ir = Rect::from_center_size(tr.center(), ts * k);
+                            painter.image(t.id(), ir, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), if enabled && in_cut { Color32::WHITE } else { Color32::from_white_alpha(60) });
+                        }
+                        if !enabled {
+                            painter.line_segment([tr.left_top(), tr.right_bottom()], Stroke::new(2.0, pal.negative));
+                            painter.line_segment([tr.right_top(), tr.left_bottom()], Stroke::new(2.0, pal.negative));
+                        }
+                        // footer: number on the left, delay on the right
+                        let fr = Rect::from_min_max(pos2(r.min.x + pad, tr.max.y), pos2(r.max.x - pad, r.max.y - 1.0));
+                        let num = format!("{}{}", i + 1, if in_cut { "" } else { " ✂" });
+                        painter.text(pos2(fr.min.x + 1.0, fr.center().y), egui::Align2::LEFT_CENTER, num, egui::FontId::proportional(if small { 10.5 } else { 12.0 }), pal.fg_muted);
+                        if !small {
+                            let dr = Rect::from_min_max(pos2(fr.max.x - 54.0, fr.min.y + 2.0), pos2(fr.max.x, fr.max.y - 1.0));
+                            // a small borderless value, sized to the footer
+                            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(dr).layout(egui::Layout::right_to_left(egui::Align::Center)));
+                            child.spacing_mut().interact_size = dr.size();
+                            child.spacing_mut().button_padding = vec2(3.0, 0.0);
+                            for st in [&mut child.visuals_mut().widgets.inactive] {
+                                st.bg_stroke = Stroke::NONE;
+                                st.weak_bg_fill = Color32::TRANSPARENT;
+                                st.bg_fill = Color32::TRANSPARENT;
+                            }
+                            child.style_mut().override_font_id = Some(egui::FontId::proportional(12.0));
+                            let d = child.add(egui::DragValue::new(&mut delay).range(1..=6000).speed(0.2).suffix(" cs")).on_hover_text("Delay in hundredths of a second. Drag or click to type.");
+                            if d.changed() {
+                                delay_change = Some((i, delay));
+                            }
+                        }
+                        // quick actions over the thumbnail on hover, when there's room
+                        if hovered && s >= 64.0 {
+                            let b = 22.0;
+                            let strip = Rect::from_min_size(pos2(tr.min.x, tr.max.y - b - 2.0), vec2(tr.width(), b + 2.0));
+                            painter.rect_filled(strip, 0.0, Color32::from_black_alpha(140));
+                            let acts: [(&str, &str, &'static str); 5] = [
+                                (if enabled { "view-hidden" } else { "view-visible" }, if enabled { "Skip" } else { "Use again" }, "toggle"),
+                                ("edit-duplicate", "Duplicate", "copy"),
+                                ("go-previous", "Move left", "left"),
+                                ("go-next", "Move right", "right"),
+                                ("edit-delete", "Delete", "delete"),
+                            ];
+                            let room = ((tr.width() / (b + 1.0)).floor() as usize).min(acts.len());
+                            let x0 = tr.center().x - room as f32 * (b + 1.0) / 2.0;
+                            for (k, (icon, tip, act)) in acts.iter().take(room).enumerate() {
+                                let br = Rect::from_min_size(pos2(x0 + k as f32 * (b + 1.0), strip.min.y + 1.0), vec2(b, b));
+                                let rr = ui.interact(br, ui.scope_id().with(("fr-act", i, k)), Sense::click());
+                                if rr.hovered() {
+                                    painter.rect_filled(br, 2.0, Color32::from_white_alpha(40));
+                                }
+                                crate::icons::paint(&painter, icon, br.center(), 16.0, Color32::WHITE);
+                                if rr.on_hover_text(*tip).clicked() {
+                                    action = Some((i, act));
+                                }
+                            }
+                        }
+                        let resp = resp.on_hover_text(format!("Frame {} · {} cs{}", i + 1, delay, if enabled { "" } else { " · skipped" }));
+                        if resp.clicked() {
+                            action = Some((i, "select"));
+                        }
+                        resp.context_menu(|ui| {
+                            ui.set_min_width(200.0);
+                            if menu_item(ui, if enabled { "view-hidden" } else { "view-visible" }, if enabled { "&Skip Frame" } else { "&Use Frame Again" }, "", true) {
+                                action = Some((i, "toggle"));
+                            }
+                            if menu_item(ui, "edit-duplicate", "&Duplicate", "", true) {
+                                action = Some((i, "copy"));
+                            }
+                            ui.separator();
+                            if menu_item(ui, "go-previous", "Move &Left", "", i > 0) {
+                                action = Some((i, "left"));
+                            }
+                            if menu_item(ui, "go-next", "Move &Right", "", i + 1 < n) {
+                                action = Some((i, "right"));
+                            }
+                            ui.separator();
+                            if menu_item(ui, "edit-delete", "De&lete Frame", "", n > 1) {
+                                action = Some((i, "delete"));
+                            }
+                        });
                     }
                 });
             }
@@ -6638,6 +6732,8 @@ impl GifKitApp {
     // ------------------------------------------------------------ tool panels
 
     fn tool_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let timed = self.tool.layer_kind().and_then(|k| self.sel_index(k)).and_then(|i| self.stack.layers.get(i)).is_some_and(|l| l.timing.clips.is_some());
+        SEL_TIMED.with(|c| c.set(timed));
         match self.tool {
             Tool::Resize => self.ui_resize(ui, ctx),
             Tool::Crop => self.ui_crop(ui, ctx),
@@ -8414,8 +8510,18 @@ fn ordinal(n: usize) -> String {
     format!("{n}{suffix}")
 }
 
+thread_local! {
+    /// The selected layer's timing lives on the timeline (its clips), so the
+    /// panel's frame range is replaced by a pointer there.
+    static SEL_TIMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Source-frame range editor (1-based, `to` 0 = end).
 fn frames_row(ui: &mut egui::Ui, from: &mut usize, to: &mut usize, n: usize) {
+    if SEL_TIMED.with(|c| c.get()) {
+        form_row(ui, "Frames", |ui| hint(ui, "Set by its clips on the timeline"));
+        return;
+    }
     form_row(ui, "Frames", |ui| {
         even_grid(ui, 2, 0.0, |ui, i, size| {
             if i == 0 {
