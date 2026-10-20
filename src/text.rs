@@ -67,6 +67,16 @@ impl Border {
     }
 }
 
+/// A strip across the top or bottom of the canvas that the text sits in
+/// (the meme caption look). The canvas grows to make room for it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum Caption {
+    #[default]
+    None,
+    Top,
+    Bottom,
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Annotation {
@@ -92,6 +102,20 @@ pub struct Annotation {
     pub angle: f32,
     /// horizontal squash (<1) or stretch (>1) of the rendered text
     pub stretch: f32,
+    /// start new lines where the text reaches the canvas edge
+    pub wrap: bool,
+    /// keep the text centred across the canvas
+    pub centre: bool,
+    pub caption: Caption,
+    pub bar_color: [u8; 3],
+    /// room above and below the text in the bar, % of the text size
+    pub bar_pad: f32,
+    // worked out from the canvas each time it changes (see Stack::layout_text)
+    /// line length for `wrap`, in the same units as `size` (0 = no wrapping)
+    pub wrap_px: f32,
+    /// the bar in output pixels: top edge and height
+    pub bar_y: i32,
+    pub bar_h: u32,
 }
 
 impl Default for Annotation {
@@ -113,6 +137,14 @@ impl Default for Annotation {
             visible: true,
             angle: 0.0,
             stretch: 1.0,
+            wrap: false,
+            centre: false,
+            caption: Caption::None,
+            bar_color: [255, 255, 255],
+            bar_pad: 35.0,
+            wrap_px: 0.0,
+            bar_y: 0,
+            bar_h: 0,
         }
     }
 }
@@ -184,6 +216,50 @@ fn shape_line(f: &FontEntry, line: &str, scale: PxScale) -> (Vec<Placed>, f32) {
     (v, x)
 }
 
+/// Break `text` into lines no wider than `max_w`, at spaces where it can and
+/// inside words that are too long on their own.
+pub fn wrap_text(f: &FontEntry, text: &str, size: f32, max_w: f32) -> String {
+    let scale = PxScale::from(size);
+    let width = |s: &str| shape_line(f, s, scale).1;
+    let mut out: Vec<String> = Vec::new();
+    for para in text.split('\n') {
+        let mut line = String::new();
+        for word in para.split(' ') {
+            let cand = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
+            if line.is_empty() || width(&cand) <= max_w {
+                line = cand;
+            } else {
+                out.push(std::mem::take(&mut line));
+                line = word.to_string();
+            }
+            // a word longer than the line: break it between letters
+            while width(&line) > max_w && line.chars().count() > 1 {
+                let chars: Vec<char> = line.chars().collect();
+                let mut k = chars.len() - 1;
+                while k > 1 && width(&chars[..k].iter().collect::<String>()) > max_w {
+                    k -= 1;
+                }
+                out.push(chars[..k].iter().collect());
+                line = chars[k..].iter().collect();
+            }
+        }
+        out.push(line);
+    }
+    out.join("\n")
+}
+
+impl Annotation {
+    /// The text as it's laid out: wrapped to `wrap_px` when that's set.
+    pub fn shown_text(&self, f: &FontEntry) -> std::borrow::Cow<'_, str> {
+        if self.wrap_px > 0.0 && (self.wrap || self.caption != Caption::None) {
+            let room = (self.wrap_px - 2.0 * self.outline_px() as f32) / self.stretch.clamp(0.05, 20.0);
+            std::borrow::Cow::Owned(wrap_text(f, &self.text, self.size, room.max(self.size)))
+        } else {
+            std::borrow::Cow::Borrowed(&self.text)
+        }
+    }
+}
+
 /// Rasterise text to a coverage mask (w, h, alpha) – no colour.
 pub fn rasterize(f: &FontEntry, text: &str, size: f32, align: Align) -> (u32, u32, Vec<f32>) {
     let font = &f.font;
@@ -232,7 +308,7 @@ impl Annotation {
 /// Size of the rendered text block including border.
 pub fn measure(fonts: &[FontEntry], a: &Annotation) -> (u32, u32) {
     let font = &fonts[a.font_idx.min(fonts.len() - 1)];
-    let (w, h, _) = rasterize(font, &a.text, a.size, a.align);
+    let (w, h, _) = rasterize(font, &a.shown_text(font), a.size, a.align);
     let r = a.outline_px() as u32;
     (stretched(w + 2 * r, a.stretch), h + 2 * r)
 }
@@ -248,7 +324,7 @@ fn stretched(w: u32, s: f32) -> u32 {
 /// Pre-rendered RGBA sprite of an annotation (so it is rasterised once per apply).
 pub fn render_sprite(fonts: &[FontEntry], a: &Annotation) -> RgbaImage {
     let font = &fonts[a.font_idx.min(fonts.len() - 1)];
-    let (w, h, mask) = rasterize(font, &a.text, a.size, a.align);
+    let (w, h, mask) = rasterize(font, &a.shown_text(font), a.size, a.align);
     let r = a.outline_px();
     let sw = w + 2 * r as u32;
     let sh = h + 2 * r as u32;

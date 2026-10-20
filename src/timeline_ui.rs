@@ -3,14 +3,13 @@
 //! clips can be moved, trimmed, split and deleted, with keyframes on top.
 
 use super::*;
-use crate::timeline::Clip;
+use crate::timeline::{Clip, Key};
 
 /// The GIF track's id in the timeline (layers use their own ids, which start at 1).
 const GIF: u64 = 0;
 const RULER_H: f32 = 22.0;
 const GIF_H: f32 = 40.0;
 const ROW_H: f32 = 28.0;
-const HEAD_W: f32 = 150.0;
 const EDGE: f32 = 5.0;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -240,6 +239,11 @@ impl GifKitApp {
                 self.tl_delete(now);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if tb_tool(ui, "go-down", "", "Hide the timeline (the clock button by the play controls brings it back)", true).clicked() {
+                    self.show_timeline = false;
+                    theme::set_setting("show_timeline", "0");
+                }
+                toolbar_sep(ui);
                 if tb_tool(ui, "zoom-fit-best", "", "Fit the whole animation", true).clicked() {
                     self.tl_zoom = 0.0;
                     self.tl_x0 = 0.0;
@@ -251,24 +255,37 @@ impl GifKitApp {
                     self.tl_zoom = (self.tl_zoom / 1.5).max(0.0);
                 }
                 let t = self.plan_time(self.cur);
-                ui.label(RichText::new(format!("{:.2} s · frame {} of {n}", t, self.cur + 1)).monospace().size(12.0).color(pal.fg_muted));
+                ui.label(RichText::new(format!("{:.2} s · frame {} of {n}", t.max(0.0), self.cur + 1)).monospace().size(12.0).color(pal.fg_muted));
             });
         });
-        // keyframe values, when the playhead sits on one of the selected layer's
-        // keys; the row is always there so the tracks never jump
-        let key_here = sel_layer.and_then(|t| self.stack.index_of(t)).and_then(|li| self.stack.layers[li].timing.key_at(self.cur).map(|k| (li, k)));
+        // the selected layer's motion at the playhead. Changing a value makes
+        // a keyframe there if there isn't one (auto key), so the row never
+        // greys out or changes shape.
+        let sel_li = sel_layer.and_then(|t| self.stack.index_of(t));
+        let key_here = sel_li.and_then(|li| self.stack.layers[li].timing.key_at(self.cur).map(|k| (li, k)));
         if self.tl_drag.is_none() {
             self.tl_key = key_here.map(|(_, k)| k);
         }
-        let mut key = key_here.map(|(li, k)| self.stack.layers[li].timing.keys[k]).unwrap_or_default();
+        let mut key = match (key_here, sel_li) {
+            (Some((li, k)), _) => self.stack.layers[li].timing.keys[k],
+            (None, Some(li)) => {
+                let m = self.stack.layers[li].timing.motion(self.cur);
+                Key { frame: self.cur, x: m.dx, y: m.dy, scale: m.scale * 100.0, angle: m.angle, opacity: m.opacity * 100.0, smooth: true }
+            }
+            _ => Key::default(),
+        };
         let before = key;
-        ui.add_enabled_ui(key_here.is_some(), |ui| {
+        ui.add_enabled_ui(sel_li.is_some(), |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                let c = ui.cursor().min + vec2(8.0, 15.0);
-                diamond(ui.painter(), c, 6.0, if key_here.is_some() { pal.highlight } else { pal.fg_muted }, Stroke::NONE);
-                ui.add_space(18.0);
-                ui.label(if key_here.is_some() { "Keyframe:" } else { "No keyframe at the playhead" });
+                let (r, _) = ui.allocate_exact_size(vec2(16.0, CHIP_H), Sense::hover());
+                // filled on a keyframe, hollow between them
+                if key_here.is_some() {
+                    diamond(ui.painter(), r.center(), 6.0, pal.highlight, Stroke::NONE);
+                } else {
+                    diamond(ui.painter(), r.center(), 5.5, Color32::TRANSPARENT, Stroke::new(1.3, pal.fg_muted));
+                }
+                ui.label("Motion:").on_hover_text("Changing a value adds a keyframe at the playhead");
                 let field = |ui: &mut egui::Ui, label: &str, v: &mut f32, suffix: &str, step: f64| {
                     ui.label(label);
                     spin(ui, vec2(86.0, CHIP_H), v, step, |d| d.speed(0.5).max_decimals(1).suffix(suffix.to_string()));
@@ -282,10 +299,13 @@ impl GifKitApp {
                 check(ui, &mut key.smooth, "Smooth").on_hover_text("Ease in and out of this keyframe");
             });
         });
-        if let Some((li, k)) = key_here {
+        if let Some(li) = sel_li {
             if key != before {
                 self.snapshot(&format!("tl-keyedit{li}"), now);
-                self.stack.layers[li].timing.keys[k] = key;
+                let t = &mut self.stack.layers[li].timing;
+                let k = t.add_key(self.cur);
+                t.keys[k] = Key { frame: self.cur, ..key };
+                self.tl_key = Some(k);
                 self.modified = true;
             }
         }
@@ -296,17 +316,20 @@ impl GifKitApp {
         let resp = ui.allocate_rect(area, Sense::click_and_drag());
         let painter = ui.painter_at(area);
         painter.rect_filled(area, 0.0, pal.view);
-        let lanes = Rect::from_min_max(pos2(area.min.x + HEAD_W, area.min.y), area.max);
+        let head_w = self.tl_head_w.clamp(90.0, (area.width() - 120.0).max(90.0));
+        let lanes = Rect::from_min_max(pos2(area.min.x + head_w, area.min.y), area.max);
         let lane_w = lanes.width().max(10.0);
-        // frames to pixels; zoom 0 fits everything
-        let fit = lane_w / n as f32;
+        // frames to pixels; zoom 0 fits everything, with a little room after
+        // the end to drag the GIF longer into
+        let span = (n as f32 * 1.08 + 2.0).max(n as f32 + 24.0);
+        let fit = lane_w / span;
         let zoom = if self.tl_zoom <= 0.0 { fit } else { self.tl_zoom.max(fit) };
         let visible = lane_w / zoom;
         // follow the playhead while playing
         if self.playing && self.tl_drag.is_none() && ((self.cur as f32) < self.tl_x0 || self.cur as f32 + 1.0 > self.tl_x0 + visible) {
             self.tl_x0 = self.cur as f32 - visible * 0.1;
         }
-        self.tl_x0 = self.tl_x0.clamp(0.0, (n as f32 - visible).max(0.0));
+        self.tl_x0 = self.tl_x0.clamp(0.0, (span - visible).max(0.0));
         let x0 = self.tl_x0;
         let fx = |f: f32| lanes.min.x + (f - x0) * zoom;
         // wheel: scroll tracks, Shift pans, Ctrl zooms about the pointer
@@ -364,7 +387,7 @@ impl GifKitApp {
             if top > area.max.y || top + h < tracks_top {
                 continue;
             }
-            let head = Rect::from_min_size(pos2(area.min.x, top), vec2(HEAD_W, h));
+            let head = Rect::from_min_size(pos2(area.min.x, top), vec2(head_w, h));
             let lane = Rect::from_min_max(pos2(lanes.min.x, top), pos2(area.max.x, top + h));
             let selected = self.tl_track == Some(id);
             tp.rect_filled(head, 0.0, if selected { mix(pal.window, pal.highlight, 0.25) } else { pal.window });
@@ -375,8 +398,12 @@ impl GifKitApp {
                 let l = &self.stack.layers[self.stack.index_of(id).unwrap()];
                 (l.name(), kind_tool(l.kind()), l.visible, Some(l.kind()))
             };
-            paint_tool_icon(&tp, icon_tool, pos2(head.min.x + 14.0, head.center().y), 16.0, if visible { pal.fg } else { pal.fg_muted });
-            let text_w = HEAD_W - 54.0;
+            let eye = Rect::from_center_size(pos2(head.min.x + 14.0, head.center().y), vec2(20.0, 20.0));
+            if id != GIF {
+                crate::icons::paint(&tp, if visible { "view-visible" } else { "view-hidden" }, eye.center(), 16.0, pal.fg_muted);
+            }
+            paint_tool_icon(&tp, icon_tool, pos2(head.min.x + 36.0, head.center().y), 16.0, if visible { pal.fg } else { pal.fg_muted });
+            let text_w = head_w - 56.0;
             let col = if visible { pal.fg } else { pal.fg_muted };
             let mut shown = name.clone();
             let mut galley = ui.fonts_mut(|f| f.layout_no_wrap(shown.clone(), egui::FontId::proportional(12.5), col));
@@ -387,10 +414,8 @@ impl GifKitApp {
                 galley = ui.fonts_mut(|f| f.layout_no_wrap(shown.clone(), egui::FontId::proportional(12.5), col));
             }
 
-            tp.galley(pos2(head.min.x + 28.0, head.center().y - galley.size().y / 2.0), galley, pal.fg);
+            tp.galley(pos2(head.min.x + 50.0, head.center().y - galley.size().y / 2.0), galley, pal.fg);
             if id != GIF {
-                let eye = Rect::from_center_size(pos2(head.max.x - 14.0, head.center().y), vec2(20.0, 20.0));
-                crate::icons::paint(&tp, if visible { "view-visible" } else { "view-hidden" }, eye.center(), 16.0, pal.fg_muted);
                 if resp.clicked() && hovered_pos.is_some_and(|p| eye.contains(p)) {
                     eye_click = Some(id);
                 } else if resp.clicked() && hovered_pos.is_some_and(|p| head.contains(p)) {
@@ -425,6 +450,12 @@ impl GifKitApp {
                         lp.rect_filled(Rect::from_center_size(pos2(x, r.center().y), vec2(3.0, r.height() - 6.0)), 1.0, pal.highlight);
                     }
                 }
+            }
+            if id == GIF && self.tl_extend > 0 {
+                let r = Rect::from_min_max(pos2(fx(n as f32), top + 3.0), pos2(fx((n + self.tl_extend) as f32), top + h - 3.0));
+                lp.rect_filled(r, 3.0, mix(pal.view, pal.highlight, 0.25));
+                lp.rect_stroke(r, 3.0, Stroke::new(1.5, pal.highlight), egui::StrokeKind::Inside);
+                lp.text(r.left_center() + vec2(6.0, 0.0), egui::Align2::LEFT_CENTER, format!("+{} frames", self.tl_extend), egui::FontId::proportional(11.0), pal.fg);
             }
             // keyframes
             if let Some(li) = (id != GIF).then(|| self.stack.index_of(id)).flatten() {
@@ -480,8 +511,62 @@ impl GifKitApp {
                 }
             }
         }
+        // the line between names and lanes resizes the name column
+        let grip = Rect::from_min_max(pos2(lanes.min.x - 4.0, tracks_top), pos2(lanes.min.x + 3.0, area.max.y));
+        if hovered_pos.is_some_and(|p| grip.contains(p)) || self.tl_head_drag {
+            ctx.set_cursor_icon(egui::CursorIcon::ResizeColumn);
+        }
+        if resp.drag_started() {
+            if let Some(p) = ui.input(|i| i.pointer.press_origin()) {
+                if grip.contains(p) {
+                    self.tl_head_drag = true;
+                } else if p.x < lanes.min.x && p.y > tracks_top {
+                    // dragging a layer's name moves it up or down the stack
+                    if let Some(t) = track_at(p.y).filter(|t| *t > 0) {
+                        self.tl_reorder = Some(t);
+                    }
+                }
+            }
+        }
+        if self.tl_head_drag {
+            if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
+                self.tl_head_w = (p.x - area.min.x).clamp(90.0, 420.0);
+            }
+            if !ui.input(|i| i.pointer.primary_down()) {
+                self.tl_head_drag = false;
+                theme::set_setting("timeline_names", &format!("{:.0}", self.tl_head_w));
+            }
+        }
+        if let Some(from) = self.tl_reorder {
+            let layers = tracks.len() - 1;
+            // slot k: before layer track k + 1 (0 = top of the list)
+            let y = ui.input(|i| i.pointer.interact_pos()).map(|p| p.y).unwrap_or(0.0);
+            let slot = (0..=layers).find(|&k| k == layers || y < row_top(k + 1) + ROW_H / 2.0).unwrap_or(layers);
+            let ly = if slot == layers { row_top(layers) + ROW_H } else { row_top(slot + 1) };
+            painter.hline(area.min.x..=area.max.x, ly, Stroke::new(2.0, pal.highlight));
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            if !ui.input(|i| i.pointer.primary_down()) {
+                self.tl_reorder = None;
+                let to = if slot > from - 1 { slot - 1 } else { slot };
+                if to != from - 1 {
+                    self.snapshot(&format!("tl-reorder{now}"), now);
+                    let mut order: Vec<u64> = tracks[1..].to_vec();
+                    let id = order.remove(from - 1);
+                    order.insert(to.min(order.len()), id);
+                    // the stack is bottom-first, the tracks top-first
+                    let mut old = std::mem::take(&mut self.stack.layers);
+                    for id in order.iter().rev() {
+                        if let Some(k) = old.iter().position(|l| l.id == *id) {
+                            self.stack.layers.push(old.remove(k));
+                        }
+                    }
+                    self.stack.layers.extend(old);
+                    self.modified = true;
+                }
+            }
+        }
         let press = resp.drag_started() || resp.clicked();
-        if press && self.tl_drag.is_none() {
+        if press && self.tl_drag.is_none() && !self.tl_head_drag {
             if let Some(p) = ui.input(|i| i.pointer.press_origin()).or(hovered_pos).filter(|p| lanes.contains(*p)) {
                 let f = frame_at(p.x);
                 let fi = (f.floor().max(0.0) as usize).min(n - 1);
@@ -576,6 +661,11 @@ impl GifKitApp {
                     let lo = spans.iter().filter(|s| s.1 < d.orig.0).map(|s| s.1 + 1).max().unwrap_or(0);
                     let hi = spans.iter().filter(|s| s.0 > d.orig.1).map(|s| s.0 - 1).min().unwrap_or(n - 1);
                     let len = d.orig.1 - d.orig.0;
+                    // the GIF's last clip can be pulled past the end to make it longer
+                    let past = d.track == GIF && grab == TlGrab::End && d.orig.1 + 1 == n;
+                    if past {
+                        self.tl_extend = (d.orig.1 as i64 + delta - (n as i64 - 1)).clamp(0, (n as i64 * 4).max(250)) as usize;
+                    }
                     let (na, nb) = match grab {
                         TlGrab::Body => {
                             let a = clamp(d.orig.0 as i64 + delta, lo, hi - len);
@@ -618,9 +708,13 @@ impl GifKitApp {
             }
             if !ui.input(|i| i.pointer.primary_down()) {
                 self.tl_drag = None;
+                if self.tl_extend > 0 {
+                    let k = std::mem::take(&mut self.tl_extend);
+                    self.tl_lengthen(k, now);
+                }
             }
         }
-        if self.tl_drag.is_some() {
+        if self.tl_drag.is_some() || self.tl_reorder.is_some() || self.tl_head_drag {
             ctx.request_repaint();
         }
 
@@ -662,6 +756,11 @@ impl GifKitApp {
             if menu_item(ui, "edit-delete", "&Delete", "Del", self.tl_clip.is_some() || self.tl_key.is_some()) {
                 self.tl_delete(now);
             }
+            if menu_item(ui, "list-add", "Make &Longer by 1 Second", "", idle) {
+                // about a second at the last frame's speed
+                let d = self.plan.last().map(|f| effective_delay(f.delay)).unwrap_or(10).max(2) as usize;
+                self.tl_lengthen((100 / d).max(1), now);
+            }
             ui.separator();
             if menu_item(ui, "node-add", "Add &Keyframe", "K", has) {
                 self.tl_add_key(now);
@@ -683,6 +782,23 @@ impl GifKitApp {
                 }
             }
         });
+    }
+
+    /// Make the animation `k` frames longer by holding its last frame, so a
+    /// single picture can become an animation for layers to move over.
+    fn tl_lengthen(&mut self, k: usize, now: f64) {
+        if k == 0 || self.busy() {
+            return;
+        }
+        self.snapshot(&format!("tl-lengthen{now}"), now);
+        let Some(base) = self.base.as_mut() else { return };
+        let Some(last) = base.frames.last().cloned() else { return };
+        let last = crate::anim::Frame { enabled: true, ..last };
+        base.frames.extend(std::iter::repeat_n(last, k));
+        self.bump();
+        self.after_base_change(false);
+        self.stack.sync_len(self.base.as_ref().map(|b| b.len()).unwrap_or(0));
+        self.info(format!("Added {k} frames"));
     }
 
     /// Select a track: its layer becomes the selected one, with its tool open.

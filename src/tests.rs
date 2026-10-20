@@ -1256,3 +1256,36 @@ fn canvas_space_pads_and_layers_follow() {
     let out = s.flatten(&a, &[], None);
     assert_eq!(out.frames[0].image.get_pixel(0, 0)[3], 0);
 }
+
+#[test]
+fn caption_bar_fits_its_text() {
+    use crate::stack::{LayerKind, Stack};
+    use crate::text::{Annotation, Caption};
+    let fonts = text::builtin_fonts();
+    let a = Animation { frames: vec![Frame::new(RgbaImage::from_pixel(200, 100, Rgba([0, 0, 255, 255])), 5)], loop_count: None };
+    let mut s = Stack::default();
+    let long = "a caption long enough that it has to wrap onto more than one line";
+    let id = s.push(LayerKind::Text(Annotation { text: long.into(), size: 16.0, caption: Caption::Bottom, ..Default::default() }));
+    while s.layout_text(200, 100, &fonts) {}
+    let out = s.flatten(&a, &fonts, None);
+    let f = &out.frames[0].image;
+    assert_eq!(f.width(), 200, "a caption bar only adds height");
+    assert!(f.height() > 100 + 40, "two or more lines make the bar taller: {}", f.height());
+    assert_eq!(f.get_pixel(100, 50).0, [0, 0, 255, 255], "the picture is untouched");
+    assert_eq!(f.get_pixel(1, 101).0, [255, 255, 255, 255], "the bar is white");
+    let dark = (100..f.height()).flat_map(|y| (0..200).map(move |x| (x, y))).filter(|&(x, y)| f.get_pixel(x, y)[0] < 80).count();
+    assert!(dark > 50, "black text in the bar");
+    // the text fits the width
+    let li = s.index_of(id).unwrap();
+    if let LayerKind::Text(t) = &s.layers[li].kind {
+        let (tw, _) = text::measure(&fonts, t);
+        assert!(tw as f32 <= 200.0, "wrapped to the canvas: {tw}");
+        assert!(t.x >= 0, "centred: {}", t.x);
+    }
+    // more padding, taller bar
+    if let LayerKind::Text(t) = &mut s.layers[li].kind {
+        t.bar_pad = 100.0;
+    }
+    while s.layout_text(200, 100, &fonts) {}
+    assert!(s.flatten(&a, &fonts, None).frames[0].image.height() > f.height());
+}

@@ -574,7 +574,7 @@ impl Stack {
     }
 
     pub fn needs_render(&self) -> bool {
-        !self.transform.geometry_identity() || self.layers.iter().any(|l| l.active())
+        !self.eff_transform(true).geometry_identity() || self.layers.iter().any(|l| l.active())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -643,7 +643,11 @@ impl Stack {
     /// Map from source-frame space to the image each layer is drawn on:
     /// frame edits followed by every active effects layer below it.
     pub fn layer_maps(&self, w: u32, h: u32) -> Vec<GeoMap> {
-        let mut g = self.transform.geo_map(w, h);
+        self.layer_maps_for(&self.eff_transform(true), w, h)
+    }
+
+    fn layer_maps_for(&self, t: &Transform, w: u32, h: u32) -> Vec<GeoMap> {
+        let mut g = t.geo_map(w, h);
         let mut out = Vec::with_capacity(self.layers.len());
         for l in &self.layers {
             out.push(g);
@@ -669,6 +673,7 @@ impl Stack {
                     let scale = ((o.w / b.w.max(1e-3)) * (o.h / b.h.max(1e-3))).sqrt();
                     let mut t2 = t.clone();
                     t2.size = (t.size * scale).clamp(1.0, 4000.0);
+                    t2.wrap_px = t.wrap_px * scale;
                     let mut sp = text::render_sprite(fonts, &t2);
                     if (o.angle % 360.0).abs() > 0.01 {
                         sp = crate::ops::rotate_any_image(&sp, o.angle, image::Rgba([0, 0, 0, 0]), true);
@@ -729,7 +734,8 @@ impl Stack {
     /// The transformed frame before any layer (geometry only).
     pub fn geometry_frame(&self, base: &Animation, plan: &[PlanFrame], i: usize) -> RgbaImage {
         let src = &base.frames[plan[i].src].image;
-        if self.transform.geometry_identity() { (**src).clone() } else { self.transform.apply_geometry(src) }
+        let t = self.eff_transform(true);
+        if t.geometry_identity() { (**src).clone() } else { t.apply_geometry(src) }
     }
 
     /// Render output frame `i` of `plan`.
@@ -810,6 +816,17 @@ impl Stack {
                     }
                 }
                 LayerKind::Text(t) => {
+                    if t.caption != text::Caption::None && t.bar_h > 0 && t.applies_to(src) {
+                        let c = t.bar_color;
+                        let (w, h) = img.dimensions();
+                        let y0 = t.bar_y.clamp(0, h as i32) as u32;
+                        let y1 = (t.bar_y + t.bar_h as i32).clamp(0, h as i32) as u32;
+                        for y in y0..y1 {
+                            for x in 0..w {
+                                img.put_pixel(x, y, Rgba([c[0], c[1], c[2], 255]));
+                            }
+                        }
+                    }
                     if let Some(Some((s, x, y))) = prep.sprites.get(li) {
                         if t.applies_to(src) {
                             draw(&mut img, s, *x, *y, t.opacity as f32 / 100.0);
@@ -822,6 +839,129 @@ impl Stack {
             }
         }
         img
+    }
+
+    /// The frame edits plus the room caption bars need (when `captions`).
+    pub fn eff_transform(&self, captions: bool) -> Transform {
+        let mut t = self.transform.clone();
+        if !captions {
+            return t;
+        }
+        let (mut top, mut bottom) = (0u32, 0u32);
+        for l in &self.layers {
+            if let LayerKind::Text(a) = &l.kind {
+                if l.active() {
+                    match a.caption {
+                        text::Caption::Top => top += a.bar_h,
+                        text::Caption::Bottom => bottom += a.bar_h,
+                        text::Caption::None => {}
+                    }
+                }
+            }
+        }
+        if top + bottom > 0 {
+            if !t.pad_on {
+                t.pad = [0; 4];
+                t.pad_transparent = false;
+            }
+            t.pad_on = true;
+            t.pad[0] += top;
+            t.pad[2] += bottom;
+        }
+        t
+    }
+
+    /// Lay out text that follows the canvas: wrapping at its edge, centring
+    /// across it, and caption bars sized to their text. Returns whether
+    /// anything moved (the caller re-renders then).
+    pub fn layout_text(&mut self, w: u32, h: u32, fonts: &[FontEntry]) -> bool {
+        use text::Caption;
+        if fonts.is_empty() || !self.layers.iter().any(|l| matches!(&l.kind, LayerKind::Text(t) if t.wrap || t.centre || t.caption != Caption::None)) {
+            return false;
+        }
+        // the canvas without caption bars sets the line length and bar sizes
+        let maps0 = self.layer_maps_for(&self.eff_transform(false), w, h);
+        let mut changed = false;
+        let mut bars: Vec<(usize, Caption, u32)> = Vec::new();
+        for li in 0..self.layers.len() {
+            let active = self.layers[li].active();
+            let LayerKind::Text(t) = &mut self.layers[li].kind else { continue };
+            let k = maps0[li].m.det().abs().sqrt().max(1e-3);
+            let wrap = t.wrap || t.caption != Caption::None;
+            let wp = if wrap { (maps0[li].w * 0.92 / k).max(8.0) } else { 0.0 };
+            if (t.wrap_px - wp).abs() > 0.25 {
+                t.wrap_px = wp;
+                changed = true;
+            }
+            if t.caption != Caption::None {
+                let bh = if active && !t.text.is_empty() {
+                    let (_, th) = text::measure(fonts, t);
+                    (th as f32 * k + 2.0 * t.size * k * t.bar_pad / 100.0).round().max(1.0) as u32
+                } else {
+                    0
+                };
+                if t.bar_h != bh {
+                    t.bar_h = bh;
+                    changed = true;
+                }
+                if bh > 0 {
+                    bars.push((li, t.caption, bh));
+                }
+            }
+        }
+        let top: u32 = bars.iter().filter(|b| b.1 == Caption::Top).map(|b| b.2).sum();
+        // with the bars in place, put each text where it belongs
+        let maps = self.layer_maps(w, h);
+        let mut bar_y: std::collections::HashMap<usize, (i32, u32)> = std::collections::HashMap::new();
+        let (mut ty, mut by) = (0u32, 0u32);
+        for (li, side, bh) in &bars {
+            let y = match side {
+                Caption::Top => {
+                    let y = ty;
+                    ty += bh;
+                    y
+                }
+                _ => {
+                    let y = top + maps0[*li].h.round() as u32 + by;
+                    by += bh;
+                    y
+                }
+            };
+            bar_y.insert(*li, (y as i32, *bh));
+        }
+        for li in 0..self.layers.len() {
+            let LayerKind::Text(t) = &mut self.layers[li].kind else { continue };
+            if !(t.centre || t.caption != Caption::None) || t.text.is_empty() {
+                continue;
+            }
+            let m = maps[li].m;
+            let inv = m.inverse();
+            let (tw, th) = text::measure(fonts, t);
+            let (sx, sy) = (t.x as f32 + tw as f32 / 2.0, t.y as f32 + th as f32 / 2.0);
+            let (_, oy_now) = m.apply(sx, sy);
+            let ox = maps[li].w / 2.0;
+            let oy = match bar_y.get(&li) {
+                Some(&(y, bh)) => {
+                    if t.bar_y != y {
+                        t.bar_y = y;
+                        changed = true;
+                    }
+                    if t.angle != 0.0 {
+                        t.angle = 0.0;
+                        changed = true;
+                    }
+                    y as f32 + bh as f32 / 2.0
+                }
+                None => oy_now,
+            };
+            let (cx, cy) = inv.apply(ox, oy);
+            let (nx, ny) = ((cx - tw as f32 / 2.0).round() as i32, (cy - th as f32 / 2.0).round() as i32);
+            if (nx, ny) != (t.x, t.y) {
+                (t.x, t.y) = (nx, ny);
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Whether layer `li` shows on each output frame by its own frame range

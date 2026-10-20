@@ -684,6 +684,13 @@ pub struct GifKitApp {
     tl_key: Option<usize>,
     tl_razor: bool,
     tl_drag: Option<timeline_ui::TlDrag>,
+    /// width of the track name column, and drags on it
+    tl_head_w: f32,
+    tl_head_drag: bool,
+    /// a layer track being dragged to a new place in the stack
+    tl_reorder: Option<usize>,
+    /// frames the GIF will grow by when the drag past its end lets go
+    tl_extend: usize,
     /// an emoji being dragged from the picker onto the picture
     emoji_drag: Option<String>,
     /// views that take drops this frame: where they are and how they map
@@ -2041,6 +2048,10 @@ impl GifKitApp {
             tl_key: None,
             tl_razor: false,
             tl_drag: None,
+            tl_head_w: theme::get_setting("timeline_names").and_then(|v| v.parse().ok()).unwrap_or(170.0),
+            tl_head_drag: false,
+            tl_reorder: None,
+            tl_extend: 0,
             emoji_drag: None,
             drop_views: Vec::new(),
             show_toolbar: theme::get_setting("show_toolbar").as_deref() != Some("0"),
@@ -3678,6 +3689,11 @@ impl eframe::App for GifKitApp {
         let dialog_open = self.export_open || self.history_open || self.about_open || self.shortcuts_open || self.video_import.is_some();
         theme::set_focused(&ctx, focused || dialog_open, self.theme);
         self.drop_views.clear();
+        // text that follows the canvas (wrapping, centring, caption bars)
+        if self.base.is_some() {
+            let (w, h) = self.dims();
+            self.stack.layout_text(w, h, &self.fonts);
+        }
         // KDE caption: "document — app", with a star while there are unsaved changes
         let title = match self.project_path.as_ref().or(self.path.as_ref()).and_then(|p| p.file_name()) {
             Some(n) if self.base.is_some() => format!("{}{} — GIFkit", n.to_string_lossy(), if self.modified { " *" } else { "" }),
@@ -3724,8 +3740,8 @@ impl eframe::App for GifKitApp {
                 .show(ui, |ui| {
                     egui::Panel::bottom("layers_panel")
                         .resizable(!self.layers_collapsed)
-                        .default_size(280.0)
-                        .size_range(if self.layers_collapsed { 34.0..=34.0 } else { 120.0..=700.0 })
+                        .default_size(380.0)
+                        .size_range(if self.layers_collapsed { 34.0..=34.0 } else { 140.0..=800.0 })
                         .frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin { left: 8, right: 8, top: 6, bottom: 2 }))
                         .show(ui, |ui| self.layer_panel(ui, &ctx));
                     egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin { left: 10, right: 8, top: 8, bottom: 4 })).show(ui, |ui| {
@@ -4369,6 +4385,10 @@ impl GifKitApp {
     /// Photoshop-style layer list: top of the stack first, drag to reorder.
     fn layer_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let pal = *p();
+        // the panel takes its height from what it holds: claim all of it up
+        // front so it never creeps shorter frame by frame
+        let full = ui.available_height();
+        ui.set_min_height(full);
         let now = ctx.input(|i| i.time);
         // header
         ui.horizontal(|ui| {
@@ -4985,7 +5005,7 @@ impl GifKitApp {
             let time_w = 112.0;
             let frame_w = 30.0 + 16.0 * digits as f32;
             let speed_w = 74.0;
-            let reserve = time_w + frame_w + speed_w + 3.0 * 10.0;
+            let reserve = time_w + frame_w + speed_w + TOOLBAR_H + 4.0 * 10.0;
             ui.spacing_mut().slider_width = (ui.available_width() - reserve).max(60.0);
             let mut f = self.cur + 1;
             if slider(ui, egui::Slider::new(&mut f, 1..=n.max(1)).show_value(false)).changed() {
@@ -5012,6 +5032,15 @@ impl GifKitApp {
                 })
                 .response
                 .on_hover_text("Playback speed of the preview. Exports keep their own timing.");
+            // show or hide the timeline dock
+            let pal = *p();
+            let on = self.show_timeline;
+            let b = ui.add(sel_btn(egui::Button::new("").frame_when_inactive(on).min_size(vec2(TOOLBAR_H, TOOLBAR_H)), on)).on_hover_text(if on { "Hide the timeline" } else { "Show the timeline" });
+            crate::icons::paint(ui.painter(), "player-time", b.rect.center(), 16.0, pal.fg);
+            if b.clicked() {
+                self.show_timeline = !on;
+                theme::set_setting("show_timeline", if self.show_timeline { "1" } else { "0" });
+            }
         });
     }
 
@@ -7625,62 +7654,6 @@ impl GifKitApp {
     }
 
     /// Default placement of a new text layer.
-    /// The meme caption format: a white strip above or below the picture,
-    /// sized for one line, with black text centred in it. The strip is
-    /// canvas space (Resize ▸ Canvas), so it can be changed there later.
-    fn add_caption_bar(&mut self, top: bool, now: f64) {
-        let (w, h) = self.dims();
-        if w == 0 {
-            return;
-        }
-        self.snapshot(&format!("caption{now}"), now);
-        // the picture's size before any space is added
-        let mut t2 = self.stack.transform.clone();
-        t2.pad_on = false;
-        let g = t2.geo_map(w, h);
-        let bar = (g.h * 0.22).round().max(36.0) as u32;
-        let tr = &mut self.stack.transform;
-        let side = if top { 0 } else { 2 };
-        tr.pad[side] = tr.pad[side].max(bar);
-        tr.pad_on = true;
-        tr.pad_transparent = false;
-        tr.pad_color = [255, 255, 255];
-        let bar = tr.pad[side] as f32;
-        let mut a = Annotation { text: if self.text_tpl.text.trim().is_empty() { "Your caption here".into() } else { self.text_tpl.text.clone() }, ..self.text_tpl.clone() };
-        a.color = [0, 0, 0, 255];
-        a.border = text::Border::None;
-        a.align = Align::Center;
-        a.angle = 0.0;
-        a.stretch = 1.0;
-        (a.from, a.to) = (1, 0);
-        let id = self.add_layer(LayerKind::Text(a));
-        // place it in output space, then bring that back to the source frame
-        let Some(li) = self.stack.index_of(id) else { return };
-        let maps = self.stack.layer_maps(w, h);
-        let mg = &maps[li];
-        let inv = mg.m.inverse();
-        let k = mg.m.det().abs().sqrt().max(1e-3);
-        let (ow, oh) = (mg.w, mg.h);
-        let (ox, oy) = (ow / 2.0, if top { bar / 2.0 } else { oh - bar / 2.0 });
-        let (cx, cy) = inv.apply(ox, oy);
-        let fonts = self.fonts.clone();
-        if let LayerKind::Text(t) = &mut self.stack.layers[li].kind {
-            t.size = (bar * 0.5 / k).max(6.0);
-            // shrink long captions to fit the width
-            let (tw, _) = text::measure(&fonts, t);
-            let room = ow * 0.92 / k;
-            if tw as f32 > room {
-                t.size *= room / tw as f32;
-            }
-            let (tw, th) = text::measure(&fonts, t);
-            t.x = (cx - tw as f32 / 2.0).round() as i32;
-            t.y = (cy - th as f32 / 2.0).round() as i32;
-        }
-        self.tool = Tool::Text;
-        self.modified = true;
-        self.info("Caption bar added – edit the text in the Text panel");
-    }
-
     fn place_text(&self, a: &mut Annotation) {
         let (w, h) = self.dims();
         a.x = (w as i32 / 2 - 80).max(0);
@@ -7737,16 +7710,24 @@ impl GifKitApp {
         group(ui, "Text", |ui| {
             ui.add(egui::TextEdit::multiline(&mut a.text).desired_rows(2).desired_width(f32::INFINITY));
         });
-        let mut bar = None;
-        group_ex(ui, "Caption Bar", true, None, |ui| {
-            hint(ui, "A white strip above or below the picture with black text in it, the classic meme look. The strip is added canvas space you can change in Resize.");
-            ui.add_space(4.0);
-            form_row(ui, "Add", |ui| {
-                even_grid(ui, 2, 0.0, |ui, i, size| {
-                    if ui.add_sized(size, egui::Button::image_and_text(crate::icons::image(ui.ctx(), if i == 0 { "go-top" } else { "go-bottom" }, 16.0, p().fg), if i == 0 { "Top" } else { "Bottom" })).clicked() {
-                        bar = Some(i == 0);
-                    }
-                })
+        group(ui, "Layout", |ui| {
+            use text::Caption;
+            form_row(ui, "Caption bar", |ui| seg_row(ui, &mut a.caption, &[(Caption::None, "None"), (Caption::Top, "Top"), (Caption::Bottom, "Bottom")]))
+                .on_hover_text("A strip above or below the picture with the text in it, sized to fit the text");
+            let bar = a.caption != Caption::None;
+            if bar {
+                form_row(ui, "Bar colour", |ui| colour_btn(ui, &mut a.bar_color));
+                slider_row(ui, "Bar padding", egui::Slider::new(&mut a.bar_pad, 0.0..=150.0).suffix("%").max_decimals(0)).on_hover_text("Room above and below the text, as a share of the text size");
+            }
+            ui.add_enabled_ui(!bar, |ui| {
+                let (mut wrap, mut centre) = (a.wrap || bar, a.centre || bar);
+                form_row(ui, "Fit", |ui| {
+                    check(ui, &mut wrap, "Wrap at the canvas edge");
+                    check(ui, &mut centre, "Centre across the canvas");
+                });
+                if !bar {
+                    (a.wrap, a.centre) = (wrap, centre);
+                }
             });
         });
         let mut picked = None;
@@ -7853,11 +7834,9 @@ impl GifKitApp {
         if sel.is_none() && changed {
             self.place_text(&mut a);
         }
-        self.text_tpl = Annotation { text: if sel.is_none() { a.text.clone() } else { self.text_tpl.text.clone() }, x: 0, y: 0, angle: 0.0, from: 1, to: 0, ..a.clone() };
+        // the next text takes this style, but not its caption bar
+        self.text_tpl = Annotation { text: if sel.is_none() { a.text.clone() } else { self.text_tpl.text.clone() }, x: 0, y: 0, angle: 0.0, from: 1, to: 0, caption: text::Caption::None, bar_h: 0, ..a.clone() };
         self.commit_layer(sel, changed, LayerKind::Text(a));
-        if let Some(top) = bar {
-            self.add_caption_bar(top, ui.input(|i| i.time));
-        }
     }
 
     fn ui_censor(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
