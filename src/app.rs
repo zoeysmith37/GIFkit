@@ -330,6 +330,41 @@ struct Snapshot {
     label: String,
 }
 
+/// A picture to show: one egui made from pixels, or one the graphics card
+/// rendered (kept alive by the cache that owns it).
+#[derive(Clone)]
+struct Tex {
+    id: egui::TextureId,
+    size: Vec2,
+}
+
+impl Tex {
+    fn id(&self) -> egui::TextureId {
+        self.id
+    }
+    fn size_vec2(&self) -> Vec2 {
+        self.size
+    }
+}
+
+impl From<TextureHandle> for Tex {
+    fn from(t: TextureHandle) -> Tex {
+        // the handle's cache keeps the texture; egui frees it when the cache drops it
+        Tex { id: t.id(), size: t.size_vec2() }
+    }
+}
+
+/// Graphics memory the views' rendered frames may hold.
+const GPU_FRAMES_BUDGET: usize = 512 << 20;
+
+/// Frames the graphics card rendered for the views, registered with egui.
+struct GpuFrames {
+    key: u64,
+    map: HashMap<usize, (eframe::wgpu::Texture, egui::TextureId, u64)>,
+    bytes: usize,
+    tick: u64,
+}
+
 /// Frame thumbnails, made in the background and only for frames someone
 /// is looking at (the frame grid and the timeline), kept while there's room.
 #[derive(Default)]
@@ -765,7 +800,11 @@ pub struct GifKitApp {
     committed: Option<(u64, Stack, GifOptions)>,
     pending_sig: u64,
     commit_since: f64,
-    last_comp: Option<(usize, TextureHandle)>,
+    last_comp: Option<(usize, Tex)>,
+    /// rendering on the graphics card, when the window draws with wgpu
+    gpu: Option<(crate::gpu_render::GpuRenderer, std::sync::Arc<egui::mutex::RwLock<eframe::egui_wgpu::Renderer>>)>,
+    gpu_frames: GpuFrames,
+
     last_tick: Option<f64>,
     /// while playing, the original view keeps its own time (seconds into
     /// the original), so cut or skipped frames in the edit don't make it jump
@@ -2097,6 +2136,12 @@ fn small_icon(ui: &mut egui::Ui, icon: &str, tip: &str) -> bool {
 impl GifKitApp {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
         theme::install(&cc.egui_ctx);
+        if std::env::var_os("GIFKIT_PERF").is_some() {
+            match &cc.wgpu_render_state {
+                Some(rs) => eprintln!("renderer: wgpu on {:?} ({:?})", rs.adapter.get_info().name, rs.adapter.get_info().backend),
+                None => eprintln!("renderer: OpenGL"),
+            }
+        }
         if let Some(z) = theme::get_setting("ui_scale").and_then(|v| v.parse::<f32>().ok()).filter(|z| (0.5..=3.0).contains(z)) {
             cc.egui_ctx.set_zoom_factor(z);
         }
@@ -2214,6 +2259,8 @@ impl GifKitApp {
             commit_since: 0.0,
             pending_sig: 0,
             last_comp: None,
+            gpu: cc.wgpu_render_state.as_ref().filter(|_| std::env::var_os("GIFKIT_CPU_PREVIEW").is_none()).map(|rs| (crate::gpu_render::GpuRenderer::new(rs.device.clone(), rs.queue.clone()), rs.renderer.clone())),
+            gpu_frames: GpuFrames { key: 0, map: HashMap::new(), bytes: 0, tick: 0 },
             last_tick: None,
             orig_clock: 0.0,
             resize_by_pct: true,
@@ -3759,16 +3806,77 @@ impl GifKitApp {
     }
 
     /// Texture of output frame `i` with all live edits applied.
-    fn composite_texture(&mut self, ctx: &egui::Context, i: usize) -> Option<TextureHandle> {
+    /// The frame rendered on the graphics card, when it can draw everything
+    /// in the stack (else None and the CPU path takes over).
+    fn gpu_composite(&mut self, i: usize) -> Option<Tex> {
+        if self.gpu.is_none() || !self.stack.gpu_capable() {
+            return None;
+        }
+        let key = self.comp_key;
+        if self.gpu_frames.key != key {
+            self.free_gpu_frames();
+            self.gpu_frames.key = key;
+        }
+        self.gpu_frames.tick += 1;
+        let tick = self.gpu_frames.tick;
+        if let Some(e) = self.gpu_frames.map.get_mut(&i) {
+            e.2 = tick;
+            return Some(Tex { id: e.1, size: vec2(e.0.width() as f32, e.0.height() as f32) });
+        }
+        let prep = self.prepared()?;
+        let (st, base) = self.render_inputs()?;
+        let src = self.plan.get(i)?.src;
+        let job = st.gpu_frame(&base, &self.plan, &self.plan_times, i, &self.fonts, &prep)?;
+        let frame = &base.frames.get(src)?.image;
+        let frame_key = hash_parts(&[self.version, src as u64, base.width() as u64, base.height() as u64]);
+        let filter = if self.pixelated { eframe::wgpu::FilterMode::Nearest } else { eframe::wgpu::FilterMode::Linear };
+        let (gpu, renderer) = self.gpu.as_mut()?;
+        if job.size.0.max(job.size.1) > gpu.max_side || frame.width().max(frame.height()) > gpu.max_side {
+            return None;
+        }
+        let tex = gpu.render(frame, frame_key, &job, key);
+        let view = tex.create_view(&Default::default());
+        let id = renderer.write().register_native_texture(&gpu.device, &view, filter);
+        let size = vec2(tex.width() as f32, tex.height() as f32);
+        let bytes = tex.width() as usize * tex.height() as usize * 4;
+        // keep to a budget, dropping what was looked at longest ago
+        while self.gpu_frames.bytes + bytes > GPU_FRAMES_BUDGET && !self.gpu_frames.map.is_empty() {
+            let oldest = *self.gpu_frames.map.iter().min_by_key(|(_, e)| e.2).map(|(k, _)| k).unwrap();
+            if let Some((t, id, _)) = self.gpu_frames.map.remove(&oldest) {
+                self.gpu_frames.bytes -= t.width() as usize * t.height() as usize * 4;
+                renderer.write().free_texture(&id);
+                t.destroy();
+            }
+        }
+        self.gpu_frames.bytes += bytes;
+        self.gpu_frames.map.insert(i, (tex, id, tick));
+        Some(Tex { id, size })
+    }
+
+    fn free_gpu_frames(&mut self) {
+        let Some((_, renderer)) = &self.gpu else { return };
+        let mut r = renderer.write();
+        for (_, (t, id, _)) in self.gpu_frames.map.drain() {
+            r.free_texture(&id);
+            t.destroy();
+        }
+        self.gpu_frames.bytes = 0;
+    }
+
+    fn composite_texture(&mut self, ctx: &egui::Context, i: usize) -> Option<Tex> {
         if self.waiting_proxy() {
             return None;
         }
         if !self.stack.needs_render() {
             let src = self.plan.get(i)?.src;
-            return self.base_texture(ctx, src);
+            return self.base_texture(ctx, src).map(Tex::from);
+        }
+        if let Some(t) = self.gpu_composite(i) {
+            self.last_comp = Some((i, t.clone()));
+            return Some(t);
         }
         let key = self.comp_key;
-        if let Some(t) = self.comp_tex.get(key, i) {
+        if let Some(t) = self.comp_tex.get(key, i).map(Tex::from) {
             self.last_comp = Some((i, t.clone()));
             return Some(t);
         }
@@ -3789,7 +3897,7 @@ impl GifKitApp {
                 self.live_job = None;
                 if k == key {
                     let o = self.tex_opts();
-                    let t = self.comp_tex.put(ctx, ji, &img, o, "comp");
+                    let t = Tex::from(self.comp_tex.put(ctx, ji, &img, o, "comp"));
                     if ji == i {
                         self.last_comp = Some((i, t.clone()));
                         return Some(t);
@@ -3820,13 +3928,18 @@ impl GifKitApp {
         }
         let img = self.render_composite(i)?;
         let o = self.tex_opts();
-        let t = self.comp_tex.put(ctx, i, &img, o, "comp");
+        let t = Tex::from(self.comp_tex.put(ctx, i, &img, o, "comp"));
         self.last_comp = Some((i, t.clone()));
         Some(t)
     }
 
     /// Track composite key changes; once stable, pre-render all frames in the background.
     fn manage_prerender(&mut self, ctx: &egui::Context, now: f64) {
+        // frames the graphics card renders are made as they're shown
+        if self.gpu.is_some() && self.stack.gpu_capable() {
+            self.prerender = None;
+            return;
+        }
         let key = self.composite_key();
         if key != self.comp_key {
             self.comp_key = key;
@@ -5895,7 +6008,7 @@ impl GifKitApp {
                 let c = self.cmp.as_ref().unwrap();
                 (c.frame_for(self.cur, self.play_time(), &self.plan), vec2(c.full.0 as f32, c.full.1 as f32))
             };
-            (self.cmp_texture(ctx, i), size)
+            (self.cmp_texture(ctx, i).map(Tex::from), size)
         } else {
             let t = self.composite_texture(ctx, self.cur);
             let size = t.as_ref().map(|t| t.size_vec2()).unwrap_or(vec2(self.out_size.0, self.out_size.1));
@@ -6540,7 +6653,7 @@ impl GifKitApp {
     /// Draw one viewport (view state `vi`): background, image and labels.
     /// Handles wheel zoom and panning for that viewport (or both, when linked).
     #[allow(clippy::too_many_arguments)]
-    fn viewport(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, vi: usize, rect: Rect, tex: Option<TextureHandle>, img_size: Vec2, label: Option<(String, Color32)>, badge: Option<String>, busy: bool) -> (egui::Response, Mapper) {
+    fn viewport(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, vi: usize, rect: Rect, tex: Option<Tex>, img_size: Vec2, label: Option<(String, Color32)>, badge: Option<String>, busy: bool) -> (egui::Response, Mapper) {
         let pal = *p();
         let fit = ((rect.width() - 24.0) / img_size.x).min((rect.height() - 24.0) / img_size.y).clamp(0.02, 64.0);
         self.views[vi].fit = fit;
@@ -6799,7 +6912,7 @@ impl GifKitApp {
                     let s = self.plan.get(self.cur).map(|f| f.src).unwrap_or(0);
                     let (w, h) = self.dims();
                     let live = if self.crop_live { self.crop_texture(ctx, self.cur) } else { None };
-                    (live.or_else(|| self.base_texture(ctx, s)), vec2(w as f32, h as f32))
+                    (live.or_else(|| self.base_texture(ctx, s)).map(Tex::from), vec2(w as f32, h as f32))
                 } else {
                     // laid out at full size whatever size the preview was made at
                     let tex = self.composite_texture(ctx, self.cur);
@@ -6819,7 +6932,7 @@ impl GifKitApp {
                     let o = self.original.as_ref().unwrap();
                     (vec2(o.width() as f32, o.height() as f32), (o.width(), o.height()) == self.dims())
                 };
-                let tex = self.orig_texture(ctx, i);
+                let tex = self.orig_texture(ctx, i).map(Tex::from);
                 let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, None, None, false);
                 // the original doesn't show what layers do, so only the crop is edited here
                 if same && self.tool == Tool::Crop {
@@ -6846,7 +6959,7 @@ impl GifKitApp {
                     };
                     let _ = n;
                     let sheet = self.cmp.as_ref().map(|c| c.sheet).unwrap_or(false);
-                    let tex = self.cmp_texture(ctx, i);
+                    let tex = self.cmp_texture(ctx, i).map(Tex::from);
                     let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, None, None, false);
                     // a sprite sheet doesn't share the frame's coordinates: no editing handles
                     if !crop_mode && !sheet {

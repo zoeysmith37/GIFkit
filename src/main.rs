@@ -8,6 +8,7 @@ mod effects;
 mod encode;
 mod geo;
 mod gpu;
+mod gpu_render;
 mod icons;
 mod io;
 mod keys;
@@ -52,7 +53,7 @@ fn main() -> eframe::Result {
         }
     }
     let initial = std::env::args_os().nth(1).map(std::path::PathBuf::from);
-    let options = eframe::NativeOptions {
+    let options = |renderer: eframe::Renderer| eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("GIFkit")
             .with_app_id("gifkit")
@@ -60,7 +61,19 @@ fn main() -> eframe::Result {
             .with_min_inner_size([960.0, 600.0])
             .with_drag_and_drop(true)
             .with_icon(app_icon()),
+        renderer,
         ..Default::default()
     };
-    eframe::run_native("GIFkit", options, Box::new(move |cc| Ok(Box::new(app::GifKitApp::new(cc, initial)))))
+    // the window draws through wgpu (Vulkan, DirectX 12, Metal) so previews can
+    // be made on the graphics card; OpenGL is the fallback for machines where
+    // wgpu can't start. GIFKIT_RENDERER=glow forces OpenGL.
+    let glow_only = std::env::var("GIFKIT_RENDERER").is_ok_and(|v| v.eq_ignore_ascii_case("glow"));
+    if !glow_only {
+        let first = initial.clone();
+        match eframe::run_native("GIFkit", options(eframe::Renderer::Wgpu), Box::new(move |cc| Ok(Box::new(app::GifKitApp::new(cc, first))))) {
+            Err(e) => eprintln!("GIFkit: wgpu couldn't start ({e}), using OpenGL"),
+            ok => return ok,
+        }
+    }
+    eframe::run_native("GIFkit", options(eframe::Renderer::Glow), Box::new(move |cc| Ok(Box::new(app::GifKitApp::new(cc, initial)))))
 }

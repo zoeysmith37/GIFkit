@@ -664,3 +664,109 @@ fn gpu_probe() {
     println!("av1 {:?}", crate::gpu::av1().map(|h| h.name));
     println!("summary {:?} in {:?}", crate::gpu::summary(), t0.elapsed());
 }
+
+/// The graphics card's frames against the CPU's, for every kind of layer and
+/// frame edit the card draws. Needs a GPU (or lavapipe).
+#[test]
+#[ignore]
+fn gpu_matches_cpu() {
+    use crate::stack::Transform;
+    let Some(mut gpu) = crate::gpu_render::GpuRenderer::headless() else {
+        println!("no GPU adapter");
+        return;
+    };
+    let fonts = crate::text::builtin_fonts();
+    let img = RgbaImage::from_fn(160, 120, |x, y| Rgba([(x * 255 / 160) as u8, (y * 2) as u8, ((x ^ y) * 3) as u8, if (x / 20 + y / 20) % 5 == 0 { 90 } else { 255 }]));
+    let base = Animation { frames: vec![Frame::new(img.clone(), 10), Frame::new(img, 10)], loop_count: None };
+    let t = |f: &dyn Fn(&mut Transform)| {
+        let mut t = Transform::default();
+        f(&mut t);
+        t
+    };
+    let mut cases: Vec<(&str, Transform, Vec<LayerKind>, Vec<crate::timeline::Key>)> = vec![
+        ("plain", Transform::default(), vec![], vec![]),
+        ("crop", t(&|t| (t.crop_on, t.crop) = (true, [20, 10, 100, 70])), vec![], vec![]),
+        ("resize down", t(&|t| (t.resize_on, t.rs_pct) = (true, 50.0)), vec![], vec![]),
+        ("resize up", t(&|t| (t.resize_on, t.rs_pct) = (true, 175.0)), vec![], vec![]),
+        ("fit pad", t(&|t| (t.resize_on, t.rs_w, t.rs_h, t.rs_mode) = (true, 120, 120, crate::ops::AspectMode::FitPad)), vec![], vec![]),
+        ("centre crop", t(&|t| (t.resize_on, t.rs_w, t.rs_h, t.rs_mode) = (true, 90, 90, crate::ops::AspectMode::CenterCrop)), vec![], vec![]),
+        ("flip + 90", t(&|t| (t.rot_on, t.flip_h, t.rot) = (true, true, 90)), vec![], vec![]),
+        ("turn 30 bg", t(&|t| (t.rot_on, t.rot_any, t.rot_deg, t.rot_expand, t.rot_bg_transparent) = (true, true, 30.0, true, false)), vec![], vec![]),
+        ("pad", t(&|t| (t.pad_on, t.pad, t.pad_transparent) = (true, [10, 0, 20, 5], false)), vec![], vec![]),
+    ];
+    let text = crate::text::Annotation { text: "Hello GPU".into(), size: 28.0, x: 10, y: 20, color: [255, 255, 0, 255], border: crate::text::Border::Light, ..Default::default() };
+    let shape = crate::shapes::ShapeSettings { x: 60, y: 30, w: 60, h: 40, angle: 20.0, ..Default::default() };
+    let emoji = crate::shapes::EmojiSettings { x: 100, y: 60, w: 40, h: 40, ..Default::default() };
+    let ov = crate::overlay::OverlaySource { name: "o".into(), path: None, frames: vec![RgbaImage::from_fn(30, 20, |x, _| Rgba([255, (x * 8) as u8, 0, 200]))], delays: vec![10] };
+    let overlay = LayerKind::Overlay(crate::stack::OverlayLayer { src: Arc::new(ov), placements: vec![crate::overlay::Placement { enabled: true, x: 20, y: 50, w: 60, h: 40, angle: 25.0 }; 2], opacity: 80.0 });
+    let layers = || vec![LayerKind::Text(text.clone()), LayerKind::Shape(Box::new(shape.clone())), LayerKind::Emoji(Box::new(emoji.clone())), overlay.clone()];
+    cases.push(("layers", Transform::default(), layers(), vec![]));
+    cases.push(("layers + turn", t(&|t| (t.rot_on, t.rot_any, t.rot_deg) = (true, true, -15.0)), layers(), vec![]));
+    cases.push(("layers + resize", t(&|t| (t.resize_on, t.rs_pct) = (true, 60.0)), layers(), vec![]));
+    let mk = crate::timeline::Key { frame: 0, x: 15.0, y: -5.0, scale_x: 150.0, scale_y: 80.0, angle: 30.0, opacity: 60.0, smooth: false };
+    cases.push(("motion", Transform::default(), layers(), vec![mk]));
+    let one = |k: usize| vec![layers().remove(k)];
+    for (k, nm) in ["text", "shape", "emoji", "overlay"].iter().enumerate() {
+        cases.push((Box::leak(format!("turn+{nm}").into_boxed_str()), t(&|t| (t.rot_on, t.rot_any, t.rot_deg) = (true, true, -15.0)), one(k), vec![]));
+        cases.push((Box::leak(format!("motion {nm}").into_boxed_str()), Transform::default(), one(k), vec![mk]));
+    }
+    cases.push(("motion text", Transform::default(), vec![LayerKind::Text(text.clone())], vec![mk]));
+    cases.push(("move text", Transform::default(), vec![LayerKind::Text(text.clone())], vec![crate::timeline::Key { scale_x: 100.0, scale_y: 100.0, angle: 0.0, opacity: 100.0, ..mk }]));
+    cases.push(("scale text", Transform::default(), vec![LayerKind::Text(text.clone())], vec![crate::timeline::Key { x: 0.0, y: 0.0, angle: 0.0, opacity: 100.0, ..mk }]));
+    cases.push(("turn text", Transform::default(), vec![LayerKind::Text(text.clone())], vec![crate::timeline::Key { x: 0.0, y: 0.0, scale_x: 100.0, scale_y: 100.0, opacity: 100.0, ..mk }]));
+    cases.push(("fade shape", Transform::default(), vec![LayerKind::Shape(Box::new(shape.clone()))], vec![crate::timeline::Key { x: 0.0, y: 0.0, scale_x: 100.0, scale_y: 100.0, angle: 0.0, ..mk }]));
+    let mut cap = text.clone();
+    cap.caption = crate::text::Caption::Bottom;
+    cases.push(("caption", Transform::default(), vec![LayerKind::Text(cap)], vec![]));
+    let mut wm = crate::effects::WatermarkSettings::default();
+    wm.tiled = true;
+    cases.push(("watermark tiled", Transform::default(), vec![LayerKind::Watermark(Box::new(wm))], vec![]));
+    for (ci, (name, tr, ls, keys)) in cases.into_iter().enumerate() {
+        let mut st = Stack::default();
+        st.transform = tr;
+        for k in ls {
+            let id = st.push(k);
+            if !keys.is_empty() {
+                st.layers.iter_mut().find(|l| l.id == id).unwrap().timing.keys = keys.clone();
+            }
+        }
+        st.layout_text(160, 120, &fonts);
+        let plan = st.plan(&base);
+        let times = crate::stack::plan_times(&plan);
+        let prep = st.prepare(&base, &fonts);
+        let cpu = st.render_frame(&base, &plan, &times, 0, &fonts, &prep);
+        let Some(job) = st.gpu_frame(&base, &plan, &times, 0, &fonts, &prep) else {
+            println!("{name:18} not on the GPU");
+            continue;
+        };
+        let tex = gpu.render(&base.frames[0].image, 1, &job, ci as u64 + 1);
+        let g = gpu.read(&tex);
+        if g.dimensions() != cpu.dimensions() {
+            println!("{name:18} SIZE gpu {:?} cpu {:?}", g.dimensions(), cpu.dimensions());
+            continue;
+        }
+        // premultiplied difference, so colour under full transparency doesn't count
+        let (mut sum, mut max, mut bad) = (0f64, 0i32, 0usize);
+        for (a, b) in g.pixels().zip(cpu.pixels()) {
+            let mut worst = 0;
+            for c in 0..4 {
+                let pa = if c == 3 { a[3] as i32 } else { a[c] as i32 * a[3] as i32 / 255 };
+                let pb = if c == 3 { b[3] as i32 } else { b[c] as i32 * b[3] as i32 / 255 };
+                worst = worst.max((pa - pb).abs());
+            }
+            sum += worst as f64;
+            max = max.max(worst);
+            if worst > 24 {
+                bad += 1;
+            }
+        }
+        let npx = (g.width() * g.height()) as f64;
+        println!("{name:18} mean {:5.2}  max {max:3}  off {:5.2}%", sum / npx, bad as f64 * 100.0 / npx);
+        if let Ok(dir) = std::env::var("GPU_OUT") {
+            let mut both = RgbaImage::new(g.width() * 2, g.height());
+            image::imageops::overlay(&mut both, &cpu, 0, 0);
+            image::imageops::overlay(&mut both, &g, g.width() as i64, 0);
+            both.save(format!("{dir}/gpu_{}.png", name.replace(' ', "_"))).unwrap();
+        }
+    }
+}
