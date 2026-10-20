@@ -1126,6 +1126,11 @@ pub fn plan_times(plan: &[PlanFrame]) -> Vec<f32> {
 }
 
 /// Index of the frame showing at time `t` (seconds, wrapped) in an animation.
+/// When frame `i` starts, in seconds (skipped frames take no time).
+pub fn frame_start_time(a: &Animation, i: usize) -> f32 {
+    a.frames.iter().take(i).filter(|f| f.enabled).map(|f| effective_delay(f.delay_cs) as f32 / 100.0).sum()
+}
+
 pub fn frame_at_time(a: &Animation, t: f32) -> usize {
     let total = a.duration_secs();
     if total <= 0.0 || a.is_empty() {

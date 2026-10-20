@@ -83,6 +83,31 @@ pub struct VideoImport {
     pub delay_cs: u16,
     /// longest side, 0 = keep the video's size
     pub max_side: u32,
+    /// how much a frame may differ from the last one kept and still be
+    /// merged into it (its time added on): see [`MERGE_LEVELS`]
+    pub merge: usize,
+}
+
+/// Merging frames that barely change: (name, share of pixels that may change).
+/// Screen recordings sit still most of the time, so this saves a lot.
+pub const MERGE_LEVELS: [(&str, f64); 4] = [("Keep every frame", -1.0), ("Merge repeated frames", 0.0002), ("Merge small changes", 0.005), ("Merge most changes", 0.03)];
+
+/// Share of pixels that differ clearly between two RGBA buffers (video
+/// noise under a small step doesn't count). Stops counting past `limit`.
+pub fn changed_share(a: &[u8], b: &[u8], limit: f64) -> f64 {
+    const TOL: i32 = 18;
+    let n = a.len() / 4;
+    let stop = (limit * n as f64) as usize + 1;
+    let mut changed = 0usize;
+    for (p, q) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+        if (p[0] as i32 - q[0] as i32).abs() > TOL || (p[1] as i32 - q[1] as i32).abs() > TOL || (p[2] as i32 - q[2] as i32).abs() > TOL || (p[3] as i32 - q[3] as i32).abs() > TOL {
+            changed += 1;
+            if changed > stop {
+                break;
+            }
+        }
+    }
+    changed as f64 / n.max(1) as f64
 }
 
 /// Frame delays GIFs can show exactly, fastest first.
@@ -92,7 +117,7 @@ impl VideoImport {
     pub fn defaults(info: &VideoInfo) -> Self {
         // the fastest exact GIF rate that isn't above the source
         let delay_cs = VIDEO_DELAYS.into_iter().find(|d| 100.0 / *d as f64 <= info.fps + 0.01).unwrap_or(10);
-        Self { start: 0.0, end: info.duration, delay_cs, max_side: VIDEO_MAX_SIDE }
+        Self { start: 0.0, end: info.duration, delay_cs, max_side: VIDEO_MAX_SIDE, merge: 1 }
     }
 
     /// Output frame size (even numbers, as video scalers need).
@@ -179,12 +204,18 @@ pub fn load_video_range(path: &Path, opt: &VideoImport, progress: Option<&std::s
         s
     });
     let frame_len = (w * h * 4) as usize;
-    let mut frames = Vec::new();
+    let mut frames: Vec<Frame> = Vec::new();
+    let limit = MERGE_LEVELS.get(opt.merge).map(|l| l.1).unwrap_or(-1.0);
+    let mut buf = vec![0u8; frame_len];
     loop {
-        let mut buf = vec![0u8; frame_len];
         match stdout.read_exact(&mut buf) {
             Ok(()) => {
-                frames.push(Frame::new(RgbaImage::from_raw(w, h, buf).context("frame size")?, opt.delay_cs));
+                // a frame close enough to the last one kept only adds its time to it
+                let last = frames.last_mut().filter(|f| limit >= 0.0 && f.delay_cs as u32 + (opt.delay_cs as u32) < 65535);
+                match last {
+                    Some(f) if changed_share(f.image.as_raw(), &buf, limit) <= limit => f.delay_cs += opt.delay_cs,
+                    _ => frames.push(Frame::new(RgbaImage::from_raw(w, h, std::mem::replace(&mut buf, vec![0u8; frame_len])).context("frame size")?, opt.delay_cs)),
+                }
                 if let Some(p) = progress {
                     p.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }

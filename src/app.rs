@@ -673,6 +673,9 @@ pub struct GifKitApp {
     commit_since: f64,
     last_comp: Option<(usize, TextureHandle)>,
     last_tick: Option<f64>,
+    /// while playing, the original view keeps its own time (seconds into
+    /// the original), so cut or skipped frames in the edit don't make it jump
+    orig_clock: f64,
     resize_by_pct: bool,
     about_open: bool,
     /// layer being renamed (id, text) and whether its field still needs focus
@@ -2077,6 +2080,7 @@ impl GifKitApp {
             pending_sig: 0,
             last_comp: None,
             last_tick: None,
+            orig_clock: 0.0,
             resize_by_pct: true,
             about_open: false,
             renaming: None,
@@ -2976,7 +2980,16 @@ impl GifKitApp {
             // ask about range, frame rate and size first
             match io::probe_video(&p) {
                 Ok(info) => {
-                    let opt = io::VideoImport::defaults(&info);
+                    let mut opt = io::VideoImport::defaults(&info);
+                    // scripting hook (tests): GIFKIT_VIDEO_IMPORT=side,delay,merge imports right away
+                    if let Some(v) = std::env::var("GIFKIT_VIDEO_IMPORT").ok() {
+                        let n: Vec<u32> = v.split(',').filter_map(|x| x.parse().ok()).collect();
+                        if let [side, delay, merge] = n[..] {
+                            (opt.max_side, opt.delay_cs, opt.merge) = (side, delay as u16, merge as usize);
+                            self.import_video(ctx, p, opt);
+                            return;
+                        }
+                    }
                     self.video_import = Some((p, info, opt));
                 }
                 Err(e) => self.error(format!("{e:#}")),
@@ -3005,7 +3018,7 @@ impl GifKitApp {
         let mut go = false;
         let mut cancel = false;
         let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        dialog(ctx, "video", "Import Video", vec2(460.0, 350.0), false, &mut open, |ui| {
+        dialog(ctx, "video", "Import Video", vec2(460.0, 400.0), false, &mut open, |ui| {
             ui.label(RichText::new(elide(&name, 48)).font(theme::medium(15.0)).color(pal.fg));
             hint(ui, &format!("{}×{} · {:.2} fps · {}", info.width, info.height, info.fps, fmt_secs(info.duration)));
             ui.add_space(10.0);
@@ -3028,12 +3041,21 @@ impl GifKitApp {
                 .collect();
             let items: Vec<(u32, &str)> = sizes.iter().map(|(m, l)| (*m, l.as_str())).collect();
             form_row(ui, "Size:", |ui| combo(ui, "vid-size", &mut opt.max_side, &items));
+            let levels: Vec<(usize, &str)> = io::MERGE_LEVELS.iter().enumerate().map(|(i, l)| (i, l.0)).collect();
+            form_row(ui, "Still parts:", |ui| combo(ui, "vid-merge", &mut opt.merge, &levels)).on_hover_text(
+                "Frames that barely change from the one before are merged into it, and it shows for longer. \
+                 Screen recordings are still most of the time, so this saves a lot of frames.\n\n\
+                 Repeated: only frames that look the same.\nSmall changes: also a moving cursor or a few typed letters.\nMost changes: anything but big movement.",
+            );
             ui.add_space(8.0);
             let gb = opt.bytes(&info) as f64 / 1e9;
             let frames = opt.frames();
-            form_row(ui, "Result:", |ui| hint(ui, &format!("{frames} frames · {} in memory", if gb >= 1.0 { format!("{gb:.1} GB") } else { format!("{:.0} MB", gb * 1000.0) })));
+            let mem = if gb >= 1.0 { format!("{gb:.1} GB") } else { format!("{:.0} MB", gb * 1000.0) };
+            let merging = opt.merge > 0;
+            form_row(ui, "Result:", |ui| hint(ui, &if merging { format!("Up to {frames} frames · up to {mem} in memory, less where the video is still") } else { format!("{frames} frames · {mem} in memory") }));
             if gb > 4.0 {
-                form_row(ui, "", |ui| ui.label(RichText::new("⚠ That's a lot of memory. A shorter range, a lower frame rate or a smaller size will be much quicker to edit.").color(pal.neutral)));
+                let tip = if merging { "⚠ That could be a lot of memory if the video moves a lot. A shorter range, a lower frame rate or a smaller size will be quicker to edit." } else { "⚠ That's a lot of memory. A shorter range, a lower frame rate, a smaller size or merging still parts will be much quicker to edit." };
+                form_row(ui, "", |ui| ui.label(RichText::new(tip).color(pal.neutral)));
             }
             ui.add_space(12.0);
             ui.separator();
@@ -3310,6 +3332,8 @@ impl GifKitApp {
     fn advance(&mut self, ctx: &egui::Context) {
         if !self.playing || self.plan.is_empty() || !self.plan.iter().any(|f| f.enabled) {
             self.last_tick = None;
+            // paused: the original waits where the edit is, to start from there
+            self.orig_clock = self.paused_original().and_then(|i| self.original.as_ref().map(|o| stack::frame_start_time(o, i))).unwrap_or(0.0) as f64;
             return;
         }
         // Real elapsed time. egui's stable_dt falls back to a fixed 1/60 s
@@ -3322,17 +3346,27 @@ impl GifKitApp {
         };
         self.last_tick = Some(now);
         self.elapsed += dt * self.play_speed as f64;
+        if let Some(o) = &self.original {
+            let total = o.duration_secs() as f64;
+            self.orig_clock = if total > 0.0 { (self.orig_clock + dt * self.play_speed as f64).rem_euclid(total) } else { 0.0 };
+        }
         let n = self.plan.len();
         if !self.plan[self.cur].enabled {
             self.cur = self.next_enabled(self.cur);
         }
-        let _ = n;
-        // Advance at most one frame per repaint. After a slow frame we drop the
-        // backlog instead of racing through frames to catch up (no speed bursts).
-        let d = effective_delay(self.plan[self.cur].delay) as f64 / 100.0;
-        if self.elapsed >= d {
-            self.elapsed = (self.elapsed - d).min(d * 0.5);
+        // Keep to real time, as a video player does: when the screen can't
+        // show every frame (big frames, a slow graphics driver), frames are
+        // skipped instead of the animation playing in slow motion. dt is
+        // capped above, so a stall never races ahead.
+        let mut steps = 0;
+        loop {
+            let d = effective_delay(self.plan[self.cur].delay) as f64 / 100.0;
+            if self.elapsed < d || steps > n {
+                break;
+            }
+            self.elapsed -= d;
             self.cur = self.next_enabled(self.cur);
+            steps += 1;
         }
         let d = effective_delay(self.plan[self.cur].delay) as f64 / 100.0;
         let remain = ((d - self.elapsed) / self.play_speed.max(0.05) as f64).max(0.004);
@@ -4160,7 +4194,7 @@ impl eframe::App for GifKitApp {
         clear_group_command(&ctx);
         if std::env::var_os("GIFKIT_PERF").is_some() {
             let ms = perf_t0.elapsed().as_secs_f64() * 1000.0;
-            eprintln!("frame {:.1} ms cur={} prerender={}", ms, self.cur, self.prerender.is_some());
+            eprintln!("frame {:.1} ms cur={} prerender={} t={:.3} orig={:?} clock={:.3} playing={}", ms, self.cur, self.prerender.is_some(), ctx.input(|i| i.time), self.original_index(), self.orig_clock, self.playing);
         }
 
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
@@ -6359,6 +6393,16 @@ impl GifKitApp {
     /// Index of the original-file frame to show: the same source frame when the
     /// frame structure is unchanged, otherwise by time.
     fn original_index(&self) -> Option<usize> {
+        let o = self.original.as_ref()?;
+        if self.playing {
+            // its own time, so it plays as the original did whatever the edit does
+            return Some(stack::frame_at_time(o, self.orig_clock as f32));
+        }
+        self.paused_original()
+    }
+
+    /// The original frame that matches the edit's frame on screen.
+    fn paused_original(&self) -> Option<usize> {
         let o = self.original.as_ref()?;
         let b = self.base.as_ref()?;
         if o.len() == b.len() {

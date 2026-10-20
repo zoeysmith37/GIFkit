@@ -614,3 +614,19 @@ fn broken_files() {
         println!("{path}: {oks} opened, {errs} errors, {} panics, slowest {worst:.2}s {:?}", panics.len(), panics.iter().take(3).collect::<Vec<_>>());
     }
 }
+
+#[test]
+#[ignore]
+fn video_merge_levels() {
+    let p = std::path::PathBuf::from(std::env::var("VIDEO").unwrap());
+    let info = crate::io::probe_video(&p).unwrap();
+    for merge in 0..crate::io::MERGE_LEVELS.len() {
+        let mut o = crate::io::VideoImport::defaults(&info);
+        o.end = o.end.min(30.0);
+        o.merge = merge;
+        let t0 = std::time::Instant::now();
+        let a = crate::io::load_video_range(&p, &o, None).unwrap();
+        let total: u32 = a.frames.iter().map(|f| f.delay_cs as u32).sum();
+        println!("{:24} {:5} frames of {:5}, {:.2} s total, {:.0} MB, {:.1}s", crate::io::MERGE_LEVELS[merge].0, a.len(), o.frames(), total as f32 / 100.0, (a.len() * a.width() as usize * a.height() as usize * 4) as f64 / 1e6, t0.elapsed().as_secs_f32());
+    }
+}
