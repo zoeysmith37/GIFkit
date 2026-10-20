@@ -1417,3 +1417,18 @@ fn distance_map_matches_brute_force() {
         }
     }
 }
+
+#[test]
+fn keys_scale_each_way_and_read_old_files() {
+    use crate::timeline::{motion_matrix, transform_sprite, Key};
+    // an old key with one scale gives both
+    let k: Key = serde_json::from_str(r#"{"frame":3,"x":1.0,"y":2.0,"scale":150.0,"angle":0.0,"opacity":100.0,"smooth":true}"#).unwrap();
+    assert_eq!((k.scale_x, k.scale_y), (150.0, 150.0));
+    // stretching only sideways keeps the height
+    let img = image::RgbaImage::from_pixel(10, 10, image::Rgba([255, 0, 0, 255]));
+    let (o, _, _) = transform_sprite(&img, 0, 0, (5.0, 5.0), (0.0, 0.0), motion_matrix(2.0, 1.0, 0.0, 0.0)).unwrap();
+    assert_eq!((o.width(), o.height()), (20, 10));
+    // on a sprite already turned 90°, its own width runs up and down
+    let (o, _, _) = transform_sprite(&img, 0, 0, (5.0, 5.0), (0.0, 0.0), motion_matrix(2.0, 1.0, 90.0, 0.0)).unwrap();
+    assert!(o.width() <= 11 && o.height() == 20, "{}x{}", o.width(), o.height());
+}

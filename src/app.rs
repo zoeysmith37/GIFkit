@@ -1555,6 +1555,23 @@ fn spin<'a, N: egui::emath::Numeric>(ui: &mut egui::Ui, size: Vec2, v: &'a mut N
 }
 
 /// A button that fills the width of the field column.
+/// X and Y rows for an object `obj_h` tall, Y shown up from the bottom of a
+/// `frame_h` frame to the object's bottom edge (stored as a top edge, down).
+fn pos_rows(ui: &mut egui::Ui, x: &mut i32, y: &mut i32, obj_h: i32, frame_h: u32) {
+    form_row(ui, "Position", |ui| {
+        even_grid(ui, 2, 0.0, |ui, i, size| {
+            if i == 0 {
+                spin(ui, size, x, 1.0, |d| d.prefix("X  ")).on_hover_text("Left edge, from the left of the frame");
+            } else {
+                let mut up = frame_h as i32 - (*y + obj_h);
+                if spin(ui, size, &mut up, 1.0, |d| d.prefix("Y  ")).on_hover_text("Bottom edge, up from the bottom of the frame").changed() {
+                    *y = frame_h as i32 - obj_h - up;
+                }
+            }
+        })
+    });
+}
+
 fn wide_button(ui: &mut egui::Ui, b: egui::Button<'_>) -> egui::Response {
     ui.add_sized(vec2(ui.available_width(), CHIP_H), b)
 }
@@ -1911,7 +1928,25 @@ fn dialog(ctx: &egui::Context, id: &str, title: &str, size: Vec2, resizable: boo
         if class == egui::ViewportClass::EmbeddedWindow {
             add(ui);
         } else {
-            egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin::same(14))).show(ui, |ui| add(ui));
+            let used = egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin::same(14)))
+                .show(ui, |ui| {
+                    add(ui);
+                    ui.cursor().top() + 14.0
+                })
+                .inner;
+            // fixed-size dialogs grow or shrink to fit what's in them, so
+            // bigger fonts or interface scales never push buttons out of sight
+            if !resizable {
+                let now = ui.ctx().input(|i| i.viewport().inner_rect).map(|r| r.height()).unwrap_or(size.y);
+                let want = used.clamp(size.y * 0.6, size.y * 1.8).ceil();
+                if std::env::var_os("GIFKIT_PERF").is_some() {
+                    eprintln!("dialog {id}: used {used:.0} now {now:.0} want {want:.0}");
+                }
+                if (want - now).abs() > 1.5 {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(size.x, want)));
+                }
+            }
         }
         ui.ctx().input(|i| i.viewport().close_requested() || i.key_pressed(egui::Key::Escape))
     });
@@ -4608,27 +4643,55 @@ impl GifKitApp {
         let pal = *p();
         let r = ui.max_rect();
         ui.painter().hline(r.x_range(), r.top() - 3.0, Stroke::new(1.0, pal.border));
+        let mut stop = false;
         ui.horizontal(|ui| {
             if let Some(job) = &self.job {
                 ui.spinner();
-                let done = job.progress.load(Ordering::Relaxed).min(job.total);
                 ui.label(RichText::new(format!("{}…", job.label)).size(12.5));
-                if job.total > 1 {
-                    ui.add(egui::ProgressBar::new(done as f32 / job.total as f32).desired_width(200.0).desired_height(12.0).fill(pal.highlight));
-                }
             } else if let Some(s) = &self.status {
                 ui.label(RichText::new(&s.text).size(12.5).color(if s.error { pal.negative } else { pal.fg_muted }));
             } else {
                 ui.label(RichText::new("Ready").size(12.5).color(pal.fg_muted));
             }
-            if self.base.is_some() {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // the right end: Stop, always there and only active while work runs,
+            // with the progress bar beside it as in KDE's job tracker
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let running = self.job.is_some();
+                let tip = match &self.job {
+                    Some(j) => format!("Stop {}", j.label.to_lowercase()),
+                    None => "Stop the running operation".to_string(),
+                };
+                let b = ui.add_enabled(running, egui::Button::image(crate::icons::image(ui.ctx(), "process-stop", 16.0, if running { pal.fg } else { pal.fg_muted })).frame_when_inactive(false).min_size(vec2(22.0, 20.0)));
+                if b.on_hover_text(tip).on_disabled_hover_text("Nothing to stop").clicked() {
+                    stop = true;
+                }
+                if let Some(job) = &self.job {
+                    let done = (job.progress.load(Ordering::Relaxed) & !stack::STOP_BIT).min(job.total);
+                    if job.total > 1 {
+                        ui.add(egui::ProgressBar::new(done as f32 / job.total as f32).desired_width(200.0).desired_height(12.0).fill(pal.highlight));
+                    }
+                }
+                if self.base.is_some() {
                     let name = self.project_path.as_ref().or(self.path.as_ref()).and_then(|p| p.file_name()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Untitled".into());
                     let room = ((ui.available_width() - 200.0) / 7.0).max(6.0) as usize;
+                    ui.add_space(8.0);
                     ui.label(RichText::new(if self.modified { format!("{} •", elide(&name, room.min(40))) } else { elide(&name, room.min(40)) }).size(12.5).color(pal.fg_muted)).on_hover_text(if self.modified { "Unsaved changes" } else { "" });
-                });
-            }
+                }
+            });
         });
+        if stop {
+            self.stop_job();
+        }
+    }
+
+    /// Give up on the running operation: its work notices and ends, and
+    /// whatever it was making is dropped.
+    fn stop_job(&mut self) {
+        if let Some(job) = self.job.take() {
+            job.progress.fetch_or(stack::STOP_BIT, Ordering::Relaxed);
+            self.info(format!("Stopped {}", job.label.to_lowercase()));
+        }
     }
 
     fn shortcuts_window(&mut self, ctx: &egui::Context) {
@@ -6543,7 +6606,17 @@ impl GifKitApp {
             ViewSource::Compressed => {
                 let encoding = self.cmp_job.is_some();
                 let fresh = self.cmp.as_ref().map(|c| c.key == self.cmp_key()).unwrap_or(false);
-                if fresh {
+                // a sampled estimate only has a few stretches of frames: elsewhere
+                // the edit shows, rather than the nearest sampled frame jumping about
+                let outside = fresh && self.cmp.as_ref().and_then(|c| c.sample.as_ref()).is_some_and(|s| !s.contains(&self.cur));
+                if outside {
+                    let tex = self.composite_texture(ctx, self.cur);
+                    let size = self.true_out_size();
+                    let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, Some(("Not in the size sample · showing the edit".into(), Color32::from_gray(225))), None, false);
+                    if !crop_mode {
+                        self.canvas_interaction(ui, &resp, m, (size.x, size.y), Space::Output, vi);
+                    }
+                } else if fresh {
                     let (i, size, n) = {
                         let c = self.cmp.as_ref().unwrap();
                         (c.frame_for(self.cur, t, &self.plan), vec2(c.full.0 as f32, c.full.1 as f32), c.size)
@@ -7498,16 +7571,28 @@ impl GifKitApp {
             let r = &mut tr.crop;
             form_row(ui, "Position", |ui| {
                 even_grid(ui, 2, 0.0, |ui, i, size| {
-                    let max = if i == 0 { w.saturating_sub(1) } else { h.saturating_sub(1) };
-                    spin(ui, size, &mut r[i], 1.0, |d| d.range(0..=max).prefix(if i == 0 { "X  " } else { "Y  " }));
+                    if i == 0 {
+                        spin(ui, size, &mut r[0], 1.0, |d| d.range(0..=w.saturating_sub(1)).prefix("X  "));
+                    } else {
+                        // shown up from the bottom of the frame
+                        let mut up = h.saturating_sub(r[1] + r[3]);
+                        if spin(ui, size, &mut up, 1.0, |d| d.range(0..=h.saturating_sub(1)).prefix("Y  ")).on_hover_text("Bottom edge, up from the bottom of the frame").changed() {
+                            r[1] = h.saturating_sub(up + r[3]);
+                        }
+                    }
                 })
             });
+            let h0 = r[3];
             form_row(ui, "Size", |ui| {
                 even_grid(ui, 2, 0.0, |ui, i, size| {
                     let max = if i == 0 { w } else { h };
                     spin(ui, size, &mut r[2 + i], 1.0, |d| d.range(1..=max).prefix(if i == 0 { "W  " } else { "H  " }));
                 })
             });
+            // a new height keeps the bottom edge, as Y counts from there
+            if r[3] != h0 {
+                r[1] = (r[1] + h0).saturating_sub(r[3]);
+            }
             r[2] = r[2].min(w.saturating_sub(r[0])).max(1);
             r[3] = r[3].min(h.saturating_sub(r[1])).max(1);
             let locks: Vec<(AspectLock, &str)> = AspectLock::ALL.iter().map(|l| (*l, l.label())).collect();
@@ -8182,20 +8267,19 @@ impl GifKitApp {
         c.to = 0;
     }
 
-    /// Position and size rows for a box in source pixels.
-    fn box_rows(ui: &mut egui::Ui, x: &mut i32, y: &mut i32, w: &mut u32, h: &mut u32, max: u32) {
-        form_row(ui, "Position", |ui| {
-            even_grid(ui, 2, 0.0, |ui, i, size| {
-                let v = if i == 0 { &mut *x } else { &mut *y };
-                spin(ui, size, v, 1.0, |d| d.prefix(if i == 0 { "X  " } else { "Y  " }));
-            })
-        });
+    /// Position and size rows for a box in source pixels. Y is shown the way
+    /// people read a graph: 0 at the bottom, up to the box's bottom edge.
+    fn box_rows(ui: &mut egui::Ui, x: &mut i32, y: &mut i32, w: &mut u32, h: &mut u32, max: u32, frame_h: u32) {
+        let bh = *h as i32;
+        pos_rows(ui, x, y, bh, frame_h);
         form_row(ui, "Size", |ui| {
             even_grid(ui, 2, 0.0, |ui, i, size| {
                 let v = if i == 0 { &mut *w } else { &mut *h };
                 spin(ui, size, v, 1.0, |d| d.range(1..=max).prefix(if i == 0 { "W  " } else { "H  " }));
             })
         });
+        // a new height keeps the bottom edge where it was, as Y counts from there
+        *y -= *h as i32 - bh;
     }
 
     fn ui_text(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
@@ -8205,6 +8289,7 @@ impl GifKitApp {
             s.add_layer(LayerKind::Text(a));
         });
         let n = self.base.as_ref().map(|b| b.len()).unwrap_or(1).max(1);
+        let fh = self.dims().1;
         let mut a = match sel.map(|i| &self.stack.layers[i].kind) {
             Some(LayerKind::Text(a)) => a.clone(),
             _ => self.text_tpl.clone(),
@@ -8283,20 +8368,21 @@ impl GifKitApp {
                     }
                 })
             });
-            form_row(ui, "Stretch", |ui| {
+            form_row(ui, "Scale", |ui| {
                 even_grid(ui, 2, 0.0, |ui, i, size| {
-                    if i == 0 {
-                        let mut pct = a.stretch * 100.0;
-                        if spin(ui, size, &mut pct, 1.0, |d| d.range(5.0..=2000.0).speed(0.5).max_decimals(0).suffix("%")).on_hover_text("Squash or stretch the text sideways. Drag a side handle on the image to do it by hand.").changed() {
-                            a.stretch = pct / 100.0;
-                        }
-                    } else {
-                        let off = (a.stretch - 1.0).abs() > 1e-3;
-                        if ui.add_enabled_ui(off, |ui| ui.add_sized(size, egui::Button::new("Reset"))).inner.clicked() {
-                            a.stretch = 1.0;
-                        }
+                    let v = if i == 0 { &mut a.stretch } else { &mut a.stretch_y };
+                    let mut pct = *v * 100.0;
+                    let tip = if i == 0 { "Squash or stretch the text sideways. Drag a side handle on the image to do it by hand." } else { "Squash or stretch the text up and down" };
+                    if spin(ui, size, &mut pct, 1.0, |d| d.range(5.0..=2000.0).speed(0.5).max_decimals(0).prefix(if i == 0 { "X  " } else { "Y  " }).suffix("%")).on_hover_text(tip).changed() {
+                        *v = pct / 100.0;
                     }
                 })
+            });
+            let scaled = (a.stretch - 1.0).abs() > 1e-3 || (a.stretch_y - 1.0).abs() > 1e-3;
+            form_row(ui, "", |ui| {
+                if ui.add_enabled_ui(scaled, |ui| wide_button(ui, egui::Button::new("Reset Scale"))).inner.clicked() {
+                    (a.stretch, a.stretch_y) = (1.0, 1.0);
+                }
             });
             form_row(ui, "Align", |ui| seg_row(ui, &mut a.align, &[(Align::Left, "Left"), (Align::Center, "Centre"), (Align::Right, "Right")]));
             slider_row(ui, "Opacity", egui::Slider::new(&mut a.opacity, 0..=100).suffix("%"));
@@ -8323,12 +8409,8 @@ impl GifKitApp {
         let placed = sel.is_some();
         ui.add_enabled_ui(placed, |ui| {
             group(ui, "Placement", |ui| {
-                form_row(ui, "Position", |ui| {
-                    even_grid(ui, 2, 0.0, |ui, i, size| {
-                        let v = if i == 0 { &mut a.x } else { &mut a.y };
-                        spin(ui, size, v, 1.0, |d| d.prefix(if i == 0 { "X  " } else { "Y  " }));
-                    })
-                });
+                let th = text::measure(&self.fonts, &a).1 as i32;
+                pos_rows(ui, &mut a.x, &mut a.y, th, fh);
                 Self::angle_row(ui, &mut a.angle);
                 frames_row(ui, &mut a.from, &mut a.to, n);
             });
@@ -8381,7 +8463,7 @@ impl GifKitApp {
         });
         ui.add_enabled_ui(sel.is_some(), |ui| {
             group(ui, "Placement", |ui| {
-                Self::box_rows(ui, &mut c.x, &mut c.y, &mut c.w, &mut c.h, (w.max(h) * 4).max(1));
+                Self::box_rows(ui, &mut c.x, &mut c.y, &mut c.w, &mut c.h, (w.max(h) * 4).max(1), h);
                 Self::angle_row(ui, &mut c.angle);
                 frames_row(ui, &mut c.from, &mut c.to, n);
             });
@@ -8436,7 +8518,7 @@ impl GifKitApp {
             group(ui, "Placement", |ui| {
                 form_row(ui, "Apply to", |ui| combo(ui, "pscope", &mut scope, &[(PlaceScope::All, PlaceScope::All.label()), (PlaceScope::Following, PlaceScope::Following.label()), (PlaceScope::This, PlaceScope::This.label())]));
                 let mut pl = o.placements[cur];
-                Self::box_rows(ui, &mut pl.x, &mut pl.y, &mut pl.w, &mut pl.h, 16384);
+                Self::box_rows(ui, &mut pl.x, &mut pl.y, &mut pl.w, &mut pl.h, 16384, ah);
                 Self::angle_row(ui, &mut pl.angle);
                 form_row(ui, "Fit", |ui| {
                     even_grid(ui, 3, 0.0, |ui, i, size| {
@@ -8695,7 +8777,7 @@ impl GifKitApp {
         });
         ui.add_enabled_ui(sel.is_some(), |ui| {
             group(ui, "Placement", |ui| {
-                Self::box_rows(ui, &mut st.x, &mut st.y, &mut st.w, &mut st.h, (w.max(h) * 4).max(1));
+                Self::box_rows(ui, &mut st.x, &mut st.y, &mut st.w, &mut st.h, (w.max(h) * 4).max(1), h);
                 Self::angle_row(ui, &mut st.angle);
                 frames_row(ui, &mut st.from, &mut st.to, n);
             });
@@ -8916,19 +8998,15 @@ impl GifKitApp {
         });
         ui.add_enabled_ui(sel.is_some(), |ui| {
             group(ui, "Placement", |ui| {
-                form_row(ui, "Position", |ui| {
+                let eh = e.h as i32;
+                pos_rows(ui, &mut e.x, &mut e.y, eh, h);
+                form_row(ui, "Size", |ui| {
                     even_grid(ui, 2, 0.0, |ui, i, size| {
-                        let v = if i == 0 { &mut e.x } else { &mut e.y };
-                        spin(ui, size, v, 1.0, |d| d.prefix(if i == 0 { "X  " } else { "Y  " }));
+                        let v = if i == 0 { &mut e.w } else { &mut e.h };
+                        spin(ui, size, v, 1.0, |d| d.range(4..=(w.max(h) * 4).max(4)).prefix(if i == 0 { "W  " } else { "H  " }).suffix(" px"));
                     })
                 });
-                form_row(ui, "Size", |ui| {
-                    let mut sz = e.w;
-                    if num_fill(ui, &mut sz, 1.0, |d| d.range(4..=(w.max(h) * 4).max(4)).suffix(" px")).changed() {
-                        e.h = ((e.h as f32 * sz as f32 / e.w.max(1) as f32).round() as u32).max(1);
-                        e.w = sz;
-                    }
-                });
+                e.y -= e.h as i32 - eh;
                 Self::angle_row(ui, &mut e.angle);
                 frames_row(ui, &mut e.from, &mut e.to, n);
             });
@@ -9380,7 +9458,13 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
         ui.add_enabled_ui(warp_on, |ui| slider_row(ui, "Strength", egui::Slider::new(&mut fx.warp_amount, 0.0..=100.0).suffix("%").max_decimals(0)));
         ui.add_enabled_ui(warp_on && fx.warp.has_centre(), |ui| {
             slider_row(ui, "Centre X", egui::Slider::new(&mut fx.warp_cx, 0.0..=100.0).suffix("%").max_decimals(0));
-            slider_row(ui, "Centre Y", egui::Slider::new(&mut fx.warp_cy, 0.0..=100.0).suffix("%").max_decimals(0));
+            {
+                // up from the bottom, like the other Y values
+                let mut up = 100.0 - fx.warp_cy;
+                if slider_row(ui, "Centre Y", egui::Slider::new(&mut up, 0.0..=100.0).suffix("%").max_decimals(0)).changed() {
+                    fx.warp_cy = 100.0 - up;
+                }
+            }
             form_row(ui, "", |ui| {
                 if wide_button(ui, egui::Button::new("Centre on Frame")).clicked() {
                     fx.warp_cx = 50.0;

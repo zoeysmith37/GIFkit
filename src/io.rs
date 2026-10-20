@@ -219,6 +219,11 @@ pub fn load_video_range(path: &Path, opt: &VideoImport, progress: Option<&std::s
                 if let Some(p) = progress {
                     p.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
+                if crate::stack::stopped(progress) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!("Stopped");
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e.into()),

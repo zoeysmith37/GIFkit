@@ -102,6 +102,8 @@ pub struct Annotation {
     pub angle: f32,
     /// horizontal squash (<1) or stretch (>1) of the rendered text
     pub stretch: f32,
+    /// the same up and down
+    pub stretch_y: f32,
     /// start new lines where the text reaches the canvas edge
     pub wrap: bool,
     /// keep the text centred across the canvas
@@ -137,6 +139,7 @@ impl Default for Annotation {
             visible: true,
             angle: 0.0,
             stretch: 1.0,
+            stretch_y: 1.0,
             wrap: false,
             centre: false,
             caption: Caption::None,
@@ -281,7 +284,7 @@ impl Annotation {
     pub fn within_budget(&self, f: &FontEntry) -> std::borrow::Cow<'_, Annotation> {
         let (w, h) = extent(f, &self.shown_text(f), self.size);
         let r = self.outline_px() as f32;
-        let area = (stretched(w, self.stretch) as f32 + 2.0 * r) * (h as f32 + 2.0 * r);
+        let area = (stretched(w, self.stretch) as f32 + 2.0 * r) * (stretched(h, self.stretch_y) as f32 + 2.0 * r);
         if area <= MAX_TEXT_PIXELS || self.size <= 1.0 {
             return std::borrow::Cow::Borrowed(self);
         }
@@ -344,7 +347,7 @@ pub fn measure(fonts: &[FontEntry], a: &Annotation) -> (u32, u32) {
     let a = &*a.within_budget(font);
     let (w, h) = extent(font, &a.shown_text(font), a.size);
     let r = a.outline_px() as u32;
-    (stretched(w + 2 * r, a.stretch), h + 2 * r)
+    (stretched(w + 2 * r, a.stretch), stretched(h + 2 * r, a.stretch_y))
 }
 
 fn stretched(w: u32, s: f32) -> u32 {
@@ -406,9 +409,9 @@ pub fn render_sprite(fonts: &[FontEntry], a: &Annotation) -> RgbaImage {
             }
         }
     }
-    let nw = stretched(out.width(), a.stretch);
-    if nw != out.width() {
-        out = image::imageops::resize(&out, nw, out.height(), image::imageops::FilterType::CatmullRom);
+    let (nw, nh) = (stretched(out.width(), a.stretch), stretched(out.height(), a.stretch_y));
+    if (nw, nh) != out.dimensions() {
+        out = image::imageops::resize(&out, nw, nh, image::imageops::FilterType::CatmullRom);
     }
     out
 }

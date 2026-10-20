@@ -1015,6 +1015,9 @@ pub fn apply(anim: &Animation, s: &EffectSettings, fonts: &[FontEntry], progress
         .par_iter()
         .enumerate()
         .map(|(i, f)| {
+            if crate::stack::stopped(Some(progress)) {
+                return f.clone();
+            }
             let img = apply_frame(&f.image, i, n, times[i], total, s, fonts);
             progress.fetch_add(1, Ordering::Relaxed);
             f.with_image(img)

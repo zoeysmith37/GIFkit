@@ -13,7 +13,7 @@ macro_rules! icon_set {
 }
 
 static ICONS: &[(&str, &str, &str)] = icon_set!(
-    "application-exit", "archive-insert", "dialog-cancel", "document-import", "object-flip-horizontal", "object-flip-vertical", "object-rotate-left", "arrow-down", "arrow-right", "collapse-all", "color-picker", "expand-all", "go-next", "go-previous", "edit-select", "node-break", "node-add", "node-delete", "bookmarks", "configure-shortcuts", "dialog-ok-apply", "document-export",
+    "application-exit", "archive-insert", "dialog-cancel", "document-import", "object-flip-horizontal", "object-flip-vertical", "object-rotate-left", "arrow-down", "arrow-right", "collapse-all", "color-picker", "expand-all", "go-next", "go-previous", "edit-select", "split", "keyframe-add", "keyframe-remove", "keyframe-record", "process-stop", "bookmarks", "configure-shortcuts", "dialog-ok-apply", "document-export",
     "document-new", "document-open", "document-open-recent", "document-save", "document-save-as", "document-sign",
     "draw-freehand", "draw-text", "edit-clear-all", "edit-cut", "edit-delete", "edit-duplicate", "edit-redo",
     "edit-rename", "edit-undo", "format-fill-color", "go-bottom", "go-down", "go-top", "go-up", "grid-rectangular",
@@ -30,7 +30,7 @@ fn hex(c: Color32) -> String {
 }
 
 /// The SVG with KDE's colour scheme classes set to our colours.
-fn recolour(svg: &str, fg: Color32) -> String {
+pub(crate) fn recolour(svg: &str, fg: Color32) -> String {
     let pal = crate::theme::p();
     let style = format!(
         ".ColorScheme-Text{{color:{t};}} .ColorScheme-Background{{color:{b};}} .ColorScheme-Highlight{{color:{h};}} .ColorScheme-Accent{{color:{h};}} .ColorScheme-HighlightedText{{color:#ffffff;}} .ColorScheme-NegativeText{{color:{n};}} .ColorScheme-PositiveText{{color:{ps};}} .ColorScheme-NeutralText{{color:{nt};}}",
@@ -52,7 +52,7 @@ fn recolour(svg: &str, fg: Color32) -> String {
     out.replace("#232629", &hex(fg))
 }
 
-fn render(svg: &str, px: u32) -> Option<egui::ColorImage> {
+pub(crate) fn render(svg: &str, px: u32) -> Option<egui::ColorImage> {
     let tree = resvg::usvg::Tree::from_str(svg, &resvg::usvg::Options::default()).ok()?;
     let mut pm = resvg::tiny_skia::Pixmap::new(px, px)?;
     let s = tree.size();

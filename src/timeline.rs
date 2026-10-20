@@ -27,14 +27,15 @@ impl Clip {
 /// A keyframe: how far the layer has moved, grown, turned and faded at
 /// `frame`, relative to where it was placed.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, from = "KeyFile")]
 pub struct Key {
     pub frame: usize,
     /// offset in source pixels
     pub x: f32,
     pub y: f32,
-    /// size, % of the placed size
-    pub scale: f32,
+    /// width and height, % of the placed size
+    pub scale_x: f32,
+    pub scale_y: f32,
     /// degrees clockwise, added to the layer's own angle
     pub angle: f32,
     /// 0..=100
@@ -45,7 +46,36 @@ pub struct Key {
 
 impl Default for Key {
     fn default() -> Self {
-        Key { frame: 0, x: 0.0, y: 0.0, scale: 100.0, angle: 0.0, opacity: 100.0, smooth: true }
+        Key { frame: 0, x: 0.0, y: 0.0, scale_x: 100.0, scale_y: 100.0, angle: 0.0, opacity: 100.0, smooth: true }
+    }
+}
+
+/// A key as stored, reading older projects that had one `scale` for both.
+#[derive(serde::Deserialize)]
+#[serde(default)]
+struct KeyFile {
+    frame: usize,
+    x: f32,
+    y: f32,
+    scale: Option<f32>,
+    scale_x: Option<f32>,
+    scale_y: Option<f32>,
+    angle: f32,
+    opacity: f32,
+    smooth: bool,
+}
+
+impl Default for KeyFile {
+    fn default() -> Self {
+        let k = Key::default();
+        KeyFile { frame: 0, x: 0.0, y: 0.0, scale: None, scale_x: None, scale_y: None, angle: k.angle, opacity: k.opacity, smooth: k.smooth }
+    }
+}
+
+impl From<KeyFile> for Key {
+    fn from(f: KeyFile) -> Key {
+        let s = f.scale.unwrap_or(100.0);
+        Key { frame: f.frame, x: f.x, y: f.y, scale_x: f.scale_x.unwrap_or(s), scale_y: f.scale_y.unwrap_or(s), angle: f.angle, opacity: f.opacity, smooth: f.smooth }
     }
 }
 
@@ -54,24 +84,25 @@ impl Default for Key {
 pub struct Motion {
     pub dx: f32,
     pub dy: f32,
-    /// factor (1 = placed size)
-    pub scale: f32,
+    /// factors (1 = placed size)
+    pub sx: f32,
+    pub sy: f32,
     pub angle: f32,
     /// factor (1 = fully shown)
     pub opacity: f32,
 }
 
 impl Motion {
-    pub const NONE: Motion = Motion { dx: 0.0, dy: 0.0, scale: 1.0, angle: 0.0, opacity: 1.0 };
+    pub const NONE: Motion = Motion { dx: 0.0, dy: 0.0, sx: 1.0, sy: 1.0, angle: 0.0, opacity: 1.0 };
 
     /// Moves, grows or turns the layer (rather than only fading it).
     pub fn moves(&self) -> bool {
-        self.dx.abs() > 0.01 || self.dy.abs() > 0.01 || (self.scale - 1.0).abs() > 0.001 || self.angle.abs() > 0.01
+        self.dx.abs() > 0.01 || self.dy.abs() > 0.01 || (self.sx - 1.0).abs() > 0.001 || (self.sy - 1.0).abs() > 0.001 || self.angle.abs() > 0.01
     }
 
     /// A box in source space, moved by this motion about its centre.
     pub fn apply(&self, b: Obb) -> Obb {
-        Obb { cx: b.cx + self.dx, cy: b.cy + self.dy, w: b.w * self.scale, h: b.h * self.scale, angle: b.angle + self.angle }
+        Obb { cx: b.cx + self.dx, cy: b.cy + self.dy, w: b.w * self.sx, h: b.h * self.sy, angle: b.angle + self.angle }
     }
 }
 
@@ -115,7 +146,7 @@ impl Timing {
         if k.is_empty() {
             return Motion::NONE;
         }
-        let m = |k: &Key| Motion { dx: k.x, dy: k.y, scale: k.scale / 100.0, angle: k.angle, opacity: (k.opacity / 100.0).clamp(0.0, 1.0) };
+        let m = |k: &Key| Motion { dx: k.x, dy: k.y, sx: k.scale_x / 100.0, sy: k.scale_y / 100.0, angle: k.angle, opacity: (k.opacity / 100.0).clamp(0.0, 1.0) };
         if i <= k[0].frame {
             return m(&k[0]);
         }
@@ -136,7 +167,7 @@ impl Timing {
         };
         let (ma, mb) = (m(&a), m(&b));
         let l = |x: f32, y: f32| x + (y - x) * t;
-        Motion { dx: l(ma.dx, mb.dx), dy: l(ma.dy, mb.dy), scale: l(ma.scale, mb.scale), angle: l(ma.angle, mb.angle), opacity: l(ma.opacity, mb.opacity) }
+        Motion { dx: l(ma.dx, mb.dx), dy: l(ma.dy, mb.dy), sx: l(ma.sx, mb.sx), sy: l(ma.sy, mb.sy), angle: l(ma.angle, mb.angle), opacity: l(ma.opacity, mb.opacity) }
     }
 
     pub fn key_at(&self, frame: usize) -> Option<usize> {
@@ -149,7 +180,7 @@ impl Timing {
             return i;
         }
         let m = self.motion(frame);
-        let k = Key { frame, x: m.dx, y: m.dy, scale: m.scale * 100.0, angle: m.angle, opacity: m.opacity * 100.0, smooth: true };
+        let k = Key { frame, x: m.dx, y: m.dy, scale_x: m.sx * 100.0, scale_y: m.sy * 100.0, angle: m.angle, opacity: m.opacity * 100.0, smooth: true };
         self.keys.push(k);
         self.sort_keys();
         self.key_at(frame).unwrap_or(0)
@@ -194,19 +225,33 @@ impl Timing {
     }
 }
 
-/// Draw `img` (placed at `x`,`y`) moved by `dx`,`dy`, scaled and turned about
-/// `centre`, all in output pixels. Returns the new sprite and its corner.
-pub fn transform_sprite(img: &RgbaImage, x: i64, y: i64, centre: (f32, f32), d: (f32, f32), scale: f32, angle_deg: f32) -> Option<(RgbaImage, i64, i64)> {
-    if scale <= 0.001 {
+/// The linear part of a layer's motion on a sprite already drawn turned by
+/// `base_deg`: stretch along the layer's own sides, then turn by `extra_deg`.
+/// Rows of a 2×2 matrix: (a, b, c, d) maps (x, y) to (a x + b y, c x + d y).
+pub fn motion_matrix(sx: f32, sy: f32, base_deg: f32, extra_deg: f32) -> [f32; 4] {
+    let (s0, c0) = base_deg.to_radians().sin_cos();
+    let (s1, c1) = (base_deg + extra_deg).to_radians().sin_cos();
+    // R(base + extra) · S(sx, sy) · R(-base)
+    let (a, b, c, d) = (c0, s0, -s0, c0);
+    let (p, q, r, t) = (c1 * sx, -s1 * sy, s1 * sx, c1 * sy);
+    [p * a + q * c, p * b + q * d, r * a + t * c, r * b + t * d]
+}
+
+/// Draw `img` (placed at `x`,`y`) moved by `d` and transformed by `lin`
+/// (see [`motion_matrix`]) about `centre`, all in output pixels. Returns the
+/// new sprite and its corner.
+pub fn transform_sprite(img: &RgbaImage, x: i64, y: i64, centre: (f32, f32), d: (f32, f32), lin: [f32; 4]) -> Option<(RgbaImage, i64, i64)> {
+    let [la, lb, lc, ld] = lin;
+    let det = la * ld - lb * lc;
+    if det.abs() < 1e-6 {
         return None;
     }
     let (w, h) = (img.width() as f32, img.height() as f32);
-    let (s, c) = angle_deg.to_radians().sin_cos();
     let (cx, cy) = centre;
     // where the sprite's corners land, for the size of the result
     let fwd = |px: f32, py: f32| {
-        let (ux, uy) = ((px - cx) * scale, (py - cy) * scale);
-        (cx + ux * c - uy * s + d.0, cy + ux * s + uy * c + d.1)
+        let (ux, uy) = (px - cx, py - cy);
+        (cx + la * ux + lb * uy + d.0, cy + lc * ux + ld * uy + d.1)
     };
     let corners = [fwd(x as f32, y as f32), fwd(x as f32 + w, y as f32), fwd(x as f32, y as f32 + h), fwd(x as f32 + w, y as f32 + h)];
     let x0 = corners.iter().map(|p| p.0).fold(f32::MAX, f32::min).floor();
@@ -223,7 +268,7 @@ pub fn transform_sprite(img: &RgbaImage, x: i64, y: i64, centre: (f32, f32), d: 
     out.par_chunks_mut(4).enumerate().for_each(|(i, p)| {
         // back from the output pixel to the sprite
         let (ox, oy) = (x0 + (i % owu) as f32 + 0.5 - d.0 - cx, y0 + (i / owu) as f32 + 0.5 - d.1 - cy);
-        let (ux, uy) = ((ox * c + oy * s) / scale, (-ox * s + oy * c) / scale);
+        let (ux, uy) = ((ld * ox - lb * oy) / det, (-lc * ox + la * oy) / det);
         let (sx, sy) = (cx + ux - x as f32 - 0.5, cy + uy - y as f32 - 0.5);
         if let Some(v) = sample(img, sx, sy) {
             p.copy_from_slice(&v);
@@ -312,9 +357,9 @@ mod tests {
     #[test]
     fn sprite_moves_and_turns() {
         let img = RgbaImage::from_pixel(10, 10, image::Rgba([255, 0, 0, 255]));
-        let (o, x, y) = transform_sprite(&img, 0, 0, (5.0, 5.0), (20.0, 0.0), 1.0, 0.0).unwrap();
+        let (o, x, y) = transform_sprite(&img, 0, 0, (5.0, 5.0), (20.0, 0.0), motion_matrix(1.0, 1.0, 0.0, 0.0)).unwrap();
         assert_eq!((x, y, o.width()), (20, 0, 10));
-        let (o, _, _) = transform_sprite(&img, 0, 0, (5.0, 5.0), (0.0, 0.0), 2.0, 45.0).unwrap();
+        let (o, _, _) = transform_sprite(&img, 0, 0, (5.0, 5.0), (0.0, 0.0), motion_matrix(2.0, 2.0, 0.0, 45.0)).unwrap();
         assert!(o.width() > 25, "doubled and turned it needs more room");
     }
 }

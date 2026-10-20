@@ -221,7 +221,7 @@ impl GifKitApp {
                 self.tl_razor = true;
             }
             toolbar_sep(ui);
-            if tb_tool(ui, "node-break", "", "Split the selected track at the playhead (S)", idle && sel_layer.is_some()).clicked() {
+            if tb_tool(ui, "split", "", "Split the selected track at the playhead (S)", idle && sel_layer.is_some()).clicked() {
                 self.tl_split(now);
             }
             if tb_tool(ui, "list-add", "", "Add a clip at the playhead (on an empty part of the selected track)", idle && sel_layer.is_some()).clicked() {
@@ -231,11 +231,11 @@ impl GifKitApp {
                 self.tl_delete(now);
             }
             toolbar_sep(ui);
-            if tb_tool(ui, "node-add", "", "Add a keyframe on the selected layer at the playhead (K)", idle && sel_layer.is_some()).clicked() {
+            if tb_tool(ui, "keyframe-add", "", "Add a keyframe on the selected layer at the playhead (K)", idle && sel_layer.is_some()).clicked() {
                 self.tl_add_key(now);
             }
             let on_key = sel_layer.and_then(|t| self.stack.index_of(t)).is_some_and(|li| self.stack.layers[li].timing.key_at(self.cur).is_some());
-            if tb_tool(ui, "node-delete", "", "Remove the keyframe at the playhead", idle && on_key).clicked() {
+            if tb_tool(ui, "keyframe-remove", "", "Remove the keyframe at the playhead", idle && on_key).clicked() {
                 self.tl_delete(now);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -270,11 +270,22 @@ impl GifKitApp {
             (Some((li, k)), _) => self.stack.layers[li].timing.keys[k],
             (None, Some(li)) => {
                 let m = self.stack.layers[li].timing.motion(self.cur);
-                Key { frame: self.cur, x: m.dx, y: m.dy, scale: m.scale * 100.0, angle: m.angle, opacity: m.opacity * 100.0, smooth: true }
+                Key { frame: self.cur, x: m.dx, y: m.dy, scale_x: m.sx * 100.0, scale_y: m.sy * 100.0, angle: m.angle, opacity: m.opacity * 100.0, smooth: true }
             }
             _ => Key::default(),
         };
         let before = key;
+        // where the layer sits, so the row can show where it is rather than
+        // how far it moved: the box's left edge, and its bottom edge measured
+        // up from the bottom of the frame
+        let src = self.plan.get(self.cur).map(|f| f.src).unwrap_or(0);
+        let frame_h = self.dims().1 as f32;
+        let placed = sel_li.and_then(|li| self.stack.layers[li].source_box(src, &self.fonts));
+        let (mut px, mut py) = match placed {
+            Some(b) => (b.cx - b.w * key.scale_x / 200.0 + key.x, frame_h - (b.cy + key.y + b.h * key.scale_y / 200.0)),
+            None => (0.0, 0.0),
+        };
+        let (px0, py0) = (px, py);
         // auto key: a record button, as in other animation tools
         let mut auto = self.tl_autokey;
         let editable = sel_li.is_some() && (auto || key_here.is_some());
@@ -284,12 +295,7 @@ impl GifKitApp {
             let b = ui
                 .add(sel_btn(egui::Button::new("").frame_when_inactive(auto).min_size(vec2(CHIP_H, CHIP_H)), auto))
                 .on_hover_text(if auto { "Auto key is on: changing a value adds a keyframe at the playhead. Click to turn it off." } else { "Auto key is off: only keyframes already there can be changed. Click to turn it on." });
-            let c = b.rect.center();
-            if auto {
-                ui.painter().circle_filled(c, 5.5, pal.negative);
-            } else {
-                ui.painter().circle_stroke(c, 5.0, Stroke::new(1.4, pal.fg_muted));
-            }
+            crate::icons::paint(ui.painter(), "keyframe-record", b.rect.center(), 16.0, if auto { pal.fg } else { pal.fg_muted });
             if b.clicked() {
                 auto = !auto;
             }
@@ -302,19 +308,34 @@ impl GifKitApp {
                     diamond(ui.painter(), r.center(), 5.5, Color32::TRANSPARENT, Stroke::new(1.3, pal.fg_muted));
                 }
                 ui.label("Motion:").on_hover_text(if self.tl_autokey { "Changing a value adds a keyframe at the playhead" } else { "Values of the keyframe at the playhead. Turn on auto key to add keyframes by changing values." });
-                let field = |ui: &mut egui::Ui, label: &str, v: &mut f32, suffix: &str, step: f64| {
-                    ui.label(label);
-                    spin(ui, vec2(86.0, CHIP_H), v, step, |d| d.speed(0.5).max_decimals(1).suffix(suffix.to_string()));
+                let field = |ui: &mut egui::Ui, prefix: &str, v: &mut f32, suffix: &str, step: f64, w: f32| {
+                    spin(ui, vec2(w, CHIP_H), v, step, |d| d.speed(0.5).max_decimals(1).prefix(prefix.to_string()).suffix(suffix.to_string()));
                 };
-                field(ui, "X:", &mut key.x, " px", 1.0);
-                field(ui, "Y:", &mut key.y, " px", 1.0);
-                field(ui, "Size:", &mut key.scale, "%", 5.0);
-                field(ui, "Angle:", &mut key.angle, "°", 5.0);
+                // effects, watermarks and the AI shield cover the whole frame: they only fade
+                ui.add_enabled_ui(placed.is_some(), |ui| {
+                    ui.label("Position:").on_hover_text("The layer's left edge, and its bottom edge up from the bottom of the frame, in pixels");
+                    field(ui, "X  ", &mut px, " px", 1.0, 108.0);
+                    field(ui, "Y  ", &mut py, " px", 1.0, 108.0);
+                    ui.label("Scale:").on_hover_text("Width and height, % of the size it was placed at");
+                    field(ui, "X  ", &mut key.scale_x, "%", 5.0, 88.0);
+                    field(ui, "Y  ", &mut key.scale_y, "%", 5.0, 88.0);
+                    ui.label("Angle:");
+                    field(ui, "", &mut key.angle, "°", 5.0, 70.0);
+                });
                 ui.label("Opacity:");
                 spin(ui, vec2(80.0, CHIP_H), &mut key.opacity, 5.0, |d| d.range(0.0..=100.0).max_decimals(0).suffix("%"));
                 check(ui, &mut key.smooth, "Smooth").on_hover_text("Ease in and out of this keyframe");
             });
         });
+        // back from where it is to how far it moved
+        if let Some(b) = placed {
+            if px != px0 {
+                key.x = px - (b.cx - b.w * key.scale_x / 200.0);
+            }
+            if py != py0 {
+                key.y = (frame_h - py) - b.h * key.scale_y / 200.0 - b.cy;
+            }
+        }
         if auto != self.tl_autokey {
             self.tl_autokey = auto;
             theme::set_setting("auto_key", if auto { "1" } else { "0" });
@@ -792,7 +813,7 @@ impl GifKitApp {
         resp.context_menu(|ui| {
             ui.set_min_width(220.0);
             let has = self.tl_track.is_some_and(|t| t != GIF);
-            if menu_item(ui, "node-break", "&Split at Playhead", "S", has) {
+            if menu_item(ui, "split", "&Split at Playhead", "S", has) {
                 self.tl_split(now);
             }
             if menu_item(ui, "list-add", "&Add Clip at Playhead", "", has) {
@@ -807,7 +828,7 @@ impl GifKitApp {
                 self.tl_lengthen((100 / d).max(1), now);
             }
             ui.separator();
-            if menu_item(ui, "node-add", "Add &Keyframe", "K", has) {
+            if menu_item(ui, "keyframe-add", "Add &Keyframe", "K", has) {
                 self.tl_add_key(now);
             }
             if menu_item(ui, "edit-clear-all", "Clear Keyframes", "", has) {

@@ -183,7 +183,7 @@ fn timing(r: &mut Rng, n: usize) -> crate::timeline::Timing {
     }
     if r.chance(0.4) {
         for _ in 0..r.below(4) {
-            t.keys.push(Key { frame: r.below(n + 4), x: r.pick(&[0.0, 30.0, -500.0]), y: r.pick(&[0.0, 12.0]), scale: r.pick(&[0.0, 50.0, 100.0, 400.0, -20.0]), angle: r.pick(&[0.0, 90.0, 720.0]), opacity: r.pick(&[0.0, 50.0, 100.0, 300.0]), smooth: r.chance(0.5) });
+            t.keys.push(Key { frame: r.below(n + 4), x: r.pick(&[0.0, 30.0, -500.0]), y: r.pick(&[0.0, 12.0]), scale_x: r.pick(&[0.0, 50.0, 100.0, 400.0, -20.0]), scale_y: r.pick(&[0.0, 100.0, 250.0]), angle: r.pick(&[0.0, 90.0, 720.0]), opacity: r.pick(&[0.0, 50.0, 100.0, 300.0]), smooth: r.chance(0.5) });
         }
         t.sort_keys();
     }
@@ -629,4 +629,29 @@ fn video_merge_levels() {
         let total: u32 = a.frames.iter().map(|f| f.delay_cs as u32).sum();
         println!("{:24} {:5} frames of {:5}, {:.2} s total, {:.0} MB, {:.1}s", crate::io::MERGE_LEVELS[merge].0, a.len(), o.frames(), total as f32 / 100.0, (a.len() * a.width() as usize * a.height() as usize * 4) as f64 / 1e6, t0.elapsed().as_secs_f32());
     }
+}
+
+/// Contact sheet of icons: ICON_LIST has lines "label|svg path".
+#[test]
+#[ignore]
+fn icon_sheet() {
+    let list = std::fs::read_to_string(std::env::var("ICON_LIST").unwrap()).unwrap();
+    let fonts = crate::text::builtin_fonts();
+    let items: Vec<(&str, &str)> = list.lines().filter_map(|l| l.split_once('|')).collect();
+    let (cw, ch, cols) = (230u32, 44u32, 6u32);
+    let rows = (items.len() as u32).div_ceil(cols);
+    let mut sheet = RgbaImage::from_pixel(cw * cols, ch * rows, Rgba([35, 38, 41, 255]));
+    for (k, (label, path)) in items.iter().enumerate() {
+        let (x, y) = ((k as u32 % cols) * cw, (k as u32 / cols) * ch);
+        if let Ok(svg) = std::fs::read_to_string(path) {
+            if let Some(img) = crate::icons::render(&crate::icons::recolour(&svg, eframe::egui::Color32::from_rgb(252, 252, 252)), 32) {
+                let rgba = RgbaImage::from_raw(32, 32, img.pixels.iter().flat_map(|p| p.to_srgba_unmultiplied()).collect()).unwrap();
+                image::imageops::overlay(&mut sheet, &rgba, x as i64 + 6, y as i64 + 6);
+            }
+        }
+        let a = crate::text::Annotation { text: label.to_string(), size: 13.0, color: [230, 230, 230, 255], ..Default::default() };
+        let t = crate::text::render_sprite(&fonts, &a);
+        image::imageops::overlay(&mut sheet, &t, x as i64 + 44, y as i64 + 12);
+    }
+    sheet.save(std::env::var("OUT").unwrap()).unwrap();
 }

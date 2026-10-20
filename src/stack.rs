@@ -800,9 +800,12 @@ impl Stack {
             // sprites drawn ahead of time follow the motion as bitmaps
             let draw = |img: &mut RgbaImage, sp: &RgbaImage, x: i64, y: i64, alpha: f32| {
                 if mo.moves() {
-                    let centre = l.source_box(src, fonts).map(|b| map_box(m, b, false)).map(|o| (o.cx, o.cy)).unwrap_or((x as f32 + sp.width() as f32 / 2.0, y as f32 + sp.height() as f32 / 2.0));
+                    let ob = l.source_box(src, fonts).map(|b| map_box(m, b, false));
+                    let centre = ob.map(|o| (o.cx, o.cy)).unwrap_or((x as f32 + sp.width() as f32 / 2.0, y as f32 + sp.height() as f32 / 2.0));
                     let d = m.apply_vec(mo.dx, mo.dy);
-                    if let Some((t, tx, ty)) = crate::timeline::transform_sprite(sp, x, y, centre, d, mo.scale, mo.angle * m.det().signum()) {
+                    // width and height stretch along the layer's own sides
+                    let lin = crate::timeline::motion_matrix(mo.sx, mo.sy, ob.map(|o| o.angle).unwrap_or(0.0), mo.angle * m.det().signum());
+                    if let Some((t, tx, ty)) = crate::timeline::transform_sprite(sp, x, y, centre, d, lin) {
                         crate::ops::overlay_with_opacity(img, &t, tx, ty, alpha);
                     }
                 } else {
@@ -1086,7 +1089,7 @@ impl Stack {
             .into_par_iter()
             .map(|i| {
                 // untouched frames share the source image rather than copying it
-                let image = if render { Arc::new(self.render_frame(base, &plan, &times, i, fonts, &prep)) } else { base.frames[plan[i].src].image.clone() };
+                let image = if render && !stopped(progress) { Arc::new(self.render_frame(base, &plan, &times, i, fonts, &prep)) } else { base.frames[plan[i].src].image.clone() };
                 if let Some(p) = progress {
                     p.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1126,6 +1129,15 @@ pub fn plan_times(plan: &[PlanFrame]) -> Vec<f32> {
 }
 
 /// Index of the frame showing at time `t` (seconds, wrapped) in an animation.
+/// Set in a job's progress counter by the Stop button: the work checks it
+/// and gives up early.
+pub const STOP_BIT: usize = 1 << (usize::BITS - 2);
+
+/// The Stop button was pressed for the job counting on `p`.
+pub fn stopped(p: Option<&AtomicUsize>) -> bool {
+    p.is_some_and(|p| p.load(Ordering::Relaxed) & STOP_BIT != 0)
+}
+
 /// When frame `i` starts, in seconds (skipped frames take no time).
 pub fn frame_start_time(a: &Animation, i: usize) -> f32 {
     a.frames.iter().take(i).filter(|f| f.enabled).map(|f| effective_delay(f.delay_cs) as f32 / 100.0).sum()
