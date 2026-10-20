@@ -39,6 +39,7 @@ pub struct GpuResize {
 /// What a layer draws: a picture, or a solid colour over a rectangle.
 #[derive(Clone, Copy)]
 pub enum GpuSrc<'a> {
+    #[allow(dead_code)]
     Img(&'a RgbaImage),
     Solid([u8; 4], (f32, f32)),
 }
@@ -51,12 +52,81 @@ pub struct GpuDraw<'a> {
     pub opacity: f32,
 }
 
+/// Where a pass reads a picture from.
+#[derive(Clone, Copy)]
+pub enum GpuIn<'a> {
+    /// the frame as it is so far (straight alpha)
+    Cur,
+    /// a scratch picture an earlier pass made
+    Tmp(u8),
+    #[allow(dead_code)]
+    Img(&'a RgbaImage),
+    /// one of `GpuFrame::owned`
+    Owned(usize),
+    /// per-pixel jitter the CPU makes with `sin`, for this pass's size:
+    /// 0 fuzzy frame, 1 colour pencil
+    Noise(u8),
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum PassKind {
+    /// `fs_fx` in gpu_fx.wgsl, `u[0]` = op, variant, output size
+    Fx,
+    /// the CPU's resize, one direction at a time (see `Rs` in the shader)
+    ResizeV,
+    ResizeH,
+    /// Pop Art's brightness cut points, into the shared buffer
+    Hist,
+}
+
+/// One full-frame pass over straight-alpha pixels.
+pub struct GpuPass<'a> {
+    pub kind: PassKind,
+    pub size: (u32, u32),
+    /// None: the result becomes the frame
+    pub out: Option<u8>,
+    /// keep unrounded floats (between the halves of a blur or resize)
+    pub float: bool,
+    pub ins: [Option<GpuIn<'a>>; 3],
+    pub u: Vec<[f32; 4]>,
+}
+
+/// In layer order: things drawn over the frame, and whole-frame work
+/// (an effects layer, a censor, the shield) mixed back by `mix`.
+pub enum GpuOp<'a> {
+    Draw(GpuDraw<'a>),
+    Effect { passes: Vec<GpuPass<'a>>, mix: f32 },
+}
+
 /// Everything needed to make one output frame.
 pub struct GpuFrame<'a> {
+    /// after the frame edits, before any layer
     pub size: (u32, u32),
     pub geo: GpuGeo,
-    pub draws: Vec<GpuDraw<'a>>,
+    pub ops: Vec<GpuOp<'a>>,
+    /// pictures made for this frame only (counter and REC text)
+    pub owned: Vec<RgbaImage>,
 }
+
+/// The CPU's `sin`-hash jitter (effects::fuzzy, booth's pencil), exactly.
+fn noise_values(kind: u8, w: u32, h: u32) -> Vec<f32> {
+    let f = (w.min(h) as f32 * 0.08).max(2.0);
+    let mut v = Vec::with_capacity((w * h) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            v.push(if kind == 0 {
+                let (x, y) = (x as f32 + 0.5, y as f32 + 0.5);
+                (((x * 12.9898 + y * 78.233).sin() * 43758.547).fract() - 0.5) * f * 0.6
+            } else {
+                let (x, y) = (x as f32, y as f32);
+                ((x * 12.9898 + y * 78.233).sin() * 43758.545).fract() * 0.8
+            });
+        }
+    }
+    v
+}
+
+const HIST_BYTES: u64 = (4 + 255_001) * 4;
 
 /// Textures by key, kept within a memory budget (oldest use goes first).
 struct TexCache {
@@ -138,66 +208,116 @@ pub struct GpuRenderer {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     layout: wgpu::BindGroupLayout,
+    hist_layout: wgpu::BindGroupLayout,
     geo: wgpu::RenderPipeline,
     quad: wgpu::RenderPipeline,
     resize_v: wgpu::RenderPipeline,
     resize_h: wgpu::RenderPipeline,
+    fx: wgpu::RenderPipeline,
+    fx_f32: wgpu::RenderPipeline,
+    hist_count: wgpu::ComputePipeline,
+    hist_cuts: wgpu::ComputePipeline,
+    hist: wgpu::Buffer,
     blank: wgpu::TextureView,
     sources: TexCache,
     sprites: TexCache,
+    noise: HashMap<(u8, u32, u32), wgpu::TextureView>,
     pub max_side: u32,
+}
+
+fn tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+        count: None,
+    }
+}
+
+fn uniform_entry() -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding: 1,
+        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+        count: None,
+    }
+}
+
+/// Uniforms for a pass: always the 24 vectors the effect shader declares.
+fn uniform_block(u: &[[f32; 4]]) -> Vec<f32> {
+    let mut v: Vec<f32> = u.iter().take(24).flatten().copied().collect();
+    v.resize(24 * 4, 0.0);
+    v
 }
 
 impl GpuRenderer {
     pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("gifkit-frames"), source: wgpu::ShaderSource::Wgsl(include_str!("gpu_render.wgsl").into()) });
+        let fx_module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("gifkit-effects"), source: wgpu::ShaderSource::Wgsl(include_str!("gpu_fx.wgsl").into()) });
+        let hist_module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("gifkit-hist"), source: wgpu::ShaderSource::Wgsl(include_str!("gpu_hist.wgsl").into()) });
+        let storage = |read_only: bool, vis: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
+            binding: 4,
+            visibility: vis,
+            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only }, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("gifkit-frames"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-            ],
+            entries: &[tex_entry(0), uniform_entry(), tex_entry(2), tex_entry(3), storage(true, wgpu::ShaderStages::FRAGMENT)],
         });
+        let hist_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("gifkit-hist"), entries: &[tex_entry(0), uniform_entry(), storage(false, wgpu::ShaderStages::COMPUTE)] });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("gifkit-frames"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
+        let hist_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("gifkit-hist"), bind_group_layouts: &[Some(&hist_layout)], immediate_size: 0 });
         let over = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add };
-        let pipe = |vs: &str, fs: &str, blend: Option<wgpu::BlendState>, format: wgpu::TextureFormat| {
+        let pipe = |module: &wgpu::ShaderModule, vs: &str, fs: &str, blend: Option<wgpu::BlendState>, format: wgpu::TextureFormat| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(fs),
                 layout: Some(&pl),
-                vertex: wgpu::VertexState { module: &module, entry_point: Some(vs), buffers: &[], compilation_options: Default::default() },
+                vertex: wgpu::VertexState { module, entry_point: Some(vs), buffers: &[], compilation_options: Default::default() },
                 primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &module,
-                    entry_point: Some(fs),
-                    targets: &[Some(wgpu::ColorTargetState { format, blend, write_mask: wgpu::ColorWrites::ALL })],
-                    compilation_options: Default::default(),
-                }),
+                fragment: Some(wgpu::FragmentState { module, entry_point: Some(fs), targets: &[Some(wgpu::ColorTargetState { format, blend, write_mask: wgpu::ColorWrites::ALL })], compilation_options: Default::default() }),
                 multiview_mask: None,
                 cache: None,
             })
         };
+        let compute = |entry: &str| device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(entry), layout: Some(&hist_pl), module: &hist_module, entry_point: Some(entry), compilation_options: Default::default(), cache: None });
         let u8f = wgpu::TextureFormat::Rgba8Unorm;
-        let geo = pipe("vs_full", "fs_geo", None, u8f);
-        let quad = pipe("vs_quad", "fs_quad", Some(wgpu::BlendState { color: over, alpha: over }), u8f);
-        let resize_v = pipe("vs_full", "fs_resize_v", None, wgpu::TextureFormat::Rgba32Float);
-        let resize_h = pipe("vs_full", "fs_resize_h", None, u8f);
+        let f32f = wgpu::TextureFormat::Rgba32Float;
+        let geo = pipe(&module, "vs_full", "fs_geo", None, u8f);
+        let quad = pipe(&module, "vs_quad", "fs_quad", Some(wgpu::BlendState { color: over, alpha: over }), u8f);
+        let resize_v = pipe(&module, "vs_full", "fs_resize_v", None, f32f);
+        let resize_h = pipe(&module, "vs_full", "fs_resize_h", None, u8f);
+        let fx = pipe(&fx_module, "vs_full", "fs_fx", None, u8f);
+        let fx_f32 = pipe(&fx_module, "vs_full", "fs_fx", None, f32f);
+        let hist_count = compute("cs_count");
+        let hist_cuts = compute("cs_cuts");
+        let hist = device.create_buffer(&wgpu::BufferDescriptor { label: Some("gifkit-hist"), size: HIST_BYTES, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let blank = upload(&device, &queue, &RgbaImage::new(1, 1), "gifkit-blank").create_view(&Default::default());
         let max_side = device.limits().max_texture_dimension_2d;
         // a quarter of what's typical for the card, capped: frames come back
         // from the CPU copy whenever they've gone
-        GpuRenderer { device, queue, layout, geo, quad, resize_v, resize_h, blank, sources: TexCache::new(768 << 20), sprites: TexCache::new(256 << 20), max_side }
+        GpuRenderer {
+            device,
+            queue,
+            layout,
+            hist_layout,
+            geo,
+            quad,
+            resize_v,
+            resize_h,
+            fx,
+            fx_f32,
+            hist_count,
+            hist_cuts,
+            hist,
+            blank,
+            sources: TexCache::new(768 << 20),
+            sprites: TexCache::new(256 << 20),
+            noise: HashMap::new(),
+            max_side,
+        }
     }
 
     /// A device of its own, for tests and for machines where the window
@@ -248,12 +368,77 @@ impl GpuRenderer {
     }
 
     fn bind(&self, view: &wgpu::TextureView, uniforms: &[f32]) -> wgpu::BindGroup {
+        self.bind3([view, &self.blank, &self.blank], uniforms)
+    }
+
+    fn bind3(&self, views: [&wgpu::TextureView; 3], uniforms: &[f32]) -> wgpu::BindGroup {
         let buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: &floats(uniforms), usage: wgpu::BufferUsages::UNIFORM });
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) }, wgpu::BindGroupEntry { binding: 1, resource: buf.as_entire_binding() }],
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(views[0]) },
+                wgpu::BindGroupEntry { binding: 1, resource: buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(views[1]) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(views[2]) },
+                wgpu::BindGroupEntry { binding: 4, resource: self.hist.as_entire_binding() },
+            ],
         })
+    }
+
+    /// The jitter picture for `kind` at a size, made once.
+    fn noise_view(&mut self, kind: u8, w: u32, h: u32) -> wgpu::TextureView {
+        if let Some(v) = self.noise.get(&(kind, w, h)) {
+            return v.clone();
+        }
+        if self.noise.len() > 8 {
+            self.noise.clear();
+        }
+        let size = wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 };
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gifkit-noise"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let data = floats(&noise_values(kind, w.max(1), h.max(1)));
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &data,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w.max(1)), rows_per_image: Some(h.max(1)) },
+            size,
+        );
+        let v = tex.create_view(&Default::default());
+        self.noise.insert((kind, w, h), v.clone());
+        v
+    }
+
+    fn sprite_view(&mut self, img: &RgbaImage, sprite_gen: u64) -> wgpu::TextureView {
+        self.sprites.get_or_upload(&self.device, &self.queue, (img as *const RgbaImage as u64) ^ sprite_gen.rotate_left(40), img)
+    }
+
+    /// Draw `quads` over `target` (kept, not cleared).
+    fn draw_quads(&self, enc: &mut wgpu::CommandEncoder, target: &wgpu::TextureView, quads: &[wgpu::BindGroup]) {
+        if quads.is_empty() {
+            return;
+        }
+        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("gifkit-layers"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: target, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.quad);
+        for b in quads {
+            pass.set_bind_group(0, b, &[]);
+            pass.draw(0..6, 0..1);
+        }
     }
 
     /// Render `f` from `frame` (cached under `frame_key`) into a new texture.
@@ -261,16 +446,7 @@ impl GpuRenderer {
     /// whenever the layers that own them do.
     pub fn render(&mut self, frame: &RgbaImage, frame_key: u64, f: &GpuFrame, sprite_gen: u64) -> wgpu::Texture {
         let (w, h) = (f.size.0.max(1), f.size.1.max(1));
-        let out = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("gifkit-frame"),
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
+        let out = self.target(w, h, wgpu::TextureFormat::Rgba8Unorm);
         let out_view = out.create_view(&Default::default());
         let src_view = self.sources.get_or_upload(&self.device, &self.queue, frame_key, frame);
         let mut g = f.geo;
@@ -289,11 +465,11 @@ impl GpuRenderer {
             };
             let mid = self.target(cw, nh, wgpu::TextureFormat::Rgba32Float);
             let mid_view = mid.create_view(&Default::default());
-            let bv = self.bind(&src_view, &[axis(ch, nh), [y0, ch as f32, x0, 1.0]].concat());
+            let bv = self.bind(&src_view, &uniform_block(&[axis(ch, nh), [y0, ch as f32, x0, 1.0]]));
             self.pass(&mut enc, &mid_view, &self.resize_v, &bv);
             let sized = self.target(nw, nh, wgpu::TextureFormat::Rgba8Unorm);
             let sized_view = sized.create_view(&Default::default());
-            let bh = self.bind(&mid_view, &[axis(cw, nw), [0.0, cw as f32, 0.0, 0.0]].concat());
+            let bh = self.bind(&mid_view, &uniform_block(&[axis(cw, nw), [0.0, cw as f32, 0.0, 0.0]]));
             self.pass(&mut enc, &sized_view, &self.resize_h, &bh);
             // the rest of the geometry now starts from the resized picture
             g.inv = g.inv.then(Affine::translate(-x0, -y0)).then(Affine::scale(nw as f32 / cw.max(1) as f32, nh as f32 / ch.max(1) as f32));
@@ -302,11 +478,13 @@ impl GpuRenderer {
         }
         let g = &g;
         let foot = footprint(&g.inv);
+        // an effect straight after the frame edits takes straight pixels
+        let straight_first = matches!(f.ops.first(), Some(GpuOp::Effect { .. }));
         let geo_bind = self.bind(
             &src_view,
-            &[
+            &uniform_block(&[
                 [g.inv.a, g.inv.b, g.inv.c, g.inv.d],
-                [g.inv.tx, g.inv.ty, if g.nearest { 1.0 } else { 0.0 }, 0.0],
+                [g.inv.tx, g.inv.ty, if g.nearest { 1.0 } else { 0.0 }, if straight_first { 1.0 } else { 0.0 }],
                 g.crop,
                 [g.inv_canvas.a, g.inv_canvas.b, g.inv_canvas.c, g.inv_canvas.d],
                 [g.inv_canvas.tx, g.inv_canvas.ty, g.canvas.0, g.canvas.1],
@@ -314,47 +492,116 @@ impl GpuRenderer {
                 rgba(g.pad_bg),
                 rgba(g.rot_bg),
                 [foot.0, foot.1, 0.0, 0.0],
-            ]
-            .concat(),
+            ]),
         );
-        let mut quads = Vec::new();
-        for d in &f.draws {
-            let inv = d.m.inverse();
-            let foot = footprint(&inv);
-            let (view, size, col, solid) = match d.src {
-                GpuSrc::Img(img) => (self.sprites.get_or_upload(&self.device, &self.queue, (img as *const RgbaImage as u64) ^ sprite_gen.rotate_left(40), img), (img.width() as f32, img.height() as f32), [0.0; 4], 0.0),
-                GpuSrc::Solid(c, s) => (self.blank.clone(), s, rgba(c), 1.0),
-            };
-            quads.push(self.bind(
-                &view,
-                &[[d.m.a, d.m.b, d.m.c, d.m.d], [d.m.tx, d.m.ty, size.0, size.1], [inv.a, inv.b, inv.c, inv.d], [inv.tx, inv.ty, w as f32, h as f32], col, [d.opacity, solid, foot.0, foot.1]].concat(),
-            ));
-        }
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("gifkit-frame"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &out_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.geo);
-            pass.set_bind_group(0, &geo_bind, &[]);
-            pass.draw(0..3, 0..1);
-            pass.set_pipeline(&self.quad);
-            for b in &quads {
-                pass.set_bind_group(0, b, &[]);
-                pass.draw(0..6, 0..1);
+        self.pass(&mut enc, &out_view, &self.geo, &geo_bind);
+        // the frame so far (premultiplied, for the screen) and its size
+        let (mut cur_tex, mut cur_view, mut cur_size) = (out, out_view, (w, h));
+        let mut quads: Vec<wgpu::BindGroup> = Vec::new();
+        let mut straight = straight_first;
+        let u8f = wgpu::TextureFormat::Rgba8Unorm;
+        for op in &f.ops {
+            match op {
+                GpuOp::Draw(d) => {
+                    let inv = d.m.inverse();
+                    let foot = footprint(&inv);
+                    let (view, size, col, solid) = match d.src {
+                        GpuSrc::Img(img) => (self.sprite_view(img, sprite_gen), (img.width() as f32, img.height() as f32), [0.0; 4], 0.0),
+                        GpuSrc::Solid(c, s) => (self.blank.clone(), s, rgba(c), 1.0),
+                    };
+                    let (ow, oh) = (cur_size.0 as f32, cur_size.1 as f32);
+                    quads.push(self.bind(&view, &uniform_block(&[[d.m.a, d.m.b, d.m.c, d.m.d], [d.m.tx, d.m.ty, size.0, size.1], [inv.a, inv.b, inv.c, inv.d], [inv.tx, inv.ty, ow, oh], col, [d.opacity, solid, foot.0, foot.1]])));
+                }
+                GpuOp::Effect { passes, mix } => {
+                    self.draw_quads(&mut enc, &cur_view, &quads);
+                    quads.clear();
+                    // straight pixels, as the CPU has them
+                    let fx_pass = |me: &Self, enc: &mut wgpu::CommandEncoder, op: f32, views: [&wgpu::TextureView; 3], size: (u32, u32), more: &[[f32; 4]]| {
+                        let t = me.target(size.0, size.1, u8f);
+                        let v = t.create_view(&Default::default());
+                        let mut u = vec![[op, 0.0, size.0 as f32, size.1 as f32]];
+                        u.extend_from_slice(more);
+                        let b = me.bind3(views, &uniform_block(&u));
+                        me.pass(enc, &v, &me.fx, &b);
+                        (t, v)
+                    };
+                    let mut s_view = if straight { cur_view.clone() } else { fx_pass(self, &mut enc, 1.0, [&cur_view, &self.blank, &self.blank], cur_size, &[]).1 };
+                    straight = false;
+                    let mut s_size = cur_size;
+                    let before = (*mix < 0.999).then(|| (s_view.clone(), s_size));
+                    let mut tmps: HashMap<u8, wgpu::TextureView> = HashMap::new();
+                    for p in passes {
+                        let mut views: Vec<wgpu::TextureView> = Vec::with_capacity(3);
+                        for i in p.ins {
+                            views.push(match i {
+                                None => self.blank.clone(),
+                                Some(GpuIn::Cur) => s_view.clone(),
+                                Some(GpuIn::Tmp(k)) => tmps.get(&k).cloned().unwrap_or_else(|| self.blank.clone()),
+                                Some(GpuIn::Img(img)) => self.sprite_view(img, sprite_gen),
+                                Some(GpuIn::Owned(k)) => match f.owned.get(k) {
+                                    Some(img) => upload(&self.device, &self.queue, img, "gifkit-owned").create_view(&Default::default()),
+                                    None => self.blank.clone(),
+                                },
+                                Some(GpuIn::Noise(k)) => self.noise_view(k, p.size.0, p.size.1),
+                            });
+                        }
+                        let vs = [&views[0], &views[1], &views[2]];
+                        if p.kind == PassKind::Hist {
+                            enc.clear_buffer(&self.hist, 0, None);
+                            let buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: &floats(&uniform_block(&p.u)), usage: wgpu::BufferUsages::UNIFORM });
+                            let b = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: None,
+                                layout: &self.hist_layout,
+                                entries: &[
+                                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(vs[0]) },
+                                    wgpu::BindGroupEntry { binding: 1, resource: buf.as_entire_binding() },
+                                    wgpu::BindGroupEntry { binding: 4, resource: self.hist.as_entire_binding() },
+                                ],
+                            });
+                            let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("gifkit-hist"), timestamp_writes: None });
+                            cp.set_bind_group(0, &b, &[]);
+                            cp.set_pipeline(&self.hist_count);
+                            cp.dispatch_workgroups(p.size.0.div_ceil(16), p.size.1.div_ceil(16), 1);
+                            cp.set_pipeline(&self.hist_cuts);
+                            cp.dispatch_workgroups(1, 1, 1);
+                            continue;
+                        }
+                        let format = if p.float { wgpu::TextureFormat::Rgba32Float } else { u8f };
+                        let t = self.target(p.size.0, p.size.1, format);
+                        let v = t.create_view(&Default::default());
+                        let pipe = match (p.kind, p.float) {
+                            (PassKind::ResizeV, _) => &self.resize_v,
+                            (PassKind::ResizeH, _) => &self.resize_h,
+                            (_, true) => &self.fx_f32,
+                            _ => &self.fx,
+                        };
+                        let b = self.bind3(vs, &uniform_block(&p.u));
+                        self.pass(&mut enc, &v, pipe, &b);
+                        match p.out {
+                            None => {
+                                s_view = v;
+                                s_size = p.size;
+                            }
+                            Some(k) => {
+                                tmps.insert(k, v);
+                            }
+                        }
+                    }
+                    // a keyed fade mixes the result with what was under it
+                    if let Some((bv, bs)) = before {
+                        let (_, v) = fx_pass(self, &mut enc, 50.0, [&s_view, &bv, &self.blank], s_size, &[[*mix, bs.0 as f32, bs.1 as f32, 0.0]]);
+                        s_view = v;
+                    }
+                    let (t, v) = fx_pass(self, &mut enc, 2.0, [&s_view, &self.blank, &self.blank], s_size, &[]);
+                    cur_tex = t;
+                    cur_view = v;
+                    cur_size = s_size;
+                }
             }
         }
+        self.draw_quads(&mut enc, &cur_view, &quads);
         self.queue.submit([enc.finish()]);
-        out
+        cur_tex
     }
 
     /// Read a rendered frame back (for export and tests), straight alpha.

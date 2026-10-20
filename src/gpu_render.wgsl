@@ -64,6 +64,9 @@ fn area(t: texture_2d<f32>, uv: vec2<f32>, foot: vec2<f32>, lo: vec2<i32>, hi: v
 fn fs_geo(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let o = pos.xy;
     if (o.x < g.inner.x || o.x >= g.inner.z || o.y < g.inner.y || o.y >= g.inner.w) {
+        if (g.inv1.w > 0.5) {
+            return g.pad_bg;
+        }
         return premul(g.pad_bg);
     }
     // the corners a free turn opens up, or a fitted picture's bars
@@ -86,7 +89,15 @@ fn fs_geo(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         c = area(src, uv, g.foot.xy, lo, hi);
     }
     c = c * cov;
-    return c + bg * (1.0 - c.a);
+    let px = c + bg * (1.0 - c.a);
+    // straight alpha when an effect comes next, without the round trip
+    if (g.inv1.w > 0.5) {
+        if (px.a <= 0.0) {
+            return vec4<f32>(0.0);
+        }
+        return vec4<f32>(px.rgb / px.a, px.a);
+    }
+    return px;
 }
 
 // ---- layers: a picture (or a solid colour) drawn through an affine map

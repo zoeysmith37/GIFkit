@@ -1167,7 +1167,7 @@ pub fn frame_at_time(a: &Animation, t: f32) -> usize {
 impl Stack {
     /// Every layer is one the graphics card can draw.
     pub fn gpu_capable(&self) -> bool {
-        !self.layers.iter().any(|l| l.active() && matches!(l.kind, LayerKind::Effects(_) | LayerKind::Censor(_) | LayerKind::Shield(_)))
+        !self.layers.iter().any(|l| l.active() && matches!(&l.kind, LayerKind::Effects(fx) if !crate::gpu_fx::effects_ok(fx)))
     }
 
     /// Frame `i` as work for the graphics card, or None when something in
@@ -1175,7 +1175,7 @@ impl Stack {
     /// goes back and forth). Mirrors `render_frame`.
     pub fn gpu_frame<'a>(&'a self, base: &Animation, plan: &[PlanFrame], times: &[f32], i: usize, fonts: &[FontEntry], prep: &'a Prepared) -> Option<crate::gpu_render::GpuFrame<'a>> {
         use crate::geo::Affine;
-        use crate::gpu_render::{GpuDraw, GpuFrame, GpuGeo, GpuSrc};
+        use crate::gpu_render::{GpuDraw, GpuFrame, GpuGeo, GpuOp, GpuSrc};
         let n = plan.len();
         let src = plan.get(i)?.src;
         let (fw, fh) = base.frames.get(src)?.image.dimensions();
@@ -1184,7 +1184,7 @@ impl Stack {
             if !l.active() || !l.timing.shows(i, n) {
                 continue;
             }
-            if matches!(l.kind, LayerKind::Effects(_) | LayerKind::Censor(_) | LayerKind::Shield(_)) {
+            if matches!(&l.kind, LayerKind::Effects(fx) if !crate::gpu_fx::effects_ok(fx)) {
                 return None;
             }
         }
@@ -1255,7 +1255,10 @@ impl Stack {
             }
         }
         let geo = geo;
-        let mut draws: Vec<GpuDraw<'a>> = Vec::new();
+        let mut draws: Vec<GpuOp<'a>> = Vec::new();
+        let mut owned: Vec<RgbaImage> = Vec::new();
+        // the frame's size as layers go (effects can change it)
+        let mut cur = (ow, oh);
         for (li, l) in self.layers.iter().enumerate() {
             if !l.active() || !l.timing.shows(i, n) {
                 continue;
@@ -1277,9 +1280,35 @@ impl Stack {
                 Affine::translate(x as f32 - cx, y as f32 - cy).then(Affine { a, b, c, d: dd, tx: 0.0, ty: 0.0 }).then(Affine::translate(cx + d.0, cy + d.1))
             };
             let k = mo.opacity;
-            let mk = |sp: &'a RgbaImage, x: i64, y: i64, alpha: f32| GpuDraw { src: GpuSrc::Img(sp), m: place(sp, x, y), opacity: alpha * k };
+            let mk = |sp: &'a RgbaImage, x: i64, y: i64, alpha: f32| GpuOp::Draw(GpuDraw { src: GpuSrc::Img(sp), m: place(sp, x, y), opacity: alpha * k });
             match &l.kind {
-                LayerKind::Effects(_) | LayerKind::Censor(_) | LayerKind::Shield(_) => unreachable!(),
+                LayerKind::Effects(fx) => {
+                    // as render_frame: the clip's own frame count and time
+                    let (s0, s1) = l.timing.clip_at(i, n).filter(|_| l.timing.clips.is_some()).unwrap_or((0, n.saturating_sub(1)));
+                    let shown = |a: usize, b: usize| plan[a..b].iter().filter(|f| f.enabled).count();
+                    let end_t = times[s1] + if plan[s1].enabled { effective_delay(plan[s1].delay) as f32 / 100.0 } else { 0.0 };
+                    let mut pl = crate::gpu_fx::Plan::new(cur, &mut owned);
+                    crate::gpu_fx::effects(&mut pl, fx, shown(s0, i), shown(s0, s1 + 1).max(1), times[i] - times[s0], end_t - times[s0], fonts);
+                    cur = pl.size;
+                    let passes = pl.passes;
+                    draws.push(GpuOp::Effect { passes, mix: k });
+                }
+                LayerKind::Censor(c) => {
+                    if c.applies_to(src) {
+                        if let Some(b) = l.source_box(src, fonts) {
+                            let mut pl = crate::gpu_fx::Plan::new(cur, &mut owned);
+                            crate::gpu_fx::censor(&mut pl, map_box(m, mo.apply(b), false), c);
+                            let passes = pl.passes;
+                            draws.push(GpuOp::Effect { passes, mix: k });
+                        }
+                    }
+                }
+                LayerKind::Shield(sh) => {
+                    let mut pl = crate::gpu_fx::Plan::new(cur, &mut owned);
+                    crate::gpu_fx::shield(&mut pl, sh, src);
+                    let passes = pl.passes;
+                    draws.push(GpuOp::Effect { passes, mix: k });
+                }
                 LayerKind::Overlay(o) => {
                     if let Some(b) = l.source_box(src, fonts) {
                         let frame = o.src.frame_at(times[i]);
@@ -1289,22 +1318,22 @@ impl Stack {
                             .then(Affine::translate(-ob.w.round().max(1.0) / 2.0, -ob.h.round().max(1.0) / 2.0))
                             .then(Affine::rotate(ob.angle))
                             .then(Affine::translate(ob.cx, ob.cy));
-                        draws.push(GpuDraw { src: GpuSrc::Img(frame), m: am, opacity: o.opacity / 100.0 * k });
+                        draws.push(GpuOp::Draw(GpuDraw { src: GpuSrc::Img(frame), m: am, opacity: o.opacity / 100.0 * k }));
                     }
                 }
                 LayerKind::Watermark(w) => {
                     let o = (w.opacity / 100.0).clamp(0.0, 1.0) * k;
                     match prep.watermarks.get(li) {
-                        Some(Some(WatermarkSprite::Single(s, x, y))) => draws.push(GpuDraw { src: GpuSrc::Img(s), m: Affine::translate(*x as f32, *y as f32), opacity: o }),
+                        Some(Some(WatermarkSprite::Single(s, x, y))) => draws.push(GpuOp::Draw(GpuDraw { src: GpuSrc::Img(s), m: Affine::translate(*x as f32, *y as f32), opacity: o })),
                         Some(Some(WatermarkSprite::Tiled(s, sx, sy))) => {
-                            let (w, h) = (ow as f32, oh as f32);
+                            let (w, h) = (cur.0 as f32, cur.1 as f32);
                             let mut row = 0;
                             let mut y = -(s.height() as f32);
                             while y < h {
                                 let off = if row % 2 == 1 { sx / 2.0 } else { 0.0 };
                                 let mut x = -(s.width() as f32) + off;
                                 while x < w {
-                                    draws.push(GpuDraw { src: GpuSrc::Img(s), m: Affine::translate(x.round(), y.round()), opacity: o });
+                                    draws.push(GpuOp::Draw(GpuDraw { src: GpuSrc::Img(s), m: Affine::translate(x.round(), y.round()), opacity: o }));
                                     x += sx;
                                 }
                                 y += sy;
@@ -1342,10 +1371,10 @@ impl Stack {
                     if tx.caption != text::Caption::None && tx.bar_h > 0 && tx.applies_to(src) {
                         let c = tx.bar_color;
                         let (by, bh) = ((tx.bar_y as f32 * p).round() as i32, (tx.bar_h as f32 * p).round() as i32);
-                        let y0 = by.clamp(0, oh as i32);
-                        let y1 = (by + bh).clamp(0, oh as i32);
+                        let y0 = by.clamp(0, cur.1 as i32);
+                        let y1 = (by + bh).clamp(0, cur.1 as i32);
                         if y1 > y0 {
-                            draws.push(GpuDraw { src: GpuSrc::Solid([c[0], c[1], c[2], 255], (ow as f32, (y1 - y0) as f32)), m: Affine::translate(0.0, y0 as f32), opacity: k });
+                            draws.push(GpuOp::Draw(GpuDraw { src: GpuSrc::Solid([c[0], c[1], c[2], 255], (cur.0 as f32, (y1 - y0) as f32)), m: Affine::translate(0.0, y0 as f32), opacity: k }));
                         }
                     }
                     if let Some(Some((s, x, y))) = prep.sprites.get(li) {
@@ -1356,6 +1385,6 @@ impl Stack {
                 }
             }
         }
-        Some(GpuFrame { size: (ow, oh), geo, draws })
+        Some(GpuFrame { size: (ow, oh), geo, ops: draws, owned })
     }
 }

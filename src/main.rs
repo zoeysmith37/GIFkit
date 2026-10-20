@@ -8,6 +8,7 @@ mod effects;
 mod encode;
 mod geo;
 mod gpu;
+mod gpu_fx;
 mod gpu_render;
 mod icons;
 mod io;

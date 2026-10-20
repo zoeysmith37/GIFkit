@@ -721,7 +721,98 @@ fn gpu_matches_cpu() {
     let mut wm = crate::effects::WatermarkSettings::default();
     wm.tiled = true;
     cases.push(("watermark tiled", Transform::default(), vec![LayerKind::Watermark(Box::new(wm))], vec![]));
+    // every effect, alone, then a few together
+    use crate::booth::BoothFx;
+    use crate::effects::EffectSettings as E;
+    use crate::motion::Transition as Tr;
+    let fx = |f: &dyn Fn(&mut E)| {
+        let mut e = E::default();
+        f(&mut e);
+        LayerKind::Effects(Box::new(e))
+    };
+    let mut fxc: Vec<(String, LayerKind)> = vec![
+        ("fx modulate".into(), fx(&|e| (e.hue, e.saturation, e.lightness) = (140.0, 150.0, 90.0))),
+        ("fx bright contrast".into(), fx(&|e| (e.brightness, e.contrast) = (20.0, 30.0))),
+        ("fx rc white".into(), fx(&|e| (e.rc_white, e.rc_fuzz) = (true, 30.0))),
+        ("fx rc custom edges".into(), fx(&|e| (e.rc_custom, e.rc_color, e.rc_fuzz, e.rc_edge_px) = (true, [128, 60, 90], 25.0, 3))),
+        ("fx rc black no edge".into(), fx(&|e| (e.rc_black, e.rc_fuzz, e.rc_clean_edges) = (true, 20.0, false))),
+        ("fx grayscale".into(), fx(&|e| e.grayscale = true)),
+        ("fx sepia".into(), fx(&|e| e.sepia = true)),
+        ("fx monochrome".into(), fx(&|e| e.monochrome = true)),
+        ("fx negative".into(), fx(&|e| e.negative = true)),
+        ("fx tint".into(), fx(&|e| e.tint = true)),
+        ("fx blur".into(), fx(&|e| e.blur = true)),
+        ("fx blur 7".into(), fx(&|e| (e.blur, e.blur_sigma) = (true, 7.0))),
+        ("fx sharpen".into(), fx(&|e| (e.sharpen, e.sharpen_sigma) = (true, 1.5))),
+        ("fx oil".into(), fx(&|e| e.oil = true)),
+        ("fx oil 9".into(), fx(&|e| (e.oil, e.oil_radius) = (true, 9))),
+        ("fx emboss".into(), fx(&|e| e.emboss = true)),
+        ("fx posterize".into(), fx(&|e| e.posterize = true)),
+        ("fx solarize".into(), fx(&|e| e.solarize = true)),
+        ("fx noise".into(), fx(&|e| e.noise = true)),
+        ("fx swirl".into(), fx(&|e| e.swirl = true)),
+        ("fx implode".into(), fx(&|e| e.implode = true)),
+        ("fx wave".into(), fx(&|e| e.wave = true)),
+        ("fx gotham".into(), fx(&|e| e.gotham = true)),
+        ("fx lomo".into(), fx(&|e| e.lomo = true)),
+        ("fx nashville".into(), fx(&|e| e.nashville = true)),
+        ("fx toaster".into(), fx(&|e| e.toaster = true)),
+        ("fx vignette".into(), fx(&|e| e.vignette = true)),
+        ("fx ordered dither".into(), fx(&|e| e.ordered_dither = true)),
+        ("fx change bg".into(), fx(&|e| (e.change_bg, e.bg_color) = (true, [20, 200, 90]))),
+        ("fx flip v".into(), fx(&|e| e.flip_v = true)),
+        ("fx flip h".into(), fx(&|e| e.flip_h = true)),
+        ("fx rot90".into(), fx(&|e| e.rot90 = true)),
+        ("fx rot270".into(), fx(&|e| e.rot270 = true)),
+        ("fx rot any".into(), fx(&|e| (e.rot_any, e.rot_deg) = (true, 30.0))),
+        ("fx camera".into(), fx(&|e| e.frame_camera = true)),
+        ("fx fuzzy".into(), fx(&|e| e.frame_fuzzy = true)),
+        ("fx rounded".into(), fx(&|e| e.frame_rounded = true)),
+        ("fx polaroid".into(), fx(&|e| e.polaroid = true)),
+        ("fx border".into(), fx(&|e| e.frame_border = true)),
+        ("fx counter".into(), fx(&|e| e.counter = true)),
+        ("fx shake".into(), fx(&|e| e.loop_shake = true)),
+        ("fx pulse".into(), fx(&|e| (e.loop_pulse, e.loop_cycles) = (true, 3))),
+        ("fx hop".into(), fx(&|e| (e.loop_hop, e.loop_cycles) = (true, 3))),
+        ("fx wobble".into(), fx(&|e| (e.loop_wobble, e.loop_cycles) = (true, 3))),
+        ("fx rainbow".into(), fx(&|e| (e.loop_rainbow, e.loop_cycles) = (true, 3))),
+        ("fx glitch".into(), fx(&|e| (e.loop_glitch, e.loop_amount) = (true, 200.0))),
+    ];
+    for b in BoothFx::LOOKS.iter().chain(BoothFx::DISTORT.iter()) {
+        let b = *b;
+        fxc.push((format!("booth {}", b.label()), fx(&move |e| (e.booth, e.booth_amount, e.booth_cx, e.booth_cy) = (b, 70.0, 40.0, 60.0))));
+    }
+    fxc.push(("warp + booth".into(), fx(&|e| (e.booth, e.warp) = (BoothFx::Comic, BoothFx::Twirl))));
+    for t in Tr::ALL.iter().skip(1) {
+        let t = *t;
+        fxc.push((format!("intro {}", t.label()), fx(&move |e| (e.intro, e.fade_frames) = (t, 3))));
+        fxc.push((format!("outro {} clear", t.label()), fx(&move |e| (e.outro, e.fade_frames, e.fade_to_transparent) = (t, 2, true))));
+    }
+    fxc.push(("fx combo".into(), fx(&|e| (e.sepia, e.blur, e.vignette, e.frame_rounded, e.polaroid, e.loop_wobble) = (true, true, true, true, true, true))));
+    fxc.push(("fx combo 2".into(), fx(&|e| (e.contrast, e.posterize, e.rot90, e.frame_border, e.noise, e.counter) = (40.0, true, true, true, true, true))));
+    for (nm, l) in fxc {
+        cases.push((Box::leak(nm.into_boxed_str()), Transform::default(), vec![l], vec![]));
+    }
+    let cen = |m: crate::effects::CensorMethod, angle: f32| LayerKind::Censor(crate::effects::CensorSettings { x: 30, y: 20, w: 70, h: 50, method: m, angle, ..Default::default() });
+    for (nm, m) in [("solid", crate::effects::CensorMethod::Solid), ("blur", crate::effects::CensorMethod::Blur), ("pixelate", crate::effects::CensorMethod::Pixelate)] {
+        cases.push((Box::leak(format!("censor {nm}").into_boxed_str()), Transform::default(), vec![cen(m, 0.0)], vec![]));
+        cases.push((Box::leak(format!("censor {nm} turned").into_boxed_str()), Transform::default(), vec![cen(m, 25.0)], vec![]));
+    }
+    let sh = crate::effects::ShieldSettings::default();
+    cases.push(("shield", Transform::default(), vec![LayerKind::Shield(sh.clone())], vec![]));
+    cases.push(("shield jitter", Transform::default(), vec![LayerKind::Shield(crate::effects::ShieldSettings { jitter: true, per_frame: true, strength: 12.0, ..sh.clone() })], vec![]));
+    // layers on both sides of an effect that changes the size
+    cases.push(("polaroid + text", t(&|t| (t.resize_on, t.rs_pct) = (true, 80.0)), vec![LayerKind::Shape(Box::new(shape.clone())), fx(&|e| (e.polaroid, e.swirl) = (true, true)), LayerKind::Text(text.clone())], vec![]));
+    cases.push(("fade effect", Transform::default(), vec![fx(&|e| (e.negative, e.rot90) = (true, false))], vec![crate::timeline::Key { x: 0.0, y: 0.0, scale_x: 100.0, scale_y: 100.0, angle: 0.0, ..mk }]));
+    cases.push(("censor moved", Transform::default(), vec![cen(crate::effects::CensorMethod::Pixelate, 10.0)], vec![crate::timeline::Key { opacity: 100.0, ..mk }]));
+    cases.push(("fx + turn frame", t(&|t| (t.rot_on, t.rot_any, t.rot_deg) = (true, true, 20.0)), vec![fx(&|e| (e.oil, e.frame_fuzzy) = (true, true))], vec![]));
+    let only = std::env::var("GPU_ONLY").ok();
     for (ci, (name, tr, ls, keys)) in cases.into_iter().enumerate() {
+        if let Some(o) = &only {
+            if !name.contains(o.as_str()) {
+                continue;
+            }
+        }
         let mut st = Stack::default();
         st.transform = tr;
         for k in ls {

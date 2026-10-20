@@ -1387,7 +1387,7 @@ impl Default for ShieldSettings {
 }
 
 #[inline]
-fn hash3(x: u32, y: u32, z: u32) -> u32 {
+pub(crate) fn hash3(x: u32, y: u32, z: u32) -> u32 {
     let mut h = x.wrapping_mul(0x8da6b343) ^ y.wrapping_mul(0xd8163841) ^ z.wrapping_mul(0xcb1ab31f);
     h ^= h >> 13;
     h = h.wrapping_mul(0x5bd1e995);

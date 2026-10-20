@@ -80,16 +80,16 @@ pub enum LoopFx {
     Glitch,
 }
 
-fn ease_out_cubic(t: f32) -> f32 {
+pub(crate) fn ease_out_cubic(t: f32) -> f32 {
     1.0 - (1.0 - t).powi(3)
 }
 
-fn ease_in_out(t: f32) -> f32 {
+pub(crate) fn ease_in_out(t: f32) -> f32 {
     if t < 0.5 { 4.0 * t * t * t } else { 1.0 - (-2.0 * t + 2.0).powi(3) / 2.0 }
 }
 
 /// The classic bouncing ball ease: lands, bounces twice, settles.
-fn ease_out_bounce(t: f32) -> f32 {
+pub(crate) fn ease_out_bounce(t: f32) -> f32 {
     let (n, d) = (7.5625, 2.75);
     if t < 1.0 / d {
         n * t * t
@@ -265,7 +265,7 @@ pub fn transition(img: &RgbaImage, kind: Transition, p: f32, transparent: bool) 
 }
 
 /// Small deterministic noise for shake and glitch (same result every render).
-fn hash(i: u64) -> f32 {
+pub(crate) fn hash(i: u64) -> f32 {
     let mut x = i.wrapping_mul(0x9E3779B97F4A7C15);
     x ^= x >> 31;
     x = x.wrapping_mul(0xBF58476D1CE4E5B9);
