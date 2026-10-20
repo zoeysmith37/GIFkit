@@ -684,6 +684,10 @@ pub struct GifKitApp {
     tl_key: Option<usize>,
     tl_razor: bool,
     tl_drag: Option<timeline_ui::TlDrag>,
+    /// an emoji being dragged from the picker onto the picture
+    emoji_drag: Option<String>,
+    /// views that take drops this frame: where they are and how they map
+    drop_views: Vec<(Rect, Mapper)>,
     show_toolbar: bool,
     show_statusbar: bool,
     /// recently opened files, newest first
@@ -2037,6 +2041,8 @@ impl GifKitApp {
             tl_key: None,
             tl_razor: false,
             tl_drag: None,
+            emoji_drag: None,
+            drop_views: Vec::new(),
             show_toolbar: theme::get_setting("show_toolbar").as_deref() != Some("0"),
             show_statusbar: theme::get_setting("show_statusbar").as_deref() != Some("0"),
             recent: theme::get_setting("recent").unwrap_or_default().split('\n').filter(|l| !l.is_empty()).map(PathBuf::from).collect(),
@@ -2295,6 +2301,7 @@ impl GifKitApp {
             }
             JobOutput::Overlay(Ok(src)) => {
                 self.add_overlay(src);
+                self.tool = Tool::AddImage;
                 self.info("Overlay added – drag it on the preview to position it");
             }
             JobOutput::Anim(Err(e)) | JobOutput::Baked(Err(e)) | JobOutput::Loaded(Err(e)) | JobOutput::Overlay(Err(e)) | JobOutput::Fit(Err(e)) | JobOutput::ProjectLoaded(Err(e)) | JobOutput::ProjectSaved(Err(e)) => self.error(format!("{label} failed: {e:#}")),
@@ -2974,11 +2981,40 @@ impl GifKitApp {
 
     fn handle_dropped(&mut self, ctx: &egui::Context) {
         let mut dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
-        // Ctrl+V with copied files (file manager "Copy") or pasted paths also opens them
-        if !ctx.egui_wants_keyboard_input() {
-            let pasted: Vec<String> = ctx.input(|i| i.events.iter().filter_map(|e| if let egui::Event::Paste(t) = e { Some(t.clone()) } else { None }).collect());
-            for t in pasted {
-                dropped.extend(paths_from_text(&t));
+        // Ctrl+V: copied files (a file manager's "Copy"), pasted paths, or a
+        // copied picture. With nothing open they open; otherwise each one
+        // becomes an image layer.
+        if !ctx.egui_wants_keyboard_input() && !self.busy() {
+            let (texts, image) = ctx.input(|i| {
+                let t: Vec<String> = i.events.iter().filter_map(|e| if let egui::Event::Paste(t) = e { Some(t.clone()) } else { None }).collect();
+                let img = i.events.iter().find_map(|e| if let egui::Event::PasteImage(c) = e { Some(c.clone()) } else { None });
+                (t, img)
+            });
+            let pasted: Vec<PathBuf> = texts.iter().flat_map(|t| paths_from_text(t)).collect();
+            if let Some(c) = image.filter(|_| pasted.is_empty()) {
+                let [w, h] = c.size;
+                let raw: Vec<u8> = c.pixels.iter().flat_map(|p| p.to_srgba_unmultiplied()).collect();
+                if let Some(img) = RgbaImage::from_raw(w as u32, h as u32, raw) {
+                    if self.base.is_some() {
+                        self.add_overlay(OverlaySource { name: "Pasted image".into(), path: None, delays: vec![10], frames: vec![img] });
+                        self.tool = Tool::AddImage;
+                        self.info("Pasted as an image layer – drag it on the preview to position it");
+                    } else {
+                        let a = Animation { frames: vec![crate::anim::Frame::new(img, 10)], loop_count: None };
+                        self.spawn(ctx, "Paste", 1, move |_| JobOutput::Loaded(Ok((a, None, None))));
+                    }
+                }
+                return;
+            }
+            if !pasted.is_empty() {
+                if self.base.is_some() {
+                    // one job at a time: the first file goes in
+                    if let Some(p) = pasted.into_iter().next() {
+                        self.load_overlay(p, ctx);
+                    }
+                    return;
+                }
+                dropped.extend(pasted);
             }
         }
         if dropped.is_empty() || self.busy() {
@@ -3641,6 +3677,7 @@ impl eframe::App for GifKitApp {
         // a dialog of ours having focus still counts as the app being active
         let dialog_open = self.export_open || self.history_open || self.about_open || self.shortcuts_open || self.video_import.is_some();
         theme::set_focused(&ctx, focused || dialog_open, self.theme);
+        self.drop_views.clear();
         // KDE caption: "document — app", with a star while there are unsaved changes
         let title = match self.project_path.as_ref().or(self.path.as_ref()).and_then(|p| p.file_name()) {
             Some(n) if self.base.is_some() => format!("{}{} — GIFkit", n.to_string_lossy(), if self.modified { " *" } else { "" }),
@@ -3767,6 +3804,7 @@ impl eframe::App for GifKitApp {
         self.export_window(&ctx);
         self.history_window(&ctx);
         self.about_window(&ctx);
+        self.emoji_drag_drop(&ctx);
         self.track_live_edits(&ctx, now);
         self.shortcuts_window(&ctx);
         self.video_import_window(&ctx);
@@ -4215,7 +4253,7 @@ impl GifKitApp {
                 ("Ctrl+E", "Export"),
                 ("Ctrl+Z / Ctrl+Y", "Undo and redo"),
                 ("Ctrl+H", "History"),
-                ("Ctrl+V", "Open copied files"),
+                ("Ctrl+V", "Paste files or a picture. With an animation open it becomes an image layer."),
                 ("Ctrl+Q", "Quit"),
                 ("Space", "Play or pause"),
                 ("← / →", "Previous and next frame"),
@@ -5961,7 +5999,8 @@ impl GifKitApp {
                 };
                 let tex = self.orig_texture(ctx, i);
                 let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, None, None, false);
-                if same {
+                // the original doesn't show what layers do, so only the crop is edited here
+                if same && self.tool == Tool::Crop {
                     self.canvas_interaction(ui, &resp, m, (size.x, size.y), Space::Source, vi);
                 }
             }
@@ -6022,6 +6061,9 @@ impl GifKitApp {
     /// Canvas editing. `space` says which coordinates the viewport shows:
     /// source frames (original / crop view) or the edited output.
     fn canvas_interaction(&mut self, ui: &mut egui::Ui, resp: &egui::Response, m: Mapper, bounds: (f32, f32), space: Space, vi: usize) {
+        if space == Space::Output {
+            self.drop_views.push((resp.rect, m));
+        }
         let painter = ui.painter_at(resp.rect);
         // in split view, gizmos only appear in the viewport you're working in
         if resp.hovered() || resp.dragged() {
@@ -6825,7 +6867,7 @@ impl GifKitApp {
                 if r1.changed() {
                     tr.rs_pct = pct.clamp(0.1, 6400.0);
                 }
-                const PCTS: [f32; 8] = [10.0, 25.0, 33.3, 50.0, 75.0, 150.0, 200.0, 400.0];
+                const PCTS: [f32; 9] = [10.0, 25.0, 33.3, 50.0, 75.0, 100.0, 150.0, 200.0, 400.0];
                 form_row(ui, "", |ui| {
                     even_grid(ui, PCTS.len(), 60.0, |ui, i, size| {
                         if ui.add_sized(size, sel_btn(egui::Button::new(format!("{}%", PCTS[i])), tr.rs_pct == PCTS[i])).clicked() {
@@ -6863,6 +6905,48 @@ impl GifKitApp {
         if before != (tr.rs_w, tr.rs_h, tr.rs_pct.to_bits(), tr.rs_mode, tr.rs_filter) {
             tr.resize_on = true;
         }
+        // more room around the picture, for captions or a bigger frame
+        group(ui, "Canvas", |ui| {
+            let names = ["Top", "Bottom", "Left", "Right"];
+            let idx = [0usize, 2, 3, 1];
+            form_row(ui, "Add space", |ui| {
+                even_grid(ui, 2, 0.0, |ui, i, size| {
+                    let v = &mut tr.pad[idx[i]];
+                    spin(ui, size, v, 1.0, |d| d.range(0..=8192).prefix(format!("{}  ", names[i])).suffix(" px"));
+                });
+                even_grid(ui, 2, 0.0, |ui, i, size| {
+                    let v = &mut tr.pad[idx[i + 2]];
+                    spin(ui, size, v, 1.0, |d| d.range(0..=8192).prefix(format!("{}  ", names[i + 2])).suffix(" px"));
+                });
+            });
+            form_row(ui, "Fill", |ui| {
+                ui.horizontal(|ui| {
+                    if radio(ui, !tr.pad_transparent, "Colour").clicked() {
+                        tr.pad_transparent = false;
+                    }
+                    ui.add_enabled_ui(!tr.pad_transparent, |ui| colour_btn(ui, &mut tr.pad_color));
+                    ui.add_space(10.0);
+                    if radio(ui, tr.pad_transparent, "Transparent").clicked() {
+                        tr.pad_transparent = true;
+                    }
+                })
+            });
+            tr.pad_on = tr.pad.iter().any(|p| *p > 0);
+            let [t, r, b, l] = tr.pad;
+            let (ow, oh) = match stack::resize_target(w, h, tr.rs_w, tr.rs_h, tr.rs_pct) {
+                Some((tw, th)) if tr.resize_on => (tw, th),
+                _ => (w, h),
+            };
+            form_row(ui, "Result", |ui| hint(ui, &if tr.pad_on { format!("{}×{} with the space", ow + l + r, oh + t + b) } else { "No space added".to_string() }));
+            form_row(ui, "", |ui| {
+                ui.add_enabled_ui(tr.pad_on, |ui| {
+                    if wide_button(ui, egui::Button::new("Remove Space")).clicked() {
+                        tr.pad = [0; 4];
+                        tr.pad_on = false;
+                    }
+                });
+            });
+        });
     }
 
     fn ui_crop(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -7541,6 +7625,62 @@ impl GifKitApp {
     }
 
     /// Default placement of a new text layer.
+    /// The meme caption format: a white strip above or below the picture,
+    /// sized for one line, with black text centred in it. The strip is
+    /// canvas space (Resize ▸ Canvas), so it can be changed there later.
+    fn add_caption_bar(&mut self, top: bool, now: f64) {
+        let (w, h) = self.dims();
+        if w == 0 {
+            return;
+        }
+        self.snapshot(&format!("caption{now}"), now);
+        // the picture's size before any space is added
+        let mut t2 = self.stack.transform.clone();
+        t2.pad_on = false;
+        let g = t2.geo_map(w, h);
+        let bar = (g.h * 0.22).round().max(36.0) as u32;
+        let tr = &mut self.stack.transform;
+        let side = if top { 0 } else { 2 };
+        tr.pad[side] = tr.pad[side].max(bar);
+        tr.pad_on = true;
+        tr.pad_transparent = false;
+        tr.pad_color = [255, 255, 255];
+        let bar = tr.pad[side] as f32;
+        let mut a = Annotation { text: if self.text_tpl.text.trim().is_empty() { "Your caption here".into() } else { self.text_tpl.text.clone() }, ..self.text_tpl.clone() };
+        a.color = [0, 0, 0, 255];
+        a.border = text::Border::None;
+        a.align = Align::Center;
+        a.angle = 0.0;
+        a.stretch = 1.0;
+        (a.from, a.to) = (1, 0);
+        let id = self.add_layer(LayerKind::Text(a));
+        // place it in output space, then bring that back to the source frame
+        let Some(li) = self.stack.index_of(id) else { return };
+        let maps = self.stack.layer_maps(w, h);
+        let mg = &maps[li];
+        let inv = mg.m.inverse();
+        let k = mg.m.det().abs().sqrt().max(1e-3);
+        let (ow, oh) = (mg.w, mg.h);
+        let (ox, oy) = (ow / 2.0, if top { bar / 2.0 } else { oh - bar / 2.0 });
+        let (cx, cy) = inv.apply(ox, oy);
+        let fonts = self.fonts.clone();
+        if let LayerKind::Text(t) = &mut self.stack.layers[li].kind {
+            t.size = (bar * 0.5 / k).max(6.0);
+            // shrink long captions to fit the width
+            let (tw, _) = text::measure(&fonts, t);
+            let room = ow * 0.92 / k;
+            if tw as f32 > room {
+                t.size *= room / tw as f32;
+            }
+            let (tw, th) = text::measure(&fonts, t);
+            t.x = (cx - tw as f32 / 2.0).round() as i32;
+            t.y = (cy - th as f32 / 2.0).round() as i32;
+        }
+        self.tool = Tool::Text;
+        self.modified = true;
+        self.info("Caption bar added – edit the text in the Text panel");
+    }
+
     fn place_text(&self, a: &mut Annotation) {
         let (w, h) = self.dims();
         a.x = (w as i32 / 2 - 80).max(0);
@@ -7596,6 +7736,18 @@ impl GifKitApp {
         }
         group(ui, "Text", |ui| {
             ui.add(egui::TextEdit::multiline(&mut a.text).desired_rows(2).desired_width(f32::INFINITY));
+        });
+        let mut bar = None;
+        group_ex(ui, "Caption Bar", true, None, |ui| {
+            hint(ui, "A white strip above or below the picture with black text in it, the classic meme look. The strip is added canvas space you can change in Resize.");
+            ui.add_space(4.0);
+            form_row(ui, "Add", |ui| {
+                even_grid(ui, 2, 0.0, |ui, i, size| {
+                    if ui.add_sized(size, egui::Button::image_and_text(crate::icons::image(ui.ctx(), if i == 0 { "go-top" } else { "go-bottom" }, 16.0, p().fg), if i == 0 { "Top" } else { "Bottom" })).clicked() {
+                        bar = Some(i == 0);
+                    }
+                })
+            });
         });
         let mut picked = None;
         let mut load_file = false;
@@ -7703,6 +7855,9 @@ impl GifKitApp {
         }
         self.text_tpl = Annotation { text: if sel.is_none() { a.text.clone() } else { self.text_tpl.text.clone() }, x: 0, y: 0, angle: 0.0, from: 1, to: 0, ..a.clone() };
         self.commit_layer(sel, changed, LayerKind::Text(a));
+        if let Some(top) = bar {
+            self.add_caption_bar(top, ui.input(|i| i.time));
+        }
     }
 
     fn ui_censor(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
@@ -8076,6 +8231,44 @@ impl GifKitApp {
         self.shape_tpl = ShapeSettings { x: geo.0, y: geo.1, w: geo.2, h: geo.3, angle: geo.4, from: geo.5, to: geo.6, ..st };
     }
 
+    /// Follow an emoji dragged from the picker, and drop it where it lands on a view.
+    fn emoji_drag_drop(&mut self, ctx: &egui::Context) {
+        let Some(f) = self.emoji_drag.clone() else { return };
+        let pos = ctx.input(|i| i.pointer.hover_pos());
+        if let (Some(p), Some(t)) = (pos, self.emoji_texture(ctx, &f)) {
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::unique("emoji-drag")));
+            let r = Rect::from_center_size(p, vec2(48.0, 48.0));
+            painter.image(t.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::from_white_alpha(220));
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
+        if ctx.input(|i| i.pointer.primary_down()) {
+            ctx.request_repaint();
+            return;
+        }
+        self.emoji_drag = None;
+        let Some(p) = pos else { return };
+        let Some(&(_, m)) = self.drop_views.iter().find(|(r, _)| r.contains(p)) else { return };
+        if self.busy() || self.base.is_none() {
+            return;
+        }
+        let now = ctx.input(|i| i.time);
+        self.snapshot(&format!("emoji-drop{now}"), now);
+        self.emoji_pick = f;
+        self.note_recent_emoji();
+        let (w, h) = self.dims();
+        let id = self.add_layer(LayerKind::Emoji(Box::new(self.default_emoji(w, h, None))));
+        // the drop point is in output pixels: take it back to the source frame
+        let Some(li) = self.stack.index_of(id) else { return };
+        let maps = self.stack.layer_maps(w, h);
+        let o = m.to_img(p);
+        let (cx, cy) = maps[li].m.inverse().apply(o.x, o.y);
+        if let LayerKind::Emoji(e) = &mut self.stack.layers[li].kind {
+            e.x = (cx - e.w as f32 / 2.0).round() as i32;
+            e.y = (cy - e.h as f32 / 2.0).round() as i32;
+        }
+        self.tool = Tool::Emoji;
+    }
+
     /// A new emoji layer with the current pick, square, centred on `at` (source px) or the frame.
     fn default_emoji(&self, w: u32, h: u32, at: Option<(f32, f32)>) -> EmojiSettings {
         let side = ((w.min(h) as f32) * 0.3).max(16.0) as u32;
@@ -8180,9 +8373,12 @@ impl GifKitApp {
                                     Some(t) => egui::Button::image(egui::Image::new(t).fit_to_exact_size(vec2(icon_s, icon_s))),
                                     None => egui::Button::new(""),
                                 };
-                                let resp = ui.add(sel_btn(b.frame_when_inactive(on), on).min_size(vec2(cell_s, cell_s))).on_hover_text(crate::emoji::name_of(f));
+                                let resp = ui.add(sel_btn(b.frame_when_inactive(on), on).min_size(vec2(cell_s, cell_s))).interact(Sense::drag()).on_hover_text(format!("{}. Click to add, or drag onto the picture.", crate::emoji::name_of(f)));
                                 if resp.clicked() {
                                     picked = Some(f.clone());
+                                }
+                                if resp.drag_started() {
+                                    self.emoji_drag = Some(f.clone());
                                 }
                             }
                         });

@@ -181,7 +181,7 @@ fn replace_white_makes_transparent() {
 fn text_and_censor_and_overlay() {
     let a = synth(false);
     let fonts = text::builtin_fonts();
-    let ann = text::Annotation { text: "Hello\nworld".into(), ..Default::default() };
+    let ann = text::Annotation { text: "Hello\nworld".into(), color: [255, 255, 255, 255], ..Default::default() };
     let s = text::render_sprite(&fonts, &ann);
     assert!(s.width() > 20 && s.height() > 40);
     assert!(s.pixels().any(|p| p[3] == 255 && p[0] == 255));
@@ -1234,4 +1234,25 @@ fn effect_intro_starts_with_its_clip() {
     assert_eq!(v(2), 200, "outside the clip nothing happens");
     assert!(v(4) < 80, "the fade starts at the clip: {}", v(4));
     assert_eq!(v(7), 200, "and is done three frames in");
+}
+
+#[test]
+fn canvas_space_pads_and_layers_follow() {
+    use crate::shapes::{ShapeKind, ShapeSettings};
+    use crate::stack::{LayerKind, Stack};
+    let a = Animation { frames: (0..2).map(|_| Frame::new(RgbaImage::from_pixel(20, 10, Rgba([0, 0, 255, 255])), 5)).collect(), loop_count: None };
+    let mut s = Stack::default();
+    s.transform.pad_on = true;
+    s.transform.pad = [6, 0, 14, 2]; // top, right, bottom, left
+    s.push(LayerKind::Shape(Box::new(ShapeSettings { kind: ShapeKind::Rect, x: 0, y: 0, w: 4, h: 4, fill: [255, 0, 0], ..Default::default() })));
+    let out = s.flatten(&a, &[], None);
+    let f = &out.frames[0].image;
+    assert_eq!(f.dimensions(), (22, 30));
+    assert_eq!(f.get_pixel(0, 0).0, [255, 255, 255, 255], "new space is white by default");
+    assert_eq!(f.get_pixel(10, 25).0, [255, 255, 255, 255]);
+    assert_eq!(f.get_pixel(15, 10).0, [0, 0, 255, 255], "the picture sits after the left and top space");
+    assert_eq!(f.get_pixel(3, 7)[0], 255, "a layer at the source corner moves with the picture");
+    s.transform.pad_transparent = true;
+    let out = s.flatten(&a, &[], None);
+    assert_eq!(out.frames[0].image.get_pixel(0, 0)[3], 0);
 }

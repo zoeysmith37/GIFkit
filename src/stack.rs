@@ -72,6 +72,12 @@ pub struct Transform {
     pub rot_expand: bool,
     pub rot_bg_transparent: bool,
     pub rot_bg: [u8; 3],
+    // extra canvas around the frames, after everything else
+    pub pad_on: bool,
+    /// pixels added at the top, right, bottom and left
+    pub pad: [u32; 4],
+    pub pad_transparent: bool,
+    pub pad_color: [u8; 3],
 }
 
 impl Default for Transform {
@@ -108,6 +114,10 @@ impl Default for Transform {
             rot_expand: true,
             rot_bg_transparent: true,
             rot_bg: [255, 255, 255],
+            pad_on: false,
+            pad: [0; 4],
+            pad_transparent: false,
+            pad_color: [255, 255, 255],
         }
     }
 }
@@ -126,7 +136,25 @@ pub fn resize_target(w: u32, h: u32, tw: u32, th: u32, pct: f32) -> Option<(u32,
 
 impl Transform {
     pub fn geometry_identity(&self) -> bool {
-        !(self.crop_on && self.crop[2] > 0 && self.crop[3] > 0) && !self.resize_on && !self.rotates()
+        !(self.crop_on && self.crop[2] > 0 && self.crop[3] > 0) && !self.resize_on && !self.rotates() && !self.pads()
+    }
+
+    /// Adds canvas around the frames.
+    pub fn pads(&self) -> bool {
+        self.pad_on && self.pad.iter().any(|p| *p > 0)
+    }
+
+    /// Put the frame on a bigger canvas (transparent or a colour).
+    fn apply_pad(&self, img: RgbaImage) -> RgbaImage {
+        if !self.pads() {
+            return img;
+        }
+        let [t, r, b, l] = self.pad;
+        let bg = if self.pad_transparent { Rgba([0, 0, 0, 0]) } else { Rgba([self.pad_color[0], self.pad_color[1], self.pad_color[2], 255]) };
+        let (w, h) = img.dimensions();
+        let mut out = RgbaImage::from_pixel(w + l + r, h + t + b, bg);
+        imageops::replace(&mut out, &img, l as i64, t as i64);
+        out
     }
 
     pub fn is_identity(&self) -> bool {
@@ -160,7 +188,7 @@ impl Transform {
         }
         let mut out = img.unwrap_or_else(|| src.clone());
         if !self.rot_on {
-            return out;
+            return self.apply_pad(out);
         }
         if self.flip_v {
             out = imageops::flip_vertical(&out);
@@ -178,7 +206,7 @@ impl Transform {
             let bg = if self.rot_bg_transparent { Rgba([0, 0, 0, 0]) } else { Rgba([self.rot_bg[0], self.rot_bg[1], self.rot_bg[2], 255]) };
             out = ops::rotate_any_image(&out, self.rot_deg, bg, self.rot_expand);
         }
-        out
+        self.apply_pad(out)
     }
 
     /// Where `apply_geometry` moves source pixels (must mirror it exactly).
@@ -232,6 +260,11 @@ impl Transform {
             if self.rot_any && self.rot_deg % 360.0 != 0.0 {
                 g.rot_any(self.rot_deg, self.rot_expand);
             }
+        }
+        if self.pads() {
+            let [t, r, b, l] = self.pad;
+            let (w, h) = (g.w, g.h);
+            g.offset(l as f32, t as f32, w + (l + r) as f32, h + (t + b) as f32);
         }
         g
     }

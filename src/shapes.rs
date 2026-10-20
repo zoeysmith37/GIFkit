@@ -163,7 +163,7 @@ pub struct ShapeSettings {
 impl Default for ShapeSettings {
     fn default() -> Self {
         Self {
-            kind: ShapeKind::Rounded,
+            kind: ShapeKind::Rect,
             x: 0,
             y: 0,
             w: 0,
