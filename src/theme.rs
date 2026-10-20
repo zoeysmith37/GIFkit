@@ -272,7 +272,43 @@ pub fn ui_font() -> Option<(String, f32)> {
 
 /// How toolbars show their buttons: (show text beside the icon, icon size).
 /// KDE's defaults are text beside icons and 22 px icons.
+/// The toolbar's own text position and icon size, chosen from its context
+/// menu: 0 follows the desktop. Text: 1 icons only, 2 text beside icons.
+static TB_TEXT: AtomicU8 = AtomicU8::new(0);
+static TB_SIZE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Read the toolbar choices saved in the settings (once at startup).
+pub fn load_toolbar_choice() {
+    let text = get_setting("toolbar_text").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let size = get_setting("toolbar_icons").and_then(|v| v.parse().ok()).unwrap_or(0);
+    TB_TEXT.store(text, Ordering::Relaxed);
+    TB_SIZE.store(size, Ordering::Relaxed);
+}
+
+pub fn toolbar_choice() -> (u8, u32) {
+    (TB_TEXT.load(Ordering::Relaxed), TB_SIZE.load(Ordering::Relaxed))
+}
+
+pub fn set_toolbar_choice(text: u8, size: u32) {
+    TB_TEXT.store(text, Ordering::Relaxed);
+    TB_SIZE.store(size, Ordering::Relaxed);
+    set_setting("toolbar_text", &text.to_string());
+    set_setting("toolbar_icons", &size.to_string());
+}
+
 pub fn toolbar_style() -> (bool, f32) {
+    let (text, size) = toolbar_choice();
+    let (sys_text, sys_size) = toolbar_style_system();
+    let text = match text {
+        1 => false,
+        2 => true,
+        _ => sys_text,
+    };
+    (text, if size == 0 { sys_size } else { size as f32 })
+}
+
+/// The desktop's toolbar style (KDE's settings, or compact icons elsewhere).
+fn toolbar_style_system() -> (bool, f32) {
     let text = match kde_value("Toolbar style", "ToolButtonStyle").as_deref() {
         Some("IconOnly") => false,
         Some(_) => true,
@@ -563,13 +599,6 @@ pub enum ThemeChoice {
 }
 
 impl ThemeChoice {
-    pub fn label(self) -> &'static str {
-        match self {
-            ThemeChoice::System => "System",
-            ThemeChoice::Dark => "Dark",
-            ThemeChoice::Light => "Light",
-        }
-    }
     pub fn apply(self, ctx: &egui::Context) {
         ctx.set_theme(match self {
             // follow the KDE colour scheme when there is one

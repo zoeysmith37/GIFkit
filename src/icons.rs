@@ -17,7 +17,7 @@ static ICONS: &[(&str, &str, &str)] = icon_set!(
     "document-new", "document-open", "document-open-recent", "document-save", "document-save-as", "document-sign",
     "draw-freehand", "draw-text", "edit-clear-all", "edit-cut", "edit-delete", "edit-duplicate", "edit-redo",
     "edit-rename", "edit-undo", "format-fill-color", "go-bottom", "go-down", "go-top", "go-up", "grid-rectangular",
-    "help-about", "insert-image", "kdenlive-show-video", "link", "list-add",
+    "help-about", "help-contents", "insert-image", "kdenlive-show-video", "link", "list-add",
     "markasblank", "media-playback-pause", "media-playback-start", "media-playlist-repeat", "media-skip-backward",
     "media-skip-forward", "merge", "object-rotate-right", "pixelate", "player-time", "security-high", "shapes",
     "sidebar-collapse-left", "sidebar-collapse-right", "smiley", "speedometer", "tools-report-bug", "tools-wizard",

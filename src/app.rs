@@ -667,6 +667,10 @@ pub struct GifKitApp {
     shortcuts_open: bool,
     /// the window title last sent, so it's only set when it changes
     win_title: String,
+    show_toolbar: bool,
+    show_statusbar: bool,
+    /// recently opened files, newest first
+    recent: Vec<PathBuf>,
     /// where the project was last saved (None = never)
     project_path: Option<PathBuf>,
     /// style for the next shape drawn
@@ -1439,7 +1443,7 @@ fn spin<'a, N: egui::emath::Numeric>(ui: &mut egui::Ui, size: Vec2, v: &'a mut N
         }
     }
     // a child that takes no room of its own: the space is already allocated above
-    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(field).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(field).layout(egui::Layout::left_to_right(egui::Align::Center).with_main_align(egui::Align::Min)));
     let w = &mut child.visuals_mut().widgets;
     for st in [&mut w.inactive, &mut w.hovered, &mut w.active] {
         st.bg_fill = Color32::TRANSPARENT;
@@ -1447,7 +1451,9 @@ fn spin<'a, N: egui::emath::Numeric>(ui: &mut egui::Ui, size: Vec2, v: &'a mut N
         st.bg_stroke = Stroke::NONE;
         st.expansion = 0.0;
     }
-    let mut resp = child.add_sized(field.size(), f(egui::DragValue::new(v)));
+    // the value sits on the left, as in a Qt spin box
+    child.spacing_mut().interact_size = field.size();
+    let mut resp = child.add(f(egui::DragValue::new(v)));
     let hovered = enabled && ui.rect_contains_pointer(rect);
     let focus = resp.has_focus() || resp.dragged();
     let stroke = Stroke::new(1.0, if focus || hovered { pal.highlight } else { pal.border });
@@ -1670,20 +1676,28 @@ fn tb_toggle(ui: &mut egui::Ui, icon: &str, on: bool, tip: &str) -> bool {
     ui.add(sel_btn(b, on)).on_hover_text(tip).clicked()
 }
 
-
-
 /// A menu entry with a Breeze icon and an optional shortcut.
 fn menu_item(ui: &mut egui::Ui, icon: &str, text: &str, shortcut: &str, enabled: bool) -> bool {
+    menu_item_tip(ui, icon, text, shortcut, enabled, "")
+}
+
+/// A menu entry with a tooltip (Open Recent shows the full path).
+fn menu_item_tip(ui: &mut egui::Ui, icon: &str, text: &str, shortcut: &str, enabled: bool, tip: &str) -> bool {
     let pal = *p();
-    let img = crate::icons::image(ui.ctx(), if icon.is_empty() { "list-add" } else { icon }, 16.0, if enabled { pal.fg } else { pal.fg_muted });
+    let col = if enabled { pal.fg } else { pal.fg_muted };
+    let img = crate::icons::image(ui.ctx(), if icon.is_empty() { "list-add" } else { icon }, 16.0, col);
     let img = if icon.is_empty() { img.tint(Color32::TRANSPARENT) } else { img };
+    let (job, key) = mnemonic(ui, text, col);
     // Breeze menu rows are taller, with more room after the icon
-    let mut b = egui::Button::image_and_text(img, text).min_size(vec2(0.0, 28.0)).gap(10.0);
+    let mut b = egui::Button::image_and_text(img, job).min_size(vec2(0.0, 28.0)).gap(10.0);
     if !shortcut.is_empty() {
         b = b.shortcut_text(RichText::new(shortcut).color(pal.fg_muted));
     }
-    let r = ui.add_enabled(enabled, b);
-    if r.clicked() {
+    let mut r = ui.add_enabled(enabled, b);
+    if !tip.is_empty() {
+        r = r.on_hover_text(tip);
+    }
+    if r.clicked() || (enabled && mnemonic_pressed(ui, key)) {
         ui.close();
         true
     } else {
@@ -1696,11 +1710,12 @@ fn menu_check(ui: &mut egui::Ui, on: bool, text: &str, shortcut: &str) -> bool {
     let pal = *p();
     let img = crate::icons::image(ui.ctx(), "dialog-ok-apply", 16.0, pal.fg);
     let img = if on { img } else { img.tint(Color32::TRANSPARENT) };
-    let mut b = egui::Button::image_and_text(img, text).min_size(vec2(0.0, 28.0)).gap(10.0);
+    let (job, key) = mnemonic(ui, text, pal.fg);
+    let mut b = egui::Button::image_and_text(img, job).min_size(vec2(0.0, 28.0)).gap(10.0);
     if !shortcut.is_empty() {
         b = b.shortcut_text(RichText::new(shortcut).color(pal.fg_muted));
     }
-    if ui.add(b).clicked() {
+    if ui.add(b).clicked() || mnemonic_pressed(ui, key) {
         ui.close();
         true
     } else {
@@ -1708,10 +1723,81 @@ fn menu_check(ui: &mut egui::Ui, on: bool, text: &str, shortcut: &str) -> bool {
     }
 }
 
-/// A submenu whose title lines up with the icon column.
-fn sub_menu(ui: &mut egui::Ui, text: &str, add: impl FnOnce(&mut egui::Ui)) {
-    let img = crate::icons::image(ui.ctx(), "dialog-ok-apply", 16.0, Color32::TRANSPARENT).tint(Color32::TRANSPARENT);
-    ui.menu_image_text_button(img, text, add);
+/// A submenu whose title lines up with the icon column, with Breeze's thin
+/// chevron on the right.
+fn sub_menu(ui: &mut egui::Ui, icon: &str, text: &str, add: impl FnOnce(&mut egui::Ui)) {
+    let pal = *p();
+    let img = crate::icons::image(ui.ctx(), if icon.is_empty() { "list-add" } else { icon }, 16.0, pal.fg);
+    let img = if icon.is_empty() { img.tint(Color32::TRANSPARENT) } else { img };
+    let (job, _) = mnemonic(ui, text, pal.fg);
+    let b = egui::Button::image_and_text(img, job).min_size(vec2(0.0, 28.0)).gap(10.0).right_text(crate::icons::image(ui.ctx(), "go-next", 16.0, pal.fg));
+    egui::containers::menu::SubMenuButton::from_button(b).ui(ui, add);
+}
+
+/// A top-level menu in the menu bar. Alt plus its underlined letter opens it.
+fn top_menu(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+    let (job, key) = mnemonic(ui, title, p().fg);
+    // the popup id egui gives the button's menu, known before the button is added
+    let popup = ui.next_auto_id().with("popup");
+    if let Some(k) = key {
+        if ui.input(|i| i.modifiers.alt && !i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(k)) {
+            egui::Popup::open_id(ui.ctx(), popup);
+            ui.ctx().data_mut(|d| d.insert_temp(mnemonics_id(), true));
+        }
+    }
+    egui::containers::menu::MenuButton::from_button(egui::Button::new(job)).ui(ui, add);
+}
+
+fn mnemonics_id() -> egui::Id {
+    egui::Id::unique("mnemonics-kbd")
+}
+
+/// Whether menus show their underlined letters: while Alt is held, or after a
+/// menu was opened from the keyboard (KDE's default "hide until Alt" style).
+fn mnemonics_shown(ctx: &egui::Context) -> bool {
+    let kbd = ctx.data(|d| d.get_temp::<bool>(mnemonics_id())).unwrap_or(false);
+    ctx.input(|i| i.modifiers.alt) || kbd
+}
+
+/// Lay out a label written with Qt's "&" mnemonic marker ("&&" for a plain &).
+/// Returns the text and the key that picks it.
+fn mnemonic(ui: &egui::Ui, text: &str, col: Color32) -> (egui::text::LayoutJob, Option<egui::Key>) {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let show = mnemonics_shown(ui.ctx());
+    let mut job = egui::text::LayoutJob::default();
+    let plain = egui::TextFormat { font_id: font, color: col, ..Default::default() };
+    let under = egui::TextFormat { underline: if show { Stroke::new(1.0, col) } else { Stroke::NONE }, ..plain.clone() };
+    let mut key = None;
+    let mut chars = text.chars();
+    let mut buf = String::new();
+    while let Some(c) = chars.next() {
+        if c != '&' {
+            buf.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('&') => buf.push('&'),
+            Some(m) if key.is_none() => {
+                if !buf.is_empty() {
+                    job.append(&std::mem::take(&mut buf), 0.0, plain.clone());
+                }
+                job.append(&m.to_string(), 0.0, under.clone());
+                key = egui::Key::from_name(&m.to_uppercase().to_string());
+            }
+            Some(m) => buf.push(m),
+            None => {}
+        }
+    }
+    if !buf.is_empty() {
+        job.append(&buf, 0.0, plain);
+    }
+    (job, key)
+}
+
+/// The mnemonic letter pressed while this menu is open (no modifiers needed).
+fn mnemonic_pressed(ui: &egui::Ui, key: Option<egui::Key>) -> bool {
+    let Some(k) = key else { return false };
+    ui.input(|i| !i.modifiers.ctrl && !i.modifiers.command && !i.modifiers.alt && i.key_pressed(k))
 }
 
 /// A dialog in a window of its own, as KDE dialogs are, centred over the main
@@ -1794,6 +1880,7 @@ fn small_icon(ui: &mut egui::Ui, icon: &str, tip: &str) -> bool {
 impl GifKitApp {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
         theme::install(&cc.egui_ctx);
+        theme::load_toolbar_choice();
         let theme_choice = match std::env::var("GIFKIT_THEME").as_deref() {
             Ok("dark") => ThemeChoice::Dark,
             Ok("light") => ThemeChoice::Light,
@@ -1927,6 +2014,9 @@ impl GifKitApp {
             cmp_full_key: 0,
             shortcuts_open: false,
             win_title: String::new(),
+            show_toolbar: theme::get_setting("show_toolbar").as_deref() != Some("0"),
+            show_statusbar: theme::get_setting("show_statusbar").as_deref() != Some("0"),
+            recent: theme::get_setting("recent").unwrap_or_default().split('\n').filter(|l| !l.is_empty()).map(PathBuf::from).collect(),
             project_path: None,
             shape_tpl: ShapeSettings::default(),
             text_tpl: Annotation { text: "Your text".into(), ..Default::default() },
@@ -2759,6 +2849,7 @@ impl GifKitApp {
     }
 
     fn open_path(&mut self, p: PathBuf, ctx: &egui::Context) {
+        self.add_recent(&p);
         if crate::project::is_project(&p) {
             self.spawn_in(ctx, "Open project", 1, false, move |_| JobOutput::ProjectLoaded(crate::project::load(&p).map(|pr| (pr, p.clone()))));
             return;
@@ -2949,7 +3040,19 @@ impl GifKitApp {
             self.shortcuts_open = false;
             self.about_open = false;
         }
-        if typing {
+        let (full, help, alt) = ctx.input(|i| (i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::F), i.key_pressed(egui::Key::F1), i.modifiers.alt));
+        if full {
+            let on = ctx.input(|i| i.viewport().fullscreen).unwrap_or(false);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!on));
+        }
+        if help {
+            open_external(&format!("{REPO_URL}#readme"));
+        }
+        // letters belong to an open menu, and Alt+letter to the menu bar
+        if !egui::Popup::is_any_open(ctx) {
+            ctx.data_mut(|d| d.remove::<bool>(mnemonics_id()));
+        }
+        if typing || alt || egui::Popup::is_any_open(ctx) {
             return;
         }
         if undo {
@@ -3537,11 +3640,15 @@ impl eframe::App for GifKitApp {
         egui::Panel::top("menubar")
             .frame(egui::Frame::new().fill(pal.header).inner_margin(egui::Margin { left: 4, right: 4, top: 2, bottom: 0 }))
             .show(ui, |ui| self.menubar(ui, &ctx));
-        egui::Panel::top("toolbar")
-            .frame(egui::Frame::new().fill(pal.header).inner_margin(egui::Margin { left: 6, right: 8, top: 3, bottom: 4 }))
-            .show(ui, |ui| self.toolbar(ui, &ctx));
+        if self.show_toolbar {
+            egui::Panel::top("toolbar")
+                .frame(egui::Frame::new().fill(pal.header).inner_margin(egui::Margin { left: 6, right: 8, top: 3, bottom: 4 }))
+                .show(ui, |ui| self.toolbar(ui, &ctx));
+        }
 
-        egui::Panel::bottom("status").frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin::symmetric(10, 3))).show(ui, |ui| self.status_bar(ui));
+        if self.show_statusbar {
+            egui::Panel::bottom("status").frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin::symmetric(10, 3))).show(ui, |ui| self.status_bar(ui));
+        }
 
         let rail_w = if self.sidebar_compact { 40.0 } else { 140.0 };
         if self.base.is_some() {
@@ -3657,99 +3764,141 @@ impl GifKitApp {
         let theme_before = self.theme;
         let backdrop_before = (self.backdrop, self.backdrop_col);
         egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("File", |ui| {
-                ui.set_min_width(240.0);
-                if menu_item(ui, "document-new", "New Project", "Ctrl+N", idle) {
+            top_menu(ui, "&File", |ui| {
+                ui.set_min_width(250.0);
+                if menu_item(ui, "document-new", "&New Project", "Ctrl+N", idle) {
                     self.new_project();
                 }
-                if menu_item(ui, "document-open", "Open…", "Ctrl+O", idle) {
+                if menu_item(ui, "document-open", "&Open…", "Ctrl+O", idle) {
                     self.open_dialog(ctx);
                 }
-                if menu_item(ui, "document-open-recent", "Open Image Sequence…", "", idle) {
+                let mut reopen = None;
+                let mut clear = false;
+                sub_menu(ui, "document-open-recent", "Open &Recent", |ui| {
+                    ui.set_min_width(260.0);
+                    if self.recent.is_empty() {
+                        ui.add_enabled(false, egui::Button::new(RichText::new("No Entries").color(p().fg_muted)).min_size(vec2(0.0, 28.0)));
+                    }
+                    for (i, path) in self.recent.iter().enumerate() {
+                        let name = path.file_name().map(|n| n.to_string_lossy().replace('&', "&&")).unwrap_or_default();
+                        // numbered as KDE numbers recent files, the number being the mnemonic
+                        let text = if i < 9 { format!("&{} {name}", i + 1) } else { name };
+                        if menu_item_tip(ui, "", &text, "", idle, &path.display().to_string()) {
+                            reopen = Some(path.clone());
+                        }
+                    }
+                    if !self.recent.is_empty() {
+                        ui.separator();
+                        if menu_item(ui, "edit-clear-all", "&Clear List", "", true) {
+                            clear = true;
+                        }
+                    }
+                });
+                if let Some(p) = reopen {
+                    self.open_path(p, ctx);
+                }
+                if clear {
+                    self.recent.clear();
+                    theme::set_setting("recent", "");
+                }
+                if menu_item(ui, "document-import", "Open Image Se&quence…", "", idle) {
                     self.open_sequence_dialog(ctx);
                 }
                 ui.separator();
-                if menu_item(ui, "document-save", "Save", "Ctrl+S", idle && has) {
+                if menu_item(ui, "document-save", "&Save", "Ctrl+S", idle && has) {
                     self.save_project(ctx, false);
                 }
-                if menu_item(ui, "document-save-as", "Save As…", "Ctrl+Shift+S", idle && has) {
+                if menu_item(ui, "document-save-as", "Save &As…", "Ctrl+Shift+S", idle && has) {
                     self.save_project(ctx, true);
                 }
                 ui.separator();
-                if menu_item(ui, "document-export", "Export…", "Ctrl+E", idle && has) {
+                if menu_item(ui, "document-export", "&Export…", "Ctrl+E", idle && has) {
                     self.export_open = true;
                 }
                 ui.separator();
-                if menu_item(ui, "application-exit", "Quit", "Ctrl+Q", true) {
+                if menu_item(ui, "application-exit", "&Quit", "Ctrl+Q", true) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
-            ui.menu_button("Edit", |ui| {
-                ui.set_min_width(240.0);
+            top_menu(ui, "&Edit", |ui| {
+                ui.set_min_width(250.0);
                 let pending = self.committed.as_ref().map(|c| c.0 != self.live_sig()).unwrap_or(false);
-                let undo = self.undo.last().map(|u| format!("Undo {}", elide(&u.label, 28))).unwrap_or_else(|| "Undo".into());
+                let undo = self.undo.last().map(|u| format!("&Undo {}", elide(&u.label, 28).replace('&', "&&"))).unwrap_or_else(|| "&Undo".into());
                 if menu_item(ui, "edit-undo", &undo, "Ctrl+Z", idle && (pending || !self.undo.is_empty())) {
                     self.do_undo();
                 }
-                let redo = self.redo.last().map(|u| format!("Redo {}", elide(&u.label, 28))).unwrap_or_else(|| "Redo".into());
+                let redo = self.redo.last().map(|u| format!("Re&do {}", elide(&u.label, 28).replace('&', "&&"))).unwrap_or_else(|| "Re&do".into());
                 if menu_item(ui, "edit-redo", &redo, "Ctrl+Y", idle && !self.redo.is_empty()) {
                     self.do_redo();
                 }
                 ui.separator();
-                if menu_item(ui, "view-history", "History", "Ctrl+H", true) {
+                if menu_item(ui, "view-history", "&History", "Ctrl+H", true) {
                     self.history_open = !self.history_open;
                 }
-                if menu_item(ui, "bookmarks", "Presets", "", has) {
+                if menu_item(ui, "bookmarks", "&Presets", "", has) {
                     self.open_tool(Tool::Presets);
                 }
                 ui.separator();
-                if menu_item(ui, "merge", "Collapse All", "", idle && has && !self.stack.is_empty()) {
+                if menu_item(ui, "merge", "&Collapse All", "", idle && has && !self.stack.is_empty()) {
                     self.bake(ctx, false);
                 }
-                if menu_item(ui, "dialog-ok-apply", "Collapse Frame Edits", "", idle && has && !self.stack.transform.is_identity()) {
+                if menu_item(ui, "dialog-ok-apply", "Collapse &Frame Edits", "", idle && has && !self.stack.transform.is_identity()) {
                     self.bake(ctx, true);
                 }
             });
-            ui.menu_button("View", |ui| {
-                ui.set_min_width(240.0);
-                if menu_check(ui, !self.compare, "Single View", "C") {
+            top_menu(ui, "&View", |ui| {
+                ui.set_min_width(250.0);
+                if menu_check(ui, !self.compare, "&Single View", "C") {
                     self.compare = false;
                 }
-                if menu_check(ui, self.compare, "Split View", "C") {
+                if menu_check(ui, self.compare, "S&plit View", "C") {
                     self.compare = true;
                 }
-                if menu_check(ui, self.link_views, "Link Both Views", "") {
+                if menu_check(ui, self.link_views, "&Link Both Views", "") {
                     self.link_views = !self.link_views;
                 }
                 ui.separator();
-                if menu_item(ui, "zoom-in", "Zoom In", "+", has) {
+                if menu_item(ui, "zoom-in", "Zoom &In", "+", has) {
                     self.zoom_to(self.cur_scale() * 1.25);
                 }
-                if menu_item(ui, "zoom-out", "Zoom Out", "−", has) {
+                if menu_item(ui, "zoom-out", "Zoom &Out", "−", has) {
                     self.zoom_to(self.cur_scale() / 1.25);
                 }
-                if menu_item(ui, "zoom-fit-best", "Fit to View", "F", has) {
+                if menu_item(ui, "zoom-fit-best", "&Fit to View", "F", has) {
                     self.zoom_fit();
                 }
-                if menu_item(ui, "zoom-original", "Actual Size", "1", has) {
+                if menu_item(ui, "zoom-original", "&Actual Size", "1", has) {
                     self.zoom_to(1.0);
                 }
+                ui.separator();
+                let full = ctx.input(|i| i.viewport().fullscreen).unwrap_or(false);
+                if menu_check(ui, full, "F&ull Screen Mode", "Ctrl+Shift+F") {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!full));
+                }
             });
-            ui.menu_button("Settings", |ui| {
-                ui.set_min_width(280.0);
-                if menu_check(ui, !self.sidebar_compact, "Show Tool Names", "") {
+            top_menu(ui, "&Settings", |ui| {
+                ui.set_min_width(290.0);
+                if menu_check(ui, self.show_toolbar, "Show &Toolbar", "") {
+                    self.show_toolbar = !self.show_toolbar;
+                    theme::set_setting("show_toolbar", if self.show_toolbar { "1" } else { "0" });
+                }
+                if menu_check(ui, self.show_statusbar, "Show St&atusbar", "") {
+                    self.show_statusbar = !self.show_statusbar;
+                    theme::set_setting("show_statusbar", if self.show_statusbar { "1" } else { "0" });
+                }
+                if menu_check(ui, !self.sidebar_compact, "Show Tool &Names", "") {
                     self.set_rail_compact(!self.sidebar_compact);
                 }
                 ui.separator();
-                sub_menu(ui, "Show Transparency As", |ui| {
+                sub_menu(ui, "", "Show T&ransparency As", |ui| {
                     ui.set_min_width(220.0);
-                    if menu_check(ui, self.backdrop == Backdrop::Checker, "Checkerboard", "") {
+                    if menu_check(ui, self.backdrop == Backdrop::Checker, "C&heckerboard", "") {
                         self.backdrop = Backdrop::Checker;
                     }
-                    if menu_check(ui, self.backdrop == Backdrop::Canvas, "Viewport Background", "") {
+                    if menu_check(ui, self.backdrop == Backdrop::Canvas, "&Viewport Background", "") {
                         self.backdrop = Backdrop::Canvas;
                     }
-                    if menu_check(ui, self.backdrop == Backdrop::Solid, "Solid Colour", "") {
+                    if menu_check(ui, self.backdrop == Backdrop::Solid, "&Solid Colour", "") {
                         self.backdrop = Backdrop::Solid;
                     }
                     ui.horizontal(|ui| {
@@ -3758,55 +3907,59 @@ impl GifKitApp {
                         colour_btn(ui, &mut self.backdrop_col);
                     });
                 });
-                if menu_check(ui, self.pixelated, "Pixelated Preview", "") {
+                if menu_check(ui, self.pixelated, "&Pixelated Preview", "") {
                     self.pixelated = !self.pixelated;
                     theme::set_setting("pixelated", if self.pixelated { "1" } else { "0" });
                 }
                 ui.separator();
-                if menu_check(ui, self.sample_preview, "Estimate Size of Long Animations", "") {
+                if menu_check(ui, self.sample_preview, "&Estimate Size of Long Animations", "") {
                     self.sample_preview = !self.sample_preview;
                     theme::set_setting("sample_preview", if self.sample_preview { "1" } else { "0" });
                 }
-                if menu_item(ui, "document-open", "Open Presets Folder", "", true) {
+                if menu_item(ui, "document-open", "Open Presets F&older", "", true) {
                     if let Some(dir) = crate::presets::folder() {
                         let _ = std::fs::create_dir_all(&dir);
                         open_in_file_manager(&dir);
                     }
                 }
                 ui.separator();
-                sub_menu(ui, "Colour Scheme", |ui| {
+                sub_menu(ui, "", "&Colour Scheme", |ui| {
                     ui.set_min_width(160.0);
-                    for t in [ThemeChoice::System, ThemeChoice::Dark, ThemeChoice::Light] {
-                        if menu_check(ui, self.theme == t, if t == ThemeChoice::System { "Follow System" } else { t.label() }, "") {
+                    for (t, l) in [(ThemeChoice::System, "&Follow System"), (ThemeChoice::Dark, "&Dark"), (ThemeChoice::Light, "&Light")] {
+                        if menu_check(ui, self.theme == t, l, "") {
                             self.theme = t;
                         }
                     }
                 });
                 if cfg!(all(unix, not(target_os = "macos"))) {
                     let native = theme::get_setting("wayland").as_deref() == Some("native");
-                    if menu_check(ui, native, "Native Wayland", "") {
+                    if menu_check(ui, native, "Native &Wayland", "") {
                         theme::set_setting("wayland", if native { "xwayland" } else { "native" });
                         self.info("Applies after a restart");
                     }
                 }
-            });
-            ui.menu_button("Help", |ui| {
-                ui.set_min_width(240.0);
-                if menu_item(ui, "configure-shortcuts", "Keyboard Shortcuts", "", true) {
+                ui.separator();
+                if menu_item(ui, "configure-shortcuts", "&Keyboard Shortcuts", "", true) {
                     self.shortcuts_open = true;
                 }
+            });
+            top_menu(ui, "&Help", |ui| {
+                ui.set_min_width(250.0);
+                if menu_item(ui, "help-contents", "GIFkit &Handbook", "F1", true) {
+                    open_external(&format!("{REPO_URL}#readme"));
+                }
                 ui.separator();
-                if menu_item(ui, "", "GitHub Page", "", true) {
-                    open_external(REPO_URL);
-                }
-                if menu_item(ui, "view-refresh", "Check for Updates", "", true) {
-                    open_external(&format!("{REPO_URL}/releases"));
-                }
-                if menu_item(ui, "tools-report-bug", "Report a Bug", "", true) {
+                if menu_item(ui, "tools-report-bug", "&Report Bug…", "", true) {
                     open_external(&format!("{REPO_URL}/issues"));
                 }
+                if menu_item(ui, "view-refresh", "Check for &Updates", "", true) {
+                    open_external(&format!("{REPO_URL}/releases"));
+                }
+                if menu_item(ui, "", "GIFkit &Website", "", true) {
+                    open_external(REPO_URL);
+                }
                 ui.separator();
-                if menu_item(ui, "help-about", "About GIFkit", "", true) {
+                if menu_item(ui, "help-about", "&About GIFkit", "", true) {
                     self.about_open = true;
                 }
             });
@@ -3818,6 +3971,16 @@ impl GifKitApp {
         if backdrop_before != (self.backdrop, self.backdrop_col) {
             self.save_backdrop();
         }
+    }
+
+    /// Remember a file for File ▸ Open Recent (ten at most, newest first).
+    fn add_recent(&mut self, p: &std::path::Path) {
+        let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        self.recent.retain(|r| *r != p);
+        self.recent.insert(0, p);
+        self.recent.truncate(10);
+        let list: Vec<String> = self.recent.iter().map(|r| r.display().to_string()).collect();
+        theme::set_setting("recent", &list.join("\n"));
     }
 
     fn save_backdrop(&self) {
@@ -3889,6 +4052,8 @@ impl GifKitApp {
         let pal = *p();
         let (_, tb_icon) = theme::toolbar_style();
         let tb_h = tb_icon + 10.0;
+        // right-clicking the bar gives KDE's toolbar menu
+        let bg = ui.interact(ui.max_rect(), ui.scope_id().with("toolbar-bg"), Sense::click());
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             let idle = !self.busy();
@@ -3937,6 +4102,34 @@ impl GifKitApp {
                     ui.add_enabled_ui(idle, |ui| self.format_menu(ui, tb_h));
                 }
             });
+        });
+        bg.context_menu(|ui| {
+            ui.set_min_width(220.0);
+            ui.add_space(2.0);
+            ui.label(RichText::new("Main Toolbar").font(theme::medium(13.0)).color(p().fg_muted));
+            ui.separator();
+            let (text, size) = theme::toolbar_choice();
+            sub_menu(ui, "", "&Text Position", |ui| {
+                ui.set_min_width(220.0);
+                for (v, l) in [(0u8, "&Follow System"), (1, "&Icons Only"), (2, "Text &Alongside Icons")] {
+                    if menu_check(ui, text == v, l, "") {
+                        theme::set_toolbar_choice(v, size);
+                    }
+                }
+            });
+            sub_menu(ui, "", "Icon &Size", |ui| {
+                ui.set_min_width(200.0);
+                for (v, l) in [(0u32, "&Follow System"), (16, "&Small (16×16)"), (22, "&Medium (22×22)"), (32, "&Large (32×32)")] {
+                    if menu_check(ui, size == v, l, "") {
+                        theme::set_toolbar_choice(text, v);
+                    }
+                }
+            });
+            ui.separator();
+            if menu_item(ui, "", "&Hide Toolbar", "", true) {
+                self.show_toolbar = false;
+                theme::set_setting("show_toolbar", "0");
+            }
         });
     }
 
@@ -4187,37 +4380,37 @@ impl GifKitApp {
                     let top = li + 1 == n;
                     let bottom = li == 0;
                     let mut act = |a: LayerAct| menu_act = Some(a);
-                    if menu_item(ui, "edit-rename", "Rename", "", true) {
+                    if menu_item(ui, "edit-rename", "&Rename", "", true) {
                         act(LayerAct::Rename(li));
                     }
-                    if menu_item(ui, "edit-duplicate", "Duplicate Layer", "", true) {
+                    if menu_item(ui, "edit-duplicate", "&Duplicate Layer", "", true) {
                         act(LayerAct::Duplicate(li));
                     }
-                    if menu_item(ui, if visible { "view-hidden" } else { "view-visible" }, if visible { "Hide Layer" } else { "Show Layer" }, "", true) {
+                    if menu_item(ui, if visible { "view-hidden" } else { "view-visible" }, if visible { "&Hide Layer" } else { "&Show Layer" }, "", true) {
                         act(LayerAct::Toggle(li));
                     }
                     ui.separator();
-                    if menu_item(ui, "go-top", "Bring to Front", "", !top) {
+                    if menu_item(ui, "go-top", "Bring to &Front", "", !top) {
                         act(LayerAct::Move(li, n - 1));
                     }
-                    if menu_item(ui, "go-up", "Move Up", "", !top) {
+                    if menu_item(ui, "go-up", "Move &Up", "", !top) {
                         act(LayerAct::Move(li, li + 1));
                     }
-                    if menu_item(ui, "go-down", "Move Down", "", !bottom) {
+                    if menu_item(ui, "go-down", "Move Do&wn", "", !bottom) {
                         act(LayerAct::Move(li, li.saturating_sub(1)));
                     }
-                    if menu_item(ui, "go-bottom", "Send to Back", "", !bottom) {
+                    if menu_item(ui, "go-bottom", "Send to &Back", "", !bottom) {
                         act(LayerAct::Move(li, 0));
                     }
                     ui.separator();
-                    if menu_item(ui, "merge", "Collapse Down", "", idle) {
+                    if menu_item(ui, "merge", "&Collapse Down", "", idle) {
                         act(LayerAct::CollapseTo(li));
                     }
-                    if menu_item(ui, "merge", "Collapse All", "", idle) {
+                    if menu_item(ui, "merge", "Collapse &All", "", idle) {
                         act(LayerAct::CollapseAll);
                     }
                     ui.separator();
-                    if menu_item(ui, "edit-delete", "Delete Layer", "", true) {
+                    if menu_item(ui, "edit-delete", "De&lete Layer", "", true) {
                         act(LayerAct::Delete(li));
                     }
                 });
@@ -4305,10 +4498,10 @@ impl GifKitApp {
                 resp.context_menu(|ui| {
                     ui.set_min_width(230.0);
                     if let Some(on) = enabled {
-                        if menu_item(ui, "edit-rename", "Rename", "", true) {
+                        if menu_item(ui, "edit-rename", "&Rename", "", true) {
                             menu_act = Some(LayerAct::RenameEdit(t));
                         }
-                        if menu_item(ui, if on { "view-hidden" } else { "view-visible" }, if on { "Turn Off" } else { "Turn On" }, "", true) {
+                        if menu_item(ui, if on { "view-hidden" } else { "view-visible" }, if on { "Turn O&ff" } else { "Turn &On" }, "", true) {
                             edit_toggle = Some(t);
                         }
                         ui.separator();
@@ -4321,7 +4514,7 @@ impl GifKitApp {
                     }
                     if enabled.is_some() {
                         ui.separator();
-                        if menu_item(ui, "edit-delete", "Remove Edit", "", true) {
+                        if menu_item(ui, "edit-delete", "Re&move Edit", "", true) {
                             edit_remove = Some(t);
                         }
                     }
@@ -4754,7 +4947,7 @@ impl GifKitApp {
             self.zoom_to(self.cur_scale() / 1.25);
         }
         let mut pct = self.cur_scale() * 100.0;
-        if ui.add_sized(vec2(68.0, CHIP_H), egui::DragValue::new(&mut pct).range(2.0..=6400.0).speed(1.0).suffix("%").max_decimals(0)).on_hover_text("Zoom").changed() {
+        if spin(ui, vec2(80.0, CHIP_H), &mut pct, 10.0, |d| d.range(2.0..=6400.0).speed(1.0).suffix("%").max_decimals(0)).on_hover_text("Zoom").changed() {
             self.zoom_to(pct / 100.0);
         }
         if tb_tool(ui, "zoom-in", "", "Zoom in (+)", true).clicked() {
