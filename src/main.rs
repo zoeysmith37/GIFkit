@@ -9,6 +9,7 @@ mod encode;
 mod geo;
 mod icons;
 mod io;
+mod keys;
 mod lzw;
 mod motion;
 mod noai;

@@ -1289,3 +1289,42 @@ fn caption_bar_fits_its_text() {
     while s.layout_text(200, 100, &fonts) {}
     assert!(s.flatten(&a, &fonts, None).frames[0].image.height() > f.height());
 }
+
+#[test]
+fn preview_proxy_matches_a_shrunk_full_render() {
+    use crate::shapes::{ShapeKind, ShapeSettings};
+    use crate::stack::{proxy_size, LayerKind, Stack};
+    let a = Animation { frames: (0..2).map(|_| Frame::new(RgbaImage::from_fn(400, 300, |x, y| Rgba([(x / 2) as u8, (y / 2) as u8, 90, 255])), 5)).collect(), loop_count: None };
+    let mut s = Stack::default();
+    s.transform.crop_on = true;
+    s.transform.crop = [40, 20, 300, 240];
+    s.transform.resize_on = true;
+    s.transform.rs_w = 240;
+    s.transform.rs_h = 0;
+    s.transform.pad_on = true;
+    s.transform.pad = [10, 0, 10, 0];
+    s.push(LayerKind::Shape(Box::new(ShapeSettings { kind: ShapeKind::Rect, x: 100, y: 100, w: 80, h: 60, fill: [255, 0, 0], ..Default::default() })));
+    let full = s.flatten(&a, &[], None);
+    let k = 0.5;
+    let (pw, ph) = proxy_size(400, 300, k);
+    let small = Animation { frames: a.frames.iter().map(|f| Frame::new(image::imageops::resize(&*f.image, pw, ph, image::imageops::FilterType::Triangle), 5)).collect(), loop_count: None };
+    let prev = s.proxy(k).flatten(&small, &[], None);
+    let (fw, fh) = full.frames[0].image.dimensions();
+    let (qw, qh) = prev.frames[0].image.dimensions();
+    assert!((qw as f32 - fw as f32 * k).abs() <= 2.0 && (qh as f32 - fh as f32 * k).abs() <= 2.0, "{fw}x{fh} vs {qw}x{qh}");
+    // the red box lands in the same place, at half the size
+    let red = |img: &RgbaImage, x: u32, y: u32| img.get_pixel(x.min(img.width() - 1), y.min(img.height() - 1))[0] > 200 && img.get_pixel(x.min(img.width() - 1), y.min(img.height() - 1))[1] < 60;
+    let f = &full.frames[0].image;
+    let q = &prev.frames[0].image;
+    let mut same = 0;
+    let mut total = 0;
+    for y in (0..fh).step_by(4) {
+        for x in (0..fw).step_by(4) {
+            total += 1;
+            if red(f, x, y) == red(q, (x as f32 * k) as u32, (y as f32 * k) as u32) {
+                same += 1;
+            }
+        }
+    }
+    assert!(same as f32 / total as f32 > 0.97, "{same} of {total}");
+}

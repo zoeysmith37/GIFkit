@@ -78,6 +78,10 @@ pub struct Transform {
     pub pad: [u32; 4],
     pub pad_transparent: bool,
     pub pad_color: [u8; 3],
+    /// for previews: the frames given are this much smaller than the
+    /// source (0 or 1 = full size); never saved
+    #[serde(skip)]
+    pub pre_scale: f32,
 }
 
 impl Default for Transform {
@@ -118,6 +122,7 @@ impl Default for Transform {
             pad: [0; 4],
             pad_transparent: false,
             pad_color: [255, 255, 255],
+            pre_scale: 1.0,
         }
     }
 }
@@ -137,6 +142,22 @@ pub fn resize_target(w: u32, h: u32, tw: u32, th: u32, pct: f32) -> Option<(u32,
 impl Transform {
     pub fn geometry_identity(&self) -> bool {
         !(self.crop_on && self.crop[2] > 0 && self.crop[3] > 0) && !self.resize_on && !self.rotates() && !self.pads()
+    }
+
+    fn pre(&self) -> f32 {
+        if self.pre_scale > 0.0 && self.pre_scale < 1.0 { self.pre_scale } else { 1.0 }
+    }
+
+    /// The same edits for frames `s` times the size (pixel amounts scale).
+    pub fn scaled(&self, s: f32) -> Transform {
+        let mut t = self.clone();
+        let px = |v: u32| if v == 0 { 0 } else { ((v as f32 * s).round() as u32).max(1) };
+        t.crop = self.crop.map(px);
+        t.rs_w = px(self.rs_w);
+        t.rs_h = px(self.rs_h);
+        t.pad = self.pad.map(px);
+        t.pre_scale = s;
+        t
     }
 
     /// Adds canvas around the frames.
@@ -211,7 +232,13 @@ impl Transform {
 
     /// Where `apply_geometry` moves source pixels (must mirror it exactly).
     pub fn geo_map(&self, w: u32, h: u32) -> GeoMap {
-        let mut g = GeoMap::new(w as f32, h as f32);
+        // a preview is made from frames `pre_scale` times the source size
+        // (w × h are those frames): source pixels shrink first
+        let p = self.pre();
+        let mut g = GeoMap::new(w as f32 / p, h as f32 / p);
+        if p < 1.0 {
+            g.scale_to(p, p, w as f32, h as f32);
+        }
         let (mut cw, mut ch) = (w, h);
         if self.crop_on && self.crop[2] > 0 && self.crop[3] > 0 {
             let x = self.crop[0].min(w.saturating_sub(1));
@@ -472,6 +499,11 @@ pub struct Stack {
     /// Bottom-most first.
     pub layers: Vec<Layer>,
     pub next_id: u64,
+}
+
+/// Size of a preview frame `s` times the source size.
+pub fn proxy_size(w: u32, h: u32, s: f32) -> (u32, u32) {
+    (((w as f32 * s).round() as u32).max(1), ((h as f32 * s).round() as u32).max(1))
 }
 
 /// Give the frames their sped up delays without going under 2 cs, which
@@ -819,8 +851,10 @@ impl Stack {
                     if t.caption != text::Caption::None && t.bar_h > 0 && t.applies_to(src) {
                         let c = t.bar_color;
                         let (w, h) = img.dimensions();
-                        let y0 = t.bar_y.clamp(0, h as i32) as u32;
-                        let y1 = (t.bar_y + t.bar_h as i32).clamp(0, h as i32) as u32;
+                        let p = self.transform.pre();
+                        let (by, bh) = ((t.bar_y as f32 * p).round() as i32, (t.bar_h as f32 * p).round() as i32);
+                        let y0 = by.clamp(0, h as i32) as u32;
+                        let y1 = (by + bh).clamp(0, h as i32) as u32;
                         for y in y0..y1 {
                             for x in 0..w {
                                 img.put_pixel(x, y, Rgba([c[0], c[1], c[2], 255]));
@@ -865,10 +899,40 @@ impl Stack {
                 t.pad_transparent = false;
             }
             t.pad_on = true;
-            t.pad[0] += top;
-            t.pad[2] += bottom;
+            let p = t.pre();
+            t.pad[0] += (top as f32 * p).round() as u32;
+            t.pad[2] += (bottom as f32 * p).round() as u32;
         }
         t
+    }
+
+    /// A copy for previews made from frames `s` times the source size:
+    /// frame edits and pixel amounts in effects scale with it, layers keep
+    /// their source positions (the maps shrink them).
+    pub fn proxy(&self, s: f32) -> Stack {
+        let mut st = self.clone();
+        st.transform = self.transform.scaled(s);
+        let px = |v: u32| if v == 0 { 0 } else { ((v as f32 * s).round() as u32).max(1) };
+        for l in &mut st.layers {
+            match &mut l.kind {
+                LayerKind::Effects(fx) => {
+                    fx.blur_sigma *= s;
+                    fx.sharpen_sigma *= s;
+                    fx.oil_radius = px(fx.oil_radius);
+                    fx.rounded_radius *= s;
+                    fx.border_px = px(fx.border_px);
+                    fx.rc_edge_px = px(fx.rc_edge_px);
+                    fx.wave_amp *= s;
+                    fx.wave_len *= s;
+                }
+                LayerKind::Censor(c) => {
+                    c.square = px(c.square).max(2);
+                    c.sigma *= s;
+                }
+                _ => {}
+            }
+        }
+        st
     }
 
     /// Lay out text that follows the canvas: wrapping at its edge, centring

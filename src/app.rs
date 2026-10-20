@@ -271,6 +271,8 @@ struct CmpResult {
     sample: Option<Vec<usize>>,
     /// file size: exact, or estimated from the sample
     size: u64,
+    /// the frames' real size (big results are shrunk for the screen)
+    full: (u32, u32),
 }
 
 impl CmpResult {
@@ -296,7 +298,7 @@ const SAMPLE_PIXELS: u64 = 60_000_000;
 struct CmpJob {
     key: u64,
     sheet: bool,
-    rx: Receiver<anyhow::Result<(Animation, Vec<u8>, Option<Vec<usize>>, u64)>>,
+    rx: Receiver<anyhow::Result<(Animation, Vec<u8>, Option<Vec<usize>>, u64, (u32, u32))>>,
 }
 
 struct Prerender {
@@ -318,22 +320,45 @@ struct Snapshot {
 struct TexCache {
     key: u64,
     map: HashMap<usize, TextureHandle>,
+    /// bytes of texture held, to stay inside a budget
+    bytes: usize,
 }
+
+/// Graphics memory a texture cache may hold before it starts over.
+const TEX_BUDGET: usize = 1 << 30;
+
+/// Pictures wider or taller than this are shrunk before they go to the
+/// graphics card: the screen can't show more, and uploads stay quick.
+const TEX_MAX_SIDE: u32 = 2048;
 
 impl TexCache {
     fn get(&mut self, key: u64, i: usize) -> Option<TextureHandle> {
         if self.key != key {
             self.map.clear();
+            self.bytes = 0;
             self.key = key;
         }
         self.map.get(&i).cloned()
     }
     fn put(&mut self, ctx: &egui::Context, i: usize, img: &RgbaImage, opts: TextureOptions, name: &str) -> TextureHandle {
-        if self.map.len() > 600 {
+        let side = img.width().max(img.height());
+        let small;
+        let img = if side > TEX_MAX_SIDE {
+            let k = TEX_MAX_SIDE as f32 / side as f32;
+            let (w, h) = stack::proxy_size(img.width(), img.height(), k);
+            small = image::imageops::resize(img, w, h, image::imageops::FilterType::Triangle);
+            &small
+        } else {
+            img
+        };
+        let size = img.width() as usize * img.height() as usize * 4;
+        if self.map.len() > 600 || self.bytes + size > TEX_BUDGET {
             self.map.clear();
+            self.bytes = 0;
         }
         let t = ctx.load_texture(format!("{name}{i}"), to_color_image(img), opts);
         self.map.insert(i, t.clone());
+        self.bytes += size;
         t
     }
 }
@@ -691,6 +716,20 @@ pub struct GifKitApp {
     tl_reorder: Option<usize>,
     /// frames the GIF will grow by when the drag past its end lets go
     tl_extend: usize,
+    keymap: crate::keys::Keymap,
+    /// the action whose new key is being waited for (shortcuts window)
+    key_capture: Option<crate::keys::Action>,
+    /// previews of big pictures are made from frames shrunk to this long
+    /// side (0 = always full size)
+    preview_max: u32,
+    /// the shrunk frames: (key, scale, frames), and the job making them
+    proxy: Option<(u64, f32, Animation, Option<Animation>)>,
+    proxy_job: Option<(u64, Receiver<(Animation, Option<Animation>)>)>,
+    /// the frame on screen rendering in the background: (key, frame, result)
+    live_job: Option<(u64, usize, Receiver<RgbaImage>)>,
+    /// how long the last frame took to render here, to decide when to go
+    /// to the background instead
+    last_render_ms: f64,
     /// an emoji being dragged from the picker onto the picture
     emoji_drag: Option<String>,
     /// views that take drops this frame: where they are and how they map
@@ -1785,8 +1824,9 @@ fn mnemonics_id() -> egui::Id {
 /// Whether menus show their underlined letters: while Alt is held, or after a
 /// menu was opened from the keyboard (KDE's default "hide until Alt" style).
 fn mnemonics_shown(ctx: &egui::Context) -> bool {
-    let kbd = ctx.data(|d| d.get_temp::<bool>(mnemonics_id())).unwrap_or(false);
-    ctx.input(|i| i.modifiers.alt) || kbd
+    // always shown, so the letters can be found without knowing to hold Alt
+    let _ = ctx;
+    true
 }
 
 /// Lay out a label written with Qt's "&" mnemonic marker ("&&" for a plain &).
@@ -1905,6 +1945,9 @@ fn small_icon(ui: &mut egui::Ui, icon: &str, tip: &str) -> bool {
 impl GifKitApp {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
         theme::install(&cc.egui_ctx);
+        if let Some(z) = theme::get_setting("ui_scale").and_then(|v| v.parse::<f32>().ok()).filter(|z| (0.5..=3.0).contains(z)) {
+            cc.egui_ctx.set_zoom_factor(z);
+        }
         theme::load_toolbar_choice();
         let theme_choice = match std::env::var("GIFKIT_THEME").as_deref() {
             Ok("dark") => ThemeChoice::Dark,
@@ -2052,6 +2095,13 @@ impl GifKitApp {
             tl_head_drag: false,
             tl_reorder: None,
             tl_extend: 0,
+            keymap: crate::keys::Keymap::load(),
+            key_capture: None,
+            preview_max: theme::get_setting("preview_max").and_then(|v| v.parse().ok()).unwrap_or(1280),
+            proxy: None,
+            proxy_job: None,
+            live_job: None,
+            last_render_ms: 0.0,
             emoji_drag: None,
             drop_views: Vec::new(),
             show_toolbar: theme::get_setting("show_toolbar").as_deref() != Some("0"),
@@ -2281,6 +2331,10 @@ impl GifKitApp {
                         PenStroke { points: hl, color: [255, 230, 0], width: 20.0, opacity: 45.0, mode: PenMode::Highlighter, ..Default::default() },
                         PenStroke { points: pts, color: [61, 174, 233], width: 5.0, ..Default::default() },
                     ] }));
+                }
+                // scripting hook for performance tests: an effects layer on top
+                if std::env::var("GIFKIT_DEMO_FX").is_ok() {
+                    self.add_layer(LayerKind::Effects(Box::new(EffectSettings { saturation: 140.0, vignette: true, blur: true, blur_sigma: 2.0, ..Default::default() })));
                 }
                 // scripting hook: GIFKIT_OVERLAY=path adds an image layer on open
                 if let Ok(ov) = std::env::var("GIFKIT_OVERLAY") {
@@ -3064,61 +3118,54 @@ impl GifKitApp {
     // ------------------------------------------------------------ keyboard
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let typing = ctx.egui_wants_keyboard_input();
-        let (save_proj, save_as) = ctx.input(|i| (i.modifiers.command && i.key_pressed(egui::Key::S), i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::S)));
-        let (undo, redo, open, save, space, left, right, fit, one, zin, zout, cmp) = ctx.input(|i| {
-            let cmd = i.modifiers.command;
-            (
-                cmd && !i.modifiers.shift && i.key_pressed(egui::Key::Z),
-                cmd && (i.key_pressed(egui::Key::Y) || (i.modifiers.shift && i.key_pressed(egui::Key::Z))),
-                cmd && i.key_pressed(egui::Key::O),
-                cmd && i.key_pressed(egui::Key::E),
-                i.key_pressed(egui::Key::Space),
-                i.key_pressed(egui::Key::ArrowLeft),
-                i.key_pressed(egui::Key::ArrowRight),
-                !cmd && i.key_pressed(egui::Key::F),
-                !cmd && i.key_pressed(egui::Key::Num1),
-                i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals),
-                i.key_pressed(egui::Key::Minus),
-                !cmd && i.key_pressed(egui::Key::C),
-            )
-        });
-        if self.busy() {
+        use crate::keys::Action as A;
+        // while a new key is being picked in the shortcuts window, keys go there
+        if self.key_capture.is_some() {
             return;
         }
-        let (new, quit, hist) = ctx.input(|i| (i.modifiers.command && i.key_pressed(egui::Key::N), i.modifiers.command && i.key_pressed(egui::Key::Q), i.modifiers.command && i.key_pressed(egui::Key::H)));
-        if new {
-            self.new_project();
-        }
-        if quit {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-        if hist {
-            self.history_open = !self.history_open;
-        }
-        if open {
-            self.open_dialog(ctx);
-        }
-        if save && self.base.is_some() {
-            self.export_open = true;
-        }
-        if save_proj && self.base.is_some() {
-            self.save_project(ctx, save_as);
-        }
+        let typing = ctx.egui_wants_keyboard_input();
+        let km = self.keymap.clone();
+        let hit = |a: A| ctx.input(|i| km.pressed(i, a));
+        let (undo, redo, play, left, right, fit, one, zin, zout, cmp) = (hit(A::Undo), hit(A::Redo), hit(A::PlayPause), hit(A::PrevFrame), hit(A::NextFrame), hit(A::Fit), hit(A::ActualSize), hit(A::ZoomIn), hit(A::ZoomOut), hit(A::SplitView));
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.export_open = false;
             self.shortcuts_open = false;
             self.about_open = false;
         }
-        let (full, help, alt) = ctx.input(|i| (i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::F), i.key_pressed(egui::Key::F1), i.modifiers.alt));
-        if full {
+        if self.busy() {
+            return;
+        }
+        if hit(A::New) {
+            self.new_project();
+        }
+        if hit(A::Quit) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if hit(A::History) {
+            self.history_open = !self.history_open;
+        }
+        if hit(A::Open) {
+            self.open_dialog(ctx);
+        }
+        if hit(A::Export) && self.base.is_some() {
+            self.export_open = true;
+        }
+        if self.base.is_some() {
+            if hit(A::SaveAs) {
+                self.save_project(ctx, true);
+            } else if hit(A::Save) {
+                self.save_project(ctx, false);
+            }
+        }
+        if hit(A::FullScreen) {
             let on = ctx.input(|i| i.viewport().fullscreen).unwrap_or(false);
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!on));
         }
-        if help {
+        if hit(A::Handbook) {
             open_external(&format!("{REPO_URL}#readme"));
         }
         // letters belong to an open menu, and Alt+letter to the menu bar
+        let alt = ctx.input(|i| i.modifiers.alt);
         if !egui::Popup::is_any_open(ctx) {
             ctx.data_mut(|d| d.remove::<bool>(mnemonics_id()));
         }
@@ -3131,7 +3178,7 @@ impl GifKitApp {
         if redo {
             self.do_redo();
         }
-        if space {
+        if play {
             self.playing = !self.playing;
         }
         if left {
@@ -3192,7 +3239,9 @@ impl GifKitApp {
         self.zoom_fit_v(self.active());
     }
     fn zoom_to(&mut self, s: f32) {
-        let vi = self.active();
+        self.zoom_to_v(self.active(), s);
+    }
+    fn zoom_to_v(&mut self, vi: usize, s: f32) {
         let old = self.scale_of(vi);
         let s = s.clamp(0.02, 64.0);
         for t in self.targets(vi) {
@@ -3281,11 +3330,17 @@ impl GifKitApp {
     }
 
     fn base_texture(&mut self, ctx: &egui::Context, src: usize) -> Option<TextureHandle> {
-        let key = hash_parts(&[self.version, self.pixelated as u64]);
+        if self.waiting_proxy() {
+            return None;
+        }
+        let key = hash_parts(&[self.version, self.pixelated as u64, self.ready_proxy().is_some() as u64]);
         if let Some(t) = self.base_tex.get(key, src) {
             return Some(t);
         }
-        let img = self.base.as_ref()?.frames.get(src)?.image.clone();
+        let img = match self.ready_proxy() {
+            Some((_, a)) => a.frames.get(src)?.image.clone(),
+            None => self.base.as_ref()?.frames.get(src)?.image.clone(),
+        };
         let o = self.tex_opts();
         Some(self.base_tex.put(ctx, src, &img, o, "base"))
     }
@@ -3294,14 +3349,135 @@ impl GifKitApp {
         if let Some(t) = self.thumb_tex.get(self.version, idx) {
             return Some(t);
         }
-        let img = self.base.as_ref()?.frames.get(idx)?.image.clone();
+        // big pictures: wait for the shrunk copy rather than shrink here
+        if self.waiting_proxy() {
+            return None;
+        }
+        let img = match self.ready_proxy() {
+            Some((_, a)) => a.frames.get(idx)?.image.clone(),
+            None => self.base.as_ref()?.frames.get(idx)?.image.clone(),
+        };
         let s = (160.0 / img.width().max(img.height()) as f32).min(1.0);
         let th = image::imageops::thumbnail(&*img, ((img.width() as f32 * s) as u32).max(1), ((img.height() as f32 * s) as u32).max(1));
         Some(self.thumb_tex.put(ctx, idx, &th, TextureOptions::LINEAR, "thumb"))
     }
 
     fn composite_key(&self) -> u64 {
-        hash_parts(&[self.stack.signature(), self.version, self.timing_rev, self.pixelated as u64, self.plan.len() as u64, self.stack.plan_signature()])
+        let proxy = self.ready_proxy().map(|(s, _)| s.to_bits() as u64).unwrap_or(0);
+        hash_parts(&[self.stack.signature(), self.version, self.timing_rev, self.pixelated as u64, self.plan.len() as u64, self.stack.plan_signature(), proxy])
+    }
+
+    /// How much smaller preview frames are than the source (1 = full size).
+    fn proxy_scale(&self) -> f32 {
+        let (w, h) = self.dims();
+        let side = w.max(h) as f32;
+        if self.preview_max == 0 || side <= self.preview_max as f32 * 1.15 {
+            1.0
+        } else {
+            self.preview_max as f32 / side
+        }
+    }
+
+    fn proxy_key(&self) -> u64 {
+        hash_parts(&[self.version, self.orig_gen, self.proxy_scale().to_bits() as u64])
+    }
+
+    /// The shrunk frames, when they're ready for the current source.
+    fn ready_proxy(&self) -> Option<(f32, &Animation)> {
+        let s = self.proxy_scale();
+        if s >= 1.0 {
+            return None;
+        }
+        let key = self.proxy_key();
+        self.proxy.as_ref().filter(|p| p.0 == key).map(|p| (p.1, &p.2))
+    }
+
+    /// A big source whose shrunk copy is still being made: views wait for it
+    /// (a moment) instead of shrinking full-size frames on the UI thread.
+    fn waiting_proxy(&self) -> bool {
+        self.proxy_scale() < 1.0 && self.ready_proxy().is_none() && self.proxy_job.is_some()
+    }
+
+    /// The original's frames for the screen: shrunk when the source is big.
+    fn orig_small(&self) -> Option<&Animation> {
+        let key = self.proxy_key();
+        self.proxy.as_ref().filter(|p| p.0 == key && self.proxy_scale() < 1.0).and_then(|p| p.3.as_ref())
+    }
+
+    /// Make the shrunk frames in the background whenever the source changes.
+    fn manage_proxy(&mut self, ctx: &egui::Context) {
+        let s = self.proxy_scale();
+        if let Some((k, rx)) = &self.proxy_job {
+            match rx.try_recv() {
+                Ok((a, o)) => {
+                    let k = *k;
+                    self.proxy_job = None;
+                    if k == self.proxy_key() {
+                        self.proxy = Some((k, s, a, o));
+                        ctx.request_repaint();
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(50)),
+                Err(_) => self.proxy_job = None,
+            }
+        }
+        if s >= 1.0 {
+            self.proxy = None;
+            return;
+        }
+        let key = self.proxy_key();
+        if self.proxy.as_ref().is_some_and(|p| p.0 == key) || self.proxy_job.as_ref().is_some_and(|j| j.0 == key) {
+            return;
+        }
+        let Some(base) = self.base.clone() else { return };
+        let original = self.original.clone();
+        let (tx, rx) = channel();
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            stack::lower_thread_priority();
+            let out = stack::bg_pool().install(|| {
+                use rayon::prelude::*;
+                let shrink = |a: &Animation| {
+                    let (w, h) = stack::proxy_size(a.width(), a.height(), s);
+                    let frames = a.frames.par_iter().map(|f| crate::anim::Frame { image: Arc::new(image::imageops::resize(&*f.image, w, h, image::imageops::FilterType::Triangle)), ..f.clone() }).collect();
+                    Animation { frames, loop_count: a.loop_count }
+                };
+                let small = shrink(&base);
+                // the original mostly shares the source's frames: reuse those
+                let orig = original.map(|o| {
+                    let (w, h) = stack::proxy_size(o.width(), o.height(), s);
+                    let frames = o
+                        .frames
+                        .par_iter()
+                        .map(|f| match base.frames.iter().position(|b| Arc::ptr_eq(&b.image, &f.image)) {
+                            Some(k) => crate::anim::Frame { image: small.frames[k].image.clone(), ..f.clone() },
+                            None => crate::anim::Frame { image: Arc::new(image::imageops::resize(&*f.image, w, h, image::imageops::FilterType::Triangle)), ..f.clone() },
+                        })
+                        .collect();
+                    Animation { frames, loop_count: o.loop_count }
+                });
+                (small, orig)
+            });
+            let _ = tx.send(out);
+            ctx2.request_repaint();
+        });
+        self.proxy_job = Some((key, rx));
+    }
+
+    /// What previews render from: the shrunk frames with a matching stack
+    /// when the source is big, else the source itself.
+    fn render_inputs(&self) -> Option<(Stack, Animation)> {
+        match self.ready_proxy() {
+            Some((s, a)) => Some((self.stack.proxy(s), a.clone())),
+            None => Some((self.stack.clone(), self.base.clone()?)),
+        }
+    }
+
+    /// The output size in full-size pixels (previews may be smaller).
+    fn true_out_size(&self) -> Vec2 {
+        let (w, h) = self.dims();
+        let g = self.stack.eff_transform(true).geo_map(w, h);
+        vec2(g.w.round(), g.h.round())
     }
 
     /// Layer geometry / sprites for the current stack, cached per composite key.
@@ -3312,8 +3488,8 @@ impl GifKitApp {
                 return Some(p.clone());
             }
         }
-        let base = self.base.as_ref()?;
-        let p = Arc::new(self.stack.prepare(base, &self.fonts));
+        let (st, base) = self.render_inputs()?;
+        let p = Arc::new(st.prepare(&base, &self.fonts));
         self.prep_cache = Some((key, p.clone()));
         Some(p)
     }
@@ -3323,8 +3499,11 @@ impl GifKitApp {
             return None;
         }
         let prep = self.prepared()?;
-        let base = self.base.as_ref()?;
-        Some(self.stack.render_frame(base, &self.plan, &self.plan_times, i, &self.fonts, &prep))
+        let (st, base) = self.render_inputs()?;
+        let t0 = std::time::Instant::now();
+        let img = st.render_frame(&base, &self.plan, &self.plan_times, i, &self.fonts, &prep);
+        self.last_render_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        Some(img)
     }
 
     /// Frame `i` with effects and layers but without crop / resize / rotate,
@@ -3364,6 +3543,9 @@ impl GifKitApp {
 
     /// Texture of output frame `i` with all live edits applied.
     fn composite_texture(&mut self, ctx: &egui::Context, i: usize) -> Option<TextureHandle> {
+        if self.waiting_proxy() {
+            return None;
+        }
         if !self.stack.needs_render() {
             let src = self.plan.get(i)?.src;
             return self.base_texture(ctx, src);
@@ -3381,6 +3563,43 @@ impl GifKitApp {
                     return Some(t.clone());
                 }
             }
+        }
+        // a render that keeps the screen waiting goes to the background, and
+        // the last picture stays up until it's done
+        if let Some((k, ji, rx)) = &self.live_job {
+            if let Ok(img) = rx.try_recv() {
+                let (k, ji) = (*k, *ji);
+                self.live_job = None;
+                if k == key {
+                    let o = self.tex_opts();
+                    let t = self.comp_tex.put(ctx, ji, &img, o, "comp");
+                    if ji == i {
+                        self.last_comp = Some((i, t.clone()));
+                        return Some(t);
+                    }
+                }
+            } else if *k == key && *ji == i {
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                return self.last_comp.as_ref().map(|c| c.1.clone());
+            }
+        }
+        // big pictures always render in the background
+        if self.last_render_ms > 40.0 || self.proxy_scale() < 1.0 {
+            if self.live_job.is_none() {
+                let prep = self.prepared()?;
+                let (st, base) = self.render_inputs()?;
+                let (plan, times, fonts) = (self.plan.clone(), self.plan_times.clone(), self.fonts.clone());
+                let (tx, rx) = channel();
+                let ctx2 = ctx.clone();
+                std::thread::spawn(move || {
+                    let img = st.render_frame(&base, &plan, &times, i, &fonts, &prep);
+                    let _ = tx.send(img);
+                    ctx2.request_repaint();
+                });
+                self.live_job = Some((key, i, rx));
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            return self.last_comp.as_ref().map(|c| c.1.clone());
         }
         let img = self.render_composite(i)?;
         let o = self.tex_opts();
@@ -3438,8 +3657,7 @@ impl GifKitApp {
             if cached {
                 return;
             }
-            let Some(base) = self.base.clone() else { return };
-            let stack = self.stack.clone();
+            let Some((stack, base)) = self.render_inputs() else { return };
             let plan = self.plan.clone();
             let times = self.plan_times.clone();
             let fonts = self.fonts.clone();
@@ -3520,9 +3738,9 @@ impl GifKitApp {
                     let (key, sheet) = (j.key, j.sheet);
                     self.cmp_job = None;
                     match res {
-                        Ok((anim, bytes, sample, size)) => {
+                        Ok((anim, bytes, sample, size, full)) => {
                             self.cmp_gen += 1;
-                            self.cmp = Some(CmpResult { key, sheet, anim, bytes: Arc::new(bytes), gen: self.cmp_gen, sample, size });
+                            self.cmp = Some(CmpResult { key, sheet, anim, bytes: Arc::new(bytes), gen: self.cmp_gen, sample, size, full });
                         }
                         Err(e) => self.error(format!("Compression preview failed: {e:#}")),
                     }
@@ -3603,6 +3821,16 @@ impl GifKitApp {
                 };
                 let t1 = t0.elapsed();
                 let (anim, bytes) = io::encode_preview(&out, &pf)?;
+                // shrink big results here, off the UI thread, for the screen
+                let full = (anim.width(), anim.height());
+                let side = full.0.max(full.1);
+                let anim = if side > TEX_MAX_SIDE {
+                    use rayon::prelude::*;
+                    let (w, h) = stack::proxy_size(full.0, full.1, TEX_MAX_SIDE as f32 / side as f32);
+                    Animation { frames: anim.frames.par_iter().map(|f| crate::anim::Frame { image: Arc::new(image::imageops::resize(&*f.image, w, h, image::imageops::FilterType::Triangle)), ..f.clone() }).collect(), loop_count: anim.loop_count }
+                } else {
+                    anim
+                };
                 let t2 = t0.elapsed();
                 if std::env::var_os("GIFKIT_PERF").is_some() {
                     eprintln!("compress: flatten {:.1}s encode {:.1}s decode {:.1}s sampled {}", t1.as_secs_f32(), (t2 - t1).as_secs_f32(), (t0.elapsed() - t2).as_secs_f32(), sample.is_some());
@@ -3617,7 +3845,7 @@ impl GifKitApp {
                         (bytes.len() as f64 * total as f64 / part.max(1) as f64) as u64
                     }
                 };
-                Ok((anim, bytes, sample, size))
+                Ok((anim, bytes, sample, size, full))
             });
             let _ = tx.send(res);
             ctx2.request_repaint();
@@ -3626,11 +3854,17 @@ impl GifKitApp {
     }
 
     fn orig_texture(&mut self, ctx: &egui::Context, i: usize) -> Option<TextureHandle> {
-        let key = hash_parts(&[self.orig_gen, self.pixelated as u64]);
+        if self.waiting_proxy() {
+            return None;
+        }
+        let key = hash_parts(&[self.orig_gen, self.pixelated as u64, self.orig_small().is_some() as u64]);
         if let Some(t) = self.orig_tex.get(key, i) {
             return Some(t);
         }
-        let img = self.original.as_ref()?.frames.get(i)?.image.clone();
+        let img = match self.orig_small() {
+            Some(o) => o.frames.get(i)?.image.clone(),
+            None => self.original.as_ref()?.frames.get(i)?.image.clone(),
+        };
         let o = self.tex_opts();
         Some(self.orig_tex.put(ctx, i, &img, o, "orig"))
     }
@@ -3706,14 +3940,30 @@ impl eframe::App for GifKitApp {
         }
         theme::set_current(&ctx);
         let now = ctx.input(|i| i.time);
+        // GIFKIT_PERF: name the slow steps of a slow frame
+        let perf = std::env::var_os("GIFKIT_PERF").is_some();
+        let mut lap = std::time::Instant::now();
+        let mut mark = |what: &str| {
+            if perf && lap.elapsed().as_millis() > 25 {
+                eprintln!("  slow: {what} {:.0} ms", lap.elapsed().as_secs_f64() * 1000.0);
+            }
+            lap = std::time::Instant::now();
+        };
         self.poll_job(&ctx);
+        mark("jobs");
         self.handle_dropped(&ctx);
         self.shortcuts(&ctx);
         self.refresh_plan();
+        mark("plan");
         self.advance(&ctx);
+        self.manage_proxy(&ctx);
+        mark("proxy");
         self.manage_prerender(&ctx, now);
+        mark("prerender");
         self.manage_compare(&ctx, now);
+        mark("compare");
         self.load_preview_fonts(&ctx);
+        mark("fonts");
         let pal = *p();
 
         // KDE layout: menu bar, then the main toolbar, both on the header colour
@@ -3795,6 +4045,7 @@ impl eframe::App for GifKitApp {
                 .show(ui, |ui| self.transport(ui));
         }
 
+        mark("panels");
         egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.canvas)).show(ui, |ui| {
             if self.base.is_none() {
                 self.empty_state(ui, &ctx);
@@ -3820,8 +4071,10 @@ impl eframe::App for GifKitApp {
         self.export_window(&ctx);
         self.history_window(&ctx);
         self.about_window(&ctx);
+        mark("canvas");
         self.emoji_drag_drop(&ctx);
         self.track_live_edits(&ctx, now);
+        mark("edits");
         self.shortcuts_window(&ctx);
         self.video_import_window(&ctx);
         eyedropper(&ctx);
@@ -3856,10 +4109,10 @@ impl GifKitApp {
         egui::MenuBar::new().ui(ui, |ui| {
             top_menu(ui, "&File", |ui| {
                 ui.set_min_width(250.0);
-                if menu_item(ui, "document-new", "&New Project", "Ctrl+N", idle) {
+                if menu_item(ui, "document-new", "&New Project", &self.keymap.text(crate::keys::Action::New), idle) {
                     self.new_project();
                 }
-                if menu_item(ui, "document-open", "&Open…", "Ctrl+O", idle) {
+                if menu_item(ui, "document-open", "&Open…", &self.keymap.text(crate::keys::Action::Open), idle) {
                     self.open_dialog(ctx);
                 }
                 let mut reopen = None;
@@ -3895,18 +4148,18 @@ impl GifKitApp {
                     self.open_sequence_dialog(ctx);
                 }
                 ui.separator();
-                if menu_item(ui, "document-save", "&Save", "Ctrl+S", idle && has) {
+                if menu_item(ui, "document-save", "&Save", &self.keymap.text(crate::keys::Action::Save), idle && has) {
                     self.save_project(ctx, false);
                 }
-                if menu_item(ui, "document-save-as", "Save &As…", "Ctrl+Shift+S", idle && has) {
+                if menu_item(ui, "document-save-as", "Save &As…", &self.keymap.text(crate::keys::Action::SaveAs), idle && has) {
                     self.save_project(ctx, true);
                 }
                 ui.separator();
-                if menu_item(ui, "document-export", "&Export…", "Ctrl+E", idle && has) {
+                if menu_item(ui, "document-export", "&Export…", &self.keymap.text(crate::keys::Action::Export), idle && has) {
                     self.export_open = true;
                 }
                 ui.separator();
-                if menu_item(ui, "application-exit", "&Quit", "Ctrl+Q", true) {
+                if menu_item(ui, "application-exit", "&Quit", &self.keymap.text(crate::keys::Action::Quit), true) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
@@ -3914,15 +4167,15 @@ impl GifKitApp {
                 ui.set_min_width(250.0);
                 let pending = self.committed.as_ref().map(|c| c.0 != self.live_sig()).unwrap_or(false);
                 let undo = self.undo.last().map(|u| format!("&Undo {}", elide(&u.label, 28).replace('&', "&&"))).unwrap_or_else(|| "&Undo".into());
-                if menu_item(ui, "edit-undo", &undo, "Ctrl+Z", idle && (pending || !self.undo.is_empty())) {
+                if menu_item(ui, "edit-undo", &undo, &self.keymap.text(crate::keys::Action::Undo), idle && (pending || !self.undo.is_empty())) {
                     self.do_undo();
                 }
                 let redo = self.redo.last().map(|u| format!("Re&do {}", elide(&u.label, 28).replace('&', "&&"))).unwrap_or_else(|| "Re&do".into());
-                if menu_item(ui, "edit-redo", &redo, "Ctrl+Y", idle && !self.redo.is_empty()) {
+                if menu_item(ui, "edit-redo", &redo, &self.keymap.text(crate::keys::Action::Redo), idle && !self.redo.is_empty()) {
                     self.do_redo();
                 }
                 ui.separator();
-                if menu_item(ui, "view-history", "&History", "Ctrl+H", true) {
+                if menu_item(ui, "view-history", "&History", &self.keymap.text(crate::keys::Action::History), true) {
                     self.history_open = !self.history_open;
                 }
                 if menu_item(ui, "bookmarks", "&Presets", "", has) {
@@ -3938,26 +4191,26 @@ impl GifKitApp {
             });
             top_menu(ui, "&View", |ui| {
                 ui.set_min_width(250.0);
-                if menu_check(ui, !self.compare, "&Single View", "C") {
+                if menu_check(ui, !self.compare, "&Single View", &self.keymap.text(crate::keys::Action::SplitView)) {
                     self.compare = false;
                 }
-                if menu_check(ui, self.compare, "S&plit View", "C") {
+                if menu_check(ui, self.compare, "S&plit View", &self.keymap.text(crate::keys::Action::SplitView)) {
                     self.compare = true;
                 }
                 if menu_check(ui, self.link_views, "&Link Both Views", "") {
                     self.link_views = !self.link_views;
                 }
                 ui.separator();
-                if menu_item(ui, "zoom-in", "Zoom &In", "+", has) {
+                if menu_item(ui, "zoom-in", "Zoom &In", &self.keymap.text(crate::keys::Action::ZoomIn), has) {
                     self.zoom_to(self.cur_scale() * 1.25);
                 }
-                if menu_item(ui, "zoom-out", "Zoom &Out", "−", has) {
+                if menu_item(ui, "zoom-out", "Zoom &Out", &self.keymap.text(crate::keys::Action::ZoomOut), has) {
                     self.zoom_to(self.cur_scale() / 1.25);
                 }
-                if menu_item(ui, "zoom-fit-best", "&Fit to View", "F", has) {
+                if menu_item(ui, "zoom-fit-best", "&Fit to View", &self.keymap.text(crate::keys::Action::Fit), has) {
                     self.zoom_fit();
                 }
-                if menu_item(ui, "zoom-original", "&Actual Size", "1", has) {
+                if menu_item(ui, "zoom-original", "&Actual Size", &self.keymap.text(crate::keys::Action::ActualSize), has) {
                     self.zoom_to(1.0);
                 }
                 ui.separator();
@@ -3966,7 +4219,7 @@ impl GifKitApp {
                     theme::set_setting("show_timeline", if self.show_timeline { "1" } else { "0" });
                 }
                 let full = ctx.input(|i| i.viewport().fullscreen).unwrap_or(false);
-                if menu_check(ui, full, "F&ull Screen Mode", "Ctrl+Shift+F") {
+                if menu_check(ui, full, "F&ull Screen Mode", &self.keymap.text(crate::keys::Action::FullScreen)) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!full));
                 }
             });
@@ -4005,6 +4258,25 @@ impl GifKitApp {
                     self.pixelated = !self.pixelated;
                     theme::set_setting("pixelated", if self.pixelated { "1" } else { "0" });
                 }
+                sub_menu(ui, "", "Pre&view Resolution", |ui| {
+                    ui.set_min_width(240.0);
+                    for (v, l) in [(0u32, "&Full Size"), (1920, "Up to &1920 px"), (1280, "Up to 1&280 px (Faster)"), (960, "Up to &960 px (Fastest)")] {
+                        if menu_check(ui, self.preview_max == v, l, "") {
+                            self.preview_max = v;
+                            theme::set_setting("preview_max", &v.to_string());
+                        }
+                    }
+                });
+                sub_menu(ui, "", "&Interface Scale", |ui| {
+                    ui.set_min_width(160.0);
+                    let cur = ctx.zoom_factor();
+                    for (v, l) in [(0.8f32, "&80%"), (0.9, "&90%"), (1.0, "&100%"), (1.1, "11&0%"), (1.25, "12&5%"), (1.5, "15&0%"), (1.75, "17&5%"), (2.0, "&200%")] {
+                        if menu_check(ui, (cur - v).abs() < 0.01, l, "") {
+                            ctx.set_zoom_factor(v);
+                            theme::set_setting("ui_scale", &format!("{v}"));
+                        }
+                    }
+                });
                 ui.separator();
                 if menu_check(ui, self.sample_preview, "&Estimate Size of Long Animations", "") {
                     self.sample_preview = !self.sample_preview;
@@ -4039,7 +4311,7 @@ impl GifKitApp {
             });
             top_menu(ui, "&Help", |ui| {
                 ui.set_min_width(250.0);
-                if menu_item(ui, "help-contents", "GIFkit &Handbook", "F1", true) {
+                if menu_item(ui, "help-contents", "GIFkit &Handbook", &self.keymap.text(crate::keys::Action::Handbook), true) {
                     open_external(&format!("{REPO_URL}#readme"));
                 }
                 ui.separator();
@@ -4143,7 +4415,6 @@ impl GifKitApp {
 
     /// Main toolbar: file actions, undo, and the view controls, each as its own button.
     fn toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let pal = *p();
         let (_, tb_icon) = theme::toolbar_style();
         let tb_h = tb_icon + 10.0;
         // right-clicking the bar gives KDE's toolbar menu
@@ -4181,17 +4452,7 @@ impl GifKitApp {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                let export = ui
-                    .add_enabled(
-                        has && idle,
-                        egui::Button::image_and_text(crate::icons::image(ctx, "document-export", tb_icon, pal.fg), RichText::new("Export…").color(pal.fg))
-                            .frame_when_inactive(false)
-                            .min_size(vec2(0.0, tb_h)),
-                    )
-                    .on_hover_text("Save the result as an image or video (Ctrl+E)");
-                if export.clicked() {
-                    self.export_open = true;
-                }
+                // exporting lives in File ▸ Export… (Ctrl+E)
                 if has {
                     ui.add_enabled_ui(idle, |ui| self.format_menu(ui, tb_h));
                 }
@@ -4255,53 +4516,104 @@ impl GifKitApp {
     }
 
     fn shortcuts_window(&mut self, ctx: &egui::Context) {
+        use crate::keys::{Action, Binding};
         if !self.shortcuts_open {
+            self.key_capture = None;
             return;
         }
         let pal = *p();
         let mut open = true;
-        dialog(ctx, "shortcuts", "Keyboard Shortcuts", vec2(500.0, 700.0), true, &mut open, |ui| {
-            let rows: &[(&str, &str)] = &[
-                ("Ctrl+N", "New project"),
-                ("Ctrl+O", "Open"),
-                ("Ctrl+S", "Save the project"),
-                ("Ctrl+Shift+S", "Save the project as"),
-                ("Ctrl+E", "Export"),
-                ("Ctrl+Z / Ctrl+Y", "Undo and redo"),
-                ("Ctrl+H", "History"),
-                ("Ctrl+V", "Paste files or a picture. With an animation open it becomes an image layer."),
-                ("Ctrl+Q", "Quit"),
-                ("Space", "Play or pause"),
-                ("← / →", "Previous and next frame"),
-                ("C", "Single or split view"),
-                ("F", "Fit to view"),
-                ("1", "Actual size"),
-                ("+ / −", "Zoom in and out"),
-                ("Mouse wheel", "Zoom"),
-                ("Middle or right drag", "Pan"),
-                ("Alt+drag", "Pan in drawing tools"),
-                ("Shift+drag", "Move in straight lines"),
-                ("Shift while resizing", "Keep or free the proportions"),
-                ("Ctrl while resizing", "Scale one way. Edge handles stretch one side."),
-                ("", ""),
-                ("Timeline", ""),
-                ("S", "Split the selected track at the playhead"),
-                ("K", "Add a keyframe at the playhead"),
-                ("X", "Switch between the selection and razor tools"),
-                ("Delete", "Delete the selected clip or keyframe"),
-                ("Ctrl+wheel", "Zoom the timeline"),
-                ("Shift+wheel", "Scroll the timeline sideways"),
-            ];
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| egui::Grid::new("keys").num_columns(2).spacing([18.0, 6.0]).striped(false).show(ui, |ui| {
-                for &(k, what) in rows {
-                    ui.label(RichText::new(k).font(theme::medium(13.0)).color(pal.fg));
-                    ui.label(RichText::new(what).color(pal.fg_muted));
-                    ui.end_row();
+        let mut set: Option<(Action, Option<Binding>)> = None;
+        let mut reset: Option<Action> = None;
+        let mut reset_all = false;
+        let mut capture = self.key_capture;
+        let km = self.keymap.clone();
+        dialog(ctx, "shortcuts", "Keyboard Shortcuts", vec2(520.0, 720.0), true, &mut open, |ui| {
+            // the next key press goes to the action waiting for one
+            if let Some(a) = capture {
+                let press = ui.input(|i| {
+                    i.events.iter().find_map(|e| match e {
+                        // a modifier on its own waits for the key that goes with it
+                        egui::Event::Key { key, pressed: true, modifiers, .. } if !["Control", "Shift", "Alt", "Meta", "Super", "Command"].iter().any(|m| key.name().contains(m)) => Some((*key, *modifiers)),
+                        _ => None,
+                    })
+                });
+                if let Some((key, m)) = press {
+                    match key {
+                        egui::Key::Escape => {}
+                        egui::Key::Backspace if m.is_none() => set = Some((a, None)),
+                        _ => set = Some((a, Some(Binding::from_press(key, m)))),
+                    }
+                    capture = None;
                 }
-            }));
+            }
+            ui.horizontal(|ui| {
+                hint(ui, "Click a shortcut and press new keys. Backspace clears it.");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Reset All").clicked() {
+                        reset_all = true;
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                egui::Grid::new("keys").num_columns(3).spacing([14.0, 4.0]).show(ui, |ui| {
+                    for a in Action::ALL {
+                        ui.label(RichText::new(a.label()).color(pal.fg));
+                        let waiting = capture == Some(a);
+                        let text = if waiting { "Press keys…".to_string() } else { km.get(a).map(|b| b.text()).unwrap_or_else(|| "None".into()) };
+                        let b = ui.add(sel_btn(egui::Button::new(RichText::new(text).font(theme::medium(13.0))).min_size(vec2(150.0, 26.0)), waiting));
+                        if b.clicked() {
+                            capture = if waiting { None } else { Some(a) };
+                        }
+                        let changed = km.get(a) != a.default_binding();
+                        if ui.add_enabled(changed, egui::Button::image(crate::icons::image(ui.ctx(), "edit-undo", 16.0, pal.fg)).frame_when_inactive(false)).on_hover_text(format!("Back to {}", a.default_binding().map(|b| b.text()).unwrap_or_else(|| "none".into()))).clicked() {
+                            reset = Some(a);
+                        }
+                        ui.end_row();
+                    }
+                });
+                ui.add_space(12.0);
+                ui.label(RichText::new("Mouse and fixed keys").font(theme::medium(13.5)).color(pal.fg));
+                ui.add_space(4.0);
+                egui::Grid::new("fixed").num_columns(2).spacing([18.0, 6.0]).show(ui, |ui| {
+                    for (k, what) in [
+                        ("Ctrl+V", "Paste files or a picture. With an animation open it becomes an image layer."),
+                        ("Alt+letter", "Open a menu by its underlined letter"),
+                        ("Mouse wheel", "Zoom"),
+                        ("Middle or right drag", "Pan"),
+                        ("Alt+drag", "Pan in drawing tools"),
+                        ("Shift+drag", "Move in straight lines"),
+                        ("Shift while resizing", "Keep or free the proportions"),
+                        ("Ctrl while resizing", "Scale one way. Edge handles stretch one side."),
+                        ("Ctrl+wheel", "Zoom the timeline"),
+                        ("Shift+wheel", "Scroll the timeline sideways"),
+                    ] {
+                        ui.label(RichText::new(k).font(theme::medium(13.0)).color(pal.fg));
+                        ui.label(RichText::new(what).color(pal.fg_muted));
+                        ui.end_row();
+                    }
+                });
+            });
+            if capture.is_some() {
+                ui.ctx().request_repaint();
+            }
         });
+        self.key_capture = capture;
+        if let Some((a, b)) = set {
+            if let Some(lost) = self.keymap.set(a, b) {
+                self.info(format!("{} is now {}; {} has no shortcut", b.map(|b| b.text()).unwrap_or_default(), a.label(), lost.label()));
+            }
+        }
+        if let Some(a) = reset {
+            self.keymap.reset(a);
+        }
+        if reset_all {
+            self.keymap.reset_all();
+        }
         if !open {
             self.shortcuts_open = false;
+            self.key_capture = None;
         }
     }
 
@@ -5057,23 +5369,7 @@ impl GifKitApp {
         if ui.add_enabled_ui(split, |ui| tb_toggle(ui, "link", self.link_views && split, "Link zoom and pan of both views")).inner {
             self.link_views = !self.link_views;
         }
-        toolbar_sep(ui);
-        if tb_tool(ui, "zoom-out", "", "Zoom out (−)", true).clicked() {
-            self.zoom_to(self.cur_scale() / 1.25);
-        }
-        let mut pct = self.cur_scale() * 100.0;
-        if spin(ui, vec2(80.0, CHIP_H), &mut pct, 10.0, |d| d.range(2.0..=6400.0).speed(1.0).suffix("%").max_decimals(0)).on_hover_text("Zoom").changed() {
-            self.zoom_to(pct / 100.0);
-        }
-        if tb_tool(ui, "zoom-in", "", "Zoom in (+)", true).clicked() {
-            self.zoom_to(self.cur_scale() * 1.25);
-        }
-        if tb_toggle(ui, "zoom-fit-best", self.views[self.active()].zoom.is_none(), "Fit to view (F)") {
-            self.zoom_fit();
-        }
-        if tb_tool(ui, "zoom-original", "", "Actual size (1)", true).clicked() {
-            self.zoom_to(1.0);
-        }
+        // zoom lives in each view's own corner
     }
 
     // ------------------------------------------------------------ export
@@ -5183,7 +5479,7 @@ impl GifKitApp {
         let (tex, size) = if fresh {
             let (i, size) = {
                 let c = self.cmp.as_ref().unwrap();
-                (c.frame_for(self.cur, self.play_time()), vec2(c.anim.width() as f32, c.anim.height() as f32))
+                (c.frame_for(self.cur, self.play_time()), vec2(c.full.0 as f32, c.full.1 as f32))
             };
             (self.cmp_texture(ctx, i), size)
         } else {
@@ -5840,7 +6136,10 @@ impl GifKitApp {
             self.paint_backdrop(&painter, ctx, vis, img_rect);
             if let Some(t) = &tex {
                 let ts = t.size_vec2();
-                let tr = Rect::from_min_size(img_rect.min, ts * scale);
+                // a texture made smaller than the picture (big sources) is
+                // stretched over it; otherwise it's drawn at its own size
+                let same_shape = ((ts.x / ts.y) - (img_size.x / img_size.y)).abs() < 0.02 * (img_size.x / img_size.y) && ts.x < img_size.x - 0.5;
+                let tr = if same_shape { img_rect } else { Rect::from_min_size(img_rect.min, ts * scale) };
                 painter.image(t.id(), tr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
             }
         }
@@ -5892,7 +6191,60 @@ impl GifKitApp {
         if self.compare && self.active_view == vi && !self.link_views {
             painter.rect_stroke(rect.shrink(1.0), 0.0, Stroke::new(1.0, pal.highlight.gamma_multiply(0.6)), egui::StrokeKind::Inside);
         }
+        if tex.is_some() {
+            self.view_zoom_overlay(ui, vi, rect);
+        }
         (resp, Mapper { rect: img_rect, scale })
+    }
+
+    /// Zoom controls floating in the corner of a view, for that view.
+    fn view_zoom_overlay(&mut self, ui: &mut egui::Ui, vi: usize, rect: Rect) {
+        let (b, pct_w) = (26.0, 58.0);
+        let w = 4.0 * b + pct_w + 14.0;
+        if rect.width() < w + 40.0 || rect.height() < 120.0 {
+            return;
+        }
+        let bar = Rect::from_min_size(pos2(rect.right() - w - 10.0, rect.bottom() - b - 16.0), vec2(w, b + 6.0));
+        let hovered = ui.rect_contains_pointer(bar);
+        ui.painter().rect_filled(bar, 4.0, Color32::from_black_alpha(if hovered { 200 } else { 150 }));
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(bar.shrink2(vec2(5.0, 3.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        child.spacing_mut().item_spacing.x = 1.0;
+        let white = Color32::from_gray(235);
+        let btn = |ui: &mut egui::Ui, icon: &str, tip: &str, on: bool| -> bool {
+            let (r, resp) = ui.allocate_exact_size(vec2(b, b), Sense::click());
+            if on || resp.hovered() {
+                ui.painter().rect_filled(r, 3.0, Color32::from_white_alpha(if on { 45 } else { 30 }));
+            }
+            crate::icons::paint(ui.painter(), icon, r.center(), 16.0, white);
+            resp.on_hover_text(tip).clicked()
+        };
+        let scale = self.scale_of(vi);
+        if btn(&mut child, "zoom-out", "Zoom out", false) {
+            self.zoom_to_v(vi, scale / 1.25);
+        }
+        let mut pct = scale * 100.0;
+        let mut pc = child.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(child.cursor().min, vec2(pct_w, b))).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        pc.spacing_mut().interact_size = vec2(pct_w, b);
+        let wv = &mut pc.visuals_mut().widgets;
+        for st in [&mut wv.inactive, &mut wv.hovered, &mut wv.active] {
+            st.bg_stroke = Stroke::NONE;
+            st.weak_bg_fill = Color32::TRANSPARENT;
+            st.bg_fill = Color32::TRANSPARENT;
+            st.fg_stroke.color = white;
+        }
+        if pc.add(egui::DragValue::new(&mut pct).range(2.0..=6400.0).speed(1.0).suffix("%").max_decimals(0)).on_hover_text("Zoom. Drag or click to type.").changed() {
+            self.zoom_to_v(vi, pct / 100.0);
+        }
+        child.add_space(pct_w);
+        if btn(&mut child, "zoom-in", "Zoom in", false) {
+            self.zoom_to_v(vi, scale * 1.25);
+        }
+        if btn(&mut child, "zoom-fit-best", "Fit to view", self.views[vi].zoom.is_none()) {
+            self.zoom_fit_v(vi);
+        }
+        if btn(&mut child, "zoom-original", "Actual size", (scale - 1.0).abs() < 1e-3) {
+            self.zoom_to_v(vi, 1.0);
+        }
     }
 
     /// Index of the original-file frame to show: the same source frame when the
@@ -5927,7 +6279,7 @@ impl GifKitApp {
                 }
                 match &self.cmp {
                     Some(c) if c.key == self.cmp_key() && c.sheet => {
-                        let (w, h) = (c.anim.width(), c.anim.height());
+                        let (w, h) = c.full;
                         format!("{f} · {w}×{h} · {}", c.size_text())
                     }
                     Some(c) if c.key == self.cmp_key() => {
@@ -6000,8 +6352,8 @@ impl GifKitApp {
         match src {
             ViewSource::Edit => {
                 let (tex, size) = if crop_mode {
-                    if let Some(t) = self.composite_texture(ctx, self.cur) {
-                        let s = t.size_vec2();
+                    if self.composite_texture(ctx, self.cur).is_some() {
+                        let s = self.true_out_size();
                         self.out_size = (s.x, s.y);
                     }
                     let s = self.plan.get(self.cur).map(|f| f.src).unwrap_or(0);
@@ -6009,8 +6361,9 @@ impl GifKitApp {
                     let live = if self.crop_live { self.crop_texture(ctx, self.cur) } else { None };
                     (live.or_else(|| self.base_texture(ctx, s)), vec2(w as f32, h as f32))
                 } else {
+                    // laid out at full size whatever size the preview was made at
                     let tex = self.composite_texture(ctx, self.cur);
-                    let size = tex.as_ref().map(|t| t.size_vec2()).unwrap_or(vec2(self.out_size.0, self.out_size.1));
+                    let size = self.true_out_size();
                     self.out_size = (size.x, size.y);
                     (tex, size)
                 };
@@ -6039,7 +6392,7 @@ impl GifKitApp {
                 if fresh {
                     let (i, size, n) = {
                         let c = self.cmp.as_ref().unwrap();
-                        (c.frame_for(self.cur, t), vec2(c.anim.width() as f32, c.anim.height() as f32), c.size)
+                        (c.frame_for(self.cur, t), vec2(c.full.0 as f32, c.full.1 as f32), c.size)
                     };
                     let _ = n;
                     let sheet = self.cmp.as_ref().map(|c| c.sheet).unwrap_or(false);
@@ -6052,7 +6405,7 @@ impl GifKitApp {
                 } else {
                     // compression pending / running: show the live preview with a warning
                     let tex = self.composite_texture(ctx, self.cur);
-                    let size = tex.as_ref().map(|t| t.size_vec2()).unwrap_or(vec2(self.out_size.0, self.out_size.1));
+                    let size = self.true_out_size();
                     let badge = if self.preview_format().is_none() {
                         if self.export_fmt.needs_ffmpeg() && !self.ffmpeg { "⚠ Needs ffmpeg to preview" } else { "Uncompressed output" }
                     } else if encoding {

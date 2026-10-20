@@ -239,11 +239,6 @@ impl GifKitApp {
                 self.tl_delete(now);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if tb_tool(ui, "go-down", "", "Hide the timeline (the clock button by the play controls brings it back)", true).clicked() {
-                    self.show_timeline = false;
-                    theme::set_setting("show_timeline", "0");
-                }
-                toolbar_sep(ui);
                 if tb_tool(ui, "zoom-fit-best", "", "Fit the whole animation", true).clicked() {
                     self.tl_zoom = 0.0;
                     self.tl_x0 = 0.0;
@@ -720,7 +715,9 @@ impl GifKitApp {
 
         // keys, while the pointer is over the timeline
         if resp.hovered() && !ctx.egui_wants_keyboard_input() {
-            let (s, del, k, x) = ui.input(|i| (i.key_pressed(egui::Key::S) && i.modifiers.is_none(), i.key_pressed(egui::Key::Delete), i.key_pressed(egui::Key::K) && i.modifiers.is_none(), i.key_pressed(egui::Key::X) && i.modifiers.is_none()));
+            use crate::keys::Action as A;
+            let km = &self.keymap;
+            let (s, del, k, x) = ui.input(|i| (km.pressed(i, A::TlSplit), km.pressed(i, A::TlDelete), km.pressed(i, A::TlKey), km.pressed(i, A::TlRazor)));
             if s {
                 self.tl_split(now);
             }
