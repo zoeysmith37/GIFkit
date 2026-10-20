@@ -361,6 +361,9 @@ const GPU_FRAMES_BUDGET: usize = 512 << 20;
 struct GpuFrames {
     key: u64,
     map: HashMap<usize, (eframe::wgpu::Texture, egui::TextureId, u64)>,
+    /// the frame last put on screen, kept after its key went stale so the
+    /// view never shows a freed texture while the new one is made
+    shown: Option<(eframe::wgpu::Texture, egui::TextureId)>,
     bytes: usize,
     tick: u64,
 }
@@ -2260,7 +2263,7 @@ impl GifKitApp {
             pending_sig: 0,
             last_comp: None,
             gpu: cc.wgpu_render_state.as_ref().filter(|_| std::env::var_os("GIFKIT_CPU_PREVIEW").is_none()).map(|rs| (crate::gpu_render::GpuRenderer::new(rs.device.clone(), rs.queue.clone()), rs.renderer.clone())),
-            gpu_frames: GpuFrames { key: 0, map: HashMap::new(), bytes: 0, tick: 0 },
+            gpu_frames: GpuFrames { key: 0, map: HashMap::new(), shown: None, bytes: 0, tick: 0 },
             last_tick: None,
             orig_clock: 0.0,
             resize_by_pct: true,
@@ -3844,8 +3847,15 @@ impl GifKitApp {
             let oldest = *self.gpu_frames.map.iter().min_by_key(|(_, e)| e.2).map(|(k, _)| k).unwrap();
             if let Some((t, id, _)) = self.gpu_frames.map.remove(&oldest) {
                 self.gpu_frames.bytes -= t.width() as usize * t.height() as usize * 4;
-                renderer.write().free_texture(&id);
-                t.destroy();
+                if self.last_comp.as_ref().is_some_and(|c| c.1.id == id) {
+                    if let Some((old, oid)) = self.gpu_frames.shown.replace((t, id)) {
+                        renderer.write().free_texture(&oid);
+                        old.destroy();
+                    }
+                } else {
+                    renderer.write().free_texture(&id);
+                    t.destroy();
+                }
             }
         }
         self.gpu_frames.bytes += bytes;
@@ -3856,9 +3866,18 @@ impl GifKitApp {
     fn free_gpu_frames(&mut self) {
         let Some((_, renderer)) = &self.gpu else { return };
         let mut r = renderer.write();
+        let shown = self.last_comp.as_ref().map(|c| c.1.id);
         for (_, (t, id, _)) in self.gpu_frames.map.drain() {
-            r.free_texture(&id);
-            t.destroy();
+            if Some(id) == shown {
+                // swap it in as the one kept on screen
+                if let Some((old, oid)) = self.gpu_frames.shown.replace((t, id)) {
+                    r.free_texture(&oid);
+                    old.destroy();
+                }
+            } else {
+                r.free_texture(&id);
+                t.destroy();
+            }
         }
         self.gpu_frames.bytes = 0;
     }
@@ -3935,11 +3954,6 @@ impl GifKitApp {
 
     /// Track composite key changes; once stable, pre-render all frames in the background.
     fn manage_prerender(&mut self, ctx: &egui::Context, now: f64) {
-        // frames the graphics card renders are made as they're shown
-        if self.gpu.is_some() && self.stack.gpu_capable() {
-            self.prerender = None;
-            return;
-        }
         let key = self.composite_key();
         if key != self.comp_key {
             self.comp_key = key;
@@ -3947,6 +3961,11 @@ impl GifKitApp {
             ctx.request_repaint();
             self.prerender = None;
             self.prerender_cancel.store(key, Ordering::Relaxed);
+        }
+        // frames the graphics card renders are made as they're shown
+        if self.gpu.is_some() && self.stack.gpu_capable() {
+            self.prerender = None;
+            return;
         }
         let mut done = false;
         if let Some(pr) = &self.prerender {
@@ -7093,7 +7112,10 @@ impl GifKitApp {
 
         // ---- start of a drag: decide what is being edited
         if started {
-            if let (Some(sp), Some(pi)) = (resp.interact_pointer_pos(), ptr_img) {
+            // where the button went down, not where the pointer is once the
+            // drag counts as started: a handle grabbed is the one pressed on
+            let origin = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos());
+            if let (Some(sp), Some(pi)) = (origin, origin.map(|p| m.to_img(p))) {
                 let mut new_drag = None;
                 if let Some((li, id, b, o)) = sel {
                     if rot_handle(&o).distance(sp) <= HANDLE_HIT {
