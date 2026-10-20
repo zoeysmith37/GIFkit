@@ -27,6 +27,8 @@ mod timeline;
 mod theme;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod fuzz;
 
 fn app_icon() -> eframe::egui::IconData {
     let img = image::load_from_memory(include_bytes!("../assets/icon/gifkit-256.png")).map(|i| i.to_rgba8()).unwrap_or_else(|_| image::RgbaImage::new(1, 1));

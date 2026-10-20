@@ -411,3 +411,95 @@ pub fn append_images(anim: &Animation, imgs: Vec<RgbaImage>, delay: u16) -> Anim
     }
     a
 }
+
+
+/// Squared distance from each cell to the nearest `true` cell (exact, after
+/// Felzenszwalb and Huttenlocher). Cells far from any are a large number.
+pub fn distance_sq(inside: &[bool], w: usize, h: usize) -> Vec<f32> {
+    use rayon::prelude::*;
+    const INF: f32 = 1e20;
+    // one dimension: lower envelope of parabolas
+    fn pass(f: &[f32], out: &mut [f32], v: &mut Vec<usize>, z: &mut Vec<f64>) {
+        let n = f.len();
+        if n == 0 {
+            return;
+        }
+        v.clear();
+        z.clear();
+        v.push(0);
+        z.push(f64::NEG_INFINITY);
+        z.push(f64::INFINITY);
+        let fx = |q: usize| f[q] as f64 + (q * q) as f64;
+        for q in 1..n {
+            let mut k = v.len() - 1;
+            let mut s = (fx(q) - fx(v[k])) / (2.0 * (q as f64 - v[k] as f64));
+            while s <= z[k] {
+                v.pop();
+                z.pop();
+                k -= 1;
+                s = (fx(q) - fx(v[k])) / (2.0 * (q as f64 - v[k] as f64));
+            }
+            v.push(q);
+            z[k + 1] = s;
+            z.push(f64::INFINITY);
+        }
+        let mut k = 0;
+        for (q, o) in out.iter_mut().enumerate() {
+            while z[k + 1] < q as f64 {
+                k += 1;
+            }
+            let d = q as f64 - v[k] as f64;
+            *o = (d * d + f[v[k]] as f64).min(INF as f64) as f32;
+        }
+    }
+    let mut g: Vec<f32> = inside.iter().map(|&b| if b { 0.0 } else { INF }).collect();
+    // columns
+    let cols: Vec<Vec<f32>> = (0..w)
+        .into_par_iter()
+        .map(|x| {
+            let f: Vec<f32> = (0..h).map(|y| g[y * w + x]).collect();
+            let mut o = vec![0.0; h];
+            pass(&f, &mut o, &mut Vec::new(), &mut Vec::new());
+            o
+        })
+        .collect();
+    for (x, c) in cols.iter().enumerate() {
+        for y in 0..h {
+            g[y * w + x] = c[y];
+        }
+    }
+    // rows
+    g.par_chunks_mut(w.max(1)).for_each(|row| {
+        let f = row.to_vec();
+        pass(&f, row, &mut Vec::new(), &mut Vec::new());
+    });
+    g
+}
+
+/// For each cell: is any `true` cell within the square of radius `r` around it.
+pub fn near_any(set: &[bool], w: usize, h: usize, r: usize) -> Vec<bool> {
+    let mut horiz = vec![false; w * h];
+    for y in 0..h {
+        let row = &set[y * w..(y + 1) * w];
+        let mut pre = vec![0u32; w + 1];
+        for x in 0..w {
+            pre[x + 1] = pre[x] + row[x] as u32;
+        }
+        for x in 0..w {
+            let (a, b) = (x.saturating_sub(r), (x + r + 1).min(w));
+            horiz[y * w + x] = pre[b] > pre[a];
+        }
+    }
+    let mut out = vec![false; w * h];
+    let mut pre = vec![0u32; h + 1];
+    for x in 0..w {
+        for y in 0..h {
+            pre[y + 1] = pre[y] + horiz[y * w + x] as u32;
+        }
+        for y in 0..h {
+            let (a, b) = (y.saturating_sub(r), (y + r + 1).min(h));
+            out[y * w + x] = pre[b] > pre[a];
+        }
+    }
+    out
+}

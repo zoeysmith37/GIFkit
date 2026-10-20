@@ -2950,7 +2950,7 @@ impl GifKitApp {
 
     fn open_dialog(&mut self, ctx: &egui::Context) {
         if let Some(p) = rfd::FileDialog::new()
-            .add_filter("Animations, images, videos & projects", &["gif", "png", "apng", "webp", "jpg", "jpeg", "bmp", "mp4", "m4v", "mov", "webm", "mkv", "avi", "wmv", "flv", "mpg", "mpeg", "ts", "ogv", "3gp", crate::project::EXT])
+            .add_filter("Animations, images, videos & projects", &["gif", "png", "apng", "webp", "jpg", "jpeg", "bmp", "avif", "mp4", "m4v", "mov", "webm", "mkv", "avi", "wmv", "flv", "mpg", "mpeg", "ts", "ogv", "3gp", crate::project::EXT])
             .add_filter("GIFkit projects", &[crate::project::EXT])
             .add_filter("All files", &["*"])
             .pick_file()
@@ -4063,10 +4063,12 @@ impl eframe::App for GifKitApp {
                 .size_range(300.0..=(ctx.content_rect().width() - rail_w - 440.0).clamp(300.0, 640.0))
                 .frame(egui::Frame::new().fill(pal.window))
                 .show(ui, |ui| {
+                    // the tool's settings always keep at least half the height
+                    let lmax = (ui.available_height() * 0.5).clamp(140.0, 800.0);
                     egui::Panel::bottom("layers_panel")
                         .resizable(!self.layers_collapsed)
-                        .default_size(380.0)
-                        .size_range(if self.layers_collapsed { 34.0..=34.0 } else { 140.0..=800.0 })
+                        .default_size(380.0f32.min(lmax))
+                        .size_range(if self.layers_collapsed { 34.0..=34.0 } else { 140.0..=lmax })
                         .frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin { left: 8, right: 8, top: 6, bottom: 2 }))
                         .show(ui, |ui| self.layer_panel(ui, &ctx));
                     egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin { left: 10, right: 8, top: 8, bottom: 4 })).show(ui, |ui| {
@@ -4108,10 +4110,12 @@ impl eframe::App for GifKitApp {
         if self.base.is_some() {
             // the timeline at the bottom, the play controls under the view as in Kdenlive
             if self.show_timeline {
+                // never more than about half the height, so the view keeps room
+                let tmax = ((ui.available_height() - 60.0) * 0.5).clamp(110.0, 640.0);
                 egui::Panel::bottom("timeline")
                     .resizable(true)
-                    .default_size(270.0)
-                    .size_range(150.0..=640.0)
+                    .default_size(270.0f32.min(tmax))
+                    .size_range(110.0f32.min(tmax)..=tmax)
                     .frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin { left: 6, right: 6, top: 6, bottom: 4 }))
                     .show(ui, |ui| self.timeline_dock(ui, &ctx));
             }
@@ -4530,7 +4534,9 @@ impl GifKitApp {
                 // exporting lives in File ▸ Export… (Ctrl+E)
                 if has {
                     ui.add_enabled_ui(idle, |ui| self.format_menu(ui, tb_h));
-                    ui.label(RichText::new("Export as").color(p().fg_muted)).on_hover_text("The format the compressed preview shows and File ▸ Export saves");
+                    if ui.available_width() > 80.0 {
+                        ui.label(RichText::new("Export as").color(p().fg_muted)).on_hover_text("The format the compressed preview shows and File ▸ Export saves");
+                    }
                 }
             });
         });
@@ -5404,8 +5410,12 @@ impl GifKitApp {
                     self.show_timeline = !on;
                     theme::set_setting("show_timeline", if self.show_timeline { "1" } else { "0" });
                 }
+                // in a narrow window the time goes first, then the speed menu
+                let room = ui.available_width() - 90.0;
+                let (show_speed, show_frame, show_time) = (room > speed_w + frame_w + 8.0, room > frame_w, room > speed_w + frame_w + time_w + 12.0);
                 let speeds = [0.25f32, 0.5, 0.75, 1.0, 1.5, 2.0, 4.0];
                 let label = |v: f32| if v == 1.0 { "1×".to_string() } else { format!("{v}×") };
+                if show_speed {
                 egui::ComboBox::from_id_salt("play_speed")
                     .icon(chevron)
                     .width(speed_w)
@@ -5419,10 +5429,15 @@ impl GifKitApp {
                     })
                     .response
                     .on_hover_text("Playback speed of the preview. Exports keep their own timing.");
+                }
                 let mono = |s: String| RichText::new(s).font(egui::FontId::monospace(12.5)).color(pal.fg);
-                ui.add_sized(vec2(frame_w, TOOLBAR_H), egui::Label::new(mono(format!("{:>w$} / {}", self.cur + 1, n, w = digits))))
-                    .on_hover_text(format!("Frame. Delay {delay} cs{}", if enabled { "" } else { " · skipped" }));
-                ui.add_sized(vec2(time_w, TOOLBAR_H), egui::Label::new(mono(format!("{now_t:.2} / {total:.2} s")))).on_hover_text("Time and length in seconds");
+                if show_frame {
+                    ui.add_sized(vec2(frame_w, TOOLBAR_H), egui::Label::new(mono(format!("{:>w$} / {}", self.cur + 1, n, w = digits))))
+                        .on_hover_text(format!("Frame. Delay {delay} cs{}", if enabled { "" } else { " · skipped" }));
+                }
+                if show_time {
+                    ui.add_sized(vec2(time_w, TOOLBAR_H), egui::Label::new(mono(format!("{now_t:.2} / {total:.2} s")))).on_hover_text("Time and length in seconds");
+                }
                 ui.add_space(6.0);
                 ui.spacing_mut().slider_width = (ui.available_width() - 4.0).max(60.0);
                 let mut f = self.cur + 1;
@@ -9311,7 +9326,7 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
                 (&mut fx.noise, "Noise", "Adds random grain"),
             ])
         });
-        ui.add_enabled_ui(fx.oil, |ui| slider_row(ui, "Oil radius", egui::Slider::new(&mut fx.oil_radius, 1..=8).clamping(egui::SliderClamping::Never)));
+        ui.add_enabled_ui(fx.oil, |ui| slider_row(ui, "Oil radius", egui::Slider::new(&mut fx.oil_radius, 1..=16)));
         ui.add_enabled_ui(fx.posterize, |ui| slider_row(ui, "Levels", egui::Slider::new(&mut fx.posterize_levels, 2..=16).clamping(egui::SliderClamping::Never)));
         ui.add_enabled_ui(fx.noise, |ui| slider_row(ui, "Noise", soft_slider(&mut fx.noise_amount, 1.0..=128.0, "").max_decimals(0)));
     });

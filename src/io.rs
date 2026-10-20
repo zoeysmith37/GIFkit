@@ -18,7 +18,13 @@ fn delay_to_cs(d: image::Delay) -> u16 {
 fn frames_from_decoder<'a, D: AnimationDecoder<'a>>(dec: D) -> Result<Vec<Frame>> {
     let mut out = Vec::new();
     for f in dec.into_frames() {
-        let f = f?;
+        // a damaged or cut-off file still opens with the frames before the damage,
+        // as browsers show it
+        let f = match f {
+            Ok(f) => f,
+            Err(e) if out.is_empty() => return Err(e.into()),
+            Err(_) => break,
+        };
         let d = delay_to_cs(f.delay());
         out.push(Frame::new(f.into_buffer(), d));
     }
@@ -49,7 +55,7 @@ pub fn load_animation(path: &Path) -> Result<Animation> {
 }
 
 /// Video file extensions opened through ffmpeg.
-pub const VIDEO_EXTS: &[&str] = &["mp4", "m4v", "mov", "webm", "mkv", "avi", "wmv", "flv", "mpg", "mpeg", "ts", "ogv", "3gp"];
+pub const VIDEO_EXTS: &[&str] = &["avif", "mp4", "m4v", "mov", "webm", "mkv", "avi", "wmv", "flv", "mpg", "mpeg", "ts", "ogv", "3gp"];
 
 pub fn is_video(path: &Path) -> bool {
     path.extension().map(|e| VIDEO_EXTS.contains(&e.to_string_lossy().to_lowercase().as_str())).unwrap_or(false)

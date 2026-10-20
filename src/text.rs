@@ -261,6 +261,39 @@ impl Annotation {
 }
 
 /// Rasterise text to a coverage mask (w, h, alpha) – no colour.
+/// Width and height text takes at `size`, without drawing it.
+pub fn extent(f: &FontEntry, text: &str, size: f32) -> (u32, u32) {
+    let scale = PxScale::from(size);
+    let sf = f.font.as_scaled(scale);
+    let line_h = sf.ascent() - sf.descent() + sf.line_gap();
+    let n = text.split('\n').count();
+    let maxw = text.split('\n').map(|l| shape_line(f, l, scale).1).fold(0.0, f32::max).ceil() as u32 + 2;
+    (maxw, (line_h * n as f32).ceil() as u32 + 2)
+}
+
+/// The most pixels one piece of text may cover (about 200 MB of picture).
+/// Bigger text is drawn smaller to fit, instead of running out of memory.
+const MAX_TEXT_PIXELS: f32 = 48_000_000.0;
+
+impl Annotation {
+    /// This text, made smaller when drawing it at its size would go past
+    /// MAX_TEXT_PIXELS (huge sizes, or long text wrapped into a tall column).
+    pub fn within_budget(&self, f: &FontEntry) -> std::borrow::Cow<'_, Annotation> {
+        let (w, h) = extent(f, &self.shown_text(f), self.size);
+        let r = self.outline_px() as f32;
+        let area = (stretched(w, self.stretch) as f32 + 2.0 * r) * (h as f32 + 2.0 * r);
+        if area <= MAX_TEXT_PIXELS || self.size <= 1.0 {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let k = (MAX_TEXT_PIXELS / area).sqrt() * 0.98;
+        let mut a = self.clone();
+        a.size = (self.size * k).max(1.0);
+        a.border_width = Some(r * k);
+        a.wrap_px = self.wrap_px * k;
+        std::borrow::Cow::Owned(a)
+    }
+}
+
 pub fn rasterize(f: &FontEntry, text: &str, size: f32, align: Align) -> (u32, u32, Vec<f32>) {
     let font = &f.font;
     let scale = PxScale::from(size);
@@ -308,7 +341,8 @@ impl Annotation {
 /// Size of the rendered text block including border.
 pub fn measure(fonts: &[FontEntry], a: &Annotation) -> (u32, u32) {
     let font = &fonts[a.font_idx.min(fonts.len() - 1)];
-    let (w, h, _) = rasterize(font, &a.shown_text(font), a.size, a.align);
+    let a = &*a.within_budget(font);
+    let (w, h) = extent(font, &a.shown_text(font), a.size);
     let r = a.outline_px() as u32;
     (stretched(w + 2 * r, a.stretch), h + 2 * r)
 }
@@ -324,35 +358,35 @@ fn stretched(w: u32, s: f32) -> u32 {
 /// Pre-rendered RGBA sprite of an annotation (so it is rasterised once per apply).
 pub fn render_sprite(fonts: &[FontEntry], a: &Annotation) -> RgbaImage {
     let font = &fonts[a.font_idx.min(fonts.len() - 1)];
+    let a = &*a.within_budget(font);
     let (w, h, mask) = rasterize(font, &a.shown_text(font), a.size, a.align);
     let r = a.outline_px();
     let sw = w + 2 * r as u32;
     let sh = h + 2 * r as u32;
     let mut out = RgbaImage::new(sw, sh);
     if r > 0 {
-        // dilated mask for outline
-        let mut dil = vec![0f32; (sw * sh) as usize];
-        for y in 0..h as i32 {
-            for x in 0..w as i32 {
-                let v = mask[(y as u32 * w + x as u32) as usize];
-                if v <= 0.0 {
-                    continue;
-                }
-                for dy in -r..=r {
-                    for dx in -r..=r {
-                        if dx * dx + dy * dy > r * r + r {
-                            continue;
-                        }
-                        let tx = (x + r + dx) as u32;
-                        let ty = (y + r + dy) as u32;
-                        let i = (ty * sw + tx) as usize;
-                        if dil[i] < v {
-                            dil[i] = v;
-                        }
-                    }
+        // the outline: everything within r of the letters, from a distance
+        // map (one pass per row and column, so thick outlines stay quick)
+        let mut inside = vec![false; (sw * sh) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                if mask[(y * w + x) as usize] >= 0.5 {
+                    inside[((y + r as u32) * sw + x + r as u32) as usize] = true;
                 }
             }
         }
+        let d2 = crate::ops::distance_sq(&inside, sw as usize, sh as usize);
+        let rf = r as f32 + 0.5;
+        let dil: Vec<f32> = d2
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let (x, y) = (i as u32 % sw, i as u32 / sw);
+                // soft letter edges count too, so thin strokes keep their outline
+                let own = if x >= r as u32 && y >= r as u32 && x - (r as u32) < w && y - (r as u32) < h { mask[((y - r as u32) * w + x - r as u32) as usize] } else { 0.0 };
+                (rf + 0.5 - d.sqrt()).clamp(0.0, 1.0).max(own)
+            })
+            .collect();
         let bc = a.border_color;
         for (i, v) in dil.iter().enumerate() {
             if *v > 0.0 {

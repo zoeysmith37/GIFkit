@@ -316,7 +316,7 @@ pub fn apply(src: &RgbaImage, fx: BoothFx, amount: f32, cx: f32, cy: f32) -> Rgb
         }
         BoothFx::Mirror => {
             let mut out = src.clone();
-            let mx = cx.clamp(1.0, w as f32 - 1.0);
+            let mx = cx.clamp(1.0, (w as f32 - 1.0).max(1.0));
             out.par_chunks_mut(4).enumerate().for_each(|(i, o)| {
                 let x = (i as u32 % w) as f32;
                 let y = i as u32 / w;

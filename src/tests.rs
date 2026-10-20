@@ -1397,3 +1397,23 @@ fn fades_line_up_with_timeline_changes() {
         assert!(first < 40, "{name}: starts too bright {shown:?}");
     }
 }
+
+#[test]
+fn distance_map_matches_brute_force() {
+    let (w, h) = (23usize, 17usize);
+    let set: Vec<bool> = (0..w * h).map(|i| (i * 7919) % 31 == 0).collect();
+    let d = crate::ops::distance_sq(&set, w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let best = (0..w * h).filter(|&j| set[j]).map(|j| ((j % w) as f32 - x as f32).powi(2) + ((j / w) as f32 - y as f32).powi(2)).fold(f32::MAX, f32::min);
+            assert!((d[y * w + x] - best).abs() < 1e-3, "{x},{y}: {} vs {best}", d[y * w + x]);
+        }
+    }
+    let near = crate::ops::near_any(&set, w, h, 2);
+    for y in 0..h {
+        for x in 0..w {
+            let any = (0..w * h).any(|j| set[j] && (j % w).abs_diff(x) <= 2 && (j / w).abs_diff(y) <= 2);
+            assert_eq!(near[y * w + x], any);
+        }
+    }
+}

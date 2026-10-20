@@ -250,7 +250,12 @@ impl GifKitApp {
                     self.tl_zoom = (self.tl_zoom / 1.5).max(0.0);
                 }
                 let t = self.plan_time(self.cur);
-                ui.label(RichText::new(format!("{:.2} s · frame {} of {n}", t.max(0.0), self.cur + 1)).monospace().size(12.0).color(pal.fg_muted));
+                let text = RichText::new(format!("{:.2} s · frame {} of {n}", t.max(0.0), self.cur + 1)).monospace().size(12.0).color(pal.fg_muted);
+                // only when it fits beside the buttons
+                let w = ui.painter().layout_no_wrap(text.text().to_string(), egui::FontId::monospace(12.0), pal.fg).size().x;
+                if ui.available_width() > w + 12.0 {
+                    ui.label(text);
+                }
             });
         });
         // the selected layer's motion at the playhead. Changing a value makes
@@ -273,7 +278,8 @@ impl GifKitApp {
         // auto key: a record button, as in other animation tools
         let mut auto = self.tl_autokey;
         let editable = sel_li.is_some() && (auto || key_here.is_some());
-        ui.horizontal(|ui| {
+        // wraps onto a second line in a narrow window
+        ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             let b = ui
                 .add(sel_btn(egui::Button::new("").frame_when_inactive(auto).min_size(vec2(CHIP_H, CHIP_H)), auto))

@@ -127,16 +127,27 @@ impl Default for Transform {
     }
 }
 
+/// The longest side a resize may make: the most WebP allows, and well past
+/// what anyone shares, so a stray number can't use up all memory.
+pub const MAX_SIDE: u32 = 16383;
+
 pub fn resize_target(w: u32, h: u32, tw: u32, th: u32, pct: f32) -> Option<(u32, u32)> {
-    if pct > 0.0 {
-        return Some((((w as f32 * pct / 100.0).round() as u32).max(1), ((h as f32 * pct / 100.0).round() as u32).max(1)));
+    let t = if pct > 0.0 {
+        (((w as f32 * pct / 100.0).round() as u32).max(1), ((h as f32 * pct / 100.0).round() as u32).max(1))
+    } else {
+        match (tw, th) {
+            (0, 0) => return None,
+            (tw, 0) => (tw, ((h as f32 * tw as f32 / w as f32).round() as u32).max(1)),
+            (0, th) => (((w as f32 * th as f32 / h as f32).round() as u32).max(1), th),
+            (tw, th) => (tw, th),
+        }
+    };
+    let side = t.0.max(t.1);
+    if side <= MAX_SIDE {
+        return Some(t);
     }
-    match (tw, th) {
-        (0, 0) => None,
-        (tw, 0) => Some((tw, ((h as f32 * tw as f32 / w as f32).round() as u32).max(1))),
-        (0, th) => Some((((w as f32 * th as f32 / h as f32).round() as u32).max(1), th)),
-        (tw, th) => Some((tw, th)),
-    }
+    let k = MAX_SIDE as f32 / side as f32;
+    Some((((t.0 as f32 * k).round() as u32).clamp(1, MAX_SIDE), ((t.1 as f32 * k).round() as u32).clamp(1, MAX_SIDE)))
 }
 
 impl Transform {

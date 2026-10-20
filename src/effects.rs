@@ -407,29 +407,17 @@ pub fn replace_color(img: &mut RgbaImage, target: [u8; 3], fuzz: f32, clean_edge
         let (w, h) = img.dimensions();
         let edge_thr = (thr * 4.0).max(0.30 * 441.67);
         let alpha: Vec<u8> = img.pixels().map(|p| p[3]).collect();
-        let r = px as i32;
         let src = img.clone();
+        // pixels with a removed one within `px` (two passes, any radius)
+        let clear: Vec<bool> = alpha.iter().map(|a| *a == 0).collect();
+        let near_clear = crate::ops::near_any(&clear, w as usize, h as usize, px as usize);
         img.par_chunks_mut(4).enumerate().for_each(|(i, p)| {
             if alpha[i] == 0 {
                 return;
             }
-            let x = (i as u32 % w) as i32;
-            let y = (i as u32 / w) as i32;
-            let mut near = false;
-            'o: for dy in -r..=r {
-                for dx in -r..=r {
-                    let (nx, ny) = (x + dx, y + dy);
-                    if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
-                        continue;
-                    }
-                    if alpha[(ny as u32 * w + nx as u32) as usize] == 0 {
-                        near = true;
-                        break 'o;
-                    }
-                }
-            }
-            if near {
-                let d = color_dist(&src.get_pixel(x as u32, y as u32).0, target);
+            let (x, y) = (i as u32 % w, i as u32 / w);
+            if near_clear[i] {
+                let d = color_dist(&src.get_pixel(x, y).0, target);
                 if d <= edge_thr {
                     // fade by closeness to the removed colour
                     let t = (d / edge_thr).clamp(0.0, 1.0);
@@ -482,7 +470,8 @@ fn convolve3(img: &RgbaImage, k: [f32; 9], bias: f32, gray: bool) -> RgbaImage {
 
 fn oil_paint(img: &RgbaImage, radius: u32) -> RgbaImage {
     let (w, h) = img.dimensions();
-    let r = radius.max(1) as i32;
+    // the work grows with the square of the radius: past 16 it only gets slower
+    let r = radius.clamp(1, 16) as i32;
     const LEVELS: usize = 20;
     let mut out = img.clone();
     out.par_chunks_mut(4).enumerate().for_each(|(i, o)| {
