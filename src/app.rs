@@ -6980,7 +6980,10 @@ impl GifKitApp {
 
         // ---- start of a drag: decide what is being edited
         if started {
-            if let (Some(sp), Some(pi)) = (resp.interact_pointer_pos(), ptr_img) {
+            // where the button went down, not where the pointer is once the
+            // drag counts as started: a handle grabbed is the one pressed on
+            let origin = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos());
+            if let (Some(sp), Some(pi)) = (origin, origin.map(|p| m.to_img(p))) {
                 let mut new_drag = None;
                 if let Some((li, id, b, o)) = sel {
                     if rot_handle(&o).distance(sp) <= HANDLE_HIT {
