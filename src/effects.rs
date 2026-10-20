@@ -56,6 +56,18 @@ pub struct EffectSettings {
     pub fade_out: bool,
     pub fade_frames: usize,
     pub fade_to_transparent: bool,
+    /// how the animation starts and ends (Fade is the old fade in / out)
+    pub intro: crate::motion::Transition,
+    pub outro: crate::motion::Transition,
+    // looping motion over the whole animation
+    pub loop_shake: bool,
+    pub loop_pulse: bool,
+    pub loop_hop: bool,
+    pub loop_wobble: bool,
+    pub loop_rainbow: bool,
+    pub loop_glitch: bool,
+    pub loop_amount: f32,
+    pub loop_cycles: u32,
 
     // Blur / sharpen
     pub blur: bool,
@@ -110,6 +122,11 @@ pub struct EffectSettings {
     /// centre of the distortion, % of the frame
     pub booth_cx: f32,
     pub booth_cy: f32,
+    /// a distortion, separate from the photo booth look so both can be on
+    pub warp: crate::booth::BoothFx,
+    pub warp_amount: f32,
+    pub warp_cx: f32,
+    pub warp_cy: f32,
 }
 
 impl Default for EffectSettings {
@@ -151,6 +168,16 @@ impl Default for EffectSettings {
             fade_out: false,
             fade_frames: 8,
             fade_to_transparent: false,
+            intro: crate::motion::Transition::None,
+            outro: crate::motion::Transition::None,
+            loop_shake: false,
+            loop_pulse: false,
+            loop_hop: false,
+            loop_wobble: false,
+            loop_rainbow: false,
+            loop_glitch: false,
+            loop_amount: 50.0,
+            loop_cycles: 1,
             blur: false,
             blur_sigma: 2.0,
             sharpen: false,
@@ -190,6 +217,10 @@ impl Default for EffectSettings {
             booth_amount: 50.0,
             booth_cx: 50.0,
             booth_cy: 50.0,
+            warp: crate::booth::BoothFx::None,
+            warp_amount: 50.0,
+            warp_cx: 50.0,
+            warp_cy: 50.0,
         }
     }
 }
@@ -823,6 +854,9 @@ pub fn apply_frame(src: &RgbaImage, idx: usize, n: usize, elapsed_s: f32, s: &Ef
     if s.booth != crate::booth::BoothFx::None {
         img = crate::booth::apply(&img, s.booth, s.booth_amount, s.booth_cx, s.booth_cy);
     }
+    if s.warp != crate::booth::BoothFx::None {
+        img = crate::booth::apply(&img, s.warp, s.warp_amount, s.warp_cx, s.warp_cy);
+    }
     if s.gotham {
         gotham(&mut img);
     }
@@ -879,21 +913,18 @@ pub fn apply_frame(src: &RgbaImage, idx: usize, n: usize, elapsed_s: f32, s: &Ef
     if s.frame_border {
         img = border(&img, s.border_px, s.border_color);
     }
-    // fades
+    // looping motion, then the intro and outro on top
+    let loops = s.loop_fx();
+    if !loops.is_empty() {
+        img = crate::motion::looped(&img, &loops, idx, n, s.loop_amount, s.loop_cycles, s.fade_to_transparent);
+    }
     let ff = s.fade_frames.max(1);
-    let mut fade = 1.0f32;
-    if s.fade_in && idx < ff {
-        fade = fade.min((idx as f32 + 1.0) / (ff as f32 + 1.0));
+    let (intro, outro) = s.transitions();
+    if intro != crate::motion::Transition::None && idx < ff {
+        img = crate::motion::transition(&img, intro, (idx as f32 + 1.0) / (ff as f32 + 1.0), s.fade_to_transparent);
     }
-    if s.fade_out && n > 0 && idx + ff >= n {
-        fade = fade.min((n - idx) as f32 / (ff as f32 + 1.0));
-    }
-    if fade < 1.0 {
-        if s.fade_to_transparent {
-            img.par_chunks_mut(4).for_each(|p| p[3] = c8(p[3] as f32 * fade));
-        } else {
-            map_rgb(&mut img, |r, g, b| (r * fade, g * fade, b * fade));
-        }
+    if outro != crate::motion::Transition::None && n > 0 && idx + ff >= n {
+        img = crate::motion::transition(&img, outro, (n - idx) as f32 / (ff as f32 + 1.0), s.fade_to_transparent);
     }
     if s.counter {
         let size = (img.height() as f32 * 0.07).max(12.0);
@@ -906,6 +937,22 @@ pub fn apply_frame(src: &RgbaImage, idx: usize, n: usize, elapsed_s: f32, s: &Ef
 }
 
 impl EffectSettings {
+    /// The intro and outro, with the old fade in / out switches as Fade.
+    pub fn transitions(&self) -> (crate::motion::Transition, crate::motion::Transition) {
+        use crate::motion::Transition as T;
+        let intro = if self.intro == T::None && self.fade_in { T::Fade } else { self.intro };
+        let outro = if self.outro == T::None && self.fade_out { T::Fade } else { self.outro };
+        (intro, outro)
+    }
+
+    pub fn loop_fx(&self) -> Vec<crate::motion::LoopFx> {
+        use crate::motion::LoopFx as L;
+        [(self.loop_shake, L::Shake), (self.loop_pulse, L::Pulse), (self.loop_hop, L::Hop), (self.loop_wobble, L::Wobble), (self.loop_rainbow, L::Rainbow), (self.loop_glitch, L::Glitch)]
+            .into_iter()
+            .filter_map(|(on, f)| on.then_some(f))
+            .collect()
+    }
+
     /// Where `apply_frame` moves pixels (flips, rotations, polaroid / border padding),
     /// so layers above this effect can follow the content.
     pub fn geo_map(&self, g: &mut crate::geo::GeoMap) {

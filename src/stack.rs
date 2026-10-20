@@ -236,6 +236,17 @@ impl Transform {
         g
     }
 
+    /// The new delay in hundredths of a second, before rounding. Delays under
+    /// 2 cs are measured as players show them (10 cs).
+    fn scale_delay_exact(&self, d: u16) -> f64 {
+        let v = self.speed_val.max(0.01) as f64;
+        match self.speed_mode {
+            SpeedMode::Percent => crate::anim::effective_delay(d) as f64 * 100.0 / v,
+            SpeedMode::DelayAll => v,
+            SpeedMode::Fps => 100.0 / v,
+        }
+    }
+
     fn scale_delay(&self, d: u16) -> u16 {
         if !self.speed_on {
             return d;
@@ -425,6 +436,38 @@ pub struct Stack {
     pub next_id: u64,
 }
 
+/// Give the frames their sped up delays without going under 2 cs, which
+/// browsers and players turn into 10 cs (a crawl). Frames too short to show
+/// are skipped and their time goes to the frame before, so the overall speed
+/// is right. Rounding error is carried along instead of piling up.
+fn retime(plan: &mut [PlanFrame], exact: &[f64]) {
+    let mut t = 0.0f64;
+    let mut open: Option<(usize, i64)> = None; // frame being timed, its start
+    for i in 0..plan.len() {
+        if !plan[i].enabled {
+            continue;
+        }
+        let now = t.round() as i64;
+        match open {
+            Some((_, start)) if now - start < 2 => {
+                // still under 2 cs: this frame folds into the open one
+                plan[i].enabled = false;
+                plan[i].delay = 0;
+            }
+            _ => {
+                if let Some((o, start)) = open {
+                    plan[o].delay = (now - start).clamp(2, u16::MAX as i64) as u16;
+                }
+                open = Some((i, now));
+            }
+        }
+        t += exact[i];
+    }
+    if let Some((o, start)) = open {
+        plan[o].delay = (t.round() as i64 - start).clamp(2, u16::MAX as i64) as u16;
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct PlanFrame {
     pub src: usize,
@@ -536,12 +579,18 @@ impl Stack {
             let back: Vec<usize> = idx[1..idx.len() - 1].iter().rev().copied().collect();
             idx.extend(back);
         }
-        idx.into_iter()
+        let mut plan: Vec<PlanFrame> = idx
+            .into_iter()
             .map(|src| {
                 let f = &base.frames[src];
                 PlanFrame { src, delay: t.scale_delay(f.delay_cs), enabled: f.enabled }
             })
-            .collect()
+            .collect();
+        if t.speed_on {
+            let exact: Vec<f64> = plan.iter().map(|f| t.scale_delay_exact(base.frames[f.src].delay_cs)).collect();
+            retime(&mut plan, &exact);
+        }
+        plan
     }
 
     pub fn loop_count(&self, base: &Animation) -> Option<u16> {
@@ -620,7 +669,7 @@ impl Stack {
                     LayerKind::Emoji(e) => {
                         let Some(b) = l.source_box(0, fonts) else { return Vec::new() };
                         let o = map_box(m, b, true);
-                        shapes::emoji_sprite(&e.emoji, o, e.shadow).map(|(img, x, y)| vec![StrokeSprite { img, x, y, from: e.from, to: e.to }]).unwrap_or_default()
+                        shapes::emoji_sprite(&e.emoji, o, e.shadow.then_some(&e.shadow_style)).map(|(img, x, y)| vec![StrokeSprite { img, x, y, from: e.from, to: e.to }]).unwrap_or_default()
                     }
                     LayerKind::Markup(mk) => {
                         let sc = shapes::map_scale(m);

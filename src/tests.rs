@@ -908,7 +908,7 @@ fn shapes_render_every_kind() {
         }
     }
     // fill off + outline on leaves the middle clear
-    let s = ShapeSettings { kind: ShapeKind::Rect, fill_on: false, stroke_w: 3.0, ..Default::default() };
+    let s = ShapeSettings { kind: ShapeKind::Rect, fill_on: false, stroke_on: true, stroke_w: 3.0, ..Default::default() };
     let (img, x, y) = shape_sprite(&s, Obb { cx: 50.0, cy: 50.0, w: 60.0, h: 60.0, angle: 0.0 }, 1.0).unwrap();
     assert_eq!(img.get_pixel((50 - x) as u32, (50 - y) as u32)[3], 0);
     assert!(img.get_pixel((20 - x) as u32, (50 - y) as u32)[3] > 200);
@@ -1166,4 +1166,26 @@ fn long_gif_encodes_in_runs() {
     let b = io::load_animation_bytes(&bytes).unwrap();
     assert_eq!(b.len(), a.len());
     assert!(max_diff(&a, &b) < 200);
+}
+
+#[test]
+fn fast_speed_skips_frames_instead_of_crawling() {
+    use crate::stack::{SpeedMode, Stack};
+    // 2 cs frames at 200% would be 1 cs, which players show as 10 cs
+    let a = Animation { frames: (0..40).map(|_| Frame::new(RgbaImage::new(4, 4), 2)).collect(), loop_count: None };
+    let mut s = Stack::default();
+    s.transform.speed_on = true;
+    s.transform.speed_mode = SpeedMode::Percent;
+    s.transform.speed_val = 200.0;
+    let plan = s.plan(&a);
+    let shown: Vec<_> = plan.iter().filter(|f| f.enabled).collect();
+    assert!(shown.iter().all(|f| f.delay >= 2), "no delay under 2 cs");
+    let total: u32 = shown.iter().map(|f| f.delay as u32).sum();
+    assert_eq!(total, 40, "twice as fast: 80 cs becomes 40 cs");
+    assert_eq!(shown.len(), 20);
+    // 3 cs at 150% stays every frame, with the 2 cs remainder spread evenly
+    let b = Animation { frames: (0..10).map(|_| Frame::new(RgbaImage::new(4, 4), 3)).collect(), loop_count: None };
+    s.transform.speed_val = 150.0;
+    let plan = s.plan(&b);
+    assert!(plan.iter().all(|f| f.enabled && f.delay == 2));
 }

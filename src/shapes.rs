@@ -64,6 +64,70 @@ impl ShapeKind {
     }
 }
 
+/// How a drop shadow looks. Distance and blur are a share of the shape's size,
+/// so the shadow keeps its look when the shape is resized.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Shadow {
+    /// direction the shadow falls, degrees clockwise from the right (45 = down right)
+    pub angle: f32,
+    /// % of the shape's larger side
+    pub distance: f32,
+    /// % of the shape's larger side
+    pub blur: f32,
+    /// 0..=100
+    pub opacity: f32,
+}
+
+impl Default for Shadow {
+    fn default() -> Self {
+        // the look shadows had before they could be adjusted
+        Self { angle: 45.0, distance: 4.0, blur: 0.0, opacity: 35.0 }
+    }
+}
+
+impl Shadow {
+    /// Offset in pixels for a shape whose larger side is `size` pixels.
+    fn offset(&self, size: f32) -> (f32, f32) {
+        let d = size * self.distance / 100.0 + 2.0 * (self.distance / 4.0).min(1.0);
+        let (sn, cs) = self.angle.to_radians().sin_cos();
+        // the old shadow sat d pixels right and d down, so 45° keeps that spot
+        (cs * d * std::f32::consts::SQRT_2, sn * d * std::f32::consts::SQRT_2)
+    }
+
+    fn blur_px(&self, size: f32) -> f32 {
+        size * self.blur / 100.0
+    }
+
+    /// Room a sprite needs around the shape for the shadow.
+    fn pad(&self, size: f32) -> f32 {
+        let (dx, dy) = self.offset(size);
+        dx.abs().max(dy.abs()) + self.blur_px(size) * 3.0 + 2.0
+    }
+
+    /// Draw a shadow of whatever `draw` paints, under what is in `pm` so far.
+    fn draw(&self, pm: &mut Pixmap, size: f32, tf: Transform, draw: impl Fn(&mut Pixmap, Transform) -> Option<()>) -> Option<()> {
+        let (dx, dy) = self.offset(size);
+        let mut sh = Pixmap::new(pm.width(), pm.height())?;
+        draw(&mut sh, tf.post_translate(dx, dy))?;
+        // black at the chosen strength, keeping the drawn shape's coverage
+        let a = (self.opacity / 100.0).clamp(0.0, 1.0);
+        let mut img = RgbaImage::new(sh.width(), sh.height());
+        for (o, p) in img.pixels_mut().zip(sh.pixels()) {
+            o.0 = [0, 0, 0, (p.alpha() as f32 * a).round() as u8];
+        }
+        let b = self.blur_px(size);
+        if b >= 0.3 {
+            img = image::imageops::blur(&img, b);
+        }
+        for (px, o) in sh.pixels_mut().iter_mut().zip(img.pixels()) {
+            *px = tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, o[3]).unwrap_or(*px);
+        }
+        pm.draw_pixmap(0, 0, sh.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+        Some(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct ShapeSettings {
@@ -88,6 +152,7 @@ pub struct ShapeSettings {
     pub points: u32,
     /// drop shadow below the shape
     pub shadow: bool,
+    pub shadow_style: Shadow,
     /// Twemoji file name of the emoji (for Emoji)
     pub emoji: String,
     pub from: usize,
@@ -106,13 +171,14 @@ impl Default for ShapeSettings {
             angle: 0.0,
             fill_on: true,
             fill: [255, 122, 26],
-            stroke_on: true,
+            stroke_on: false,
             stroke: [255, 255, 255],
             stroke_w: 4.0,
             opacity: 100.0,
             corner: 20.0,
             points: 5,
             shadow: false,
+            shadow_style: Shadow::default(),
             emoji: "1f600".into(),
             from: 1,
             to: 0,
@@ -258,9 +324,11 @@ pub fn shape_sprite(s: &ShapeSettings, o: Obb, scale: f32) -> Option<(RgbaImage,
     if o.w < 1.0 || o.h < 1.0 {
         return None;
     }
-    let sw = if s.stroke_on { (s.stroke_w * scale).max(0.5) } else { 0.0 };
+    // a line is all outline, so it always has its width
+    let sw = if s.stroke_on || s.kind == ShapeKind::Line { (s.stroke_w * scale).max(0.5) } else { 0.0 };
     let (hw, hh) = (o.w / 2.0, o.h / 2.0);
-    let pad = sw * 2.0 + 4.0 + if s.shadow { o.w.max(o.h) * 0.06 + 6.0 } else { 0.0 };
+    let size = o.w.max(o.h);
+    let pad = sw * 2.0 + 4.0 + if s.shadow { s.shadow_style.pad(size) } else { 0.0 };
     let (bx0, by0, bx1, by1) = o.bounds();
     let x0 = (bx0 - pad).floor();
     let y0 = (by0 - pad).floor();
@@ -273,23 +341,26 @@ pub fn shape_sprite(s: &ShapeSettings, o: Obb, scale: f32) -> Option<(RgbaImage,
     let tf = Transform::from_rotate(o.angle).post_translate(o.cx - x0, o.cy - y0);
 
     if s.kind == ShapeKind::Emoji {
-        return emoji_sprite(&s.emoji, o, s.shadow);
+        return emoji_sprite(&s.emoji, o, s.shadow.then_some(&s.shadow_style));
     }
 
     let path = shape_path(s, hw, hh)?;
     let line = s.kind == ShapeKind::Line;
     if s.shadow {
-        let off = o.w.max(o.h) * 0.04 + 2.0;
-        let st = tf.post_translate(off, off);
-        let p = paint([0, 0, 0], 90);
-        if line {
-            pm.stroke_path(&path, &p, &Stroke { width: sw.max(1.0), line_cap: LineCap::Round, ..Default::default() }, st, None);
-        } else {
-            if sw > 0.0 {
-                pm.stroke_path(&path, &p, &Stroke { width: sw * 2.0, line_join: LineJoin::Round, ..Default::default() }, st, None);
+        s.shadow_style.draw(&mut pm, size, tf, |sh, st| {
+            let p = paint([0, 0, 0], 255);
+            if line {
+                sh.stroke_path(&path, &p, &Stroke { width: sw.max(1.0), line_cap: LineCap::Round, ..Default::default() }, st, None);
+            } else {
+                if sw > 0.0 {
+                    sh.stroke_path(&path, &p, &Stroke { width: sw * 2.0, line_join: LineJoin::Round, ..Default::default() }, st, None);
+                }
+                if s.fill_on || sw <= 0.0 {
+                    sh.fill_path(&path, &p, FillRule::Winding, st, None);
+                }
             }
-            pm.fill_path(&path, &p, FillRule::Winding, st, None);
-        }
+            Some(())
+        })?;
     }
     if line {
         let w = sw.max(1.0);
@@ -324,6 +395,7 @@ pub struct EmojiSettings {
     /// 0..=100
     pub opacity: f32,
     pub shadow: bool,
+    pub shadow_style: Shadow,
     pub from: usize,
     /// 0 = end
     pub to: usize,
@@ -331,7 +403,7 @@ pub struct EmojiSettings {
 
 impl Default for EmojiSettings {
     fn default() -> Self {
-        Self { emoji: "1f600".into(), x: 0, y: 0, w: 0, h: 0, angle: 0.0, opacity: 100.0, shadow: false, from: 1, to: 0 }
+        Self { emoji: "1f600".into(), x: 0, y: 0, w: 0, h: 0, angle: 0.0, opacity: 100.0, shadow: false, shadow_style: Shadow::default(), from: 1, to: 0 }
     }
 }
 
@@ -343,12 +415,12 @@ impl EmojiSettings {
 }
 
 /// Draw an emoji into an output-space box (vector, so sharp at any size).
-pub fn emoji_sprite(file: &str, o: Obb, shadow: bool) -> Option<(RgbaImage, i64, i64)> {
+pub fn emoji_sprite(file: &str, o: Obb, shadow: Option<&Shadow>) -> Option<(RgbaImage, i64, i64)> {
     if o.w < 1.0 || o.h < 1.0 {
         return None;
     }
-    let off = if shadow { o.w.max(o.h) * 0.04 + 2.0 } else { 0.0 };
-    let pad = 2.0 + off;
+    let size = o.w.max(o.h);
+    let pad = 2.0 + shadow.map(|s| s.pad(size)).unwrap_or(0.0);
     let (bx0, by0, bx1, by1) = o.bounds();
     let x0 = (bx0 - pad).floor();
     let y0 = (by0 - pad).floor();
@@ -359,13 +431,8 @@ pub fn emoji_sprite(file: &str, o: Obb, shadow: bool) -> Option<(RgbaImage, i64,
     }
     let mut pm = Pixmap::new(pw, ph)?;
     let tf = Transform::from_rotate(o.angle).post_translate(o.cx - x0, o.cy - y0).pre_translate(-o.w / 2.0, -o.h / 2.0);
-    if shadow {
-        let mut sh = Pixmap::new(pw, ph)?;
-        crate::emoji::draw(file, &mut sh.as_mut(), o.w, o.h, tf.post_translate(off, off))?;
-        for px in sh.pixels_mut() {
-            *px = tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, (px.alpha() as u32 * 90 / 255) as u8).unwrap_or(*px);
-        }
-        pm.draw_pixmap(0, 0, sh.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+    if let Some(sh) = shadow {
+        sh.draw(&mut pm, size, tf, |p, t| crate::emoji::draw(file, &mut p.as_mut(), o.w, o.h, t))?;
     }
     crate::emoji::draw(file, &mut pm.as_mut(), o.w, o.h, tf)?;
     Some((pixmap_to_rgba(&pm), x0 as i64, y0 as i64))

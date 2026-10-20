@@ -10,6 +10,7 @@ mod geo;
 mod icons;
 mod io;
 mod lzw;
+mod motion;
 mod noai;
 mod ops;
 mod overlay;
