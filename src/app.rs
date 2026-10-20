@@ -2163,7 +2163,7 @@ impl GifKitApp {
             font_keys: HashMap::new(),
             font_meta: HashMap::new(),
             font_search: String::new(),
-            ffmpeg: io::ffmpeg_available(),
+            ffmpeg: { let f = io::ffmpeg_available(); if f { crate::gpu::warm_up(); } f },
             theme: theme_choice,
             compare: true,
             view_left: ViewSource::Original,
@@ -4542,6 +4542,18 @@ impl GifKitApp {
                     }
                 });
                 ui.separator();
+                let gpu = crate::gpu::enabled();
+                if menu_check(ui, gpu, "Use &Graphics Card for Video", "") {
+                    crate::gpu::set_enabled(!gpu);
+                }
+                // what was found, under the entry (GIF, WebP and APNG always use the processor)
+                if gpu {
+                    let found = crate::gpu::summary().unwrap_or_else(|| "Looking for hardware encoders…".into());
+                    ui.horizontal(|ui| {
+                        ui.add_space(36.0);
+                        ui.label(RichText::new(found).size(11.5).color(p().fg_muted));
+                    });
+                }
                 if menu_check(ui, self.sample_preview, "&Estimate Size of Long Animations", "") {
                     self.sample_preview = !self.sample_preview;
                     theme::set_setting("sample_preview", if self.sample_preview { "1" } else { "0" });
@@ -6008,7 +6020,7 @@ impl GifKitApp {
                         let b = io::encode_avif(a, q)?;
                         let b = if noai { crate::noai::tag_avif(b) } else { b };
                         std::fs::write(&path, &b)?;
-                        Ok(format!("Saved {} ({})", path.display(), fmt_size(b.len() as u64)))
+                        Ok(format!("Saved {} ({}){}", path.display(), fmt_size(b.len() as u64), crate::gpu::last_used_note()))
                     });
                 }
             }
@@ -6022,7 +6034,7 @@ impl GifKitApp {
                 let (fmt, ext) = if self.export_fmt == ExportFormat::Mp4 { (VideoFormat::Mp4, "mp4") } else { (VideoFormat::WebmAlpha, "webm") };
                 if let Some(path) = self.save_path(ext, &[ext]) {
                     let bg = self.video_bg;
-                    self.run_export(ctx, "Export video", move |a, _| io::export_video(a, &path, fmt, bg, noai).map(|_| format!("Saved {}", path.display())));
+                    self.run_export(ctx, "Export video", move |a, _| io::export_video(a, &path, fmt, bg, noai).map(|_| format!("Saved {}{}", path.display(), crate::gpu::last_used_note())));
                 }
             }
             ExportFormat::Frames => {

@@ -7,6 +7,7 @@ mod bundled;
 mod effects;
 mod encode;
 mod geo;
+mod gpu;
 mod icons;
 mod io;
 mod keys;

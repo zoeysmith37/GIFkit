@@ -655,3 +655,12 @@ fn icon_sheet() {
     }
     sheet.save(std::env::var("OUT").unwrap()).unwrap();
 }
+
+#[test]
+#[ignore]
+fn gpu_probe() {
+    let t0 = std::time::Instant::now();
+    println!("h264 {:?}", crate::gpu::h264().map(|h| h.name));
+    println!("av1 {:?}", crate::gpu::av1().map(|h| h.name));
+    println!("summary {:?} in {:?}", crate::gpu::summary(), t0.elapsed());
+}

@@ -173,12 +173,29 @@ pub fn probe_video(path: &Path) -> Result<VideoInfo> {
 /// Import part of a video as frames, streaming raw pixels from ffmpeg (no
 /// temporary files, no length cap). `progress` counts frames as they arrive.
 pub fn load_video_range(path: &Path, opt: &VideoImport, progress: Option<&std::sync::atomic::AtomicUsize>) -> Result<Animation> {
+    // decode on the graphics card when there is one; if that fails, again in software
+    let hw = !crate::gpu::decode_args().is_empty();
+    match load_video_range_with(path, opt, progress, hw) {
+        Err(_) if hw && !crate::stack::stopped(progress) => {
+            if let Some(p) = progress {
+                p.fetch_and(crate::stack::STOP_BIT, std::sync::atomic::Ordering::Relaxed);
+            }
+            load_video_range_with(path, opt, progress, false)
+        }
+        r => r,
+    }
+}
+
+fn load_video_range_with(path: &Path, opt: &VideoImport, progress: Option<&std::sync::atomic::AtomicUsize>, hw: bool) -> Result<Animation> {
     use std::io::Read;
     let info = probe_video(path)?;
     let (w, h) = opt.size(&info);
     let fps = 100.0 / opt.delay_cs as f64;
     let mut cmd = std::process::Command::new("ffmpeg");
     cmd.args(["-v", "error", "-nostdin"]);
+    if hw {
+        cmd.args(crate::gpu::decode_args());
+    }
     if opt.start > 0.0 {
         cmd.args(["-ss", &format!("{:.3}", opt.start)]);
     }
@@ -271,6 +288,15 @@ pub fn load_video_opts(path: &Path, max_side: Option<u32>, crop_to: Option<(u32,
 
 /// `decoder` forces an ffmpeg decoder (e.g. libvpx-vp9, which keeps WebM alpha).
 fn load_video_dec(path: &Path, max_side: Option<u32>, crop_to: Option<(u32, u32)>, decoder: Option<&str>) -> Result<Animation> {
+    // a forced decoder (WebM alpha) stays in software; otherwise the card first
+    let hw = decoder.is_none() && !crate::gpu::decode_args().is_empty();
+    match load_video_dec_with(path, max_side, crop_to, decoder, hw) {
+        Err(_) if hw => load_video_dec_with(path, max_side, crop_to, decoder, false),
+        r => r,
+    }
+}
+
+fn load_video_dec_with(path: &Path, max_side: Option<u32>, crop_to: Option<(u32, u32)>, decoder: Option<&str>, hw: bool) -> Result<Animation> {
     anyhow::ensure!(ffmpeg_available(), "Opening videos needs ffmpeg installed and on PATH");
     let src_fps = probe_fps(path).unwrap_or(25.0);
     // GIF delays are whole 1/100 s: pick the fastest exact rate not above the source
@@ -290,6 +316,9 @@ fn load_video_dec(path: &Path, max_side: Option<u32>, crop_to: Option<(u32, u32)
     vf.push_str(",format=rgba");
     let mut cmd = std::process::Command::new("ffmpeg");
     cmd.args(["-v", "error", "-y"]);
+    if hw {
+        cmd.args(crate::gpu::decode_args());
+    }
     if let Some(d) = decoder {
         cmd.args(["-c:v", d]);
     }
@@ -929,45 +958,97 @@ pub fn export_video_q(anim: &Animation, path: &Path, fmt: VideoFormat, bg: [u8; 
     let list_path = tmp.join("list.txt");
     std::fs::write(&list_path, list)?;
 
-    let mut cmd = std::process::Command::new("ffmpeg");
-    cmd.arg("-y").arg("-loglevel").arg("error").arg("-f").arg("concat").arg("-safe").arg("0").arg("-i").arg(&list_path);
     // quality 0..100 -> CRF (lower = better)
-    let crf = |best: f32, worst: f32, default: u8| -> String {
+    let crf = |best: f32, worst: f32, default: u8| -> i32 {
         match quality {
-            Some(q) => format!("{}", (worst + (best - worst) * q.min(100) as f32 / 100.0).round() as i32),
-            None => default.to_string(),
+            Some(q) => (worst + (best - worst) * q.min(100) as f32 / 100.0).round() as i32,
+            None => default as i32,
         }
     };
-    match fmt {
-        VideoFormat::Mp4 => {
-            cmd.args(["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2,fps=50", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", &crf(12.0, 40.0, 18), "-movflags", "+faststart"]);
+    // the graphics card first when it has an encoder for this; software after
+    let hw = match fmt {
+        VideoFormat::Mp4 => crate::gpu::h264(),
+        // hardware AV1 can't carry AVIF's second (alpha) stream
+        VideoFormat::Avif if !has_alpha => crate::gpu::av1(),
+        _ => None,
+    };
+    let attempt = |hw: Option<&crate::gpu::HwEnc>| -> Result<()> {
+        let mut cmd = std::process::Command::new("ffmpeg");
+        cmd.arg("-y").arg("-loglevel").arg("error");
+        if let Some(h) = hw {
+            cmd.args(h.pre_input());
         }
-        VideoFormat::WebmAlpha => {
-            cmd.args(["-vf", "fps=50", "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-b:v", "0", "-crf", &crf(15.0, 55.0, 30), "-auto-alt-ref", "0"]);
-        }
-        VideoFormat::Avif => {
-            let q = crf(10.0, 55.0, 28);
-            if has_alpha {
-                // AVIF stores alpha as a second AV1 stream
-                cmd.args(["-filter_complex", "[0:v]fps=50,pad=ceil(iw/2)*2:ceil(ih/2)*2:color=black@0,format=rgba,split[c][a];[c]format=yuv420p[cc];[a]alphaextract,format=gray[al]", "-map", "[cc]", "-map", "[al]"]);
-            } else {
-                cmd.args(["-vf", "fps=50,pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p"]);
+        cmd.arg("-f").arg("concat").arg("-safe").arg("0").arg("-i").arg(&list_path);
+        let tail = hw.map(|h| h.filter_tail()).unwrap_or("");
+        match fmt {
+            VideoFormat::Mp4 => {
+                let q = crf(12.0, 40.0, 18);
+                match hw {
+                    Some(h) => {
+                        cmd.arg("-vf").arg(format!("pad=ceil(iw/2)*2:ceil(ih/2)*2,fps=50{tail}"));
+                        cmd.args(h.codec_args(q));
+                    }
+                    None => {
+                        cmd.args(["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2,fps=50", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", &q.to_string()]);
+                    }
+                }
+                cmd.args(["-movflags", "+faststart"]);
             }
-            cmd.args(["-c:v", "libaom-av1", "-crf", &q, "-b:v", "0", "-cpu-used", "6", "-row-mt", "1", "-still-picture", "0", "-f", "avif"]);
-            if anim.loop_count.is_none() {
-                cmd.args(["-loop", "0"]);
+            VideoFormat::WebmAlpha => {
+                cmd.args(["-vf", "fps=50", "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-b:v", "0", "-crf", &crf(15.0, 55.0, 30).to_string(), "-auto-alt-ref", "0"]);
+            }
+            VideoFormat::Avif => {
+                let q = crf(10.0, 55.0, 28);
+                match hw {
+                    Some(h) => {
+                        cmd.arg("-vf").arg(format!("fps=50,pad=ceil(iw/2)*2:ceil(ih/2)*2{tail}"));
+                        cmd.args(h.codec_args(q));
+                    }
+                    None => {
+                        if has_alpha {
+                            // AVIF stores alpha as a second AV1 stream
+                            cmd.args(["-filter_complex", "[0:v]fps=50,pad=ceil(iw/2)*2:ceil(ih/2)*2:color=black@0,format=rgba,split[c][a];[c]format=yuv420p[cc];[a]alphaextract,format=gray[al]", "-map", "[cc]", "-map", "[al]"]);
+                        } else {
+                            cmd.args(["-vf", "fps=50,pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p"]);
+                        }
+                        cmd.args(["-c:v", "libaom-av1", "-crf", &q.to_string(), "-b:v", "0", "-cpu-used", "6", "-row-mt", "1", "-still-picture", "0"]);
+                    }
+                }
+                cmd.args(["-f", "avif"]);
+                if anim.loop_count.is_none() {
+                    cmd.args(["-loop", "0"]);
+                }
             }
         }
-    }
-    if noai {
-        cmd.arg("-metadata").arg(format!("comment={}", crate::noai::COMMENT));
-    }
-    cmd.arg(path);
-    let out = cmd.output().context("Failed to run ffmpeg (is it installed and on PATH?)")?;
+        if noai {
+            cmd.arg("-metadata").arg(format!("comment={}", crate::noai::COMMENT));
+        }
+        cmd.arg(path);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        let out = cmd.output().context("Failed to run ffmpeg (is it installed and on PATH?)")?;
+        if !out.status.success() {
+            bail!("ffmpeg failed: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        Ok(())
+    };
+    let used = match hw.as_ref().map(|h| (h, attempt(Some(h)))) {
+        Some((h, Ok(()))) => Some(format!("{}, {}", h.label(), h.name)),
+        // the card couldn't do this one (size, profile, driver): software
+        _ => {
+            let r = attempt(None);
+            if r.is_err() {
+                let _ = std::fs::remove_dir_all(&tmp);
+            }
+            r?;
+            None
+        }
+    };
+    crate::gpu::note_used(used);
     let _ = std::fs::remove_dir_all(&tmp);
-    if !out.status.success() {
-        bail!("ffmpeg failed: {}", String::from_utf8_lossy(&out.stderr));
-    }
     Ok(())
 }
 
