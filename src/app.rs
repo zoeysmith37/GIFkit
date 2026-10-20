@@ -253,6 +253,15 @@ enum JobOutput {
     ProjectSaved(anyhow::Result<PathBuf>),
 }
 
+/// Something that would throw away unsaved changes, waiting for an answer.
+#[derive(Clone, Debug, PartialEq)]
+enum Pending {
+    New,
+    Quit,
+    Open(PathBuf),
+    Sequence(Vec<PathBuf>),
+}
+
 struct Job {
     label: String,
     rx: Receiver<JobOutput>,
@@ -319,6 +328,91 @@ struct Snapshot {
     gif: GifOptions,
     /// the edit made after this state (shown in History)
     label: String,
+}
+
+/// Frame thumbnails, made in the background and only for frames someone
+/// is looking at (the frame grid and the timeline), kept while there's room.
+#[derive(Default)]
+struct Thumbs {
+    key: u64,
+    map: HashMap<usize, (TextureHandle, u64)>,
+    pending: std::collections::HashSet<usize>,
+    queue: Vec<(usize, Arc<RgbaImage>)>,
+    rx: Option<Receiver<(u64, usize, RgbaImage)>>,
+    tx: Option<std::sync::mpsc::Sender<(u64, usize, RgbaImage)>>,
+    tick: u64,
+}
+
+/// Longest side of a thumbnail, and how many are kept on the graphics card.
+const THUMB_SIDE: u32 = 192;
+const THUMB_KEEP: usize = 2500;
+
+impl Thumbs {
+    fn get(&mut self, key: u64, i: usize) -> Option<TextureHandle> {
+        if self.key != key {
+            self.map.clear();
+            self.pending.clear();
+            self.queue.clear();
+            self.key = key;
+        }
+        let tick = self.tick;
+        self.map.get_mut(&i).map(|e| {
+            e.1 = tick;
+            e.0.clone()
+        })
+    }
+
+    fn want(&mut self, i: usize, img: Arc<RgbaImage>) {
+        if self.pending.insert(i) {
+            self.queue.push((i, img));
+        }
+    }
+
+    /// Once a frame: take in finished thumbnails, start the ones asked for.
+    fn pump(&mut self, ctx: &egui::Context) {
+        self.tick += 1;
+        if self.tx.is_none() {
+            let (tx, rx) = channel();
+            (self.tx, self.rx) = (Some(tx), Some(rx));
+        }
+        let mut got = 0;
+        // a few dozen uploads a frame keeps scrolling smooth
+        while got < 48 {
+            let Some(Ok((key, i, img))) = self.rx.as_ref().map(|r| r.try_recv()) else { break };
+            got += 1;
+            if key != self.key {
+                continue;
+            }
+            self.pending.remove(&i);
+            let t = ctx.load_texture(format!("thumb{i}"), to_color_image(&img), TextureOptions::LINEAR);
+            self.map.insert(i, (t, self.tick));
+        }
+        if self.map.len() > THUMB_KEEP {
+            // forget the ones not seen for longest
+            let mut v: Vec<(u64, usize)> = self.map.iter().map(|(i, e)| (e.1, *i)).collect();
+            v.sort_unstable();
+            for (_, i) in v.into_iter().take(self.map.len() - THUMB_KEEP * 4 / 5) {
+                self.map.remove(&i);
+            }
+        }
+        if !self.queue.is_empty() {
+            let batch = std::mem::take(&mut self.queue);
+            let (tx, key, ctx2) = (self.tx.clone().unwrap(), self.key, ctx.clone());
+            stack::bg_pool().spawn(move || {
+                use rayon::prelude::*;
+                batch.into_par_iter().for_each_with(tx, |tx, (i, img)| {
+                    let s = (THUMB_SIDE as f32 / img.width().max(img.height()) as f32).min(1.0);
+                    let (w, h) = (((img.width() as f32 * s).round() as u32).max(1), ((img.height() as f32 * s).round() as u32).max(1));
+                    let th = if s < 1.0 { image::imageops::resize(&*img, w, h, image::imageops::FilterType::Triangle) } else { (*img).clone() };
+                    let _ = tx.send((key, i, th));
+                });
+                ctx2.request_repaint();
+            });
+        }
+        if !self.pending.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+        }
+    }
 }
 
 /// Texture cache invalidated by a key.
@@ -593,7 +687,7 @@ pub struct GifKitApp {
     pixelated: bool,
 
     base_tex: TexCache,
-    thumb_tex: TexCache,
+    thumbs: Thumbs,
     comp_tex: TexCache,
     orig_tex: TexCache,
     cmp_tex: TexCache,
@@ -727,6 +821,12 @@ pub struct GifKitApp {
     tl_reorder: Option<usize>,
     /// frames the GIF will grow by when the drag past its end lets go
     tl_extend: usize,
+    /// asking whether to save first, and what to do after
+    confirm: Option<Pending>,
+    /// the same, once a save started from the question finishes
+    after_save: Option<Pending>,
+    /// the question was answered: let the window close
+    quitting: bool,
     /// changing a motion value at a frame without a keyframe adds one
     tl_autokey: bool,
     /// while trimming the GIF's outer ends: the output frames that stay
@@ -2043,7 +2143,7 @@ impl GifKitApp {
             backdrop_col: theme::get_setting("backdrop_col").and_then(|v| parse_hex(&v)).unwrap_or([255, 255, 255]),
             pixelated: theme::get_setting("pixelated").as_deref() == Some("1"),
             base_tex: TexCache::default(),
-            thumb_tex: TexCache::default(),
+            thumbs: Thumbs::default(),
             comp_tex: TexCache::default(),
             orig_tex: TexCache::default(),
             cmp_tex: TexCache::default(),
@@ -2149,6 +2249,9 @@ impl GifKitApp {
             tl_head_drag: false,
             tl_reorder: None,
             tl_extend: 0,
+            confirm: None,
+            after_save: None,
+            quitting: false,
             tl_autokey: theme::get_setting("auto_key").map(|v| v != "0").unwrap_or(true),
             tl_trim: None,
             keymap: crate::keys::Keymap::load(),
@@ -3006,6 +3109,15 @@ impl GifKitApp {
     }
 
     fn open_path(&mut self, p: PathBuf, ctx: &egui::Context) {
+        // opening another file replaces this one: ask first if it has changes
+        if self.base.is_some() && self.modified {
+            self.confirm = Some(Pending::Open(p));
+            return;
+        }
+        self.open_path_now(p, ctx);
+    }
+
+    fn open_path_now(&mut self, p: PathBuf, ctx: &egui::Context) {
         self.add_recent(&p);
         if crate::project::is_project(&p) {
             self.spawn_in(ctx, "Open project", 1, false, move |_| JobOutput::ProjectLoaded(crate::project::load(&p).map(|pr| (pr, p.clone()))));
@@ -3116,6 +3228,10 @@ impl GifKitApp {
     }
 
     fn open_sequence(&mut self, ps: Vec<PathBuf>, ctx: &egui::Context) {
+        if self.base.is_some() && self.modified {
+            self.confirm = Some(Pending::Sequence(ps));
+            return;
+        }
         let n = ps.len();
         self.spawn(ctx, "Open sequence", n, move |_| JobOutput::Loaded(io::load_sequence(&ps, 10).map(|a| (a, None, None))));
     }
@@ -3449,21 +3565,18 @@ impl GifKitApp {
         Some(self.base_tex.put(ctx, src, &img, o, "base"))
     }
 
-    fn thumb_texture(&mut self, ctx: &egui::Context, idx: usize) -> Option<TextureHandle> {
-        if let Some(t) = self.thumb_tex.get(self.version, idx) {
+    /// A frame's thumbnail if it's ready; otherwise it's asked for and made
+    /// in the background (from the shrunk copy of big pictures when there is one).
+    fn thumb_texture(&mut self, _ctx: &egui::Context, idx: usize) -> Option<TextureHandle> {
+        if let Some(t) = self.thumbs.get(self.version, idx) {
             return Some(t);
-        }
-        // big pictures: wait for the shrunk copy rather than shrink here
-        if self.waiting_proxy() {
-            return None;
         }
         let img = match self.ready_proxy() {
             Some((_, a)) => a.frames.get(idx)?.image.clone(),
             None => self.base.as_ref()?.frames.get(idx)?.image.clone(),
         };
-        let s = (160.0 / img.width().max(img.height()) as f32).min(1.0);
-        let th = image::imageops::thumbnail(&*img, ((img.width() as f32 * s) as u32).max(1), ((img.height() as f32 * s) as u32).max(1));
-        Some(self.thumb_tex.put(ctx, idx, &th, TextureOptions::LINEAR, "thumb"))
+        self.thumbs.want(idx, img);
+        None
     }
 
     fn composite_key(&self) -> u64 {
@@ -4062,6 +4175,8 @@ impl eframe::App for GifKitApp {
         let ctx = ui.ctx().clone();
         let perf_t0 = std::time::Instant::now();
         theme::refresh(&ctx, self.theme);
+        self.guard_close(&ctx);
+        self.thumbs.pump(&ctx);
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true) || std::env::var_os("GIFKIT_ASSUME_FOCUS").is_some();
         // a dialog of ours having focus still counts as the app being active
         let dialog_open = self.export_open || self.history_open || self.about_open || self.shortcuts_open || self.video_import.is_some();
@@ -4218,6 +4333,7 @@ impl eframe::App for GifKitApp {
 
         self.export_window(&ctx);
         self.history_window(&ctx);
+        self.confirm_window(&ctx);
         self.about_window(&ctx);
         mark("canvas");
         self.emoji_drag_drop(&ctx);
@@ -4523,21 +4639,116 @@ impl GifKitApp {
         self.drag = None;
     }
 
+    /// Do what was waiting on the unsaved-changes question.
+    fn run_pending(&mut self, ctx: &egui::Context, what: Pending) {
+        self.modified = false;
+        match what {
+            Pending::New => self.close_document(),
+            Pending::Quit => {
+                self.quitting = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Pending::Open(p) => self.open_path_now(p, ctx),
+            Pending::Sequence(ps) => self.open_sequence(ps, ctx),
+        }
+    }
+
+    /// The window closing, and the save-first question KDE apps ask.
+    fn guard_close(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested()) && self.modified && self.base.is_some() && !self.quitting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm = Some(Pending::Quit);
+        }
+        // a save started from the question: carry on once it's done, or
+        // drop it if the save was cancelled or failed
+        if let Some(what) = self.after_save.clone() {
+            if self.job.is_none() {
+                self.after_save = None;
+                if !self.modified {
+                    self.run_pending(ctx, what);
+                }
+            }
+        }
+    }
+
+    /// "The document has been modified": Save, Discard or Cancel, laid out
+    /// as KDE's message boxes are.
+    fn confirm_window(&mut self, ctx: &egui::Context) {
+        let Some(what) = self.confirm.clone() else { return };
+        let pal = *p();
+        let mut open = true;
+        let mut answer: Option<u8> = None;
+        let name = self.project_path.as_ref().or(self.path.as_ref()).and_then(|p| p.file_name()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Untitled".into());
+        let title = match what {
+            Pending::Quit => "Close Document",
+            Pending::New => "New Project",
+            _ => "Open",
+        };
+        dialog(ctx, "confirm", title, vec2(460.0, 160.0), false, &mut open, |ui| {
+            ui.horizontal_top(|ui| {
+                ui.add(crate::icons::image(ui.ctx(), "dialog-warning", 48.0, pal.fg));
+                ui.add_space(10.0);
+                ui.vertical(|ui| {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(format!("The document \"{}\" has been modified.", elide(&name, 40))).color(pal.fg));
+                    ui.label(RichText::new("Do you want to save your changes or discard them?").color(pal.fg));
+                });
+            });
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let btn = |ui: &mut egui::Ui, icon: &str, text: &str, default: bool| {
+                        let b = egui::Button::image_and_text(crate::icons::image(ui.ctx(), icon, 16.0, pal.fg), text).min_size(vec2(96.0, 30.0));
+                        ui.add(if default { b.stroke(Stroke::new(1.0, pal.highlight)) } else { b }).clicked()
+                    };
+                    if btn(ui, "dialog-cancel", "Cancel", false) {
+                        answer = Some(0);
+                    }
+                    if btn(ui, "edit-delete", "Discard", false) {
+                        answer = Some(2);
+                    }
+                    if btn(ui, "document-save", "Save", true) {
+                        answer = Some(1);
+                    }
+                });
+            });
+            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                answer = Some(1);
+            }
+        });
+        if !open {
+            answer = Some(0);
+        }
+        match answer {
+            Some(0) => self.confirm = None,
+            Some(1) => {
+                self.confirm = None;
+                self.save_project(ctx, false);
+                // the save runs in the background; what was asked for follows it
+                self.after_save = Some(what);
+            }
+            Some(_) => {
+                self.confirm = None;
+                self.run_pending(ctx, what);
+            }
+            None => {}
+        }
+    }
+
     /// Close the current file and start over (asks first when there are unsaved changes).
     fn new_project(&mut self) {
         if self.base.is_none() {
             return;
         }
         if self.modified {
-            let ok = rfd::MessageDialog::new()
-                .set_title("New Project")
-                .set_description("Discard the unsaved changes to this project?")
-                .set_buttons(rfd::MessageButtons::OkCancelCustom("Discard".into(), "Cancel".into()))
-                .show();
-            if !matches!(ok, rfd::MessageDialogResult::Custom(ref s) if s == "Discard") && ok != rfd::MessageDialogResult::Ok {
-                return;
-            }
+            self.confirm = Some(Pending::New);
+            return;
         }
+        self.close_document();
+    }
+
+    /// Forget the open animation and everything done to it.
+    fn close_document(&mut self) {
         self.base = None;
         self.original = None;
         self.orig_gen += 1;
@@ -7236,9 +7447,11 @@ impl GifKitApp {
         let mut action: Option<(usize, &'static str)> = None;
         let mut delay_change: Option<(usize, u16)> = None;
         let cols = (((ui.available_width() - 14.0 + gap) / (cell.x + gap)).floor() as usize).max(1);
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.spacing_mut().item_spacing = vec2(gap, gap);
-            for row in 0..n.div_ceil(cols) {
+        // only the rows in view are laid out (and only their thumbnails made),
+        // so a few thousand frames scroll as easily as a few
+        ui.spacing_mut().item_spacing = vec2(gap, gap);
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, cell.y, n.div_ceil(cols), |ui, rows| {
+            for row in rows {
                 ui.horizontal(|ui| {
                     for i in row * cols..((row + 1) * cols).min(n) {
                         let (enabled, mut delay) = {
