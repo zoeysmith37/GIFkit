@@ -407,6 +407,9 @@ pub struct Layer {
     pub color: Option<[u8; 3]>,
     /// the whole layer's opacity, % (on top of any keyed opacity)
     pub opacity: f32,
+    /// a clipping mask: shows only where the nearest unclipped layer below
+    /// it has drawn something, as in Photoshop
+    pub clip: bool,
 }
 
 impl Layer {
@@ -521,6 +524,9 @@ pub fn layer_signature(l: &Layer) -> u64 {
     if l.opacity < 100.0 {
         l.opacity.to_bits().hash(&mut h);
     }
+    if l.clip {
+        "clip".hash(&mut h);
+    }
     h.finish()
 }
 
@@ -598,6 +604,18 @@ impl Prepared {
     }
 }
 
+/// Mix `img` back toward `before` where `mask` is clear: a clipped layer
+/// shows only where its base drew.
+fn mask_blend(img: &mut RgbaImage, before: &RgbaImage, mask: &image::GrayImage) {
+    use rayon::prelude::*;
+    img.par_chunks_mut(4).zip(before.par_chunks(4)).zip(mask.as_raw().par_iter()).for_each(|((p, q), m)| {
+        let a = *m as f32 / 255.0;
+        for k in 0..4 {
+            p[k] = (q[k] as f32 + (p[k] as f32 - q[k] as f32) * a).round() as u8;
+        }
+    });
+}
+
 /// Run the calling thread at a lower priority, so long background renders
 /// never starve the desktop compositor or the app's own UI.
 pub fn lower_thread_priority() {
@@ -640,7 +658,7 @@ impl Stack {
     pub fn push(&mut self, kind: LayerKind) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
-        self.layers.push(Layer { id, visible: true, kind, label: None, timing: Default::default(), locked: false, color: None, opacity: 100.0 });
+        self.layers.push(Layer { id, visible: true, kind, label: None, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false });
         id
     }
 
@@ -832,113 +850,174 @@ impl Stack {
             &fresh
         };
         let n = plan.len();
-        let src = plan[i].src;
         let mut img = self.geometry_frame(base, plan, i);
+        // each clipped layer's base: the nearest unclipped layer below it
+        let mut base_of: Vec<Option<usize>> = vec![None; self.layers.len()];
+        let mut last = None;
         for (li, l) in self.layers.iter().enumerate() {
-            if !l.active() || !l.timing.shows(i, n) {
-                continue;
+            if l.clip {
+                base_of[li] = last;
+            } else {
+                last = Some(li);
             }
-            let mo = l.motion(i);
-            if mo.opacity <= 0.001 {
-                continue;
-            }
-            // a keyed fade mixes the layer's result with what was under it
-            let before = (mo.opacity < 0.999).then(|| img.clone());
-            let m = &prep.maps[li].m;
-            // sprites drawn ahead of time follow the motion as bitmaps
-            let draw = |img: &mut RgbaImage, sp: &RgbaImage, x: i64, y: i64, alpha: f32| {
-                if mo.moves() {
-                    let ob = l.source_box(src, fonts).map(|b| map_box(m, b, false));
-                    let centre = ob.map(|o| (o.cx, o.cy)).unwrap_or((x as f32 + sp.width() as f32 / 2.0, y as f32 + sp.height() as f32 / 2.0));
-                    let d = m.apply_vec(mo.dx, mo.dy);
-                    // width and height stretch along the layer's own sides
-                    let lin = crate::timeline::motion_matrix(mo.sx, mo.sy, ob.map(|o| o.angle).unwrap_or(0.0), mo.angle * m.det().signum());
-                    if let Some((t, tx, ty)) = crate::timeline::transform_sprite(sp, x, y, centre, d, lin) {
-                        crate::ops::overlay_with_opacity(img, &t, tx, ty, alpha);
-                    }
-                } else {
-                    crate::ops::overlay_with_opacity(img, sp, x, y, alpha);
-                }
-            };
-            match &l.kind {
-                LayerKind::Effects(fx) => {
-                    // effects run over their own clip, so an intro starts where the clip does
-                    let (s0, s1) = l.timing.clip_at(i, n).filter(|_| l.timing.clips.is_some()).unwrap_or((0, n.saturating_sub(1)));
-                    // count only frames that show: skipped ones (trims, speed-ups)
-                    // would otherwise swallow the start of an intro or the end of an outro
-                    let shown = |a: usize, b: usize| plan[a..b].iter().filter(|f| f.enabled).count();
-                    let end_t = times[s1] + if plan[s1].enabled { effective_delay(plan[s1].delay) as f32 / 100.0 } else { 0.0 };
-                    img = effects::apply_frame(&img, shown(s0, i), shown(s0, s1 + 1).max(1), times[i] - times[s0], end_t - times[s0], fx, fonts);
-                }
-                LayerKind::Censor(c) => {
-                    if c.applies_to(src) {
-                        if let Some(b) = l.source_box(src, fonts) {
-                            img = effects::censor_obb(&img, map_box(m, mo.apply(b), false), c);
+        }
+        let has_clips = |li: usize| self.layers.get(li + 1).is_some_and(|l| l.clip);
+        // the base's coverage, made when the base is drawn
+        let mut masks: Vec<Option<image::GrayImage>> = vec![None; self.layers.len()];
+        for li in 0..self.layers.len() {
+            match base_of[li].filter(|_| self.layers[li].clip) {
+                Some(b) => {
+                    let Some(mask) = &masks[b] else {
+                        // a base that draws nothing here hides what's clipped to it
+                        if self.layer_shows(b, i, n) && !Self::coverage_kind(&self.layers[b].kind) {
+                            self.draw_layer(&mut img, li, i, plan, times, fonts, prep);
                         }
+                        continue;
+                    };
+                    let before = img.clone();
+                    self.draw_layer(&mut img, li, i, plan, times, fonts, prep);
+                    if img.dimensions() == before.dimensions() && img.dimensions() == mask.dimensions() {
+                        mask_blend(&mut img, &before, mask);
                     }
                 }
-                LayerKind::Overlay(o) => {
-                    if let Some(b) = l.source_box(src, fonts) {
-                        let frame = o.src.frame_at(times[i]);
-                        crate::overlay::draw_in_obb(&mut img, frame, map_box(m, mo.apply(b), true), o.opacity / 100.0);
-                    }
-                }
-                LayerKind::Watermark(w) => {
-                    if let Some(Some(sp)) = prep.watermarks.get(li) {
-                        effects::draw_watermark(&mut img, sp, w.opacity);
-                    }
-                }
-                LayerKind::Shield(sh) => img = effects::shield(&img, sh, src),
-                LayerKind::Shape(sh) => {
-                    if let Some(st) = prep.stamps.get(li) {
-                        for sp in st.iter().filter(|_| sh.applies_to(src)) {
-                            draw(&mut img, &sp.img, sp.x, sp.y, sh.opacity / 100.0);
-                        }
-                    }
-                }
-                LayerKind::Emoji(e) => {
-                    if let Some(st) = prep.stamps.get(li) {
-                        for sp in st.iter().filter(|_| e.applies_to(src)) {
-                            draw(&mut img, &sp.img, sp.x, sp.y, e.opacity / 100.0);
-                        }
-                    }
-                }
-                LayerKind::Markup(_) => {
-                    if let Some(st) = prep.stamps.get(li) {
-                        for sp in st {
-                            let i = src + 1;
-                            if i >= sp.from.max(1) && (sp.to == 0 || i <= sp.to) {
-                                draw(&mut img, &sp.img, sp.x, sp.y, 1.0);
-                            }
-                        }
-                    }
-                }
-                LayerKind::Text(t) => {
-                    if t.caption != text::Caption::None && t.bar_h > 0 && t.applies_to(src) {
-                        let c = t.bar_color;
+                None => {
+                    self.draw_layer(&mut img, li, i, plan, times, fonts, prep);
+                    if has_clips(li) && Self::coverage_kind(&self.layers[li].kind) && self.layer_shows(li, i, n) {
+                        // what this layer draws, on its own, as the mask for those clipped to it
                         let (w, h) = img.dimensions();
-                        let p = self.transform.pre();
-                        let (by, bh) = ((t.bar_y as f32 * p).round() as i32, (t.bar_h as f32 * p).round() as i32);
-                        let y0 = by.clamp(0, h as i32) as u32;
-                        let y1 = (by + bh).clamp(0, h as i32) as u32;
-                        for y in y0..y1 {
-                            for x in 0..w {
-                                img.put_pixel(x, y, Rgba([c[0], c[1], c[2], 255]));
-                            }
-                        }
-                    }
-                    if let Some(Some((s, x, y))) = prep.sprites.get(li) {
-                        if t.applies_to(src) {
-                            draw(&mut img, s, *x, *y, t.opacity as f32 / 100.0);
-                        }
+                        let mut alone = RgbaImage::new(w, h);
+                        self.draw_layer(&mut alone, li, i, plan, times, fonts, prep);
+                        masks[li] = Some(image::GrayImage::from_fn(w, h, |x, y| image::Luma([alone.get_pixel(x, y)[3]])));
                     }
                 }
-            }
-            if let Some(b) = before {
-                crate::timeline::blend(&mut img, &b, mo.opacity);
             }
         }
         img
+    }
+
+    /// Does layer `li` show at plan frame `i`?
+    fn layer_shows(&self, li: usize, i: usize, n: usize) -> bool {
+        let l = &self.layers[li];
+        l.active() && l.timing.shows(i, n) && l.motion(i).opacity > 0.001
+    }
+
+    /// Layers that draw something with a shape, which clipped layers can
+    /// follow. Effects, censors and the shield work on the whole frame, so
+    /// clipping to them clips to everything.
+    fn coverage_kind(k: &LayerKind) -> bool {
+        !matches!(k, LayerKind::Effects(_) | LayerKind::Censor(_) | LayerKind::Shield(_))
+    }
+
+    /// Draw layer `li` onto `img` for plan frame `i`.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_layer(&self, target: &mut RgbaImage, li: usize, i: usize, plan: &[PlanFrame], times: &[f32], fonts: &[FontEntry], prep: &Prepared) {
+        let n = plan.len();
+        let src = plan[i].src;
+        let l = &self.layers[li];
+        if !l.active() || !l.timing.shows(i, n) {
+            return;
+        }
+        let mo = l.motion(i);
+        if mo.opacity <= 0.001 {
+            return;
+        }
+        let mut img = std::mem::take(target);
+        // a keyed fade mixes the layer's result with what was under it
+        let before = (mo.opacity < 0.999).then(|| img.clone());
+        let m = &prep.maps[li].m;
+        // sprites drawn ahead of time follow the motion as bitmaps
+        let draw = |img: &mut RgbaImage, sp: &RgbaImage, x: i64, y: i64, alpha: f32| {
+            if mo.moves() {
+                let ob = l.source_box(src, fonts).map(|b| map_box(m, b, false));
+                let centre = ob.map(|o| (o.cx, o.cy)).unwrap_or((x as f32 + sp.width() as f32 / 2.0, y as f32 + sp.height() as f32 / 2.0));
+                let d = m.apply_vec(mo.dx, mo.dy);
+                // width and height stretch along the layer's own sides
+                let lin = crate::timeline::motion_matrix(mo.sx, mo.sy, ob.map(|o| o.angle).unwrap_or(0.0), mo.angle * m.det().signum());
+                if let Some((t, tx, ty)) = crate::timeline::transform_sprite(sp, x, y, centre, d, lin) {
+                    crate::ops::overlay_with_opacity(img, &t, tx, ty, alpha);
+                }
+            } else {
+                crate::ops::overlay_with_opacity(img, sp, x, y, alpha);
+            }
+        };
+        match &l.kind {
+            LayerKind::Effects(fx) => {
+                // effects run over their own clip, so an intro starts where the clip does
+                let (s0, s1) = l.timing.clip_at(i, n).filter(|_| l.timing.clips.is_some()).unwrap_or((0, n.saturating_sub(1)));
+                // count only frames that show: skipped ones (trims, speed-ups)
+                // would otherwise swallow the start of an intro or the end of an outro
+                let shown = |a: usize, b: usize| plan[a..b].iter().filter(|f| f.enabled).count();
+                let end_t = times[s1] + if plan[s1].enabled { effective_delay(plan[s1].delay) as f32 / 100.0 } else { 0.0 };
+                img = effects::apply_frame(&img, shown(s0, i), shown(s0, s1 + 1).max(1), times[i] - times[s0], end_t - times[s0], fx, fonts);
+            }
+            LayerKind::Censor(c) => {
+                if c.applies_to(src) {
+                    if let Some(b) = l.source_box(src, fonts) {
+                        img = effects::censor_obb(&img, map_box(m, mo.apply(b), false), c);
+                    }
+                }
+            }
+            LayerKind::Overlay(o) => {
+                if let Some(b) = l.source_box(src, fonts) {
+                    let frame = o.src.frame_at(times[i]);
+                    crate::overlay::draw_in_obb(&mut img, frame, map_box(m, mo.apply(b), true), o.opacity / 100.0);
+                }
+            }
+            LayerKind::Watermark(w) => {
+                if let Some(Some(sp)) = prep.watermarks.get(li) {
+                    effects::draw_watermark(&mut img, sp, w.opacity);
+                }
+            }
+            LayerKind::Shield(sh) => img = effects::shield(&img, sh, src),
+            LayerKind::Shape(sh) => {
+                if let Some(st) = prep.stamps.get(li) {
+                    for sp in st.iter().filter(|_| sh.applies_to(src)) {
+                        draw(&mut img, &sp.img, sp.x, sp.y, sh.opacity / 100.0);
+                    }
+                }
+            }
+            LayerKind::Emoji(e) => {
+                if let Some(st) = prep.stamps.get(li) {
+                    for sp in st.iter().filter(|_| e.applies_to(src)) {
+                        draw(&mut img, &sp.img, sp.x, sp.y, e.opacity / 100.0);
+                    }
+                }
+            }
+            LayerKind::Markup(_) => {
+                if let Some(st) = prep.stamps.get(li) {
+                    for sp in st {
+                        let i = src + 1;
+                        if i >= sp.from.max(1) && (sp.to == 0 || i <= sp.to) {
+                            draw(&mut img, &sp.img, sp.x, sp.y, 1.0);
+                        }
+                    }
+                }
+            }
+            LayerKind::Text(t) => {
+                if t.caption != text::Caption::None && t.bar_h > 0 && t.applies_to(src) {
+                    let c = t.bar_color;
+                    let (w, h) = img.dimensions();
+                    let p = self.transform.pre();
+                    let (by, bh) = ((t.bar_y as f32 * p).round() as i32, (t.bar_h as f32 * p).round() as i32);
+                    let y0 = by.clamp(0, h as i32) as u32;
+                    let y1 = (by + bh).clamp(0, h as i32) as u32;
+                    for y in y0..y1 {
+                        for x in 0..w {
+                            img.put_pixel(x, y, Rgba([c[0], c[1], c[2], 255]));
+                        }
+                    }
+                }
+                if let Some(Some((s, x, y))) = prep.sprites.get(li) {
+                    if t.applies_to(src) {
+                        draw(&mut img, s, *x, *y, t.opacity as f32 / 100.0);
+                    }
+                }
+            }
+        }
+        if let Some(b) = before {
+            crate::timeline::blend(&mut img, &b, mo.opacity);
+        }
+        *target = img;
     }
 
     /// The frame edits plus the room caption bars need (when `captions`).
@@ -1276,7 +1355,12 @@ pub fn frame_at_time(a: &Animation, t: f32) -> usize {
 impl Stack {
     /// Every layer is one the graphics card can draw.
     pub fn gpu_capable(&self) -> bool {
-        !self.layers.iter().any(|l| l.active() && matches!(&l.kind, LayerKind::Effects(fx) if !crate::gpu_fx::effects_ok(fx)))
+        !self.layers.iter().any(|l| l.active() && matches!(&l.kind, LayerKind::Effects(fx) if !crate::gpu_fx::effects_ok(fx))) && !self.has_clipping()
+    }
+
+    /// Is any showing layer clipped to one below it? (CPU only for now)
+    pub fn has_clipping(&self) -> bool {
+        self.layers.iter().enumerate().any(|(li, l)| l.clip && l.active() && li > 0)
     }
 
     /// Frame `i` as work for the graphics card, or None when something in
@@ -1285,7 +1369,7 @@ impl Stack {
     pub fn gpu_frame<'a>(&'a self, base: &Animation, plan: &[PlanFrame], times: &[f32], i: usize, fonts: &[FontEntry], prep: &'a Prepared) -> Option<crate::gpu_render::GpuFrame<'a>> {
         use crate::geo::Affine;
         use crate::gpu_render::{GpuDraw, GpuFrame, GpuGeo, GpuOp, GpuSrc};
-        if !prep.fits(self) {
+        if !prep.fits(self) || self.has_clipping() {
             return None;
         }
         let n = plan.len();

@@ -7,7 +7,7 @@
 //! GIF, WebP and APNG have no hardware encoders anywhere: they stay on the
 //! CPU, spread over all cores.
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -128,7 +128,7 @@ fn candidates(codec: &str) -> Vec<HwEnc> {
 
 /// Run ffmpeg, giving up after `limit` (a driver can hang on a bad card).
 fn run_quiet(args: &[String], limit: Duration) -> bool {
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = crate::io::hidden_cmd("ffmpeg");
     cmd.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     #[cfg(windows)]
     {

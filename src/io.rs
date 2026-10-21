@@ -143,7 +143,7 @@ impl VideoImport {
 /// Size, frame rate and length of a video via ffprobe.
 pub fn probe_video(path: &Path) -> Result<VideoInfo> {
     anyhow::ensure!(ffmpeg_available(), "Opening videos needs ffmpeg installed and on PATH");
-    let out = std::process::Command::new("ffprobe")
+    let out = crate::io::hidden_cmd("ffprobe")
         .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,avg_frame_rate,r_frame_rate,duration:stream_tags=rotate:stream_side_data=rotation:format=duration", "-of", "json"])
         .arg(path)
         .output()
@@ -191,7 +191,7 @@ fn load_video_range_with(path: &Path, opt: &VideoImport, progress: Option<&std::
     let info = probe_video(path)?;
     let (w, h) = opt.size(&info);
     let fps = 100.0 / opt.delay_cs as f64;
-    let mut cmd = std::process::Command::new("ffmpeg");
+    let mut cmd = crate::io::hidden_cmd("ffmpeg");
     cmd.args(["-v", "error", "-nostdin"]);
     if hw {
         cmd.args(crate::gpu::decode_args());
@@ -257,7 +257,7 @@ fn load_video_range_with(path: &Path, opt: &VideoImport, progress: Option<&std::
 
 /// Source frame rate via ffprobe, if available.
 fn probe_fps(path: &Path) -> Option<f64> {
-    let out = std::process::Command::new("ffprobe")
+    let out = crate::io::hidden_cmd("ffprobe")
         .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=avg_frame_rate,r_frame_rate", "-of", "default=nw=1:nk=1"])
         .arg(path)
         .output()
@@ -314,7 +314,7 @@ fn load_video_dec_with(path: &Path, max_side: Option<u32>, crop_to: Option<(u32,
         vf.push_str(&format!(",crop={w}:{h}:0:0"));
     }
     vf.push_str(",format=rgba");
-    let mut cmd = std::process::Command::new("ffmpeg");
+    let mut cmd = crate::io::hidden_cmd("ffmpeg");
     cmd.args(["-v", "error", "-y"]);
     if hw {
         cmd.args(crate::gpu::decode_args());
@@ -753,14 +753,32 @@ pub fn export_spritesheet(anim: &Animation, png_path: &Path, opt: &SheetOptions)
     Ok(written.join(", "))
 }
 
+/// Is ffmpeg on the PATH? Asked once; the answer is kept.
 pub fn ffmpeg_available() -> bool {
-    std::process::Command::new("ffmpeg")
-        .arg("-version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAS.get_or_init(|| {
+        hidden_cmd("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+/// A command for a console tool (ffmpeg, ffprobe, curl). On Windows each
+/// would otherwise open a console window for as long as it runs.
+pub fn hidden_cmd(program: &str) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut cmd = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -973,7 +991,7 @@ pub fn export_video_q(anim: &Animation, path: &Path, fmt: VideoFormat, bg: [u8; 
         _ => None,
     };
     let attempt = |hw: Option<&crate::gpu::HwEnc>| -> Result<()> {
-        let mut cmd = std::process::Command::new("ffmpeg");
+        let mut cmd = crate::io::hidden_cmd("ffmpeg");
         cmd.arg("-y").arg("-loglevel").arg("error");
         if let Some(h) = hw {
             cmd.args(h.pre_input());

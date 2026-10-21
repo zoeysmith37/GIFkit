@@ -71,6 +71,9 @@ pub struct ProjLayerEntry {
     /// the layer's opacity, %
     #[serde(default = "full", skip_serializing_if = "is_full")]
     pub opacity: f32,
+    /// clipped to the layer below
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clip: bool,
 }
 
 fn full() -> f32 {

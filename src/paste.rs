@@ -99,7 +99,7 @@ pub fn download(url: &str) -> anyhow::Result<PathBuf> {
     let name = url.split(['?', '#']).next().unwrap_or(url).rsplit('/').next().unwrap_or("pasted");
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).filter(|e| e.len() <= 5 && e.chars().all(|c| c.is_ascii_alphanumeric())).unwrap_or_else(|| "gif".into());
     let out = std::env::temp_dir().join(format!("gifkit-pasted-{}.{ext}", std::process::id()));
-    let mut cmd = std::process::Command::new("curl");
+    let mut cmd = crate::io::hidden_cmd("curl");
     cmd.args(["-sSL", "--fail", "--max-time", "60", "-A", "Mozilla/5.0 GIFkit", "-o"]).arg(&out).arg(url);
     #[cfg(windows)]
     {

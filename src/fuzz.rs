@@ -282,7 +282,9 @@ fn case(seed: u64, stage: &Mutex<&'static str>) -> String {
         let tm = timing(&mut r, n);
         let vis = !r.chance(0.1);
         let op = r.pick(&[100.0f32, 100.0, 50.0, 0.0, -10.0, 300.0]);
+        let clip = r.chance(0.3);
         if let Some(l) = st.layers.iter_mut().find(|l| l.id == id) {
+            l.clip = clip;
             l.timing = tm;
             l.visible = vis;
             l.opacity = op;
@@ -1120,4 +1122,32 @@ fn stale_prepared_layers() {
         assert_eq!(f.dimensions(), (40, 30));
         assert!(st.gpu_frame(&base, &plan, &times, i, &fonts, &prep).is_none());
     }
+}
+
+/// An effect clipped to a shape changes the shape's pixels and nothing else.
+#[test]
+fn clipping_mask() {
+    let fonts = crate::text::builtin_fonts();
+    let img = RgbaImage::from_pixel(60, 40, Rgba([200, 40, 40, 255]));
+    let base = Animation { frames: vec![Frame::new(img, 10)], loop_count: None };
+    let mut st = Stack::default();
+    let shape = crate::shapes::ShapeSettings { x: 20, y: 10, w: 20, h: 20, fill: [0, 0, 255], stroke_on: false, ..Default::default() };
+    st.push(LayerKind::Shape(Box::new(shape)));
+    let id = st.push(LayerKind::Effects(Box::new(crate::effects::EffectSettings { negative: true, ..Default::default() })));
+    st.layout_text(60, 40, &fonts);
+    let plan = st.plan(&base);
+    let times = crate::stack::plan_times(&plan);
+    let render = |st: &Stack| {
+        let prep = st.prepare(&base, &fonts);
+        st.render_frame(&base, &plan, &times, 0, &fonts, &prep)
+    };
+    let free = render(&st);
+    st.layers.iter_mut().find(|l| l.id == id).unwrap().clip = true;
+    let clipped = render(&st);
+    // outside the shape: the background as it was, not inverted
+    assert_eq!(clipped.get_pixel(2, 2).0, [200, 40, 40, 255]);
+    assert_ne!(free.get_pixel(2, 2).0, [200, 40, 40, 255]);
+    // inside: inverted like the unclipped effect
+    assert_eq!(clipped.get_pixel(30, 20).0, free.get_pixel(30, 20).0);
+    assert!(st.gpu_frame(&base, &plan, &times, 0, &fonts, &st.prepare(&base, &fonts)).is_none());
 }

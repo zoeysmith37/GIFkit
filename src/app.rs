@@ -1459,6 +1459,7 @@ enum LayerAct {
     RenameEdit(Tool),
     Duplicate(usize),
     Toggle(usize),
+    Clip(usize),
     Move(usize, usize),
     Delete(usize),
     CollapseTo(usize),
@@ -2087,7 +2088,15 @@ fn shadow_rows(ui: &mut egui::Ui, on: &mut bool, sh: &mut crate::shapes::Shadow)
 
 /// A labelled row with an on/off checkbox; the rest stays in place and greys out when off.
 fn opt_row<R>(ui: &mut egui::Ui, label: &str, on: &mut bool, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    form_row_once(ui, label, |ui| {
+    // a switch of its own: shown by its own name, not as a setting of what's above
+    if !find_row_shown(label) {
+        return find_hidden(ui, |ui| form_row_raw(ui, label, |ui| ui.horizontal(|ui| {
+            check(ui, on, "");
+            ui.add_enabled_ui(false, add).inner
+        }).inner));
+    }
+    find_count();
+    form_row_raw(ui, label, |ui| {
         ui.horizontal(|ui| {
             check(ui, on, "");
             let en = *on;
@@ -4596,6 +4605,7 @@ impl GifKitApp {
                 l.timing = src.timing.clone();
                 l.color = src.color;
                 l.opacity = src.opacity;
+                l.clip = src.clip;
                 last = Some((l.kind(), id));
             }
         }
@@ -6056,6 +6066,16 @@ impl GifKitApp {
                         self.modified = true;
                     }
                 }
+                let clipped = sel_li.is_some_and(|i| self.stack.layers[i].clip);
+                let can_clip = sel_li.is_some_and(|i| i > 0) && !locked;
+                let icon = crate::icons::image(ui.ctx(), "mask-alpha", 16.0, pal.fg);
+                let c = ui.add_enabled(can_clip, sel_btn(egui::Button::image(icon).min_size(vec2(28.0, 26.0)), clipped)).on_hover_text(if clipped { "Stop clipping to the layer below" } else { "Clip to the layer below: show only where it has drawn" });
+                if c.clicked() {
+                    if let Some(i) = sel_li {
+                        self.stack.layers[i].clip = !clipped;
+                        self.modified = true;
+                    }
+                }
                 ui.add_space(6.0);
                 ui.label(RichText::new("Opacity:").color(if sel_li.is_some() { pal.fg } else { pal.fg_muted }));
                 ui.add_enabled_ui(!locked, |ui| {
@@ -6096,9 +6116,9 @@ impl GifKitApp {
             ui.spacing_mut().item_spacing.y = 0.0;
             let mut rows: Vec<(usize, Rect)> = Vec::new();
             for li in (0..n).rev() {
-                let (id, name, kind, visible, locked) = {
+                let (id, name, kind, visible, locked, clipped) = {
                     let l = &self.stack.layers[li];
-                    (l.id, l.name(), l.kind(), l.visible, l.locked)
+                    (l.id, l.name(), l.kind(), l.visible, l.locked, l.clip && li > 0)
                 };
                 if !find.is_empty() && !name.to_lowercase().contains(&find) && !kind_tool(kind).label().to_lowercase().contains(&find) {
                     continue;
@@ -6123,17 +6143,25 @@ impl GifKitApp {
                 if eye.clicked() {
                     toggle = Some(li);
                 }
+                // clipped layers sit indented under their base, with Photoshop's bent arrow
+                let ind = if clipped { 16.0 } else { 0.0 };
+                if clipped {
+                    let (ax, ay) = (r.left() + 34.0, r.center().y);
+                    let st = Stroke::new(1.3, if visible { pal.fg } else { pal.fg_muted });
+                    painter.add(egui::Shape::line(vec![pos2(ax, ay - 6.0), pos2(ax, ay + 4.0)], st));
+                    painter.add(egui::Shape::line(vec![pos2(ax - 3.0, ay + 1.0), pos2(ax, ay + 4.5), pos2(ax + 3.0, ay + 1.0)], st));
+                }
                 // icon + name (elided)
-                paint_tool_icon(&painter, kind_tool(kind), pos2(r.left() + 38.0, r.center().y), 14.0, if visible { pal.fg } else { pal.fg_muted });
+                paint_tool_icon(&painter, kind_tool(kind), pos2(r.left() + 38.0 + ind, r.center().y), 14.0, if visible { pal.fg } else { pal.fg_muted });
                 let del_w = 44.0;
-                let name_w = (r.width() - 52.0 - del_w - 6.0).max(10.0);
+                let name_w = (r.width() - 52.0 - ind - del_w - 6.0).max(10.0);
                 let mut job = egui::text::LayoutJob::simple_singleline(elide(&name, 60), egui::FontId::proportional(13.0), if visible { pal.fg } else { pal.fg_muted });
                 job.wrap = egui::text::TextWrapping { max_width: name_w, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
                 let galley = ui.painter().layout_job(job);
                 let gy = r.center().y - galley.size().y / 2.0;
                 let renaming = self.renaming.as_ref().map(|(rid, _)| *rid == id).unwrap_or(false);
                 if !renaming {
-                    painter.galley(pos2(r.left() + 52.0, gy), galley, pal.fg);
+                    painter.galley(pos2(r.left() + 52.0 + ind, gy), galley, pal.fg);
                 } else if let Some((_, buf)) = &mut self.renaming {
                     let name_r = Rect::from_min_size(pos2(r.left() + 48.0, r.top() + 4.0), vec2(name_w + 4.0, r.height() - 8.0));
                     let te = ui.put(name_r, egui::TextEdit::singleline(buf).font(egui::FontId::proportional(13.0)).margin(vec2(4.0, 2.0)));
@@ -6166,6 +6194,9 @@ impl GifKitApp {
                     }
                     if menu_item(ui, if visible { "view-hidden" } else { "view-visible" }, if visible { "&Hide Layer" } else { "&Show Layer" }, "", true) {
                         act(LayerAct::Toggle(li));
+                    }
+                    if menu_check(ui, clipped, "&Clip to Layer Below", "") && li > 0 && !locked {
+                        act(LayerAct::Clip(li));
                     }
                     ui.separator();
                     if menu_item(ui, "go-top", "Bring to &Front", "", !top) {
@@ -6503,6 +6534,7 @@ impl GifKitApp {
                     l.timing = src.timing.clone();
                     l.color = src.color;
                     l.opacity = src.opacity;
+                    l.clip = src.clip;
                     self.stack.layers.insert(li + 1, l);
                 }
                 self.select(src.kind(), id);
@@ -6510,6 +6542,10 @@ impl GifKitApp {
             }
             LayerAct::Toggle(li) => {
                 self.stack.layers[li].visible = !self.stack.layers[li].visible;
+                self.modified = true;
+            }
+            LayerAct::Clip(li) => {
+                self.stack.layers[li].clip = !self.stack.layers[li].clip;
                 self.modified = true;
             }
             LayerAct::Move(from, to) => {
@@ -7119,7 +7155,7 @@ impl GifKitApp {
                     LayerKind::Markup(m) => ProjLayer::Markup { markup: m.clone() },
                     LayerKind::Emoji(e) => ProjLayer::Emoji { emoji: (**e).clone() },
                 };
-                ProjLayerEntry { visible: l.visible, label: l.label.clone(), layer, timing: l.timing.clone(), locked: l.locked, color: l.color, opacity: l.opacity }
+                ProjLayerEntry { visible: l.visible, label: l.label.clone(), layer, timing: l.timing.clone(), locked: l.locked, color: l.color, opacity: l.opacity, clip: l.clip }
             })
             .collect();
         let file = ProjectFile {
@@ -7190,6 +7226,7 @@ impl GifKitApp {
                 l.locked = e.locked;
                 l.color = e.color;
                 l.opacity = e.opacity;
+                l.clip = e.clip;
             }
         }
         self.stack.markers = file.markers;
