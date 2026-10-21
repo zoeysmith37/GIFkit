@@ -794,6 +794,8 @@ pub struct GifKitApp {
     layers_collapsed: bool,
     /// the layer panel's height when open, to slide back to
     layers_open_h: f32,
+    /// the timeline's height when shown, to slide back to
+    timeline_open_h: f32,
     layer_drag: Option<u64>,
     export_open: bool,
     export_fmt: ExportFormat,
@@ -2599,6 +2601,7 @@ impl GifKitApp {
             sidebar_compact: theme::get_setting("sidebar_compact").as_deref() != Some("0"),
             layers_collapsed: false,
             layers_open_h: 380.0,
+            timeline_open_h: 270.0,
             layer_drag: None,
             export_open: false,
             export_fmt: ExportFormat::Gif,
@@ -5072,15 +5075,31 @@ impl eframe::App for GifKitApp {
 
         if self.base.is_some() {
             // the timeline at the bottom, the play controls under the view as in Kdenlive
-            if self.show_timeline {
+            // it slides up and down from the height it had
+            let t = theme::openness(&ctx, egui::Id::unique("timeline-open"), self.show_timeline);
+            if t > 0.0 {
                 // never more than about half the height, so the view keeps room
                 let tmax = ((ui.available_height() - 60.0) * 0.5).clamp(110.0, 640.0);
-                egui::Panel::bottom("timeline")
+                let mut panel = egui::Panel::bottom("timeline")
                     .resizable(true)
                     .default_size(270.0f32.min(tmax))
-                    .size_range(110.0f32.min(tmax)..=tmax)
+                    .size_range(110.0f32.min(tmax)..=tmax);
+                let sliding = t < 1.0;
+                if sliding {
+                    let h = self.timeline_open_h.clamp(110.0f32.min(tmax), tmax) * t;
+                    panel = panel.resizable(false).size_range(0.0..=tmax).exact_size(h);
+                    ctx.request_repaint();
+                }
+                let shown = panel
                     .frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin { left: 6, right: 6, top: 6, bottom: 4 }))
-                    .show(ui, |ui| self.timeline_dock(ui, &ctx));
+                    .show(ui, |ui| {
+                        // drawn at full height and clipped while it slides
+                        ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect().expand(6.0)));
+                        self.timeline_dock(ui, &ctx)
+                    });
+                if !sliding {
+                    self.timeline_open_h = shown.response.rect.height();
+                }
             }
             egui::Panel::bottom("transport")
                 .frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin::symmetric(8, 5)))
