@@ -11,13 +11,14 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Settings ▸ Use Graphics Card for Video (on unless turned off).
+/// Settings ▸ Use Hardware Acceleration (on unless turned off): video on
+/// the card here, and frames on the card in `gpu_render`.
 pub fn enabled() -> bool {
-    crate::theme::get_setting("gpu_video").map(|v| v != "0").unwrap_or(true)
+    crate::theme::get_setting("hw_accel").map(|v| v != "0").unwrap_or(true)
 }
 
 pub fn set_enabled(on: bool) {
-    crate::theme::set_setting("gpu_video", if on { "1" } else { "0" });
+    crate::theme::set_setting("hw_accel", if on { "1" } else { "0" });
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -192,6 +193,7 @@ pub fn warm_up() {
 }
 
 /// What was found, for the Settings menu (None while still looking).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn summary() -> Option<String> {
     let (h, a) = (H264.get()?, AV1.get()?);
     Some(match (h, a) {

@@ -4685,30 +4685,11 @@ impl GifKitApp {
                     }
                 });
                 ui.separator();
-                let gpu = crate::gpu::enabled();
-                if menu_check(ui, gpu, "Use &Graphics Card for Video", "") {
-                    crate::gpu::set_enabled(!gpu);
-                }
-                // what was found, under the entry (GIF, WebP and APNG always use the processor)
-                if gpu {
-                    let found = crate::gpu::summary().unwrap_or_else(|| "Looking for hardware encoders…".into());
-                    ui.horizontal(|ui| {
-                        ui.add_space(36.0);
-                        ui.label(RichText::new(found).size(11.5).color(p().fg_muted));
-                    });
-                }
-                let fx_gpu = crate::gpu_render::enabled();
-                if menu_check(ui, fx_gpu, "Use Graphics Card for E&ffects", "") {
-                    crate::gpu_render::set_enabled(!fx_gpu);
+                let hw = crate::gpu::enabled();
+                if menu_check(ui, hw, "Use &Hardware Acceleration", "") {
+                    crate::gpu::set_enabled(!hw);
                     self.free_gpu_frames();
                     self.comp_key = 0;
-                }
-                if fx_gpu {
-                    let on = crate::gpu_render::shared_name().map(|n| format!("Preview, export and size estimates on {n}")).unwrap_or_else(|| "No graphics card found · using the processor".into());
-                    ui.horizontal(|ui| {
-                        ui.add_space(36.0);
-                        ui.label(RichText::new(on).size(11.5).color(p().fg_muted));
-                    });
                 }
                 if menu_check(ui, self.sample_preview, "&Estimate Size of Long Animations", "") {
                     self.sample_preview = !self.sample_preview;

@@ -694,13 +694,14 @@ impl GpuRenderer {
 // ---- a renderer shared by background work (export, the compressed preview)
 
 static SHARED: std::sync::Mutex<Option<GpuRenderer>> = std::sync::Mutex::new(None);
-static SHARED_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Hand background work a renderer (on the window's device, or its own).
 pub fn set_shared(r: GpuRenderer, name: String) {
     if let Ok(mut s) = SHARED.lock() {
         *s = Some(r);
-        let _ = SHARED_NAME.set(name);
+        if std::env::var_os("GIFKIT_PERF").is_some() {
+            eprintln!("background frames on {name}");
+        }
     }
 }
 
@@ -709,11 +710,6 @@ pub fn set_shared(r: GpuRenderer, name: String) {
 /// for tests).
 pub fn worth_using(info: &wgpu::AdapterInfo) -> bool {
     info.device_type != wgpu::DeviceType::Cpu || std::env::var_os("GIFKIT_SOFT_GPU").is_some()
-}
-
-/// The card background work runs on, once there is one.
-pub fn shared_name() -> Option<String> {
-    SHARED_NAME.get().cloned()
 }
 
 /// Run `f` with the shared renderer, when there is one and it's turned on.
@@ -729,11 +725,7 @@ pub fn with_shared<T>(f: impl FnOnce(&mut GpuRenderer) -> T) -> Option<T> {
     Some(f(r))
 }
 
-/// Settings ▸ Use Graphics Card for Effects (on unless turned off).
+/// Settings ▸ Use Hardware Acceleration, shared with video (`gpu::enabled`).
 pub fn enabled() -> bool {
-    std::env::var_os("GIFKIT_CPU_PREVIEW").is_none() && crate::theme::get_setting("gpu_render").map(|v| v != "0").unwrap_or(true)
-}
-
-pub fn set_enabled(on: bool) {
-    crate::theme::set_setting("gpu_render", if on { "1" } else { "0" });
+    std::env::var_os("GIFKIT_CPU_PREVIEW").is_none() && crate::gpu::enabled()
 }
