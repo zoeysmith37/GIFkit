@@ -11,6 +11,12 @@ const RULER_H: f32 = 22.0;
 const GIF_H: f32 = 40.0;
 const ROW_H: f32 = 28.0;
 const EDGE: f32 = 5.0;
+/// room before frame 1, so a clip's start edge is easy to grab
+const PAD: f32 = 14.0;
+/// most pixels per frame when zoomed in
+const ZOOM_MAX: f32 = 120.0;
+/// the scroll bar along the bottom
+const BAR_H: f32 = 9.0;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(super) enum TlGrab {
@@ -57,12 +63,14 @@ impl GifKitApp {
     fn gif_runs(&self) -> Vec<(usize, usize)> {
         let Some(base) = &self.base else { return Vec::new() };
         let shown: Vec<bool> = self.plan.iter().map(|f| base.frames[f.src].enabled).collect();
+        // a split starts a new clip
+        let cut: Vec<bool> = self.plan.iter().map(|f| base.frames[f.src].cut).collect();
         let mut v = Vec::new();
         let mut i = 0;
         while i < shown.len() {
             if shown[i] {
                 let s = i;
-                while i + 1 < shown.len() && shown[i + 1] {
+                while i + 1 < shown.len() && shown[i + 1] && !cut[i + 1] {
                     i += 1;
                 }
                 v.push((s, i));
@@ -109,18 +117,100 @@ impl GifKitApp {
 
     /// Split the selected track at the playhead.
     fn tl_split(&mut self, now: f64) {
-        let (n, f) = (self.plan.len(), self.cur);
         let Some(track) = self.tl_track else { return };
-        self.snapshot(&format!("tl-split{now}"), now);
+        self.tl_split_at(track, self.cur, now);
+    }
+
+    /// Split `track` so a clip starts at output frame `f`.
+    fn tl_split_at(&mut self, track: u64, f: usize, now: f64) {
+        let n = self.plan.len();
         if track == GIF {
-            // the GIF has nothing to split into: a skipped frame makes the cut
+            // the frame where the new clip starts carries the split
+            let runs = self.gif_runs();
+            let Some(ci) = runs.iter().position(|&(a, b)| f > a && f <= b) else { return };
+            self.snapshot(&format!("tl-split{now}"), now);
+            let src = self.plan[f].src;
+            if let Some(base) = self.base.as_mut() {
+                base.frames[src].cut = true;
+            }
+            self.modified = true;
+            self.tl_clip = Some(ci + 1);
             return;
         }
+        self.snapshot(&format!("tl-split{now}"), now);
         let done = self.tl_layer_mut(track).map(|l| l.timing.split(f, n).then(|| l.timing.spans(n).iter().position(|s| s.0 == f))).flatten();
         if let Some(c) = done {
             self.modified = true;
             self.tl_clip = c;
         }
+    }
+
+    /// Join the selected clip with the one right after it.
+    fn tl_join(&mut self, now: f64) {
+        let (Some(track), Some(c)) = (self.tl_track, self.tl_clip) else { return };
+        let n = self.plan.len();
+        let spans = self.track_spans(track);
+        let (Some(&(a, b)), Some(&(na, nb))) = (spans.get(c), spans.get(c + 1)) else { return };
+        if na != b + 1 {
+            return;
+        }
+        self.snapshot(&format!("tl-join{now}"), now);
+        if track == GIF {
+            let src = self.plan[na].src;
+            if let Some(base) = self.base.as_mut() {
+                base.frames[src].cut = false;
+            }
+        } else if let Some(l) = self.tl_layer_mut(track) {
+            if let Some(cl) = &mut l.timing.clips {
+                cl.sort_by_key(|c| c.start);
+                if c + 1 < cl.len() {
+                    cl.remove(c + 1);
+                    cl[c] = Clip { start: a, end: if nb + 1 >= n { None } else { Some(nb) } };
+                }
+            }
+        }
+        self.modified = true;
+    }
+
+    /// Can the selected clip be joined with the next one (they touch)?
+    fn tl_can_join(&self) -> bool {
+        let (Some(track), Some(c)) = (self.tl_track, self.tl_clip) else { return false };
+        let spans = self.track_spans(track);
+        matches!((spans.get(c), spans.get(c + 1)), (Some(&(_, b)), Some(&(na, _))) if na == b + 1)
+    }
+
+    /// Move the GIF's clip `a..=b` (output frames) so it starts at output
+    /// boundary `to`: its frames move in the animation, the clips after it
+    /// close up, and layers stay where they are in time.
+    fn tl_gif_move(&mut self, a: usize, b: usize, to: usize, now: f64) {
+        let n = self.plan.len();
+        if b >= n || to > n || (to >= a && to <= b + 1) || !self.gif_forwards() {
+            return;
+        }
+        let (s0, s1) = (self.plan[a].src, self.plan[b].src);
+        let t = if to < n { self.plan[to].src } else { self.plan[n - 1].src + 1 };
+        self.snapshot(&format!("tl-gifmove{now}"), now);
+        let Some(base) = self.base.as_mut() else { return };
+        let mut block: Vec<crate::anim::Frame> = base.frames.drain(s0..=s1).collect();
+        let len = block.len();
+        // what followed the clip starts a clip of its own now
+        if let Some(f) = base.frames.get_mut(s0) {
+            f.cut = true;
+        }
+        block[0].cut = true;
+        let at = if t > s1 { t - len } else { t };
+        base.frames.splice(at..at, block);
+        if let Some(f) = base.frames.get_mut(at + len) {
+            f.cut = true;
+        }
+        // the clip, where it landed
+        let dest = if to > b { to - (b - a + 1) } else { to };
+        self.bump();
+        self.after_base_change(false);
+        self.modified = true;
+        self.tl_clip = self.gif_runs().iter().position(|r| r.0 == dest);
+        self.cur = dest.min(self.plan.len().saturating_sub(1));
+        self.info(format!("Moved {} frames", b - a + 1));
     }
 
     fn tl_delete(&mut self, now: f64) {
@@ -221,10 +311,11 @@ impl GifKitApp {
                 self.tl_razor = true;
             }
             toolbar_sep(ui);
-            if tb_tool(ui, "split", "", "Split the selected track at the playhead (S)", idle && sel_layer.is_some()).clicked() {
+            if tb_tool(ui, "split", "", "Split the selected track at the playhead (S)", idle && self.tl_track.is_some()).clicked() {
                 self.tl_split(now);
             }
-            if tb_tool(ui, "list-add", "", "Add a clip at the playhead (on an empty part of the selected track)", idle && sel_layer.is_some()).clicked() {
+            let gap_here = sel_layer.is_some_and(|t| !self.track_spans(t).iter().any(|&(a, b)| self.cur >= a && self.cur <= b));
+            if tb_tool(ui, "list-add", "", "Add a clip at the playhead (on an empty part of the selected track)", idle && gap_here).clicked() {
                 self.tl_add_clip(now);
             }
             if tb_tool(ui, "edit-delete", "", "Delete the selected clip or keyframe (Delete). On the GIF track this skips its frames.", idle && (self.tl_clip.is_some() || self.tl_key.is_some())).clicked() {
@@ -243,11 +334,19 @@ impl GifKitApp {
                     self.tl_zoom = 0.0;
                     self.tl_x0 = 0.0;
                 }
-                if tb_tool(ui, "zoom-in", "", "Zoom in (Ctrl+wheel)", true).clicked() {
-                    self.tl_zoom = (self.tl_zoom.max(1.0) * 1.5).min(120.0);
+                let (fit, cur_z) = (self.tl_fit.max(1e-3), self.tl_zoom_now.max(1e-3));
+                let top = ZOOM_MAX.max(fit * 1.01);
+                if tb_tool(ui, "zoom-in", "", "Zoom in (Ctrl+wheel)", cur_z < top * 0.999).clicked() {
+                    self.tl_zoom_to = Some(cur_z * 1.5);
                 }
-                if tb_tool(ui, "zoom-out", "", "Zoom out (Ctrl+wheel)", true).clicked() {
-                    self.tl_zoom = (self.tl_zoom / 1.5).max(0.0);
+                // a zoom slider, as in Kdenlive: fit at the left, closest at the right
+                let mut t = ((cur_z / fit).ln() / (top / fit).ln()).clamp(0.0, 1.0);
+                ui.spacing_mut().slider_width = 90.0;
+                if ui.add(egui::Slider::new(&mut t, 0.0..=1.0).show_value(false)).on_hover_text("Zoom the timeline (Ctrl+wheel). Drag with the middle button to pan.").changed() {
+                    self.tl_zoom_to = Some(fit * (top / fit).powf(t));
+                }
+                if tb_tool(ui, "zoom-out", "", "Zoom out (Ctrl+wheel)", cur_z > fit * 1.001).clicked() {
+                    self.tl_zoom_to = Some(cur_z / 1.5);
                 }
                 let t = self.plan_time(self.cur);
                 let text = RichText::new(format!("{:.2} s · frame {} of {n}", t.max(0.0), self.cur + 1)).monospace().size(12.0).color(pal.fg_muted);
@@ -359,12 +458,25 @@ impl GifKitApp {
         painter.rect_filled(area, 0.0, pal.view);
         let head_w = self.tl_head_w.clamp(90.0, (area.width() - 120.0).max(90.0));
         let lanes = Rect::from_min_max(pos2(area.min.x + head_w, area.min.y), area.max);
-        let lane_w = lanes.width().max(10.0);
+        // a little room before frame 1 so clip starts are easy to grab
+        let lane_w = (lanes.width() - PAD).max(10.0);
         // frames to pixels; zoom 0 fits everything, with a little room after
         // the end to drag the GIF longer into
         let span = (n as f32 * 1.08 + 2.0).max(n as f32 + 24.0);
         let fit = lane_w / span;
+        self.tl_fit = fit;
+        // the toolbar's zoom, about the playhead (kept where it is on screen)
+        if let Some(z) = self.tl_zoom_to.take() {
+            let old = if self.tl_zoom <= 0.0 { fit } else { self.tl_zoom.max(fit) };
+            let nz = z.clamp(fit, ZOOM_MAX.max(fit));
+            let anchor = self.cur as f32 + 0.5;
+            let rel = (anchor - self.tl_x0) / (lane_w / old);
+            let rel = if (0.0..=1.0).contains(&rel) { rel } else { 0.5 };
+            self.tl_zoom = if nz <= fit * 1.0001 { 0.0 } else { nz };
+            self.tl_x0 = anchor - rel * lane_w / nz;
+        }
         let zoom = if self.tl_zoom <= 0.0 { fit } else { self.tl_zoom.max(fit) };
+        self.tl_zoom_now = zoom;
         let visible = lane_w / zoom;
         // follow the playhead while playing
         if self.playing && self.tl_drag.is_none() && ((self.cur as f32) < self.tl_x0 || self.cur as f32 + 1.0 > self.tl_x0 + visible) {
@@ -372,25 +484,36 @@ impl GifKitApp {
         }
         self.tl_x0 = self.tl_x0.clamp(0.0, (span - visible).max(0.0));
         let x0 = self.tl_x0;
-        let fx = |f: f32| lanes.min.x + (f - x0) * zoom;
-        // wheel: scroll tracks, Shift pans, Ctrl zooms about the pointer
+        let fx = |f: f32| lanes.min.x + PAD + (f - x0) * zoom;
+        let rows_h = GIF_H + (tracks.len() - 1) as f32 * ROW_H;
+        let tracks_top = area.min.y + RULER_H;
+        let tracks_h = (area.max.y - tracks_top - BAR_H).max(10.0);
+        // wheel: Ctrl zooms about the pointer, Shift pans; plain scrolls the
+        // tracks, or pans when they all fit
         if resp.hovered() {
             let (scroll, ctrl, shift) = ui.input(|i| (i.smooth_scroll_delta, i.modifiers.command, i.modifiers.shift));
             if ctrl && scroll.y != 0.0 {
-                let at = ui.input(|i| i.pointer.hover_pos()).map(|p| x0 + (p.x - lanes.min.x) / zoom).unwrap_or(x0);
-                let nz = (zoom * (1.0 + scroll.y * 0.004)).clamp(fit, 120.0);
-                self.tl_zoom = nz;
+                let at = ui.input(|i| i.pointer.hover_pos()).map(|p| x0 + (p.x - lanes.min.x - PAD) / zoom).unwrap_or(x0);
+                let nz = (zoom * (1.0 + scroll.y * 0.004)).clamp(fit, ZOOM_MAX.max(fit));
+                self.tl_zoom = if nz <= fit * 1.0001 { 0.0 } else { nz };
                 self.tl_x0 = at - (at - x0) * zoom / nz;
-            } else if shift || scroll.x != 0.0 {
-                self.tl_x0 -= (scroll.x + if shift { scroll.y } else { 0.0 }) / zoom;
+            } else if shift || scroll.x != 0.0 || (scroll.y != 0.0 && rows_h <= tracks_h) {
+                self.tl_x0 -= (scroll.x + if shift || rows_h <= tracks_h { scroll.y } else { 0.0 }) / zoom;
             } else if scroll.y != 0.0 {
                 self.tl_y0 -= scroll.y;
             }
         }
-
-        let rows_h = GIF_H + (tracks.len() - 1) as f32 * ROW_H;
-        let tracks_top = area.min.y + RULER_H;
-        let tracks_h = (area.max.y - tracks_top - 8.0).max(10.0);
+        // the middle button drags the view around
+        let (mid, md) = ui.input(|i| (i.pointer.middle_down(), i.pointer.delta()));
+        if mid && (self.tl_pan || resp.hovered()) {
+            self.tl_pan = true;
+            self.tl_x0 -= md.x / zoom;
+            self.tl_y0 -= md.y;
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            ctx.request_repaint();
+        } else {
+            self.tl_pan = false;
+        }
         self.tl_y0 = self.tl_y0.clamp(0.0, (rows_h - tracks_h).max(0.0));
         let y0 = self.tl_y0;
         let row_top = |t: usize| tracks_top - y0 + if t == 0 { 0.0 } else { GIF_H + (t - 1) as f32 * ROW_H };
@@ -402,7 +525,7 @@ impl GifKitApp {
         // a tick every so many frames, labels where they fit
         let step = [1usize, 2, 5, 10, 20, 25, 50, 100, 200, 500, 1000].into_iter().find(|s| *s as f32 * zoom >= 48.0).unwrap_or(2000);
         let minor = [1usize, 2, 5, 10, 25, 50, 100].into_iter().find(|s| *s as f32 * zoom >= 8.0).unwrap_or(step);
-        let first = (x0 as usize / minor) * minor;
+        let first = ((x0 - PAD / zoom).max(0.0) as usize / minor) * minor;
         let mut f = first;
         while (f as f32) < x0 + visible + 1.0 && f <= n {
             let x = fx(f as f32);
@@ -504,6 +627,19 @@ impl GifKitApp {
                     }
                 }
             }
+            // a GIF clip being moved: where it would go
+            if let (true, Some(d)) = (id == GIF, self.tl_drag.filter(|d| d.track == GIF && d.grab == TlGrab::Body)) {
+                if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
+                    let dx = (p.x - lanes.min.x - PAD) / zoom + x0 - d.at;
+                    let r = Rect::from_min_max(pos2(fx(d.orig.0 as f32 + dx), top + 3.0), pos2(fx(d.orig.1 as f32 + 1.0 + dx), top + h - 3.0));
+                    lp.rect_filled(r, 3.0, mix(pal.view, pal.highlight, 0.35).gamma_multiply(0.85));
+                    lp.rect_stroke(r, 3.0, Stroke::new(1.5, pal.highlight), egui::StrokeKind::Inside);
+                }
+                if let Some(t) = self.tl_gif_drop {
+                    let x = fx(t as f32);
+                    lp.vline(x, (top - 1.0)..=(top + h + 1.0), Stroke::new(3.0, pal.highlight));
+                }
+            }
             if id == GIF && self.tl_extend > 0 {
                 let r = Rect::from_min_max(pos2(fx(n as f32), top + 3.0), pos2(fx((n + self.tl_extend) as f32), top + h - 3.0));
                 lp.rect_filled(r, 3.0, mix(pal.view, pal.highlight, 0.25));
@@ -521,13 +657,14 @@ impl GifKitApp {
         }
         painter.vline(lanes.min.x, tracks_top..=area.max.y, Stroke::new(1.0, pal.border));
 
-        // horizontal scroll bar when zoomed in
-        if visible < n as f32 {
-            let bar = Rect::from_min_max(pos2(lanes.min.x, area.max.y - 6.0), pos2(area.max.x, area.max.y - 1.0));
-            painter.rect_filled(bar, 2.0, mix(pal.view, pal.fg, 0.08));
-            let a = bar.min.x + bar.width() * x0 / n as f32;
-            let w = (bar.width() * visible / n as f32).max(16.0);
-            painter.rect_filled(Rect::from_min_size(pos2(a, bar.min.y), vec2(w, bar.height())), 2.0, mix(pal.view, pal.fg, 0.35));
+        // horizontal scroll bar when zoomed in: drag it, or click to jump
+        let bar = Rect::from_min_max(pos2(lanes.min.x + 2.0, area.max.y - BAR_H + 1.0), pos2(area.max.x - 2.0, area.max.y - 1.0));
+        let scrolls = visible < span - 0.5;
+        let thumb = Rect::from_min_size(pos2(bar.min.x + bar.width() * x0 / span, bar.min.y), vec2((bar.width() * visible / span).max(20.0).min(bar.width()), bar.height()));
+        if scrolls {
+            let over = hovered_pos.is_some_and(|p| bar.expand(2.0).contains(p)) || self.tl_bar_drag.is_some();
+            painter.rect_filled(bar, 3.0, mix(pal.view, pal.fg, 0.08));
+            painter.rect_filled(thumb, 3.0, mix(pal.view, if over { pal.highlight } else { pal.fg }, if over { 0.6 } else { 0.35 }));
         }
 
         // playhead
@@ -538,7 +675,7 @@ impl GifKitApp {
         }
 
         // ---- pointer
-        let frame_at = |x: f32| x0 + (x - lanes.min.x) / zoom;
+        let frame_at = |x: f32| x0 + (x - lanes.min.x - PAD) / zoom;
         let track_at = |y: f32| -> Option<usize> {
             (0..tracks.len()).find(|&t| y >= row_top(t) && y < row_top(t) + row_h(t)).filter(|_| y >= tracks_top)
         };
@@ -570,9 +707,13 @@ impl GifKitApp {
         if hovered_pos.is_some_and(|p| grip.contains(p)) || self.tl_head_drag {
             ctx.set_cursor_icon(egui::CursorIcon::ResizeColumn);
         }
-        if resp.drag_started() {
+        if resp.drag_started_by(egui::PointerButton::Primary) {
             if let Some(p) = ui.input(|i| i.pointer.press_origin()) {
-                if grip.contains(p) {
+                if scrolls && bar.expand(2.0).contains(p) {
+                    // grab the thumb where it was pressed, or jump its middle there
+                    let at = (p.x - bar.min.x) / bar.width() * span;
+                    self.tl_bar_drag = Some(if thumb.contains(p) { at - x0 } else { visible / 2.0 });
+                } else if grip.contains(p) {
                     self.tl_head_drag = true;
                 } else if p.x < lanes.min.x && p.y > tracks_top {
                     // dragging a layer's name moves it up or down the stack
@@ -580,6 +721,14 @@ impl GifKitApp {
                         self.tl_reorder = Some(t);
                     }
                 }
+            }
+        }
+        if let Some(off) = self.tl_bar_drag {
+            if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
+                self.tl_x0 = (p.x - bar.min.x) / bar.width() * span - off;
+            }
+            if !ui.input(|i| i.pointer.primary_down()) {
+                self.tl_bar_drag = None;
             }
         }
         if self.tl_head_drag {
@@ -619,9 +768,9 @@ impl GifKitApp {
                 }
             }
         }
-        let press = resp.drag_started() || resp.clicked();
-        if press && self.tl_drag.is_none() && !self.tl_head_drag {
-            if let Some(p) = ui.input(|i| i.pointer.press_origin()).or(hovered_pos).filter(|p| lanes.contains(*p)) {
+        let press = resp.drag_started_by(egui::PointerButton::Primary) || resp.clicked();
+        if press && self.tl_drag.is_none() && !self.tl_head_drag && self.tl_bar_drag.is_none() {
+            if let Some(p) = ui.input(|i| i.pointer.press_origin()).or(hovered_pos).filter(|p| lanes.contains(*p) && !(scrolls && bar.expand(2.0).contains(*p))) {
                 let f = frame_at(p.x);
                 let fi = (f.floor().max(0.0) as usize).min(n - 1);
                 if p.y < tracks_top {
@@ -650,23 +799,24 @@ impl GifKitApp {
                         self.tl_clip = Some(ci);
                         self.tl_key = None;
                         if self.tl_razor {
-                            if resp.clicked() && id != GIF && fi > a {
-                                self.snapshot(&format!("tl-razor{now}"), now);
-                                if let Some(l) = self.tl_layer_mut(id) {
-                                    l.timing.split(fi, n);
-                                }
-                                self.modified = true;
+                            if resp.clicked() && fi > a {
+                                self.tl_split_at(id, fi, now);
                             }
                         } else {
-                            let grab = if (fx(a as f32) - p.x).abs() < EDGE || (a as f32 <= x0 && p.x - lanes.min.x < EDGE * 1.6) {
+                            let grab = if (fx(a as f32) - p.x).abs() < EDGE || (a as f32 <= x0 && p.x - lanes.min.x < PAD + EDGE) {
                                 TlGrab::Start
                             } else if (fx(b as f32 + 1.0) - p.x).abs() < EDGE {
                                 TlGrab::End
                             } else {
                                 TlGrab::Body
                             };
-                            if resp.drag_started() {
-                                self.snapshot(&format!("tl-drag{now}"), now);
+                            let gif_move = id == GIF && grab == TlGrab::Body;
+                            if gif_move && resp.drag_started() && !self.gif_forwards() {
+                                self.info("GIF clips move when the animation plays forwards (turn off Reverse and Boomerang)");
+                            } else if resp.drag_started() {
+                                if !gif_move {
+                                    self.snapshot(&format!("tl-drag{now}"), now);
+                                }
                                 if id != GIF {
                                     if let Some(li) = self.stack.index_of(id) {
                                         self.stack.ensure_clips(li, &self.plan);
@@ -708,6 +858,16 @@ impl GifKitApp {
                         }
                         self.cur = nf;
                     }
+                }
+                TlGrab::Body if d.track == GIF => {
+                    // where the clip would go: the clip boundary nearest its middle
+                    let len = (d.orig.1 - d.orig.0 + 1) as f32;
+                    let centre = d.orig.0 as f32 + (f - d.at) + len / 2.0;
+                    let mut bounds: Vec<usize> = self.gif_runs().iter().flat_map(|r| [r.0, r.1 + 1]).collect();
+                    bounds.dedup();
+                    let best = bounds.into_iter().min_by(|x, y| (*x as f32 - centre).abs().total_cmp(&(*y as f32 - centre).abs()));
+                    self.tl_gif_drop = best.filter(|&t| t < d.orig.0 || t > d.orig.1 + 1);
+                    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
                 }
                 grab => {
                     let spans = self.track_spans(d.track);
@@ -769,6 +929,9 @@ impl GifKitApp {
             }
             if !ui.input(|i| i.pointer.primary_down()) {
                 self.tl_drag = None;
+                if let Some(t) = self.tl_gif_drop.take() {
+                    self.tl_gif_move(d.orig.0, d.orig.1, t, now);
+                }
                 if let Some((a, b)) = self.tl_trim.take() {
                     self.tl_cut(a, b);
                 }
@@ -778,7 +941,7 @@ impl GifKitApp {
                 }
             }
         }
-        if self.tl_drag.is_some() || self.tl_reorder.is_some() || self.tl_head_drag {
+        if self.tl_drag.is_some() || self.tl_reorder.is_some() || self.tl_head_drag || self.tl_bar_drag.is_some() {
             ctx.request_repaint();
         }
 
@@ -802,24 +965,56 @@ impl GifKitApp {
         }
         // right-click picks what's under the pointer first, as a left click would
         if resp.secondary_clicked() {
-            if let Some(p) = hovered_pos.filter(|p| lanes.contains(*p)) {
+            self.tl_menu_head = None;
+            if let Some(p) = hovered_pos.filter(|p| p.y > tracks_top && p.x >= area.min.x) {
                 if let Some(t) = track_at(p.y) {
                     let id = tracks[t];
                     self.tl_select_track(id);
-                    self.tl_clip = self.track_spans(id).iter().position(|&(a, b)| p.x >= fx(a as f32) && p.x <= fx(b as f32 + 1.0));
+                    if p.x < lanes.min.x {
+                        // the name: the layer's own menu
+                        self.tl_menu_head = Some(id);
+                    } else {
+                        self.tl_clip = self.track_spans(id).iter().position(|&(a, b)| p.x >= fx(a as f32) && p.x <= fx(b as f32 + 1.0));
+                    }
                 }
             }
         }
         resp.context_menu(|ui| {
             ui.set_min_width(220.0);
+            let layer = self.tl_track.filter(|t| *t != GIF).and_then(|t| self.stack.index_of(t));
+            if let (Some(_), Some(li)) = (self.tl_menu_head, layer) {
+                let visible = self.stack.layers[li].visible;
+                let mut act = None;
+                if menu_item(ui, "edit-rename", "&Rename", "", true) {
+                    act = Some(LayerAct::Rename(li));
+                }
+                if menu_item(ui, "edit-duplicate", "&Duplicate Layer", "", true) {
+                    act = Some(LayerAct::Duplicate(li));
+                }
+                if menu_item(ui, if visible { "view-hidden" } else { "view-visible" }, if visible { "&Hide Layer" } else { "&Show Layer" }, "", true) {
+                    act = Some(LayerAct::Toggle(li));
+                }
+                ui.separator();
+                if menu_item(ui, "edit-delete", "D&elete Layer", "", idle) {
+                    act = Some(LayerAct::Delete(li));
+                }
+                if let Some(a) = act {
+                    self.apply_layer_act(ctx, a, now);
+                }
+                return;
+            }
             let has = self.tl_track.is_some_and(|t| t != GIF);
-            if menu_item(ui, "split", "&Split at Playhead", "S", has) {
+            if menu_item(ui, "split", "&Split at Playhead", "S", self.tl_track.is_some()) {
                 self.tl_split(now);
             }
-            if menu_item(ui, "list-add", "&Add Clip at Playhead", "", has) {
+            if menu_item(ui, "merge", "&Join with Next Clip", "", self.tl_can_join()) {
+                self.tl_join(now);
+            }
+            let gap_here = has && !self.tl_track.map(|t| self.track_spans(t)).unwrap_or_default().iter().any(|&(a, b)| self.cur >= a && self.cur <= b);
+            if menu_item(ui, "list-add", "&Add Clip at Playhead", "", gap_here) {
                 self.tl_add_clip(now);
             }
-            if menu_item(ui, "edit-delete", "&Delete", "Del", self.tl_clip.is_some() || self.tl_key.is_some()) {
+            if menu_item(ui, "edit-delete", "&Delete Clip", "Del", self.tl_clip.is_some() || self.tl_key.is_some()) {
                 self.tl_delete(now);
             }
             if menu_item(ui, "list-add", "Make &Longer by 1 Second", "", idle) {
@@ -845,6 +1040,12 @@ impl GifKitApp {
                     self.stack.ensure_clips(li, &self.plan);
                     self.stack.layers[li].timing.clips = Some(vec![Clip::all()]);
                     self.modified = true;
+                }
+            }
+            if let Some(li) = layer {
+                ui.separator();
+                if menu_item(ui, "edit-delete", "D&elete Layer", "", idle) {
+                    self.apply_layer_act(ctx, LayerAct::Delete(li), now);
                 }
             }
         });

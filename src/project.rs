@@ -30,6 +30,9 @@ const VERSION: u32 = 1;
 pub struct FrameMeta {
     pub delay: u16,
     pub enabled: bool,
+    /// a GIF track clip starts here
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cut: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -102,7 +105,7 @@ fn png(img: &RgbaImage) -> Result<Vec<u8>> {
 }
 
 fn meta(a: &Animation) -> Vec<FrameMeta> {
-    a.frames.iter().map(|f| FrameMeta { delay: f.delay_cs, enabled: f.enabled }).collect()
+    a.frames.iter().map(|f| FrameMeta { delay: f.delay_cs, enabled: f.enabled, cut: f.cut }).collect()
 }
 
 /// Write a project. `images` are the frames of image layers and watermark
@@ -183,7 +186,7 @@ pub fn load(path: &Path) -> Result<Project> {
             .enumerate()
             .map(|(i, m)| {
                 let img = decoded.remove(&format!("{dir}/{i:05}.png")).with_context(|| format!("{dir}/{i:05}.png is missing"))?;
-                Ok(Frame { image: Arc::new(img), delay_cs: m.delay, enabled: m.enabled })
+                Ok(Frame { image: Arc::new(img), delay_cs: m.delay, enabled: m.enabled, cut: m.cut })
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Animation { frames, loop_count })

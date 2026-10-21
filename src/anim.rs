@@ -14,14 +14,16 @@ pub struct Frame {
     pub delay_cs: u16,
     /// Disabled ("skipped") frames are hidden from playback and export.
     pub enabled: bool,
+    /// A clip on the timeline's GIF track starts here (a split).
+    pub cut: bool,
 }
 
 impl Frame {
     pub fn new(image: RgbaImage, delay_cs: u16) -> Self {
-        Self { image: Arc::new(image), delay_cs, enabled: true }
+        Self { image: Arc::new(image), delay_cs, enabled: true, cut: false }
     }
     pub fn with_image(&self, image: RgbaImage) -> Self {
-        Self { image: Arc::new(image), delay_cs: self.delay_cs, enabled: self.enabled }
+        Self { image: Arc::new(image), delay_cs: self.delay_cs, enabled: self.enabled, cut: self.cut }
     }
 }
 

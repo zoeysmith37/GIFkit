@@ -1111,7 +1111,7 @@ impl Stack {
                 if let Some(p) = progress {
                     p.fetch_add(1, Ordering::Relaxed);
                 }
-                Frame { image, delay_cs: plan[i].delay, enabled: plan[i].enabled }
+                Frame { image, delay_cs: plan[i].delay, enabled: plan[i].enabled, cut: false }
             })
             .collect()
     }
@@ -1124,9 +1124,10 @@ impl Stack {
         static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let gen = GEN.fetch_add(1, Ordering::Relaxed);
         let mut out: Vec<Frame> = Vec::with_capacity(idx.len());
-        // about 256 MB of frames in flight
+        // a few frames at a time: enough to keep the card busy, little
+        // enough that a stop or other work never waits long
         let (bw, bh) = (base.width().max(1) as usize, base.height().max(1) as usize);
-        let batch = ((256usize << 20) / (bw * bh * 4 * 2)).clamp(1, 32);
+        let batch = ((128usize << 20) / (bw * bh * 4 * 2)).clamp(1, 8);
         for chunk in idx.chunks(batch) {
             let mut texs = Vec::new();
             let mut slots: Vec<Option<Arc<RgbaImage>>> = Vec::with_capacity(chunk.len());
@@ -1155,7 +1156,7 @@ impl Stack {
                 if let Some(p) = progress {
                     p.fetch_add(1, Ordering::Relaxed);
                 }
-                out.push(Frame { image, delay_cs: plan[i].delay, enabled: plan[i].enabled });
+                out.push(Frame { image, delay_cs: plan[i].delay, enabled: plan[i].enabled, cut: false });
             }
         }
         Some(out)

@@ -847,6 +847,18 @@ pub struct GifKitApp {
     show_timeline: bool,
     /// pixels per frame (0 fits the whole animation)
     tl_zoom: f32,
+    /// pixels per frame that fit the whole animation, and the zoom now (last drawn)
+    tl_fit: f32,
+    tl_zoom_now: f32,
+    /// a zoom the toolbar asked for, applied about the playhead
+    tl_zoom_to: Option<f32>,
+    /// middle-button panning, and dragging the scroll bar (grab offset in frames)
+    tl_pan: bool,
+    tl_bar_drag: Option<f32>,
+    /// where a GIF clip being dragged would go (an output frame boundary)
+    tl_gif_drop: Option<usize>,
+    /// the track whose name was right-clicked (its menu is the layer's)
+    tl_menu_head: Option<u64>,
     /// first frame shown, and how far the tracks are scrolled
     tl_x0: f32,
     tl_y0: f32,
@@ -1114,6 +1126,21 @@ fn key_label(key: &str) -> String {
         "dup" | "duplicate" => "Duplicate frame".into(),
         "skip" | "toggle" => "Skip / enable frame".into(),
         "left" | "right" | "move" => "Move frame".into(),
+        "tl" => match key.trim_start_matches("tl-").chars().take_while(|c| c.is_ascii_alphabetic()).collect::<String>().as_str() {
+            "split" | "razor" => "Split clip".into(),
+            "del" => "Delete clip".into(),
+            "delkey" => "Delete keyframe".into(),
+            "add" => "Add clip".into(),
+            "key" | "keyedit" => "Keyframe".into(),
+            "drag" => "Move clip".into(),
+            "gifmove" => "Move frames".into(),
+            "join" => "Join clips".into(),
+            "reorder" => "Reorder layers".into(),
+            "lengthen" => "Make longer".into(),
+            "clearkeys" => "Clear keyframes".into(),
+            "full" => "Show on every frame".into(),
+            _ => "Timeline".into(),
+        },
         "" => "Edit".into(),
         w => {
             let mut c = w.chars();
@@ -2148,20 +2175,13 @@ impl GifKitApp {
         if let Some(z) = theme::get_setting("ui_scale").and_then(|v| v.parse::<f32>().ok()).filter(|z| (0.5..=3.0).contains(z)) {
             cc.egui_ctx.set_zoom_factor(z);
         }
-        // a renderer for background work (export, the compressed preview):
-        // on the window's card, or a device of its own when the window uses
-        // OpenGL. Made off the UI thread since the shaders compile first.
+        // a renderer for background work (export, the compressed preview),
+        // on a device of its own: long jobs then never hold up the window's
+        // device (resizing waits for it to go idle). Made off the UI thread
+        // since the shaders compile first.
         if std::env::var_os("GIFKIT_CPU_PREVIEW").is_none() {
-            // a software card (llvmpipe, WARP) is slower than the CPU path
-            let rs = cc.wgpu_render_state.as_ref().filter(|rs| crate::gpu_render::worth_using(&rs.adapter.get_info())).map(|rs| (rs.device.clone(), rs.queue.clone(), rs.adapter.get_info().name));
-            let window_soft = cc.wgpu_render_state.is_some() && rs.is_none();
-            std::thread::spawn(move || {
-                let r = match rs {
-                    Some((d, q, name)) => Some((crate::gpu_render::GpuRenderer::new(d, q), name)),
-                    None if window_soft => None,
-                    None => crate::gpu_render::GpuRenderer::headless_named(),
-                };
-                if let Some((r, name)) = r {
+            std::thread::spawn(|| {
+                if let Some((r, name)) = crate::gpu_render::GpuRenderer::headless_named() {
                     crate::gpu_render::set_shared(r, name);
                 }
             });
@@ -2306,6 +2326,13 @@ impl GifKitApp {
             win_title: String::new(),
             show_timeline: theme::get_setting("show_timeline").as_deref() != Some("0"),
             tl_zoom: 0.0,
+            tl_fit: 1.0,
+            tl_zoom_now: 1.0,
+            tl_zoom_to: None,
+            tl_pan: false,
+            tl_bar_drag: None,
+            tl_gif_drop: None,
+            tl_menu_head: None,
             tl_x0: 0.0,
             tl_y0: 0.0,
             tl_track: None,
@@ -5615,47 +5642,8 @@ impl GifKitApp {
         if to_frames {
             self.tool = Tool::Frames;
         }
-        match menu_act {
-            Some(LayerAct::Rename(li)) => {
-                let l = &self.stack.layers[li];
-                self.renaming = Some((l.id, l.name()));
-                self.rename_fresh = true;
-            }
-            Some(LayerAct::RenameEdit(t)) => {
-                self.edit_renaming = Some((t, self.edit_labels.get(&t).cloned().unwrap_or_else(|| t.label().to_string())));
-                self.rename_fresh = true;
-            }
-            Some(LayerAct::Duplicate(li)) => {
-                self.snapshot(&format!("duplicate{now}"), now);
-                let src = self.stack.layers[li].clone();
-                let id = self.stack.push(src.kind.clone());
-                if let Some(mut l) = self.stack.layers.pop() {
-                    l.label = src.label.as_ref().map(|s| format!("{s} copy"));
-                    l.visible = src.visible;
-                    self.stack.layers.insert(li + 1, l);
-                }
-                self.select(src.kind(), id);
-                self.modified = true;
-            }
-            Some(LayerAct::Toggle(li)) => {
-                self.stack.layers[li].visible = !self.stack.layers[li].visible;
-                self.modified = true;
-            }
-            Some(LayerAct::Move(from, to)) => {
-                if from != to && to < n {
-                    self.snapshot(&format!("reorder{now}"), now);
-                    let l = self.stack.layers.remove(from);
-                    self.stack.layers.insert(to, l);
-                }
-            }
-            Some(LayerAct::Delete(li)) => {
-                self.snapshot(&format!("del{now}"), now);
-                self.stack.layers.remove(li);
-            }
-            Some(LayerAct::CollapseTo(li)) => self.collapse_down(ctx, li),
-            Some(LayerAct::CollapseAll) => self.bake(ctx, false),
-            Some(LayerAct::CollapseEdits) => self.bake(ctx, true),
-            None => {}
+        if let Some(act) = menu_act {
+            self.apply_layer_act(ctx, act, now);
         }
     }
 
@@ -5676,6 +5664,55 @@ impl GifKitApp {
             let out = lower.flatten(&base, &fonts, Some(p));
             JobOutput::Baked(Ok((out, keep)))
         });
+    }
+
+    /// A layer action from the layer list or the timeline.
+    fn apply_layer_act(&mut self, ctx: &egui::Context, act: LayerAct, now: f64) {
+        let n = self.stack.layers.len();
+        match act {
+            LayerAct::Rename(li) => {
+                let l = &self.stack.layers[li];
+                self.renaming = Some((l.id, l.name()));
+                self.rename_fresh = true;
+            }
+            LayerAct::RenameEdit(t) => {
+                self.edit_renaming = Some((t, self.edit_labels.get(&t).cloned().unwrap_or_else(|| t.label().to_string())));
+                self.rename_fresh = true;
+            }
+            LayerAct::Duplicate(li) => {
+                self.snapshot(&format!("duplicate{now}"), now);
+                let src = self.stack.layers[li].clone();
+                let id = self.stack.push(src.kind.clone());
+                if let Some(mut l) = self.stack.layers.pop() {
+                    l.label = src.label.as_ref().map(|s| format!("{s} copy"));
+                    l.visible = src.visible;
+                    // the copy keeps its clips and keyframes
+                    l.timing = src.timing.clone();
+                    self.stack.layers.insert(li + 1, l);
+                }
+                self.select(src.kind(), id);
+                self.modified = true;
+            }
+            LayerAct::Toggle(li) => {
+                self.stack.layers[li].visible = !self.stack.layers[li].visible;
+                self.modified = true;
+            }
+            LayerAct::Move(from, to) => {
+                if from != to && to < n {
+                    self.snapshot(&format!("reorder{now}"), now);
+                    let l = self.stack.layers.remove(from);
+                    self.stack.layers.insert(to, l);
+                }
+            }
+            LayerAct::Delete(li) => {
+                self.snapshot(&format!("del{now}"), now);
+                self.stack.layers.remove(li);
+                self.modified = true;
+            }
+            LayerAct::CollapseTo(li) => self.collapse_down(ctx, li),
+            LayerAct::CollapseAll => self.bake(ctx, false),
+            LayerAct::CollapseEdits => self.bake(ctx, true),
+        }
     }
 
     /// Is a frame edit switched on?
