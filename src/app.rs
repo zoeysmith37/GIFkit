@@ -4449,13 +4449,22 @@ impl GifKitApp {
             if let Ok(img) = rx.try_recv() {
                 let (k, ji) = (*k, *ji);
                 self.live_job = None;
+                let o = self.tex_opts();
+                if std::env::var_os("GIFKIT_PERF").is_some() {
+                    eprintln!("live render: frame {ji} {}", if k == key { "current" } else { "stale" });
+                }
                 if k == key {
-                    let o = self.tex_opts();
                     let t = Tex::from(self.comp_tex.put(ctx, ji, &img, o, "comp"));
                     if ji == i {
                         self.last_comp = Some((i, t.clone()));
                         return Some(t);
                     }
+                } else if ji == i {
+                    // made for settings that have moved on since (a slider
+                    // still being dragged): show it anyway, as the newest there
+                    // is, and start on the current settings straight away
+                    let t = Tex::from(ctx.load_texture("comp-live", to_color_image(&img), o));
+                    self.last_comp = Some((i, t));
                 }
             } else if *k == key && *ji == i {
                 ctx.request_repaint_after(std::time::Duration::from_millis(16));
