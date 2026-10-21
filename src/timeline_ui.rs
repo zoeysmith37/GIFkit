@@ -397,26 +397,35 @@ impl GifKitApp {
             let avail = ui.available_width();
             // the zoom controls on the right; the slider goes first when it's narrow
             let slider_on = avail > 560.0;
-            let right_w = bw * 3.0 + if slider_on { 100.0 } else { 0.0 } + 8.0;
-            let title_w = 76.0;
-            let group_w = |g: &Vec<Item>| g.len() as f32 * (bw + 2.0) + 11.0;
-            let total: f32 = groups.iter().map(group_w).sum();
+            // widths as drawn last time (estimates the first time), so the
+            // groups that don't fit go into the menu instead of under the zoom
+            let mem = egui::Id::unique("tl-toolbar-widths");
+            let (seen_groups, seen_title, seen_right): (Vec<f32>, f32, [f32; 2]) = ui.ctx().data(|d| d.get_temp(mem)).unwrap_or_default();
+            let right_w = seen_right[usize::from(slider_on)].max(bw * 3.0 + if slider_on { 110.0 } else { 0.0 } + 8.0) + 8.0;
+            let title_w = seen_title.max(76.0);
+            let group_w = |gi: usize, g: &Vec<Item>| seen_groups.get(gi).copied().filter(|w| *w > 0.0).unwrap_or(g.len() as f32 * (bw + 2.0) + 14.0);
+            let total: f32 = groups.iter().enumerate().map(|(gi, g)| group_w(gi, g)).sum();
             let room = avail - right_w - title_w;
             let fits_all = total <= room;
             let mut used = 0.0;
             let mut cut = groups.len();
             if !fits_all {
                 for (gi, g) in groups.iter().enumerate() {
-                    if used + group_w(g) > room - bw - 6.0 {
+                    if used + group_w(gi, g) > room - bw - 16.0 {
                         cut = gi;
                         break;
                     }
-                    used += group_w(g);
+                    used += group_w(gi, g);
                 }
             }
+            let x0 = ui.cursor().min.x;
             ui.label(RichText::new("Timeline").font(theme::medium(13.5)).color(pal.fg));
             ui.add_space(8.0);
+            let new_title = ui.cursor().min.x - x0;
+            let mut new_groups = seen_groups.clone();
+            new_groups.resize(groups.len(), 0.0);
             for (gi, g) in groups.iter().enumerate().take(cut) {
+                let gx = ui.cursor().min.x;
                 if gi > 0 {
                     toolbar_sep(ui);
                 }
@@ -429,6 +438,7 @@ impl GifKitApp {
                         act = Some(*a);
                     }
                 }
+                new_groups[gi] = ui.cursor().min.x - gx;
             }
             if cut < groups.len() {
                 // the rest, in a menu
@@ -449,7 +459,9 @@ impl GifKitApp {
                     }
                 });
             }
+            let mut new_right = seen_right;
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let rx = ui.cursor().max.x;
                 if tb_tool(ui, "zoom-fit-best", "", "Fit the whole animation", true).clicked() {
                     self.tl_zoom = 0.0;
                     self.tl_x0 = 0.0;
@@ -470,6 +482,7 @@ impl GifKitApp {
                 if tb_tool(ui, "zoom-out", "", "Zoom out (Ctrl+wheel)", cur_z > fit * 1.001).clicked() {
                     self.tl_zoom_to = Some(cur_z / 1.5);
                 }
+                new_right[usize::from(slider_on)] = rx - ui.cursor().max.x;
                 if fits_all {
                     let t = self.plan_time(self.cur);
                     let text = RichText::new(format!("{:.2} s · frame {} of {n}", t.max(0.0), self.cur + 1)).monospace().size(12.0).color(pal.fg_muted);
@@ -480,6 +493,7 @@ impl GifKitApp {
                     }
                 }
             });
+            ui.ctx().data_mut(|d| d.insert_temp(mem, (new_groups, new_title, new_right)));
         });
         match act {
             Some(TbAct::Select) => self.tl_razor = false,

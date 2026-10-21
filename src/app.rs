@@ -792,6 +792,8 @@ pub struct GifKitApp {
     // layout
     sidebar_compact: bool,
     layers_collapsed: bool,
+    /// the layer panel's height when open, to slide back to
+    layers_open_h: f32,
     layer_drag: Option<u64>,
     export_open: bool,
     export_fmt: ExportFormat,
@@ -935,8 +937,10 @@ pub struct GifKitApp {
     /// the tool panel's search text, and the tool it was typed for
     panel_find: String,
     panel_find_tool: Option<Tool>,
-    /// the layer list's search text
+    /// the layer list's search text, and whether its box is showing
     layer_find: String,
+    layer_find_open: bool,
+    layer_find_fresh: bool,
     /// previews of big pictures are made from frames shrunk to this long
     /// side (0 = always full size)
     preview_max: u32,
@@ -1397,13 +1401,37 @@ fn group_ex<R>(ui: &mut egui::Ui, title: &str, default_open: bool, badge: Option
     painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, pal.border));
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     let _ = resp;
-    if !open {
+    let t = theme::openness(ui.ctx(), id.with("anim"), open);
+    if t <= 0.0 {
         ui.add_space(6.0);
         return None;
     }
-    ui.add_space(8.0);
-    let r = if forced { find_scoped(Some(""), all, false, || add(ui)) } else { add(ui) };
-    ui.add_space(GROUP_GAP + 4.0);
+    let h_id = id.with("height");
+    let mut body = |ui: &mut egui::Ui| if forced { find_scoped(Some(""), all, false, || add(ui)) } else { add(ui) };
+    if t >= 1.0 {
+        ui.add_space(8.0);
+        let top = ui.cursor().top();
+        let r = body(ui);
+        let h = ui.cursor().top() - top;
+        ui.ctx().data_mut(|d| d.insert_temp(h_id, h));
+        ui.add_space(GROUP_GAP + 4.0);
+        return Some(r);
+    }
+    // sliding open or shut: the body drawn whole but clipped to the part showing
+    let full: f32 = ui.ctx().data(|d| d.get_temp(h_id)).unwrap_or(160.0);
+    let total = 8.0 + full + GROUP_GAP + 4.0;
+    let shown = (6.0 + (total - 6.0) * t).max(0.0);
+    let w = ui.available_width();
+    let at = ui.cursor().min;
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(at, vec2(w, total.max(1.0) + 2000.0))).layout(*ui.layout()));
+    child.set_clip_rect(Rect::from_min_size(at, vec2(w, shown)).intersect(ui.clip_rect()));
+    child.add_space(8.0);
+    let top = child.cursor().top();
+    let r = body(&mut child);
+    let h = child.cursor().top() - top;
+    ui.ctx().data_mut(|d| d.insert_temp(h_id, h));
+    ui.allocate_exact_size(vec2(w, shown), Sense::hover());
+    ui.ctx().request_repaint();
     Some(r)
 }
 
@@ -1508,6 +1536,7 @@ fn label_w(ui: &egui::Ui, labels: &[&str]) -> f32 {
 
 /// Toggle buttons in even rows.
 fn toggle_grid(ui: &mut egui::Ui, min_w: f32, items: &mut [(&mut bool, &str, &str)]) {
+    FIND.with(|f| f.borrow_mut().choice = true);
     // a search that matched some of these shows just those
     if FIND.with(|f| f.borrow().items) {
         let total = items.len();
@@ -1738,6 +1767,11 @@ struct Find {
     items: bool,
     /// rows shown for the search so far
     shown: usize,
+    /// a row in this group matched by something in it (a checkbox, say):
+    /// the settings after it go with it
+    follow: bool,
+    /// the row being probed is a set of on/off choices
+    choice: bool,
 }
 
 thread_local! {
@@ -1800,31 +1834,48 @@ fn find_hidden<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R 
 
 /// Draw out of sight and report whether anything in it matched.
 fn find_probe<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> (R, bool) {
-    let (was_p, was_h) = FIND.with(|f| {
+    let (r, hit, _) = find_probe_choice(ui, add);
+    (r, hit)
+}
+
+/// `find_probe`, also saying whether what was drawn is a grid of on/off choices.
+fn find_probe_choice<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> (R, bool, bool) {
+    let (was_p, was_h, was_c) = FIND.with(|f| {
         let mut f = f.borrow_mut();
-        let w = (f.probing, f.hit);
+        let w = (f.probing, f.hit, f.choice);
         f.probing = true;
         f.hit = false;
+        f.choice = false;
         w
     });
     let r = find_hidden(ui, add);
-    let hit = FIND.with(|f| {
+    let (hit, choice) = FIND.with(|f| {
         let mut f = f.borrow_mut();
-        let h = f.hit;
+        let h = (f.hit, f.choice);
         f.probing = was_p;
-        f.hit = was_h || h;
+        f.hit = was_h || h.0;
+        f.choice = was_c;
         h
     });
-    (r, hit)
+    (r, hit, choice)
+}
+
+fn find_follow() -> bool {
+    FIND.with(|f| {
+        let f = f.borrow();
+        !f.q.is_empty() && !f.probing && f.follow
+    })
 }
 
 /// Run `add` with the search's per-group state set, then put it back.
 fn find_scoped<R>(ctx: Option<&str>, all: bool, items: bool, add: impl FnOnce() -> R) -> R {
     let old = FIND.with(|f| {
         let mut f = f.borrow_mut();
-        let old = (f.ctx.clone(), f.group_all, f.items);
+        let old = (f.ctx.clone(), f.group_all, f.items, f.follow);
         if let Some(c) = ctx {
+            // a new group or heading: nothing to follow yet
             f.ctx = c.to_string();
+            f.follow = false;
         }
         f.group_all = all;
         f.items = items;
@@ -1833,7 +1884,7 @@ fn find_scoped<R>(ctx: Option<&str>, all: bool, items: bool, add: impl FnOnce() 
     let r = add();
     FIND.with(|f| {
         let mut f = f.borrow_mut();
-        (f.ctx, f.group_all, f.items) = old;
+        (f.ctx, f.group_all, f.items, f.follow) = old;
     });
     r
 }
@@ -1861,18 +1912,26 @@ fn form_row<R>(ui: &mut egui::Ui, label: &str, mut add: impl FnMut(&mut egui::Ui
         return form_row_raw(ui, label, &mut add);
     }
     // not by its label: see whether anything in it matches
-    let (r, hit) = find_probe(ui, |ui| form_row_raw(ui, label, &mut add));
+    let (r, hit, choice) = find_probe_choice(ui, |ui| form_row_raw(ui, label, &mut add));
     if !hit {
+        // after a match in this group its settings come along, but not
+        // other sets of choices
+        if find_follow() && !choice {
+            find_count();
+            return form_row_raw(ui, label, &mut add);
+        }
         return r;
     }
     let all = FIND.with(|f| f.borrow().group_all);
     find_count();
-    find_scoped(None, all, true, || form_row_raw(ui, label, &mut add))
+    let r = find_scoped(None, all, true, || form_row_raw(ui, label, &mut add));
+    FIND.with(|f| f.borrow_mut().follow = true);
+    r
 }
 
 /// A form row shown only by its label (its controls can only be drawn once).
 fn form_row_once<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    if find_row_shown(label) {
+    if find_row_shown(label) || find_follow() {
         find_count();
         form_row_raw(ui, label, add)
     } else {
@@ -2539,6 +2598,7 @@ impl GifKitApp {
             view_single: ViewSource::Edit,
             sidebar_compact: theme::get_setting("sidebar_compact").as_deref() != Some("0"),
             layers_collapsed: false,
+            layers_open_h: 380.0,
             layer_drag: None,
             export_open: false,
             export_fmt: ExportFormat::Gif,
@@ -2634,6 +2694,8 @@ impl GifKitApp {
             panel_find: String::new(),
             panel_find_tool: None,
             layer_find: String::new(),
+            layer_find_open: false,
+            layer_find_fresh: false,
             preview_max: theme::get_setting("preview_max").and_then(|v| v.parse().ok()).unwrap_or(1280),
             proxy: None,
             proxy_job: None,
@@ -4939,12 +5001,24 @@ impl eframe::App for GifKitApp {
                 .show(ui, |ui| {
                     // the tool's settings always keep at least half the height
                     let lmax = (ui.available_height() * 0.5).clamp(140.0, 800.0);
-                    egui::Panel::bottom("layers_panel")
+                    // it slides open and shut between its header and the height it had
+                    let t = theme::openness(&ctx, egui::Id::unique("layers-open"), !self.layers_collapsed);
+                    let open_h = self.layers_open_h.clamp(140.0, lmax);
+                    let mut panel = egui::Panel::bottom("layers_panel")
                         .resizable(!self.layers_collapsed)
                         .default_size(380.0f32.min(lmax))
-                        .size_range(if self.layers_collapsed { 34.0..=34.0 } else { 140.0..=lmax })
+                        .size_range(if self.layers_collapsed { 34.0..=34.0 } else { 140.0..=lmax });
+                    let sliding = t > 0.0 && t < 1.0;
+                    if sliding {
+                        panel = panel.resizable(false).exact_size(34.0 + (open_h - 34.0) * t);
+                        ctx.request_repaint();
+                    }
+                    let shown = panel
                         .frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin { left: 8, right: 8, top: 6, bottom: 2 }))
                         .show(ui, |ui| self.layer_panel(ui, &ctx));
+                    if !sliding && !self.layers_collapsed {
+                        self.layers_open_h = shown.response.rect.height();
+                    }
                     egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin { left: 10, right: 8, top: 8, bottom: 4 })).show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let (ir, _) = ui.allocate_exact_size(vec2(22.0, 24.0), Sense::hover());
@@ -5243,6 +5317,9 @@ impl GifKitApp {
                         colour_btn(ui, &mut self.backdrop_col);
                     });
                 });
+                if menu_check(ui, theme::animate(), "&Animate Panels", "") {
+                    theme::set_animate(ui.ctx(), !theme::animate());
+                }
                 if menu_check(ui, self.pixelated, "&Pixelated Preview", "") {
                     self.pixelated = !self.pixelated;
                     theme::set_setting("pixelated", if self.pixelated { "1" } else { "0" });
@@ -5896,13 +5973,31 @@ impl GifKitApp {
             if h.on_hover_text("Right-click a layer for more").clicked() {
                 self.layers_collapsed = !self.layers_collapsed;
             }
+            if !self.layers_collapsed {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let on = self.layer_find_open;
+                    let b = ui.add(sel_btn(egui::Button::image(crate::icons::image(ui.ctx(), "edit-find", 16.0, pal.fg)).frame_when_inactive(on), on)).on_hover_text(if on { "Hide the search" } else { "Search layers" });
+                    if b.clicked() {
+                        self.layer_find_open = !on;
+                        self.layer_find_fresh = !on;
+                        if on {
+                            self.layer_find.clear();
+                        }
+                    }
+                });
+            }
         });
         if self.layers_collapsed {
             return;
         }
         ui.add_space(4.0);
-        search_box(ui, &mut self.layer_find, "Search layers", egui::Id::unique("layer-find"));
-        ui.add_space(4.0);
+        if self.layer_find_open {
+            let r = search_box(ui, &mut self.layer_find, "Search layers", egui::Id::unique("layer-find"));
+            if std::mem::take(&mut self.layer_find_fresh) {
+                r.request_focus();
+            }
+            ui.add_space(4.0);
+        }
         // the selected layer's lock and opacity, as in Photoshop's layer panel
         let sel_li = self.sel_layer_index();
         ui.horizontal(|ui| {
@@ -5919,7 +6014,7 @@ impl GifKitApp {
                 ui.add_space(6.0);
                 ui.label(RichText::new("Opacity:").color(if sel_li.is_some() { pal.fg } else { pal.fg_muted }));
                 ui.add_enabled_ui(!locked, |ui| {
-                    if slider(ui, egui::Slider::new(&mut op, 0.0..=100.0).suffix("%").max_decimals(0)).on_hover_text("The whole layer's opacity").changed() {
+                    if fill_slider(ui, egui::Slider::new(&mut op, 0.0..=100.0).suffix("%").max_decimals(0)).on_hover_text("The whole layer's opacity").changed() {
                         if let Some(i) = sel_li {
                             self.stack.layers[i].opacity = op;
                             self.modified = true;
@@ -6087,6 +6182,10 @@ impl GifKitApp {
             let mut edit_rows: Vec<(Tool, String, Option<bool>)> = self.frame_edit_rows().into_iter().map(|(t, l, on)| (t, l, Some(on))).collect();
             edit_rows.push((Tool::Frames, "Frames".to_string(), None));
             for (t, label, enabled) in edit_rows {
+                let shown = self.edit_labels.get(&t).cloned().unwrap_or_else(|| label.clone());
+                if !find.is_empty() && !shown.to_lowercase().contains(&find) && !t.label().to_lowercase().contains(&find) {
+                    continue;
+                }
                 let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h - 4.0), Sense::click());
                 let painter = ui.painter();
                 let sel = self.tool == t;
@@ -8466,22 +8565,7 @@ impl GifKitApp {
         let timed = self.tool.layer_kind().and_then(|k| self.sel_index(k)).and_then(|i| self.stack.layers.get(i)).is_some_and(|l| l.timing.clips.is_some());
         SEL_TIMED.with(|c| c.set(timed));
         // a locked layer's settings can be seen but not changed
-        if let Some(li) = self.sel_layer_index().filter(|i| self.stack.layers[*i].locked) {
-            let pal = *p();
-            egui::Frame::new().fill(mix(pal.window, pal.neutral, 0.14)).stroke(Stroke::new(1.0, mix(pal.window, pal.neutral, 0.5))).corner_radius(4.0).inner_margin(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    crate::icons::paint(ui.painter(), "object-locked", ui.cursor().min + vec2(8.0, 13.0), 16.0, pal.fg);
-                    ui.add_space(22.0);
-                    ui.label(RichText::new("This layer is locked").color(pal.fg));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Unlock").clicked() {
-                            self.stack.layers[li].locked = false;
-                            self.modified = true;
-                        }
-                    });
-                });
-            });
-            ui.add_space(8.0);
+        if self.sel_layer_index().is_some_and(|i| self.stack.layers[i].locked) {
             ui.add_enabled_ui(false, |ui| self.tool_panel_inner(ui, ctx));
             return;
         }
@@ -10671,7 +10755,11 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform) {
 /// A small heading inside a group, over one effect's own settings.
 fn sub_head(ui: &mut egui::Ui, text: &str) {
     // the rows under it go with it in a search
-    FIND.with(|f| f.borrow_mut().ctx = text.to_string());
+    FIND.with(|f| {
+        let mut f = f.borrow_mut();
+        f.ctx = text.to_string();
+        f.follow = false;
+    });
     if find_row_shown("") {
         ui.add_space(4.0);
         form_row_raw(ui, "", |ui| ui.label(egui::RichText::new(text).strong()));
