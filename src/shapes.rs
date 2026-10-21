@@ -89,7 +89,9 @@ impl Default for Shadow {
 impl Shadow {
     /// Offset in pixels for a shape whose larger side is `size` pixels.
     fn offset(&self, size: f32) -> (f32, f32) {
-        let d = size * self.distance / 100.0 + 2.0 * (self.distance / 4.0).min(1.0);
+        // typed past the slider: kept to something a sprite can hold
+        let dist = self.distance.clamp(0.0, 300.0);
+        let d = size * dist / 100.0 + 2.0 * (dist / 4.0).min(1.0);
         let (sn, cs) = self.angle.to_radians().sin_cos();
         // the old shadow sat d pixels right and d down, so 45° keeps that spot
         (cs * d * std::f32::consts::SQRT_2, sn * d * std::f32::consts::SQRT_2)

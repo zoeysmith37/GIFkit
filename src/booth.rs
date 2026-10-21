@@ -224,7 +224,13 @@ pub fn apply_item(src: &RgbaImage, it: &BoothItem) -> RgbaImage {
         return src.clone();
     }
     if BoothFx::LOOKS.contains(&it.fx) {
-        return apply(src, it.fx, it.amount.min(100.0), it.cx, it.cy);
+        if it.amount > 100.0 {
+            // past full strength: pushed further from the picture
+            let mut out = apply(src, it.fx, 100.0, it.cx, it.cy);
+            crate::timeline::blend(&mut out, src, it.amount / 100.0);
+            return out;
+        }
+        return apply(src, it.fx, it.amount, it.cx, it.cy);
     }
     if it.fx == BoothFx::Mirror {
         let cx = it.cx / 100.0 * w as f32;

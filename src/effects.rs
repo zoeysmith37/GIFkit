@@ -540,6 +540,13 @@ fn convolve3(img: &RgbaImage, k: [f32; 9], bias: f32, gray: bool) -> RgbaImage {
     out
 }
 
+/// Blurs past this are no softer to look at, only slower.
+pub const MAX_SIGMA: f32 = 250.0;
+
+/// How far past 100% a strength can push an effect (it's mixed away from
+/// the picture beyond the full effect).
+pub const MAX_STRENGTH: f32 = 4.0;
+
 /// Emboss kernels: the light comes from one of eight directions, clockwise
 /// from the top left.
 pub(crate) fn emboss_kernel(dir: u8) -> [f32; 9] {
@@ -899,17 +906,17 @@ pub fn apply_frame(src: &RgbaImage, idx: usize, n: usize, elapsed_s: f32, clip_s
         tint(&mut img, s.tint_color, s.tint_amount);
     }
     if s.blur {
-        img = imageops::blur(&img, s.blur_sigma.max(0.1));
+        img = imageops::blur(&img, s.blur_sigma.clamp(0.1, MAX_SIGMA));
     }
     if s.sharpen {
-        img = imageops::unsharpen(&img, s.sharpen_sigma.max(0.1), 2);
+        img = imageops::unsharpen(&img, s.sharpen_sigma.clamp(0.1, MAX_SIGMA), 2);
     }
     if s.oil {
         img = oil_paint(&img, s.oil_radius, s.oil_detail);
     }
     if s.emboss {
         let mut e = convolve3(&img, emboss_kernel(s.emboss_dir), 0.0, !s.emboss_colour);
-        if s.emboss_amount < 99.95 {
+        if (s.emboss_amount - 100.0).abs() >= 0.05 {
             crate::timeline::blend(&mut e, &img, s.emboss_amount / 100.0);
         }
         img = e;
@@ -942,7 +949,7 @@ pub fn apply_frame(src: &RgbaImage, idx: usize, n: usize, elapsed_s: f32, clip_s
     }
     // filters at a strength: mixed back toward the picture before them
     let strength = |img: &mut RgbaImage, amount: f32, f: &dyn Fn(&mut RgbaImage)| {
-        if amount >= 99.95 {
+        if (amount - 100.0).abs() < 0.05 {
             f(img);
         } else {
             let before = img.clone();
@@ -1035,7 +1042,7 @@ pub fn counter_sprite(fonts: &[FontEntry], elapsed_s: f32, w: u32, h: u32, pos: 
     if fonts.is_empty() {
         return None;
     }
-    let size = (h as f32 * size_pct / 100.0).max(12.0);
+    let size = (h as f32 * size_pct.clamp(0.0, 200.0) / 100.0).max(12.0);
     let a = crate::text::Annotation { text: format!("{:.2}s", elapsed_s), size, align: crate::text::Align::Left, ..Default::default() };
     let sp = crate::text::render_sprite(fonts, &a);
     let (sw, sh) = (sp.width() as i32, sp.height() as i32);

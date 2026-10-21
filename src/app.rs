@@ -792,6 +792,8 @@ pub struct GifKitApp {
     // layout
     sidebar_compact: bool,
     layers_collapsed: bool,
+    /// where the divider between the two views sits, 0 to 1 across
+    split_frac: f32,
     /// the layer panel's height when open, to slide back to
     layers_open_h: f32,
     /// the timeline's height when shown, to slide back to
@@ -2076,8 +2078,8 @@ fn slider_row(ui: &mut egui::Ui, label: &str, s: egui::Slider<'_>) -> egui::Resp
 fn shadow_rows(ui: &mut egui::Ui, on: &mut bool, sh: &mut crate::shapes::Shadow) {
     form_row(ui, "Shadow", |ui| check(ui, on, "Drop shadow"));
     ui.add_enabled_ui(*on, |ui| {
-        slider_row(ui, "Angle", egui::Slider::new(&mut sh.angle, 0.0..=360.0).suffix("°").max_decimals(0)).on_hover_text("Direction the shadow falls. 45° is down and to the right.");
-        slider_row(ui, "Distance", egui::Slider::new(&mut sh.distance, 0.0..=30.0).suffix("%").max_decimals(1)).on_hover_text("How far the shadow sits from the shape, as a share of its size");
+        slider_row(ui, "Angle", soft_slider(&mut sh.angle, 0.0..=360.0, "").suffix("°").max_decimals(0)).on_hover_text("Direction the shadow falls. 45° is down and to the right.");
+        slider_row(ui, "Distance", soft_slider(&mut sh.distance, 0.0..=30.0, "").suffix("%").max_decimals(1)).on_hover_text("How far the shadow sits from the shape, as a share of its size");
         slider_row(ui, "Blur", egui::Slider::new(&mut sh.blur, 0.0..=20.0).suffix("%").max_decimals(1)).on_hover_text("Softness, as a share of the shape's size");
         slider_row(ui, "Strength", egui::Slider::new(&mut sh.opacity, 0.0..=100.0).suffix("%").max_decimals(0));
     });
@@ -2601,6 +2603,7 @@ impl GifKitApp {
             sidebar_compact: theme::get_setting("sidebar_compact").as_deref() != Some("0"),
             layers_collapsed: false,
             layers_open_h: 380.0,
+            split_frac: theme::get_setting("split").and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite()).unwrap_or(0.5).clamp(0.05, 0.95),
             timeline_open_h: 270.0,
             layer_drag: None,
             export_open: false,
@@ -5018,7 +5021,18 @@ impl eframe::App for GifKitApp {
                     }
                     let shown = panel
                         .frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin { left: 8, right: 8, top: 6, bottom: 2 }))
-                        .show(ui, |ui| self.layer_panel(ui, &ctx));
+                        .show(ui, |ui| {
+                            if !sliding {
+                                self.layer_panel(ui, &ctx);
+                                return;
+                            }
+                            // drawn at its open height and clipped, so it can't push the panel taller
+                            let r = ui.max_rect();
+                            let full = Rect::from_min_size(r.min, vec2(r.width(), (open_h - 8.0).max(r.height())));
+                            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(full));
+                            child.set_clip_rect(ui.clip_rect().intersect(r));
+                            self.layer_panel(&mut child, &ctx);
+                        });
                     if !sliding && !self.layers_collapsed {
                         self.layers_open_h = shown.response.rect.height();
                     }
@@ -5085,17 +5099,29 @@ impl eframe::App for GifKitApp {
                     .default_size(270.0f32.min(tmax))
                     .size_range(110.0f32.min(tmax)..=tmax);
                 let sliding = t < 1.0;
+                let open_h = self.timeline_open_h.clamp(110.0f32.min(tmax), tmax);
                 if sliding {
-                    let h = self.timeline_open_h.clamp(110.0f32.min(tmax), tmax) * t;
+                    let h = open_h * t;
                     panel = panel.resizable(false).size_range(0.0..=tmax).exact_size(h);
                     ctx.request_repaint();
                 }
+                // the margins shrink with it, so a nearly shut timeline never
+                // takes less than no room (that dropped the play bar too low)
+                let mg = |v: f32| (v * if sliding { t } else { 1.0 }).round() as i8;
                 let shown = panel
-                    .frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin { left: 6, right: 6, top: 6, bottom: 4 }))
+                    .frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin { left: 6, right: 6, top: mg(6.0), bottom: mg(4.0) }))
                     .show(ui, |ui| {
-                        // drawn at full height and clipped while it slides
-                        ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect().expand(6.0)));
-                        self.timeline_dock(ui, &ctx)
+                        if !sliding {
+                            self.timeline_dock(ui, &ctx);
+                            return;
+                        }
+                        // while it slides it's drawn at its open height off to
+                        // the side and clipped, so it can't push the panel taller
+                        let r = ui.max_rect();
+                        let full = Rect::from_min_size(r.min, vec2(r.width(), (open_h - 10.0).max(r.height())));
+                        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(full));
+                        child.set_clip_rect(ui.clip_rect().intersect(r.expand2(vec2(6.0, 0.0))));
+                        self.timeline_dock(&mut child, &ctx);
                     });
                 if !sliding {
                     self.timeline_open_h = shown.response.rect.height();
@@ -7852,12 +7878,33 @@ impl GifKitApp {
             return;
         }
         let gap = 2.0;
-        let left = Rect::from_min_max(full.min, pos2(full.center().x - gap / 2.0, full.max.y));
-        let right = Rect::from_min_max(pos2(full.center().x + gap / 2.0, full.min.y), full.max);
-        ui.painter().rect_filled(Rect::from_min_max(pos2(left.max.x, full.min.y), pos2(right.min.x, full.max.y)), 0.0, pal.border);
+        // the divider sits where it was dragged, each side keeping some room
+        let min_side = (full.width() * 0.5 - 4.0).min(180.0);
+        let mid = (full.min.x + full.width() * self.split_frac).clamp(full.min.x + min_side, full.max.x - min_side);
+        let left = Rect::from_min_max(full.min, pos2(mid - gap / 2.0, full.max.y));
+        let right = Rect::from_min_max(pos2(mid + gap / 2.0, full.min.y), full.max);
         let (l, r) = (self.view_left, self.view_right);
         self.source_view(ui, ctx, left, l, 1, true);
         self.source_view(ui, ctx, right, r, 2, true);
+        // drawn and grabbed after the views, so it's on top of them
+        let grab = Rect::from_center_size(pos2(mid, full.center().y), vec2(10.0, full.height()));
+        let d = ui.interact(grab, egui::Id::unique("split-divider"), Sense::click_and_drag()).on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+        let hot = d.hovered() || d.dragged();
+        let line = Rect::from_min_max(pos2(left.max.x, full.min.y), pos2(right.min.x, full.max.y));
+        ui.painter().rect_filled(if hot { line.expand2(vec2(1.0, 0.0)) } else { line }, 0.0, if hot { pal.highlight } else { pal.border });
+        if d.dragged() {
+            if let Some(pp) = d.interact_pointer_pos() {
+                self.split_frac = ((pp.x - full.min.x) / full.width().max(1.0)).clamp(0.05, 0.95);
+            }
+        }
+        if d.drag_stopped() {
+            theme::set_setting("split", &format!("{:.4}", self.split_frac));
+        }
+        if d.double_clicked() {
+            self.split_frac = 0.5;
+            theme::set_setting("split", "0.5");
+        }
+        d.on_hover_text("Drag to resize the views. Double-click to make them even.");
     }
 
     /// Canvas editing. `space` says which coordinates the viewport shows:
@@ -9555,7 +9602,7 @@ impl GifKitApp {
             let bar = a.caption != Caption::None;
             if bar {
                 form_row(ui, "Bar colour", |ui| colour_btn(ui, &mut a.bar_color));
-                slider_row(ui, "Bar padding", egui::Slider::new(&mut a.bar_pad, 0.0..=150.0).suffix("%").max_decimals(0)).on_hover_text("Room above and below the text, as a share of the text size");
+                slider_row(ui, "Bar padding", soft_slider(&mut a.bar_pad, 0.0..=150.0, "").suffix("%").max_decimals(0)).on_hover_text("Room above and below the text, as a share of the text size");
             }
             ui.add_enabled_ui(!bar, |ui| {
                 let (mut wrap, mut centre) = (a.wrap || bar, a.centre || bar);
@@ -9881,7 +9928,7 @@ impl GifKitApp {
             slider_row(ui, "Opacity", egui::Slider::new(&mut w.opacity, 0.0..=100.0).suffix("%").max_decimals(0));
             form_row(ui, "Layout", |ui| seg_row(ui, &mut w.tiled, &[(false, "Single"), (true, "Tiled")]));
             if w.tiled {
-                slider_row(ui, "Angle", egui::Slider::new(&mut w.angle, -90.0..=90.0).suffix("°").max_decimals(0));
+                slider_row(ui, "Angle", soft_slider(&mut w.angle, -90.0..=90.0, "").suffix("°").max_decimals(0));
                 slider_row(ui, "Spacing", soft_slider(&mut w.spacing, 0.8..=4.0, "").max_decimals(2));
             } else {
                 use crate::effects::Anchor;
@@ -10595,10 +10642,80 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform) {
         fx.warps.insert(0, BoothItem { fx: fx.warp, amount: fx.warp_amount, cx: fx.warp_cx, cy: fx.warp_cy, reverse: false });
         fx.warp = BoothFx::None;
     }
-    group_ex(ui, "Photo Booth", true, (!fx.looks.is_empty()).then(|| "●".to_string()), |ui| {
-        form_row(ui, "Look", |ui| stack_grid(ui, &BoothFx::LOOKS, &mut fx.looks, None));
+    // photo booth looks, artistic styles and filters: one place for how it looks
+    let styled = !fx.looks.is_empty() || fx.oil || fx.emboss || fx.posterize || fx.solarize || fx.noise || fx.pixelate || fx.gotham || fx.lomo || fx.nashville || fx.toaster || fx.vignette || fx.polaroid;
+    group_ex(ui, "Styles", true, styled.then(|| "●".to_string()), |ui| {
+        form_row(ui, "Photo booth", |ui| stack_grid(ui, &BoothFx::LOOKS, &mut fx.looks, None));
+        form_row(ui, "Artistic", |ui| {
+            toggle_grid(ui, 92.0, &mut [
+                (&mut fx.oil, "Oil Paint", "Smooths detail into brush-like patches"),
+                (&mut fx.emboss, "Emboss", "Raised relief look"),
+                (&mut fx.posterize, "Posterize", "Fewer colour steps"),
+                (&mut fx.solarize, "Solarize", "Inverts the brightest tones"),
+                (&mut fx.noise, "Noise", "Adds random grain"),
+                (&mut fx.pixelate, "Pixelate", "Big square pixels"),
+            ])
+        });
+        form_row(ui, "Filter", |ui| {
+            toggle_grid(ui, 92.0, &mut [
+                (&mut fx.gotham, "Gotham", "Cool and gritty high contrast"),
+                (&mut fx.lomo, "Lomo", "Saturated with dark corners"),
+                (&mut fx.nashville, "Nashville", "Warm pink vintage tint"),
+                (&mut fx.toaster, "Toaster", "Warm faded film look"),
+                (&mut fx.vignette, "Vignette", "Darkens the corners"),
+                (&mut fx.polaroid, "Polaroid", "White instant-photo frame"),
+            ])
+        });
         for it in fx.looks.iter_mut() {
-            slider_row(ui, it.fx.label(), egui::Slider::new(&mut it.amount, 0.0..=100.0).suffix("%").max_decimals(0)).on_hover_text("Strength");
+            sub_head(ui, it.fx.label());
+            slider_row(ui, "Strength", soft_slider(&mut it.amount, 0.0..=100.0, "").suffix("%").max_decimals(0)).on_hover_text("Type a bigger number for a stronger effect");
+        }
+        if fx.oil {
+            sub_head(ui, "Oil Paint");
+            slider_row(ui, "Brush", egui::Slider::new(&mut fx.oil_radius, 1..=16).suffix(" px")).on_hover_text("How far each patch reaches");
+            slider_row(ui, "Detail", egui::Slider::new(&mut fx.oil_detail, 2..=64)).on_hover_text("How many shades it keeps apart. Fewer gives flatter patches.");
+        }
+        if fx.emboss {
+            sub_head(ui, "Emboss");
+            slider_row(ui, "Strength", soft_slider(&mut fx.emboss_amount, 0.0..=100.0, "").suffix("%").max_decimals(0)).on_hover_text("Type a bigger number for a stronger effect");
+            const DIRS: [(u8, &str); 8] = [(0, "Top left"), (1, "Top"), (2, "Top right"), (3, "Right"), (4, "Bottom right"), (5, "Bottom"), (6, "Bottom left"), (7, "Left")];
+            form_row(ui, "Light from", |ui| combo(ui, "fx_emboss_dir", &mut fx.emboss_dir, &DIRS));
+            form_row(ui, "", |ui| check(ui, &mut fx.emboss_colour, "Keep colours").on_hover_text("Raised relief over the picture instead of grey"));
+        }
+        if fx.posterize {
+            sub_head(ui, "Posterize");
+            slider_row(ui, "Levels", egui::Slider::new(&mut fx.posterize_levels, 2..=16).clamping(egui::SliderClamping::Never));
+        }
+        if fx.solarize {
+            sub_head(ui, "Solarize");
+            slider_row(ui, "Threshold", egui::Slider::new(&mut fx.solarize_threshold, 0.0..=255.0).max_decimals(0)).on_hover_text("Tones past this flip");
+            form_row(ui, "", |ui| check(ui, &mut fx.solarize_reverse, "Reverse").on_hover_text("Flip the dark tones instead"));
+        }
+        if fx.noise {
+            sub_head(ui, "Noise");
+            slider_row(ui, "Amount", soft_slider(&mut fx.noise_amount, 1.0..=128.0, "").max_decimals(0));
+            form_row(ui, "", |ui| {
+                ui.horizontal(|ui| {
+                    check(ui, &mut fx.noise_mono, "Grey").on_hover_text("The same grain on every colour");
+                    check(ui, &mut fx.noise_still, "Still").on_hover_text("The same grain on every frame");
+                })
+            });
+        }
+        if fx.pixelate {
+            sub_head(ui, "Pixelate");
+            slider_row(ui, "Block size", egui::Slider::new(&mut fx.pixelate_size, 2..=64).suffix(" px").clamping(egui::SliderClamping::Never));
+        }
+        for (on, name, v) in [
+            (fx.gotham, "Gotham", &mut fx.gotham_amount),
+            (fx.lomo, "Lomo", &mut fx.lomo_amount),
+            (fx.nashville, "Nashville", &mut fx.nashville_amount),
+            (fx.toaster, "Toaster", &mut fx.toaster_amount),
+            (fx.vignette, "Vignette", &mut fx.vignette_amount),
+        ] {
+            if on {
+                sub_head(ui, name);
+                slider_row(ui, "Strength", soft_slider(v, 0.0..=100.0, "").suffix("%").max_decimals(0)).on_hover_text("Type a bigger number for a stronger effect");
+            }
         }
     });
     group_ex(ui, "Transparency", false, on(&[fx.rc_white, fx.rc_black, fx.rc_custom]), |ui| {
@@ -10638,53 +10755,6 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform) {
         form_row(ui, "Method", |ui| toggle_grid(ui, 0.0, &mut [(&mut fx.ordered_dither, "Ordered", "Regular pattern dithering"), (&mut fx.error_dither, "Diffusion", "Error diffusion dithering")]));
         ui.add_enabled_ui(fx.ordered_dither || fx.error_dither, |ui| slider_row(ui, "Levels", egui::Slider::new(&mut fx.dither_levels, 2..=16).clamping(egui::SliderClamping::Never)));
     });
-    group_ex(ui, "Artistic", false, on(&[fx.oil, fx.emboss, fx.posterize, fx.solarize, fx.noise, fx.pixelate]), |ui| {
-        form_row(ui, "Style", |ui| {
-            toggle_grid(ui, 92.0, &mut [
-                (&mut fx.oil, "Oil Paint", "Smooths detail into brush-like patches"),
-                (&mut fx.emboss, "Emboss", "Raised relief look"),
-                (&mut fx.posterize, "Posterize", "Fewer colour steps"),
-                (&mut fx.solarize, "Solarize", "Inverts the brightest tones"),
-                (&mut fx.noise, "Noise", "Adds random grain"),
-                (&mut fx.pixelate, "Pixelate", "Big square pixels"),
-            ])
-        });
-        if fx.oil {
-            sub_head(ui, "Oil Paint");
-            slider_row(ui, "Brush", egui::Slider::new(&mut fx.oil_radius, 1..=16).suffix(" px")).on_hover_text("How far each patch reaches");
-            slider_row(ui, "Detail", egui::Slider::new(&mut fx.oil_detail, 2..=64)).on_hover_text("How many shades it keeps apart. Fewer gives flatter patches.");
-        }
-        if fx.emboss {
-            sub_head(ui, "Emboss");
-            slider_row(ui, "Strength", egui::Slider::new(&mut fx.emboss_amount, 0.0..=100.0).suffix("%").max_decimals(0));
-            const DIRS: [(u8, &str); 8] = [(0, "Top left"), (1, "Top"), (2, "Top right"), (3, "Right"), (4, "Bottom right"), (5, "Bottom"), (6, "Bottom left"), (7, "Left")];
-            form_row(ui, "Light from", |ui| combo(ui, "fx_emboss_dir", &mut fx.emboss_dir, &DIRS));
-            form_row(ui, "", |ui| check(ui, &mut fx.emboss_colour, "Keep colours").on_hover_text("Raised relief over the picture instead of grey"));
-        }
-        if fx.posterize {
-            sub_head(ui, "Posterize");
-            slider_row(ui, "Levels", egui::Slider::new(&mut fx.posterize_levels, 2..=16).clamping(egui::SliderClamping::Never));
-        }
-        if fx.solarize {
-            sub_head(ui, "Solarize");
-            slider_row(ui, "Threshold", egui::Slider::new(&mut fx.solarize_threshold, 0.0..=255.0).max_decimals(0)).on_hover_text("Tones past this flip");
-            form_row(ui, "", |ui| check(ui, &mut fx.solarize_reverse, "Reverse").on_hover_text("Flip the dark tones instead"));
-        }
-        if fx.noise {
-            sub_head(ui, "Noise");
-            slider_row(ui, "Amount", soft_slider(&mut fx.noise_amount, 1.0..=128.0, "").max_decimals(0));
-            form_row(ui, "", |ui| {
-                ui.horizontal(|ui| {
-                    check(ui, &mut fx.noise_mono, "Grey").on_hover_text("The same grain on every colour");
-                    check(ui, &mut fx.noise_still, "Still").on_hover_text("The same grain on every frame");
-                })
-            });
-        }
-        if fx.pixelate {
-            sub_head(ui, "Pixelate");
-            slider_row(ui, "Block size", egui::Slider::new(&mut fx.pixelate_size, 2..=64).suffix(" px").clamping(egui::SliderClamping::Never));
-        }
-    });
     group_ex(ui, "Distort", false, on(&[!fx.warps.is_empty(), fx.wave, fx.swirl, fx.implode]), |ui| {
         form_row(ui, "Effect", |ui| stack_grid(ui, &BoothFx::DISTORT, &mut fx.warps, Some((&mut fx.wave, "Wave", "Ripples the picture up and down"))));
         for (k, it) in fx.warps.iter_mut().enumerate() {
@@ -10714,29 +10784,6 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform) {
         }
         if fx.implode {
             opt_row(ui, "Implode (old)", &mut fx.implode, |ui| fill_slider(ui, soft_slider(&mut fx.implode_amount, -2.0..=2.0, "").max_decimals(2)));
-        }
-    });
-    group_ex(ui, "Filters", false, on(&[fx.gotham, fx.lomo, fx.nashville, fx.toaster, fx.vignette, fx.polaroid]), |ui| {
-        form_row(ui, "Filter", |ui| {
-            toggle_grid(ui, 92.0, &mut [
-                (&mut fx.gotham, "Gotham", "Cool and gritty high contrast"),
-                (&mut fx.lomo, "Lomo", "Saturated with dark corners"),
-                (&mut fx.nashville, "Nashville", "Warm pink vintage tint"),
-                (&mut fx.toaster, "Toaster", "Warm faded film look"),
-                (&mut fx.vignette, "Vignette", "Darkens the corners"),
-                (&mut fx.polaroid, "Polaroid", "White instant-photo frame"),
-            ])
-        });
-        for (on, name, v) in [
-            (fx.gotham, "Gotham", &mut fx.gotham_amount),
-            (fx.lomo, "Lomo", &mut fx.lomo_amount),
-            (fx.nashville, "Nashville", &mut fx.nashville_amount),
-            (fx.toaster, "Toaster", &mut fx.toaster_amount),
-            (fx.vignette, "Vignette", &mut fx.vignette_amount),
-        ] {
-            if on {
-                slider_row(ui, name, egui::Slider::new(v, 0.0..=100.0).suffix("%").max_decimals(0)).on_hover_text("Strength");
-            }
         }
     });
     group_ex(ui, "Frame", false, on(&[fx.frame_camera, fx.frame_fuzzy, fx.frame_rounded, fx.frame_border]), |ui| {
@@ -10859,7 +10906,7 @@ fn anim_ui(ui: &mut egui::Ui, fx: &mut EffectSettings) {
             ])
         });
         ui.add_enabled_ui(looping, |ui| {
-            slider_row(ui, "Strength", egui::Slider::new(&mut fx.loop_amount, 0.0..=200.0).suffix("%").max_decimals(0));
+            slider_row(ui, "Strength", soft_slider(&mut fx.loop_amount, 0.0..=200.0, "").suffix("%").max_decimals(0));
             form_row(ui, "Repeats", |ui| num_fill(ui, &mut fx.loop_cycles, 1.0, |d| d.range(1..=20).suffix("× per loop"))).on_hover_text("Whole numbers keep the loop seamless");
             form_row(ui, "", |ui| check(ui, &mut fx.loop_reverse, "Reverse").on_hover_text("Turn, bob and cycle colours the other way"));
         });
@@ -10870,7 +10917,7 @@ fn anim_ui(ui: &mut egui::Ui, fx: &mut EffectSettings) {
         ui.add_enabled_ui(fx.counter, |ui| {
             const CORNERS: [(u8, &str); 4] = [(2, "Top left"), (3, "Top right"), (0, "Bottom left"), (1, "Bottom right")];
             form_row(ui, "Corner", |ui| combo(ui, "fx_counter_pos", &mut fx.counter_pos, &CORNERS));
-            slider_row(ui, "Size", egui::Slider::new(&mut fx.counter_size, 2.0..=40.0).suffix("%").max_decimals(0)).on_hover_text("Of the picture's height");
+            slider_row(ui, "Size", soft_slider(&mut fx.counter_size, 2.0..=40.0, "").suffix("%").max_decimals(0)).on_hover_text("Of the picture's height");
         });
     });
     group_ex(ui, "Hidden Parts", false, None, |ui| {

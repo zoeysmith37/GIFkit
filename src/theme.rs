@@ -564,7 +564,7 @@ pub fn install(ctx: &egui::Context) {
     let anim = get_setting("animate").as_deref() != Some("0");
     ANIMATE.store(anim, std::sync::atomic::Ordering::Relaxed);
     ctx.all_styles_mut(|s| {
-        s.animation_time = if anim { ANIM_TIME } else { 0.0 };
+        s.animation_time = if anim { anim_time() } else { 0.0 };
         // Kirigami units: 4 px inside a group, 6 px between controls, 8 px between groups
         s.spacing.item_spacing = Vec2::new(6.0, 6.0);
         // Breeze controls are about 30 px tall with roomy padding
@@ -591,6 +591,12 @@ pub fn install(ctx: &egui::Context) {
 /// How long opening and closing things takes, seconds.
 pub const ANIM_TIME: f32 = 0.16;
 
+/// `ANIM_TIME`, slowed by GIFKIT_ANIM_SLOW (a factor, for testing).
+fn anim_time() -> f32 {
+    static SLOW: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    ANIM_TIME * *SLOW.get_or_init(|| std::env::var("GIFKIT_ANIM_SLOW").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0))
+}
+
 static ANIMATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Do panels and groups slide open and shut? (Settings ▸ Animate Panels)
@@ -601,7 +607,7 @@ pub fn animate() -> bool {
 pub fn set_animate(ctx: &egui::Context, on: bool) {
     ANIMATE.store(on, std::sync::atomic::Ordering::Relaxed);
     set_setting("animate", if on { "1" } else { "0" });
-    ctx.all_styles_mut(|s| s.animation_time = if on { ANIM_TIME } else { 0.0 });
+    ctx.all_styles_mut(|s| s.animation_time = if on { anim_time() } else { 0.0 });
 }
 
 /// 0 shut to 1 open, eased, for something keyed by `id`.
@@ -609,7 +615,7 @@ pub fn openness(ctx: &egui::Context, id: egui::Id, open: bool) -> f32 {
     if !animate() {
         return if open { 1.0 } else { 0.0 };
     }
-    let t = ctx.animate_bool_with_time(id, open, ANIM_TIME);
+    let t = ctx.animate_bool_with_time(id, open, anim_time());
     // ease in and out
     t * t * (3.0 - 2.0 * t)
 }

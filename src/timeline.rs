@@ -353,10 +353,11 @@ fn sample(img: &RgbaImage, x: f32, y: f32) -> Option<[u8; 4]> {
 /// Mix `after` back toward `before` so the layer shows at `amount` (0..1).
 pub fn blend(after: &mut RgbaImage, before: &RgbaImage, amount: f32) {
     use rayon::prelude::*;
-    let a = amount.clamp(0.0, 1.0);
+    // past 1 it pushes further away from `before` (stronger effects)
+    let a = amount.clamp(0.0, crate::effects::MAX_STRENGTH);
     after.par_chunks_mut(4).zip(before.par_chunks(4)).for_each(|(p, q)| {
         for k in 0..4 {
-            p[k] = (q[k] as f32 + (p[k] as f32 - q[k] as f32) * a).round() as u8;
+            p[k] = (q[k] as f32 + (p[k] as f32 - q[k] as f32) * a).round().clamp(0.0, 255.0) as u8;
         }
     });
 }

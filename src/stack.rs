@@ -1026,7 +1026,7 @@ impl Stack {
             if t.caption != Caption::None {
                 let bh = if active && !t.text.is_empty() {
                     let (_, th) = text::measure(fonts, t);
-                    (th as f32 * k + 2.0 * t.size * k * t.bar_pad / 100.0).round().max(1.0) as u32
+                    (th as f32 * k + 2.0 * t.size * k * t.bar_pad.clamp(0.0, 1000.0) / 100.0).round().max(1.0) as u32
                 } else {
                     0
                 };

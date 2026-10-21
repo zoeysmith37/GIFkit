@@ -900,6 +900,11 @@ fn gpu_matches_cpu() {
             _ => (e.vignette, e.vignette_amount) = (true, 40.0),
         })));
     }
+    fxc.push(("look glow 300".into(), fx(&move |e| e.looks = vec![item(BoothFx::Glow, 300.0, false)])));
+    fxc.push(("look comic 180".into(), fx(&move |e| e.looks = vec![item(BoothFx::Comic, 180.0, false)])));
+    fxc.push(("fx gotham 250%".into(), fx(&|e| (e.gotham, e.gotham_amount) = (true, 250.0))));
+    fxc.push(("fx emboss 300%".into(), fx(&|e| (e.emboss, e.emboss_amount) = (true, 300.0))));
+    fxc.push(("fx loop 900%".into(), fx(&|e| (e.loop_wobble, e.loop_amount) = (true, 900.0))));
     fxc.push(("fx oil detail".into(), fx(&|e| (e.oil, e.oil_detail) = (true, 50))));
     fxc.push(("fx emboss dir".into(), fx(&|e| (e.emboss, e.emboss_dir, e.emboss_amount) = (true, 3, 60.0))));
     fxc.push(("fx emboss colour".into(), fx(&|e| (e.emboss, e.emboss_dir, e.emboss_colour) = (true, 6, true))));

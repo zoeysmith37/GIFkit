@@ -155,7 +155,7 @@ impl<'a, 'f> Plan<'a, 'f> {
     /// Run `f` at `amount` %: below 100 the result is mixed back toward the
     /// picture before it (timeline::blend).
     fn at_strength(&mut self, amount: f32, f: impl FnOnce(&mut Self)) {
-        if amount >= 99.95 {
+        if (amount - 100.0).abs() < 0.05 {
             f(self);
             return;
         }
@@ -163,7 +163,7 @@ impl<'a, 'f> Plan<'a, 'f> {
         self.raw(0, 0.0, [Some(GpuIn::Cur), None, None], Some(T_PRE), size, false, &[]);
         f(self);
         let size = self.size;
-        self.raw(50, 0.0, [Some(GpuIn::Cur), Some(GpuIn::Tmp(T_PRE)), None], None, size, false, &[[(amount / 100.0).clamp(0.0, 1.0), size.0 as f32, size.1 as f32, 0.0]]);
+        self.raw(50, 0.0, [Some(GpuIn::Cur), Some(GpuIn::Tmp(T_PRE)), None], None, size, false, &[[(amount / 100.0).clamp(0.0, crate::effects::MAX_STRENGTH), size.0 as f32, size.1 as f32, 0.0]]);
     }
 
     /// motion::pixelate
@@ -240,11 +240,11 @@ pub fn effects<'a>(p: &mut Plan<'a, '_>, s: &EffectSettings, idx: usize, n: usiz
     }
     if s.blur {
         let size = p.size;
-        p.blur_all(GpuIn::Cur, None, size, s.blur_sigma.max(0.1));
+        p.blur_all(GpuIn::Cur, None, size, s.blur_sigma.clamp(0.1, crate::effects::MAX_SIGMA));
     }
     if s.sharpen {
         let size = p.size;
-        p.blur_all(GpuIn::Cur, Some(T_BLUR), size, s.sharpen_sigma.max(0.1));
+        p.blur_all(GpuIn::Cur, Some(T_BLUR), size, s.sharpen_sigma.clamp(0.1, crate::effects::MAX_SIGMA));
         p.raw(18, 0.0, [Some(GpuIn::Cur), Some(GpuIn::Tmp(T_BLUR)), None], None, size, false, &[[2.0, 0.0, 0.0, 0.0]]);
     }
     if s.oil {
@@ -401,7 +401,12 @@ fn booth_item(p: &mut Plan<'_, '_>, it: &crate::booth::BoothItem) {
         return;
     }
     if BoothFx::LOOKS.contains(&it.fx) {
-        booth(p, it.fx, it.amount.min(100.0), it.cx, it.cy);
+        if it.amount > 100.0 {
+            // past full strength: pushed further from the picture
+            p.at_strength(it.amount, |p| booth(p, it.fx, 100.0, it.cx, it.cy));
+        } else {
+            booth(p, it.fx, it.amount, it.cx, it.cy);
+        }
         return;
     }
     if it.fx == BoothFx::Mirror {
@@ -521,7 +526,7 @@ fn looped(p: &mut Plan<'_, '_>, fx: &[LoopFx], idx: usize, n: usize, amount: f32
         return;
     }
     use crate::motion::hash;
-    let k = (amount / 100.0).clamp(0.0, 2.0);
+    let k = (amount / 100.0).clamp(0.0, crate::motion::MAX_LOOP);
     let (w, h) = p.wf();
     let l = crate::motion::loop_place(fx, idx, n, amount, cycles, reverse, w, h);
     if l.moves() {

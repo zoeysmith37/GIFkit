@@ -290,6 +290,9 @@ pub(crate) fn hash(i: u64) -> f32 {
 
 /// Looping motion for frame `idx` of `n`. `amount` is 0 to 100, `cycles` how
 /// many times it repeats over the animation (whole numbers keep the loop seamless).
+/// The most a loop's strength (100% = 1) is taken as.
+pub const MAX_LOOP: f32 = 10.0;
+
 /// Where a loop puts the picture this frame.
 pub(crate) struct LoopPlace {
     pub sx: f32,
@@ -311,7 +314,7 @@ impl LoopPlace {
 
 /// The numbers `looped` works from, shared with the graphics card.
 pub(crate) fn loop_place(fx: &[LoopFx], idx: usize, n: usize, amount: f32, cycles: u32, reverse: bool, w: f32, h: f32) -> LoopPlace {
-    let k = (amount / 100.0).clamp(0.0, 2.0);
+    let k = (amount / 100.0).clamp(0.0, MAX_LOOP);
     let cyc = cycles.max(1) as f32;
     let phase = idx as f32 / n.max(1) as f32 * cyc * TAU;
     let dir = if reverse { -1.0 } else { 1.0 };
@@ -370,7 +373,7 @@ pub fn looped(img: &RgbaImage, fx: &[LoopFx], idx: usize, n: usize, amount: f32,
     if fx.is_empty() || n == 0 {
         return img.clone();
     }
-    let k = (amount / 100.0).clamp(0.0, 2.0);
+    let k = (amount / 100.0).clamp(0.0, MAX_LOOP);
     let (w, h) = (img.width() as f32, img.height() as f32);
     let l = loop_place(fx, idx, n, amount, cycles, reverse, w, h);
     let mut out = if l.moves() { place_xy(img, l.sx, l.sy, l.angle, l.dx, l.dy, hidden_px(transparent)) } else { img.clone() };
