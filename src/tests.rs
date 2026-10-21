@@ -1050,11 +1050,11 @@ fn project_round_trip() {
     let overlay: Vec<image::RgbaImage> = (0..3).map(|i| image::RgbaImage::from_pixel(8, 6, image::Rgba([i * 80, 10, 200, 255]))).collect();
     let wm = Arc::new(image::RgbaImage::from_pixel(5, 5, image::Rgba([1, 2, 3, 128])));
     let layers = vec![
-        ProjLayerEntry { visible: true, label: Some("Caption".into()), timing: Default::default(), layer: ProjLayer::Text { text: crate::text::Annotation { text: "hi".into(), stretch: 0.7, ..Default::default() }, font: Some(("builtin".into(), "Sans Bold".into())) } },
-        ProjLayerEntry { visible: false, label: None, timing: Default::default(), layer: ProjLayer::Image { id: 1, name: "ov.png".into(), path: None, delays: vec![5, 5, 5], placements: vec![Default::default(); base.len()], opacity: 80.0 } },
-        ProjLayerEntry { visible: true, label: None, timing: Default::default(), layer: ProjLayer::Watermark { id: 2, watermark: Default::default(), has_image: true } },
-        ProjLayerEntry { visible: true, label: None, timing: crate::timeline::Timing { clips: Some(vec![crate::timeline::Clip { start: 2, end: Some(5) }]), keys: vec![crate::timeline::Key { frame: 3, x: 10.0, ..Default::default() }] }, layer: ProjLayer::Emoji { emoji: crate::shapes::EmojiSettings { emoji: "1f525".into(), w: 20, h: 20, ..Default::default() } } },
-        ProjLayerEntry { visible: true, label: None, timing: Default::default(), layer: ProjLayer::Markup { markup: crate::shapes::MarkupSettings { strokes: vec![crate::shapes::PenStroke { points: vec![[1.0, 2.0], [3.0, 4.0]], ..Default::default() }] } } },
+        ProjLayerEntry { opacity: 100.0, color: None, locked: false, visible: true, label: Some("Caption".into()), timing: Default::default(), layer: ProjLayer::Text { text: crate::text::Annotation { text: "hi".into(), stretch: 0.7, ..Default::default() }, font: Some(("builtin".into(), "Sans Bold".into())) } },
+        ProjLayerEntry { opacity: 100.0, color: None, locked: false, visible: false, label: None, timing: Default::default(), layer: ProjLayer::Image { id: 1, name: "ov.png".into(), path: None, delays: vec![5, 5, 5], placements: vec![Default::default(); base.len()], opacity: 80.0 } },
+        ProjLayerEntry { opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: Default::default(), layer: ProjLayer::Watermark { id: 2, watermark: Default::default(), has_image: true } },
+        ProjLayerEntry { opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: crate::timeline::Timing { clips: Some(vec![crate::timeline::Clip { start: 2, end: Some(5) }]), keys: vec![crate::timeline::Key { frame: 3, x: 10.0, ..Default::default() }] }, layer: ProjLayer::Emoji { emoji: crate::shapes::EmojiSettings { emoji: "1f525".into(), w: 20, h: 20, ..Default::default() } } },
+        ProjLayerEntry { opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: Default::default(), layer: ProjLayer::Markup { markup: crate::shapes::MarkupSettings { strokes: vec![crate::shapes::PenStroke { points: vec![[1.0, 2.0], [3.0, 4.0]], ..Default::default() }] } } },
     ];
     let mut transform = crate::stack::Transform::default();
     transform.reverse = true;
@@ -1205,7 +1205,7 @@ fn layer_clips_and_keyframes_render() {
     let li = s.index_of(id).unwrap();
     s.layers[li].timing.clips = Some(vec![Clip { start: 2, end: Some(7) }]);
     // moves 30 px right from frame 2 to frame 7, steady speed
-    s.layers[li].timing.keys = vec![Key { frame: 2, smooth: false, ..Default::default() }, Key { frame: 7, x: 30.0, smooth: false, ..Default::default() }];
+    s.layers[li].timing.keys = vec![Key { frame: 2, ease: crate::timeline::Ease::Linear, ..Default::default() }, Key { frame: 7, x: 30.0, ease: crate::timeline::Ease::Linear, ..Default::default() }];
     let out = s.flatten(&a, &[], None);
     let red = |f: usize, x: u32, y: u32| out.frames[f].image.get_pixel(x, y)[0] > 200;
     assert!(!red(0, 10, 10) && !red(1, 10, 10), "hidden before its clip");

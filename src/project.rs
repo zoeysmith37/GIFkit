@@ -30,6 +30,12 @@ const VERSION: u32 = 1;
 pub struct FrameMeta {
     pub delay: u16,
     pub enabled: bool,
+    /// a GIF track clip starts here
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cut: bool,
+    /// a gap on the GIF track (shows nothing)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub blank: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -57,6 +63,22 @@ pub struct ProjLayerEntry {
     /// clips and keyframes (none in older projects)
     #[serde(default, skip_serializing_if = "crate::timeline::Timing::is_default")]
     pub timing: crate::timeline::Timing,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub locked: bool,
+    /// the bar's colour on the timeline
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[u8; 3]>,
+    /// the layer's opacity, %
+    #[serde(default = "full", skip_serializing_if = "is_full")]
+    pub opacity: f32,
+}
+
+fn full() -> f32 {
+    100.0
+}
+
+fn is_full(v: &f32) -> bool {
+    *v >= 100.0
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -75,6 +97,12 @@ pub struct ProjectFile {
     pub original: Option<(Vec<FrameMeta>, Option<u16>)>,
     pub transform: Transform,
     pub layers: Vec<ProjLayerEntry>,
+    /// timeline markers
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub markers: Vec<crate::timeline::Marker>,
+    /// the GIF track's colour on the timeline
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gif_color: Option<[u8; 3]>,
     /// output and tool settings, kept loose so new fields never break old files
     pub settings: serde_json::Value,
 }
@@ -102,7 +130,7 @@ fn png(img: &RgbaImage) -> Result<Vec<u8>> {
 }
 
 fn meta(a: &Animation) -> Vec<FrameMeta> {
-    a.frames.iter().map(|f| FrameMeta { delay: f.delay_cs, enabled: f.enabled }).collect()
+    a.frames.iter().map(|f| FrameMeta { delay: f.delay_cs, enabled: f.enabled, cut: f.cut, blank: f.blank }).collect()
 }
 
 /// Write a project. `images` are the frames of image layers and watermark
@@ -183,7 +211,7 @@ pub fn load(path: &Path) -> Result<Project> {
             .enumerate()
             .map(|(i, m)| {
                 let img = decoded.remove(&format!("{dir}/{i:05}.png")).with_context(|| format!("{dir}/{i:05}.png is missing"))?;
-                Ok(Frame { image: Arc::new(img), delay_cs: m.delay, enabled: m.enabled })
+                Ok(Frame { image: Arc::new(img), delay_cs: m.delay, enabled: m.enabled, cut: m.cut, blank: m.blank })
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Animation { frames, loop_count })

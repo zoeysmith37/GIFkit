@@ -155,7 +155,7 @@ impl Transform {
         !(self.crop_on && self.crop[2] > 0 && self.crop[3] > 0) && !self.resize_on && !self.rotates() && !self.pads()
     }
 
-    fn pre(&self) -> f32 {
+    pub(crate) fn pre(&self) -> f32 {
         if self.pre_scale > 0.0 && self.pre_scale < 1.0 { self.pre_scale } else { 1.0 }
     }
 
@@ -380,6 +380,8 @@ pub enum LayerKind {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Effects,
+    /// an effects layer made in the Animation panel
+    Animation,
     Text,
     Censor,
     Overlay,
@@ -399,11 +401,25 @@ pub struct Layer {
     pub label: Option<String>,
     /// clips and keyframes from the timeline
     pub timing: crate::timeline::Timing,
+    /// can't be moved or changed on the timeline or the picture
+    pub locked: bool,
+    /// its bar's colour on the timeline (None: by kind)
+    pub color: Option<[u8; 3]>,
+    /// the whole layer's opacity, % (on top of any keyed opacity)
+    pub opacity: f32,
 }
 
 impl Layer {
+    /// Its motion at plan frame `i`, with the layer's own opacity in.
+    pub fn motion(&self, i: usize) -> crate::timeline::Motion {
+        let mut m = self.timing.motion(i);
+        m.opacity *= (self.opacity / 100.0).clamp(0.0, 1.0);
+        m
+    }
+
     pub fn kind(&self) -> Kind {
         match self.kind {
+            LayerKind::Effects(ref fx) if fx.anim => Kind::Animation,
             LayerKind::Effects(_) => Kind::Effects,
             LayerKind::Text(_) => Kind::Text,
             LayerKind::Censor(_) => Kind::Censor,
@@ -418,7 +434,7 @@ impl Layer {
     pub fn active(&self) -> bool {
         self.visible
             && match &self.kind {
-                LayerKind::Effects(fx) => **fx != EffectSettings::default(),
+                LayerKind::Effects(fx) => **fx != EffectSettings { anim: fx.anim, ..Default::default() },
                 LayerKind::Text(t) => !t.text.is_empty(),
                 LayerKind::Censor(c) => c.w > 0 && c.h > 0,
                 LayerKind::Overlay(_) => true,
@@ -465,6 +481,7 @@ impl Layer {
             return l.clone();
         }
         match &self.kind {
+            LayerKind::Effects(fx) if fx.anim => "Animation".into(),
             LayerKind::Effects(_) => "Effects".into(),
             LayerKind::Text(t) => t.text.lines().next().unwrap_or("").to_string(),
             LayerKind::Censor(c) => format!("Censor · {:?}", c.method),
@@ -501,6 +518,9 @@ pub fn layer_signature(l: &Layer) -> u64 {
     if !l.timing.is_default() {
         format!("{:?}", l.timing).hash(&mut h);
     }
+    if l.opacity < 100.0 {
+        l.opacity.to_bits().hash(&mut h);
+    }
     h.finish()
 }
 
@@ -510,6 +530,10 @@ pub struct Stack {
     /// Bottom-most first.
     pub layers: Vec<Layer>,
     pub next_id: u64,
+    /// named points on the timeline (output frames), sorted
+    pub markers: Vec<crate::timeline::Marker>,
+    /// the GIF track's bar colour on the timeline (None: the accent)
+    pub gif_color: Option<[u8; 3]>,
 }
 
 /// Size of a preview frame `s` times the source size.
@@ -566,6 +590,14 @@ pub struct Prepared {
     stamps: Vec<Vec<StrokeSprite>>,
 }
 
+impl Prepared {
+    /// Was this made for `st`'s layers? (one entry per layer)
+    pub fn fits(&self, st: &Stack) -> bool {
+        let n = st.layers.len();
+        self.maps.len() == n && self.sprites.len() == n && self.watermarks.len() == n && self.stamps.len() == n
+    }
+}
+
 /// Run the calling thread at a lower priority, so long background renders
 /// never starve the desktop compositor or the app's own UI.
 pub fn lower_thread_priority() {
@@ -608,7 +640,7 @@ impl Stack {
     pub fn push(&mut self, kind: LayerKind) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
-        self.layers.push(Layer { id, visible: true, kind, label: None, timing: Default::default() });
+        self.layers.push(Layer { id, visible: true, kind, label: None, timing: Default::default(), locked: false, color: None, opacity: 100.0 });
         id
     }
 
@@ -776,13 +808,29 @@ impl Stack {
 
     /// The transformed frame before any layer (geometry only).
     pub fn geometry_frame(&self, base: &Animation, plan: &[PlanFrame], i: usize) -> RgbaImage {
-        let src = &base.frames[plan[i].src].image;
+        let f = &base.frames[plan[i].src];
+        if f.blank {
+            // a gap on the GIF track: nothing, through the same frame edits
+            let empty = RgbaImage::new(f.image.width(), f.image.height());
+            let t = self.eff_transform(true);
+            return if t.geometry_identity() { empty } else { t.apply_geometry(&empty) };
+        }
+        let src = &f.image;
         let t = self.eff_transform(true);
         if t.geometry_identity() { (**src).clone() } else { t.apply_geometry(src) }
     }
 
     /// Render output frame `i` of `plan`.
     pub fn render_frame(&self, base: &Animation, plan: &[PlanFrame], times: &[f32], i: usize, fonts: &[FontEntry], prep: &Prepared) -> RgbaImage {
+        // made for another layer list (one was just added or removed):
+        // make it again rather than read past its end
+        let fresh;
+        let prep = if prep.fits(self) {
+            prep
+        } else {
+            fresh = self.prepare(base, fonts);
+            &fresh
+        };
         let n = plan.len();
         let src = plan[i].src;
         let mut img = self.geometry_frame(base, plan, i);
@@ -790,7 +838,7 @@ impl Stack {
             if !l.active() || !l.timing.shows(i, n) {
                 continue;
             }
-            let mo = l.timing.motion(i);
+            let mo = l.motion(i);
             if mo.opacity <= 0.001 {
                 continue;
             }
@@ -1084,21 +1132,82 @@ impl Stack {
         let plan = self.plan(base);
         let times = plan_times(&plan);
         let prep = self.prepare(base, fonts);
-        let render = self.needs_render();
-        let frames: Vec<Frame> = (0..plan.len())
-            .into_par_iter()
-            .map(|i| {
-                // untouched frames share the source image rather than copying it
-                let image = if render && !stopped(progress) { Arc::new(self.render_frame(base, &plan, &times, i, fonts, &prep)) } else { base.frames[plan[i].src].image.clone() };
-                if let Some(p) = progress {
-                    p.fetch_add(1, Ordering::Relaxed);
-                }
-                Frame { image, delay_cs: plan[i].delay, enabled: plan[i].enabled }
-            })
-            .collect();
+        let idx: Vec<usize> = (0..plan.len()).collect();
+        let frames = self.render_frames(base, &plan, &times, &idx, fonts, &prep, progress);
         let mut out = Animation { frames, loop_count: self.loop_count(base) };
         effects::normalize_sizes(&mut out);
         out
+    }
+
+    /// Output frames `idx` of `plan`: on the graphics card when one is free
+    /// for background work and can draw this stack, else on the CPU across
+    /// every core. Untouched frames share the source image.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_frames(&self, base: &Animation, plan: &[PlanFrame], times: &[f32], idx: &[usize], fonts: &[FontEntry], prep: &Prepared, progress: Option<&AtomicUsize>) -> Vec<Frame> {
+        let render = self.needs_render() || base.frames.iter().any(|f| f.blank);
+        if render && self.gpu_capable() {
+            if let Some(Some(f)) = crate::gpu_render::with_shared(|gpu| self.render_frames_gpu(gpu, base, plan, times, idx, fonts, prep, progress)) {
+                if std::env::var_os("GIFKIT_PERF").is_some() {
+                    eprintln!("frames: {} on the graphics card", f.len());
+                }
+                return f;
+            }
+        }
+        idx.par_iter()
+            .map(|&i| {
+                let image = if render && !stopped(progress) { Arc::new(self.render_frame(base, plan, times, i, fonts, prep)) } else { base.frames[plan[i].src].image.clone() };
+                if let Some(p) = progress {
+                    p.fetch_add(1, Ordering::Relaxed);
+                }
+                Frame { image, delay_cs: plan[i].delay, enabled: plan[i].enabled, cut: false, blank: false }
+            })
+            .collect()
+    }
+
+    /// `render_frames` on the card: a batch of frames goes out, then all of
+    /// them come back in one wait. A frame the card can't take (too big)
+    /// renders on the CPU. None if nothing could be drawn there.
+    #[allow(clippy::too_many_arguments)]
+    fn render_frames_gpu(&self, gpu: &mut crate::gpu_render::GpuRenderer, base: &Animation, plan: &[PlanFrame], times: &[f32], idx: &[usize], fonts: &[FontEntry], prep: &Prepared, progress: Option<&AtomicUsize>) -> Option<Vec<Frame>> {
+        static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let gen = GEN.fetch_add(1, Ordering::Relaxed);
+        let mut out: Vec<Frame> = Vec::with_capacity(idx.len());
+        // a few frames at a time: enough to keep the card busy, little
+        // enough that a stop or other work never waits long
+        let (bw, bh) = (base.width().max(1) as usize, base.height().max(1) as usize);
+        let batch = ((128usize << 20) / (bw * bh * 4 * 2)).clamp(1, 8);
+        for chunk in idx.chunks(batch) {
+            let mut texs = Vec::new();
+            let mut slots: Vec<Option<Arc<RgbaImage>>> = Vec::with_capacity(chunk.len());
+            for &i in chunk {
+                let src = plan[i].src;
+                let frame = &base.frames[src].image;
+                if stopped(progress) {
+                    slots.push(Some(frame.clone()));
+                    continue;
+                }
+                let job = self.gpu_frame(base, plan, times, i, fonts, prep).filter(|j| j.fits(frame, gpu.max_side));
+                match job {
+                    Some(job) => {
+                        texs.push(gpu.render_straight(frame, src as u64 + 1, &job, gen));
+                        slots.push(None);
+                    }
+                    None => slots.push(Some(Arc::new(self.render_frame(base, plan, times, i, fonts, prep)))),
+                }
+            }
+            let mut read = gpu.read_raw(&texs).into_iter();
+            for (k, &i) in chunk.iter().enumerate() {
+                let image = match slots[k].take() {
+                    Some(img) => img,
+                    None => Arc::new(read.next()?),
+                };
+                if let Some(p) = progress {
+                    p.fetch_add(1, Ordering::Relaxed);
+                }
+                out.push(Frame { image, delay_cs: plan[i].delay, enabled: plan[i].enabled, cut: false, blank: false });
+            }
+        }
+        Some(out)
     }
 
     /// Keep per-frame data in sync with the number of source frames.
@@ -1160,4 +1269,235 @@ pub fn frame_at_time(a: &Animation, t: f32) -> usize {
         tt -= d;
     }
     a.len() - 1
+}
+
+// ---------------------------------------------------------------- graphics card
+
+impl Stack {
+    /// Every layer is one the graphics card can draw.
+    pub fn gpu_capable(&self) -> bool {
+        !self.layers.iter().any(|l| l.active() && matches!(&l.kind, LayerKind::Effects(fx) if !crate::gpu_fx::effects_ok(fx)))
+    }
+
+    /// Frame `i` as work for the graphics card, or None when something in
+    /// it only renders on the CPU (then the whole frame does, so it never
+    /// goes back and forth). Mirrors `render_frame`.
+    pub fn gpu_frame<'a>(&'a self, base: &Animation, plan: &[PlanFrame], times: &[f32], i: usize, fonts: &[FontEntry], prep: &'a Prepared) -> Option<crate::gpu_render::GpuFrame<'a>> {
+        use crate::geo::Affine;
+        use crate::gpu_render::{GpuDraw, GpuFrame, GpuGeo, GpuOp, GpuSrc};
+        if !prep.fits(self) {
+            return None;
+        }
+        let n = plan.len();
+        let src = plan.get(i)?.src;
+        let (fw, fh) = base.frames.get(src)?.image.dimensions();
+        // only layers the card can draw
+        for l in &self.layers {
+            if !l.active() || !l.timing.shows(i, n) {
+                continue;
+            }
+            if matches!(&l.kind, LayerKind::Effects(fx) if !crate::gpu_fx::effects_ok(fx)) {
+                return None;
+            }
+        }
+        let t = self.eff_transform(true);
+        let full = t.geo_map(fw, fh);
+        let (ow, oh) = (full.w.round().max(1.0) as u32, full.h.round().max(1.0) as u32);
+        let p = t.pre();
+        let inv = full.m.inverse().then(Affine::scale(p, p));
+        let crop = if t.crop_on && t.crop[2] > 0 && t.crop[3] > 0 {
+            let x = t.crop[0].min(fw.saturating_sub(1));
+            let y = t.crop[1].min(fh.saturating_sub(1));
+            let cw = t.crop[2].clamp(1, fw - x);
+            let ch = t.crop[3].clamp(1, fh - y);
+            [x as f32, y as f32, (x + cw) as f32, (y + ch) as f32]
+        } else {
+            [0.0, 0.0, fw as f32, fh as f32]
+        };
+        let mut t2 = t.clone();
+        t2.rot_any = false;
+        t2.pad_on = false;
+        let cm = t2.geo_map(fw, fh);
+        let inner = if t.pads() {
+            let [pt, pr, pb, pl] = t.pad;
+            [pl as f32, pt as f32, ow as f32 - pr as f32, oh as f32 - pb as f32]
+        } else {
+            [0.0, 0.0, ow as f32, oh as f32]
+        };
+        let turned = t.rot_on && t.rot_any && t.rot_deg % 360.0 != 0.0;
+        let geo = GpuGeo {
+            inv,
+            crop,
+            inv_canvas: full.m.inverse().then(cm.m),
+            canvas: (cm.w, cm.h),
+            inner,
+            pad_bg: if t.pad_transparent { [0; 4] } else { [t.pad_color[0], t.pad_color[1], t.pad_color[2], 255] },
+            rot_bg: if turned && !t.rot_bg_transparent { [t.rot_bg[0], t.rot_bg[1], t.rot_bg[2], 255] } else { [0; 4] },
+            nearest: t.resize_on && t.rs_filter == ResizeFilter::Nearest,
+            resize: None,
+            blank: base.frames[src].blank,
+        };
+        // the size change apply_geometry makes, and the picture it makes
+        let mut geo = geo;
+        if t.resize_on {
+            let (cw, ch) = ((crop[2] - crop[0]) as u32, (crop[3] - crop[1]) as u32);
+            if let Some((tw, th)) = resize_target(cw, ch, t.rs_w, t.rs_h, t.rs_pct) {
+                if (tw, th) != (cw, ch) || t.rs_mode == AspectMode::FitPad {
+                    let (fw, fh) = (cw as f32, ch as f32);
+                    let (nw, nh) = match t.rs_mode {
+                        AspectMode::Stretch => (tw, th),
+                        AspectMode::CenterCrop => {
+                            let s = (tw as f32 / fw).max(th as f32 / fh);
+                            (((fw * s).round() as u32).max(tw), ((fh * s).round() as u32).max(th))
+                        }
+                        AspectMode::FitPad => {
+                            let s = (tw as f32 / fw).min(th as f32 / fh);
+                            (((fw * s).round() as u32).clamp(1, tw), ((fh * s).round() as u32).clamp(1, th))
+                        }
+                    };
+                    if (nw, nh) != (cw, ch) {
+                        let kernel = match t.rs_filter {
+                            ResizeFilter::Nearest => 0,
+                            ResizeFilter::Bilinear => 1,
+                            ResizeFilter::Bicubic => 2,
+                            ResizeFilter::Lanczos3 => 3,
+                        };
+                        geo.resize = Some(crate::gpu_render::GpuResize { size: (nw, nh), kernel });
+                    }
+                }
+            }
+        }
+        let geo = geo;
+        let mut draws: Vec<GpuOp<'a>> = Vec::new();
+        let mut owned: Vec<RgbaImage> = Vec::new();
+        // the frame's size as layers go (effects can change it)
+        let mut cur = (ow, oh);
+        for (li, l) in self.layers.iter().enumerate() {
+            if !l.active() || !l.timing.shows(i, n) {
+                continue;
+            }
+            let mo = l.motion(i);
+            if mo.opacity <= 0.001 {
+                continue;
+            }
+            let m = &prep.maps[li].m;
+            // a sprite at (x, y), moved the way `transform_sprite` moves it
+            let place = |sp: &RgbaImage, x: i64, y: i64| -> Affine {
+                if !mo.moves() {
+                    return Affine::translate(x as f32, y as f32);
+                }
+                let ob = l.source_box(src, fonts).map(|b| map_box(m, b, false));
+                let (cx, cy) = ob.map(|o| (o.cx, o.cy)).unwrap_or((x as f32 + sp.width() as f32 / 2.0, y as f32 + sp.height() as f32 / 2.0));
+                let d = m.apply_vec(mo.dx, mo.dy);
+                let [a, b, c, dd] = crate::timeline::motion_matrix(mo.sx, mo.sy, ob.map(|o| o.angle).unwrap_or(0.0), mo.angle * m.det().signum());
+                Affine::translate(x as f32 - cx, y as f32 - cy).then(Affine { a, b, c, d: dd, tx: 0.0, ty: 0.0 }).then(Affine::translate(cx + d.0, cy + d.1))
+            };
+            let k = mo.opacity;
+            let mk = |sp: &'a RgbaImage, x: i64, y: i64, alpha: f32| GpuOp::Draw(GpuDraw { src: GpuSrc::Img(sp), m: place(sp, x, y), opacity: alpha * k });
+            match &l.kind {
+                LayerKind::Effects(fx) => {
+                    // as render_frame: the clip's own frame count and time
+                    let (s0, s1) = l.timing.clip_at(i, n).filter(|_| l.timing.clips.is_some()).unwrap_or((0, n.saturating_sub(1)));
+                    let shown = |a: usize, b: usize| plan[a..b].iter().filter(|f| f.enabled).count();
+                    let end_t = times[s1] + if plan[s1].enabled { effective_delay(plan[s1].delay) as f32 / 100.0 } else { 0.0 };
+                    let mut pl = crate::gpu_fx::Plan::new(cur, &mut owned);
+                    crate::gpu_fx::effects(&mut pl, fx, shown(s0, i), shown(s0, s1 + 1).max(1), times[i] - times[s0], end_t - times[s0], fonts);
+                    cur = pl.size;
+                    let passes = pl.passes;
+                    draws.push(GpuOp::Effect { passes, mix: k });
+                }
+                LayerKind::Censor(c) => {
+                    if c.applies_to(src) {
+                        if let Some(b) = l.source_box(src, fonts) {
+                            let mut pl = crate::gpu_fx::Plan::new(cur, &mut owned);
+                            crate::gpu_fx::censor(&mut pl, map_box(m, mo.apply(b), false), c);
+                            let passes = pl.passes;
+                            draws.push(GpuOp::Effect { passes, mix: k });
+                        }
+                    }
+                }
+                LayerKind::Shield(sh) => {
+                    let mut pl = crate::gpu_fx::Plan::new(cur, &mut owned);
+                    crate::gpu_fx::shield(&mut pl, sh, src);
+                    let passes = pl.passes;
+                    draws.push(GpuOp::Effect { passes, mix: k });
+                }
+                LayerKind::Overlay(o) => {
+                    if let Some(b) = l.source_box(src, fonts) {
+                        let frame = o.src.frame_at(times[i]);
+                        let ob = map_box(m, mo.apply(b), true);
+                        let (iw, ih) = (frame.width().max(1) as f32, frame.height().max(1) as f32);
+                        let am = Affine::scale(ob.w.round().max(1.0) / iw, ob.h.round().max(1.0) / ih)
+                            .then(Affine::translate(-ob.w.round().max(1.0) / 2.0, -ob.h.round().max(1.0) / 2.0))
+                            .then(Affine::rotate(ob.angle))
+                            .then(Affine::translate(ob.cx, ob.cy));
+                        draws.push(GpuOp::Draw(GpuDraw { src: GpuSrc::Img(frame), m: am, opacity: o.opacity / 100.0 * k }));
+                    }
+                }
+                LayerKind::Watermark(w) => {
+                    let o = (w.opacity / 100.0).clamp(0.0, 1.0) * k;
+                    match prep.watermarks.get(li) {
+                        Some(Some(WatermarkSprite::Single(s, x, y))) => draws.push(GpuOp::Draw(GpuDraw { src: GpuSrc::Img(s), m: Affine::translate(*x as f32, *y as f32), opacity: o })),
+                        Some(Some(WatermarkSprite::Tiled(s, sx, sy))) => {
+                            let (w, h) = (cur.0 as f32, cur.1 as f32);
+                            let mut row = 0;
+                            let mut y = -(s.height() as f32);
+                            while y < h {
+                                let off = if row % 2 == 1 { sx / 2.0 } else { 0.0 };
+                                let mut x = -(s.width() as f32) + off;
+                                while x < w {
+                                    draws.push(GpuOp::Draw(GpuDraw { src: GpuSrc::Img(s), m: Affine::translate(x.round(), y.round()), opacity: o }));
+                                    x += sx;
+                                }
+                                y += sy;
+                                row += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                LayerKind::Shape(sh) => {
+                    if let Some(st) = prep.stamps.get(li) {
+                        for sp in st.iter().filter(|_| sh.applies_to(src)) {
+                            draws.push(mk(&sp.img, sp.x, sp.y, sh.opacity / 100.0));
+                        }
+                    }
+                }
+                LayerKind::Emoji(e) => {
+                    if let Some(st) = prep.stamps.get(li) {
+                        for sp in st.iter().filter(|_| e.applies_to(src)) {
+                            draws.push(mk(&sp.img, sp.x, sp.y, e.opacity / 100.0));
+                        }
+                    }
+                }
+                LayerKind::Markup(_) => {
+                    if let Some(st) = prep.stamps.get(li) {
+                        for sp in st {
+                            let f = src + 1;
+                            if f >= sp.from.max(1) && (sp.to == 0 || f <= sp.to) {
+                                draws.push(mk(&sp.img, sp.x, sp.y, 1.0));
+                            }
+                        }
+                    }
+                }
+                LayerKind::Text(tx) => {
+                    if tx.caption != text::Caption::None && tx.bar_h > 0 && tx.applies_to(src) {
+                        let c = tx.bar_color;
+                        let (by, bh) = ((tx.bar_y as f32 * p).round() as i32, (tx.bar_h as f32 * p).round() as i32);
+                        let y0 = by.clamp(0, cur.1 as i32);
+                        let y1 = (by + bh).clamp(0, cur.1 as i32);
+                        if y1 > y0 {
+                            draws.push(GpuOp::Draw(GpuDraw { src: GpuSrc::Solid([c[0], c[1], c[2], 255], (cur.0 as f32, (y1 - y0) as f32)), m: Affine::translate(0.0, y0 as f32), opacity: k }));
+                        }
+                    }
+                    if let Some(Some((s, x, y))) = prep.sprites.get(li) {
+                        if tx.applies_to(src) {
+                            draws.push(mk(s, *x, *y, tx.opacity as f32 / 100.0));
+                        }
+                    }
+                }
+            }
+        }
+        Some(GpuFrame { size: (ow, oh), geo, ops: draws, owned })
+    }
 }

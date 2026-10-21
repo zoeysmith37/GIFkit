@@ -1,6 +1,6 @@
 [package]
 name = "gifkit"
-version = "1.0.0"
+version = "1.2.0"
 edition = "2021"
 description = "Local, cross-platform animated GIF editor / optimiser"
 license = "Apache-2.0"
@@ -9,7 +9,7 @@ build = "build.rs"
 
 [dependencies]
 crc32fast = "1"
-eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11", "clipboard"] }
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wgpu", "wayland", "x11", "clipboard"] }
 image = { version = "0.25", default-features = false, features = ["gif", "png", "jpeg", "webp", "bmp", "rayon"] }
 gif = "0.14"
 png = "0.18"
@@ -18,7 +18,9 @@ ab_glyph = "0.2"
 rustybuzz = "0.20"
 unicode-bidi = "0.3"
 rayon = "1.10"
+pollster = "1.0"
 rfd = "0.17"
+arboard = "3.7"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

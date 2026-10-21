@@ -561,7 +561,10 @@ pub fn install(ctx: &egui::Context) {
     let (d, l) = palettes();
     ctx.set_visuals_of(Theme::Dark, visuals(d, true));
     ctx.set_visuals_of(Theme::Light, visuals(l, false));
+    let anim = get_setting("animate").as_deref() != Some("0");
+    ANIMATE.store(anim, std::sync::atomic::Ordering::Relaxed);
     ctx.all_styles_mut(|s| {
+        s.animation_time = if anim { ANIM_TIME } else { 0.0 };
         // Kirigami units: 4 px inside a group, 6 px between controls, 8 px between groups
         s.spacing.item_spacing = Vec2::new(6.0, 6.0);
         // Breeze controls are about 30 px tall with roomy padding
@@ -583,6 +586,32 @@ pub fn install(ctx: &egui::Context) {
         ]
         .into();
     });
+}
+
+/// How long opening and closing things takes, seconds.
+pub const ANIM_TIME: f32 = 0.16;
+
+static ANIMATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Do panels and groups slide open and shut? (Settings ▸ Animate Panels)
+pub fn animate() -> bool {
+    ANIMATE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_animate(ctx: &egui::Context, on: bool) {
+    ANIMATE.store(on, std::sync::atomic::Ordering::Relaxed);
+    set_setting("animate", if on { "1" } else { "0" });
+    ctx.all_styles_mut(|s| s.animation_time = if on { ANIM_TIME } else { 0.0 });
+}
+
+/// 0 shut to 1 open, eased, for something keyed by `id`.
+pub fn openness(ctx: &egui::Context, id: egui::Id, open: bool) -> f32 {
+    if !animate() {
+        return if open { 1.0 } else { 0.0 };
+    }
+    let t = ctx.animate_bool_with_time(id, open, ANIM_TIME);
+    // ease in and out
+    t * t * (3.0 - 2.0 * t)
 }
 
 pub fn medium(size: f32) -> FontId {

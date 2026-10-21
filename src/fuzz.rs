@@ -32,7 +32,7 @@ impl Rng {
     }
 }
 
-const VARIANTS: &[&str] = &["ActualSize","Apng","Arrow","Avif","Bicubic","Bilinear","Blinds","Blur","Bottom","BottomLeft","BottomRight","Bubble","Bulge","Burst","Censor","Center","CenterCrop","Comic","Dark","DelayAll","DeleteObject","Dent","Drop","Effects","Ellipse","Emoji","Export","Fade","FishEye","Fit","FitPad","Fps","FullScreen","Gif","Glitch","Glow","Handbook","Heart","Heavy","Highlighter","History","Hop","Iris","Kaleidoscope","Lanczos3","Left","Light","Line","Markup","Mirror","Mp4","Nearest","New","NextFrame","None","Open","Overlay","Pen","Pencil","Percent","Pixelate","PlayPause","Png","PopArt","PrevFrame","Pulse","Quit","Rainbow","Rect","Redo","Right","Rounded","Save","SaveAs","Shake","Shape","Shield","SlideDown","SlideLeft","SlideRight","SlideUp","Solid","Speech","Spin","SplitView","Squeeze","Star","Stretch","System","Text","Thermal","Thought","TlDelete","TlKey","TlRazor","TlSplit","Top","TopLeft","TopRight","Triangle","Tunnel","Twirl","Undo","Watermark","WebmAlpha","WipeDown","WipeLeft","WipeRight","WipeUp","Wobble","XRay","Zoom","ZoomIn","ZoomOut",];
+const VARIANTS: &[&str] = &["ActualSize","Apng","Arrow","Avif","Bicubic","Bilinear","Blinds","Blur","Bottom","BottomLeft","BottomRight","Bubble","Bulge","Burst","Censor","Center","CenterCrop","Comic","Dark","DelayAll","DeleteObject","Dent","Drop","Effects","Ellipse","Emoji","Export","Fade","Float","Heartbeat","Blink","Squash","Hold","Linear","Smooth","FishEye","Fit","FitPad","Fps","FullScreen","Gif","Glitch","Glow","Handbook","Heart","Heavy","Highlighter","History","Hop","Iris","Kaleidoscope","Lanczos3","Left","Light","Line","Markup","Mirror","Mp4","Nearest","New","NextFrame","None","Open","Overlay","Pen","Pencil","Percent","Pixelate","PlayPause","Png","PopArt","PrevFrame","Pulse","Quit","Rainbow","Rect","Redo","Right","Rounded","Save","SaveAs","Shake","Shape","Shield","SlideDown","SlideLeft","SlideRight","SlideUp","Solid","Speech","Spin","SplitView","Squeeze","Star","Stretch","System","Text","Thermal","Thought","TlDelete","TlKey","TlRazor","TlSplit","Top","TopLeft","TopRight","Triangle","Tunnel","Twirl","Undo","Watermark","WebmAlpha","WipeDown","WipeLeft","WipeRight","WipeUp","Wobble","XRay","Zoom","ZoomIn","ZoomOut",];
 const TEXTS: &[&str] = &["", " ", "Hello", "a\nb\n\nc", "🔥🔥 emoji 👍🏽", "مرحبا بالعالم", "日本語のテキスト", "x", "averyveryveryverylongwordwithoutanyspacesatallthatkeepsgoing and then some more words to wrap around the canvas edge"];
 
 fn perturb(v: &mut Value, r: &mut Rng, p: f64, key: &str) {
@@ -130,6 +130,9 @@ fn anim(r: &mut Rng) -> Animation {
             });
             let mut f = Frame::new(img, r.pick(&delays));
             f.enabled = !r.chance(0.15);
+            // gaps and clip starts from splitting the GIF row
+            f.blank = r.chance(0.2);
+            f.cut = r.chance(0.2);
             f
         })
         .collect();
@@ -139,7 +142,7 @@ fn anim(r: &mut Rng) -> Animation {
 fn layer(r: &mut Rng, w: u32, h: u32, n: usize, p: f64) -> LayerKind {
     use crate::{effects, shapes, text};
     match r.below(10) {
-        0 | 1 => LayerKind::Effects(Box::new(fuzz(&effects::EffectSettings::default(), r, p))),
+        0 | 1 => LayerKind::Effects(Box::new(fuzz(&effects_base(r), r, p))),
         2 => LayerKind::Text(fuzz(&text::Annotation::default(), r, p)),
         3 => LayerKind::Censor(fuzz(&effects::CensorSettings::default(), r, p)),
         4 => {
@@ -175,6 +178,62 @@ fn layer(r: &mut Rng, w: u32, h: u32, n: usize, p: f64) -> LayerKind {
     }
 }
 
+/// Effects with stacked looks and distortions and some animation on, so the
+/// fuzzing has lists and switches to work on.
+fn effects_base(r: &mut Rng) -> crate::effects::EffectSettings {
+    use crate::booth::{BoothFx, BoothItem};
+    let mut e = crate::effects::EffectSettings::default();
+    let item = |r: &mut Rng, list: &[BoothFx]| BoothItem {
+        fx: r.pick(list),
+        amount: r.pick(&[0.0, 1.0, 50.0, 100.0, 250.0, 5000.0, 1e7, -40.0]),
+        cx: r.pick(&[0.0, 50.0, 100.0, -20.0, 300.0]),
+        cy: r.pick(&[0.0, 50.0, 100.0, -20.0]),
+        reverse: r.chance(0.5),
+    };
+    for _ in 0..r.below(3) {
+        let it = item(r, &BoothFx::LOOKS);
+        e.looks.push(it);
+    }
+    for _ in 0..r.below(4) {
+        let it = item(r, &BoothFx::DISTORT);
+        e.warps.push(it);
+    }
+    e.anim = r.chance(0.4);
+    e.counter = r.chance(0.4);
+    e.counter_pos = r.pick(&[0u8, 1, 2, 3, 9]);
+    e.counter_size = r.pick(&[0.0, 7.0, 40.0, 500.0]);
+    e.intro = crate::motion::Transition::ALL[r.below(crate::motion::Transition::ALL.len())];
+    e.outro = crate::motion::Transition::ALL[r.below(crate::motion::Transition::ALL.len())];
+    e.intro_frames = r.pick(&[0usize, 1, 3, 1000]);
+    e.outro_frames = r.pick(&[0usize, 2, 1000]);
+    e.loop_spin = r.chance(0.3);
+    e.loop_float = r.chance(0.3);
+    e.loop_squash = r.chance(0.3);
+    e.loop_heartbeat = r.chance(0.3);
+    e.loop_blink = r.chance(0.3);
+    e.loop_reverse = r.chance(0.5);
+    e.loop_amount = r.pick(&[0.0, 50.0, 200.0, 1000.0]);
+    e.wave = r.chance(0.2);
+    e.wave_reverse = r.chance(0.5);
+    e.pixelate = r.chance(0.2);
+    e.pixelate_size = r.pick(&[0u32, 1, 2, 9, 100000]);
+    e.oil = r.chance(0.1);
+    e.oil_detail = r.pick(&[0u32, 2, 64, 1000]);
+    e.emboss = r.chance(0.2);
+    e.emboss_dir = r.pick(&[0u8, 3, 7, 200]);
+    e.emboss_colour = r.chance(0.5);
+    e.solarize = r.chance(0.2);
+    e.solarize_threshold = r.pick(&[-5.0, 0.0, 127.0, 255.0, 900.0]);
+    e.noise = r.chance(0.2);
+    e.noise_mono = r.chance(0.5);
+    e.noise_still = r.chance(0.5);
+    for (on, v) in [(&mut e.gotham, &mut e.gotham_amount), (&mut e.lomo, &mut e.lomo_amount), (&mut e.toaster, &mut e.toaster_amount), (&mut e.vignette, &mut e.vignette_amount)] {
+        *on = r.chance(0.2);
+        *v = r.pick(&[0.0, 40.0, 100.0, 300.0, -50.0]);
+    }
+    e
+}
+
 fn timing(r: &mut Rng, n: usize) -> crate::timeline::Timing {
     let mut t = crate::timeline::Timing::default();
     if r.chance(0.5) {
@@ -183,7 +242,7 @@ fn timing(r: &mut Rng, n: usize) -> crate::timeline::Timing {
     }
     if r.chance(0.4) {
         for _ in 0..r.below(4) {
-            t.keys.push(Key { frame: r.below(n + 4), x: r.pick(&[0.0, 30.0, -500.0]), y: r.pick(&[0.0, 12.0]), scale_x: r.pick(&[0.0, 50.0, 100.0, 400.0, -20.0]), scale_y: r.pick(&[0.0, 100.0, 250.0]), angle: r.pick(&[0.0, 90.0, 720.0]), opacity: r.pick(&[0.0, 50.0, 100.0, 300.0]), smooth: r.chance(0.5) });
+            t.keys.push(Key { frame: r.below(n + 4), x: r.pick(&[0.0, 30.0, -500.0]), y: r.pick(&[0.0, 12.0]), scale_x: r.pick(&[0.0, 50.0, 100.0, 400.0, -20.0]), scale_y: r.pick(&[0.0, 100.0, 250.0]), angle: r.pick(&[0.0, 90.0, 720.0]), opacity: r.pick(&[0.0, 50.0, 100.0, 300.0]), ease: crate::timeline::Ease::ALL[r.below(5)] });
         }
         t.sort_keys();
     }
@@ -222,9 +281,11 @@ fn case(seed: u64, stage: &Mutex<&'static str>) -> String {
         let id = st.push(kind);
         let tm = timing(&mut r, n);
         let vis = !r.chance(0.1);
+        let op = r.pick(&[100.0f32, 100.0, 50.0, 0.0, -10.0, 300.0]);
         if let Some(l) = st.layers.iter_mut().find(|l| l.id == id) {
             l.timing = tm;
             l.visible = vis;
+            l.opacity = op;
         }
     }
     let desc = format!("seed {seed}: {w}x{h} n={n} layers={:?}", st.layers.iter().map(|l| format!("{:?}", l.kind())).collect::<Vec<_>>());
@@ -266,6 +327,8 @@ fn case(seed: u64, stage: &Mutex<&'static str>) -> String {
         let img = st.render_frame(&base, &plan, &times, i, &fonts, &prep);
         assert!(img.width() > 0 && img.height() > 0, "empty frame");
     }
+    set("gpu");
+    gpu_check(&st, &base, &plan, &times, &fonts, &prep, &desc);
     set("proxy");
     if w > 4 && h > 4 {
         let s = 0.5;
@@ -294,12 +357,47 @@ fn case(seed: u64, stage: &Mutex<&'static str>) -> String {
     ];
     for (name, f) in fmts {
         set(name);
-        if shown == 0 {
+        // effects that turn the frame can still make it enormous; encoding
+        // those only finds out how much memory this machine has
+        if shown == 0 || flat.width() as u64 * flat.height() as u64 > 16_000_000 {
             continue;
         }
         let _ = crate::io::encode_preview(&flat, &f);
     }
     desc
+}
+
+thread_local! {
+    static FUZZ_GPU: std::cell::RefCell<Option<Option<crate::gpu_render::GpuRenderer>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The same frames on the graphics card (when there is one, FUZZ_GPU=1):
+/// they must come out the size the CPU makes them.
+#[allow(clippy::too_many_arguments)]
+fn gpu_check(st: &Stack, base: &Animation, plan: &[crate::stack::PlanFrame], times: &[f32], fonts: &[crate::text::FontEntry], prep: &crate::stack::Prepared, desc: &str) {
+    if std::env::var_os("FUZZ_GPU").is_none() {
+        return;
+    }
+    FUZZ_GPU.with(|g| {
+        let mut g = g.borrow_mut();
+        let gpu = g.get_or_insert_with(crate::gpu_render::GpuRenderer::headless);
+        let Some(gpu) = gpu.as_mut() else { return };
+        for i in 0..plan.len().min(4) {
+            let Some(job) = st.gpu_frame(base, plan, times, i, fonts, prep) else { continue };
+            let src = plan[i].src;
+            let frame = &base.frames[src].image;
+            if !job.fits(frame, gpu.max_side) {
+                continue;
+            }
+            // keys unique to this run: the renderer keeps pictures by key
+            static KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let key = KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tex = gpu.render(frame, key, &job, key);
+            let out = gpu.read(&tex);
+            let cpu = st.render_frame(base, plan, times, i, fonts, prep);
+            assert_eq!(out.dimensions(), cpu.dimensions(), "gpu size differs, frame {i}: {desc}");
+        }
+    });
 }
 
 #[test]
@@ -663,4 +761,358 @@ fn gpu_probe() {
     println!("h264 {:?}", crate::gpu::h264().map(|h| h.name));
     println!("av1 {:?}", crate::gpu::av1().map(|h| h.name));
     println!("summary {:?} in {:?}", crate::gpu::summary(), t0.elapsed());
+}
+
+/// The graphics card's frames against the CPU's, for every kind of layer and
+/// frame edit the card draws. Needs a GPU (or lavapipe).
+#[test]
+#[ignore]
+fn gpu_matches_cpu() {
+    use crate::stack::Transform;
+    let Some(mut gpu) = crate::gpu_render::GpuRenderer::headless() else {
+        println!("no GPU adapter");
+        return;
+    };
+    let fonts = crate::text::builtin_fonts();
+    let img = RgbaImage::from_fn(160, 120, |x, y| Rgba([(x * 255 / 160) as u8, (y * 2) as u8, ((x ^ y) * 3) as u8, if (x / 20 + y / 20) % 5 == 0 { 90 } else { 255 }]));
+    let base = Animation { frames: vec![Frame::new(img.clone(), 10), Frame::new(img, 10)], loop_count: None };
+    let t = |f: &dyn Fn(&mut Transform)| {
+        let mut t = Transform::default();
+        f(&mut t);
+        t
+    };
+    let mut cases: Vec<(&str, Transform, Vec<LayerKind>, Vec<crate::timeline::Key>)> = vec![
+        ("plain", Transform::default(), vec![], vec![]),
+        ("crop", t(&|t| (t.crop_on, t.crop) = (true, [20, 10, 100, 70])), vec![], vec![]),
+        ("resize down", t(&|t| (t.resize_on, t.rs_pct) = (true, 50.0)), vec![], vec![]),
+        ("resize up", t(&|t| (t.resize_on, t.rs_pct) = (true, 175.0)), vec![], vec![]),
+        ("fit pad", t(&|t| (t.resize_on, t.rs_w, t.rs_h, t.rs_mode) = (true, 120, 120, crate::ops::AspectMode::FitPad)), vec![], vec![]),
+        ("centre crop", t(&|t| (t.resize_on, t.rs_w, t.rs_h, t.rs_mode) = (true, 90, 90, crate::ops::AspectMode::CenterCrop)), vec![], vec![]),
+        ("flip + 90", t(&|t| (t.rot_on, t.flip_h, t.rot) = (true, true, 90)), vec![], vec![]),
+        ("turn 30 bg", t(&|t| (t.rot_on, t.rot_any, t.rot_deg, t.rot_expand, t.rot_bg_transparent) = (true, true, 30.0, true, false)), vec![], vec![]),
+        ("pad", t(&|t| (t.pad_on, t.pad, t.pad_transparent) = (true, [10, 0, 20, 5], false)), vec![], vec![]),
+    ];
+    let text = crate::text::Annotation { text: "Hello GPU".into(), size: 28.0, x: 10, y: 20, color: [255, 255, 0, 255], border: crate::text::Border::Light, ..Default::default() };
+    let shape = crate::shapes::ShapeSettings { x: 60, y: 30, w: 60, h: 40, angle: 20.0, ..Default::default() };
+    let emoji = crate::shapes::EmojiSettings { x: 100, y: 60, w: 40, h: 40, ..Default::default() };
+    let ov = crate::overlay::OverlaySource { name: "o".into(), path: None, frames: vec![RgbaImage::from_fn(30, 20, |x, _| Rgba([255, (x * 8) as u8, 0, 200]))], delays: vec![10] };
+    let overlay = LayerKind::Overlay(crate::stack::OverlayLayer { src: Arc::new(ov), placements: vec![crate::overlay::Placement { enabled: true, x: 20, y: 50, w: 60, h: 40, angle: 25.0 }; 2], opacity: 80.0 });
+    let layers = || vec![LayerKind::Text(text.clone()), LayerKind::Shape(Box::new(shape.clone())), LayerKind::Emoji(Box::new(emoji.clone())), overlay.clone()];
+    cases.push(("layers", Transform::default(), layers(), vec![]));
+    cases.push(("layers + turn", t(&|t| (t.rot_on, t.rot_any, t.rot_deg) = (true, true, -15.0)), layers(), vec![]));
+    cases.push(("layers + resize", t(&|t| (t.resize_on, t.rs_pct) = (true, 60.0)), layers(), vec![]));
+    let mk = crate::timeline::Key { frame: 0, x: 15.0, y: -5.0, scale_x: 150.0, scale_y: 80.0, angle: 30.0, opacity: 60.0, ease: crate::timeline::Ease::Linear };
+    cases.push(("motion", Transform::default(), layers(), vec![mk]));
+    let one = |k: usize| vec![layers().remove(k)];
+    for (k, nm) in ["text", "shape", "emoji", "overlay"].iter().enumerate() {
+        cases.push((Box::leak(format!("turn+{nm}").into_boxed_str()), t(&|t| (t.rot_on, t.rot_any, t.rot_deg) = (true, true, -15.0)), one(k), vec![]));
+        cases.push((Box::leak(format!("motion {nm}").into_boxed_str()), Transform::default(), one(k), vec![mk]));
+    }
+    cases.push(("motion text", Transform::default(), vec![LayerKind::Text(text.clone())], vec![mk]));
+    cases.push(("move text", Transform::default(), vec![LayerKind::Text(text.clone())], vec![crate::timeline::Key { scale_x: 100.0, scale_y: 100.0, angle: 0.0, opacity: 100.0, ..mk }]));
+    cases.push(("scale text", Transform::default(), vec![LayerKind::Text(text.clone())], vec![crate::timeline::Key { x: 0.0, y: 0.0, angle: 0.0, opacity: 100.0, ..mk }]));
+    cases.push(("turn text", Transform::default(), vec![LayerKind::Text(text.clone())], vec![crate::timeline::Key { x: 0.0, y: 0.0, scale_x: 100.0, scale_y: 100.0, opacity: 100.0, ..mk }]));
+    cases.push(("fade shape", Transform::default(), vec![LayerKind::Shape(Box::new(shape.clone()))], vec![crate::timeline::Key { x: 0.0, y: 0.0, scale_x: 100.0, scale_y: 100.0, angle: 0.0, ..mk }]));
+    let mut cap = text.clone();
+    cap.caption = crate::text::Caption::Bottom;
+    cases.push(("caption", Transform::default(), vec![LayerKind::Text(cap)], vec![]));
+    let mut wm = crate::effects::WatermarkSettings::default();
+    wm.tiled = true;
+    cases.push(("watermark tiled", Transform::default(), vec![LayerKind::Watermark(Box::new(wm))], vec![]));
+    // every effect, alone, then a few together
+    use crate::booth::BoothFx;
+    use crate::effects::EffectSettings as E;
+    use crate::motion::Transition as Tr;
+    let fx = |f: &dyn Fn(&mut E)| {
+        let mut e = E::default();
+        f(&mut e);
+        LayerKind::Effects(Box::new(e))
+    };
+    let mut fxc: Vec<(String, LayerKind)> = vec![
+        ("fx modulate".into(), fx(&|e| (e.hue, e.saturation, e.lightness) = (140.0, 150.0, 90.0))),
+        ("fx bright contrast".into(), fx(&|e| (e.brightness, e.contrast) = (20.0, 30.0))),
+        ("fx rc white".into(), fx(&|e| (e.rc_white, e.rc_fuzz) = (true, 30.0))),
+        ("fx rc custom edges".into(), fx(&|e| (e.rc_custom, e.rc_color, e.rc_fuzz, e.rc_edge_px) = (true, [128, 60, 90], 25.0, 3))),
+        ("fx rc black no edge".into(), fx(&|e| (e.rc_black, e.rc_fuzz, e.rc_clean_edges) = (true, 20.0, false))),
+        ("fx grayscale".into(), fx(&|e| e.grayscale = true)),
+        ("fx sepia".into(), fx(&|e| e.sepia = true)),
+        ("fx monochrome".into(), fx(&|e| e.monochrome = true)),
+        ("fx negative".into(), fx(&|e| e.negative = true)),
+        ("fx tint".into(), fx(&|e| e.tint = true)),
+        ("fx blur".into(), fx(&|e| e.blur = true)),
+        ("fx blur 7".into(), fx(&|e| (e.blur, e.blur_sigma) = (true, 7.0))),
+        ("fx sharpen".into(), fx(&|e| (e.sharpen, e.sharpen_sigma) = (true, 1.5))),
+        ("fx oil".into(), fx(&|e| e.oil = true)),
+        ("fx oil 9".into(), fx(&|e| (e.oil, e.oil_radius) = (true, 9))),
+        ("fx emboss".into(), fx(&|e| e.emboss = true)),
+        ("fx posterize".into(), fx(&|e| e.posterize = true)),
+        ("fx solarize".into(), fx(&|e| e.solarize = true)),
+        ("fx noise".into(), fx(&|e| e.noise = true)),
+        ("fx swirl".into(), fx(&|e| e.swirl = true)),
+        ("fx implode".into(), fx(&|e| e.implode = true)),
+        ("fx wave".into(), fx(&|e| e.wave = true)),
+        ("fx gotham".into(), fx(&|e| e.gotham = true)),
+        ("fx lomo".into(), fx(&|e| e.lomo = true)),
+        ("fx nashville".into(), fx(&|e| e.nashville = true)),
+        ("fx toaster".into(), fx(&|e| e.toaster = true)),
+        ("fx vignette".into(), fx(&|e| e.vignette = true)),
+        ("fx ordered dither".into(), fx(&|e| e.ordered_dither = true)),
+        ("fx change bg".into(), fx(&|e| (e.change_bg, e.bg_color) = (true, [20, 200, 90]))),
+        ("fx flip v".into(), fx(&|e| e.flip_v = true)),
+        ("fx flip h".into(), fx(&|e| e.flip_h = true)),
+        ("fx rot90".into(), fx(&|e| e.rot90 = true)),
+        ("fx rot270".into(), fx(&|e| e.rot270 = true)),
+        ("fx rot any".into(), fx(&|e| (e.rot_any, e.rot_deg) = (true, 30.0))),
+        ("fx camera".into(), fx(&|e| e.frame_camera = true)),
+        ("fx fuzzy".into(), fx(&|e| e.frame_fuzzy = true)),
+        ("fx rounded".into(), fx(&|e| e.frame_rounded = true)),
+        ("fx polaroid".into(), fx(&|e| e.polaroid = true)),
+        ("fx border".into(), fx(&|e| e.frame_border = true)),
+        ("fx counter".into(), fx(&|e| e.counter = true)),
+        ("fx shake".into(), fx(&|e| e.loop_shake = true)),
+        ("fx pulse".into(), fx(&|e| (e.loop_pulse, e.loop_cycles) = (true, 3))),
+        ("fx hop".into(), fx(&|e| (e.loop_hop, e.loop_cycles) = (true, 3))),
+        ("fx wobble".into(), fx(&|e| (e.loop_wobble, e.loop_cycles) = (true, 3))),
+        ("fx rainbow".into(), fx(&|e| (e.loop_rainbow, e.loop_cycles) = (true, 3))),
+        ("fx glitch".into(), fx(&|e| (e.loop_glitch, e.loop_amount) = (true, 200.0))),
+    ];
+    for b in BoothFx::LOOKS.iter().chain(BoothFx::DISTORT.iter()) {
+        let b = *b;
+        fxc.push((format!("booth {}", b.label()), fx(&move |e| (e.booth, e.booth_amount, e.booth_cx, e.booth_cy) = (b, 70.0, 40.0, 60.0))));
+    }
+    fxc.push(("warp + booth".into(), fx(&|e| (e.booth, e.warp) = (BoothFx::Comic, BoothFx::Twirl))));
+    use crate::booth::BoothItem;
+    let item = |fx: BoothFx, amount: f32, reverse: bool| BoothItem { fx, amount, cx: 40.0, cy: 60.0, reverse };
+    for b in BoothFx::DISTORT.iter() {
+        let b = *b;
+        fxc.push((format!("warp {} 250", b.label()), fx(&move |e| e.warps = vec![item(b, 250.0, false)])));
+        fxc.push((format!("warp {} reversed", b.label()), fx(&move |e| e.warps = vec![item(b, 80.0, true)])));
+    }
+    fxc.push(("looks stacked".into(), fx(&move |e| e.looks = vec![item(BoothFx::Comic, 60.0, false), item(BoothFx::Thermal, 40.0, false)])));
+    fxc.push(("warps stacked".into(), fx(&move |e| e.warps = vec![item(BoothFx::Twirl, 120.0, false), item(BoothFx::Bulge, 70.0, false), item(BoothFx::Mirror, 50.0, true)])));
+    fxc.push(("wave reversed".into(), fx(&|e| (e.wave, e.wave_reverse) = (true, true))));
+    for (nm, f) in [("gotham", 0usize), ("lomo", 1), ("nashville", 2), ("toaster", 3), ("vignette", 4)] {
+        fxc.push((format!("fx {nm} 40%"), fx(&move |e| match f {
+            0 => (e.gotham, e.gotham_amount) = (true, 40.0),
+            1 => (e.lomo, e.lomo_amount) = (true, 40.0),
+            2 => (e.nashville, e.nashville_amount) = (true, 40.0),
+            3 => (e.toaster, e.toaster_amount) = (true, 40.0),
+            _ => (e.vignette, e.vignette_amount) = (true, 40.0),
+        })));
+    }
+    fxc.push(("fx oil detail".into(), fx(&|e| (e.oil, e.oil_detail) = (true, 50))));
+    fxc.push(("fx emboss dir".into(), fx(&|e| (e.emboss, e.emboss_dir, e.emboss_amount) = (true, 3, 60.0))));
+    fxc.push(("fx emboss colour".into(), fx(&|e| (e.emboss, e.emboss_dir, e.emboss_colour) = (true, 6, true))));
+    fxc.push(("fx solarize rev".into(), fx(&|e| (e.solarize, e.solarize_threshold, e.solarize_reverse) = (true, 80.0, true))));
+    fxc.push(("fx noise mono".into(), fx(&|e| (e.noise, e.noise_mono, e.noise_still) = (true, true, true))));
+    fxc.push(("fx pixelate".into(), fx(&|e| (e.pixelate, e.pixelate_size) = (true, 7))));
+    fxc.push(("fx heartbeat".into(), fx(&|e| (e.loop_heartbeat, e.loop_amount) = (true, 150.0))));
+    fxc.push(("fx squash float".into(), fx(&|e| (e.loop_squash, e.loop_float, e.loop_reverse) = (true, true, true))));
+    fxc.push(("fx spin".into(), fx(&|e| e.loop_spin = true)));
+    fxc.push(("fx blink rev".into(), fx(&|e| (e.loop_blink, e.loop_reverse) = (true, true))));
+    fxc.push(("intro long".into(), fx(&|e| (e.intro, e.intro_frames) = (Tr::Iris, 6))));
+    for pos in 0..4u8 {
+        fxc.push((format!("counter {pos}"), fx(&move |e| (e.counter, e.counter_pos, e.counter_size) = (true, pos, 12.0))));
+    }
+    for t in Tr::ALL.iter().skip(1) {
+        let t = *t;
+        fxc.push((format!("intro {}", t.label()), fx(&move |e| (e.intro, e.fade_frames) = (t, 3))));
+        fxc.push((format!("outro {} clear", t.label()), fx(&move |e| (e.outro, e.fade_frames, e.fade_to_transparent) = (t, 2, true))));
+    }
+    fxc.push(("fx combo".into(), fx(&|e| (e.sepia, e.blur, e.vignette, e.frame_rounded, e.polaroid, e.loop_wobble) = (true, true, true, true, true, true))));
+    fxc.push(("fx combo 2".into(), fx(&|e| (e.contrast, e.posterize, e.rot90, e.frame_border, e.noise, e.counter) = (40.0, true, true, true, true, true))));
+    for (nm, l) in fxc {
+        cases.push((Box::leak(nm.into_boxed_str()), Transform::default(), vec![l], vec![]));
+    }
+    let cen = |m: crate::effects::CensorMethod, angle: f32| LayerKind::Censor(crate::effects::CensorSettings { x: 30, y: 20, w: 70, h: 50, method: m, angle, ..Default::default() });
+    for (nm, m) in [("solid", crate::effects::CensorMethod::Solid), ("blur", crate::effects::CensorMethod::Blur), ("pixelate", crate::effects::CensorMethod::Pixelate)] {
+        cases.push((Box::leak(format!("censor {nm}").into_boxed_str()), Transform::default(), vec![cen(m, 0.0)], vec![]));
+        cases.push((Box::leak(format!("censor {nm} turned").into_boxed_str()), Transform::default(), vec![cen(m, 25.0)], vec![]));
+    }
+    let sh = crate::effects::ShieldSettings::default();
+    cases.push(("shield", Transform::default(), vec![LayerKind::Shield(sh.clone())], vec![]));
+    cases.push(("shield jitter", Transform::default(), vec![LayerKind::Shield(crate::effects::ShieldSettings { jitter: true, per_frame: true, strength: 12.0, ..sh.clone() })], vec![]));
+    // layers on both sides of an effect that changes the size
+    cases.push(("polaroid + text", t(&|t| (t.resize_on, t.rs_pct) = (true, 80.0)), vec![LayerKind::Shape(Box::new(shape.clone())), fx(&|e| (e.polaroid, e.swirl) = (true, true)), LayerKind::Text(text.clone())], vec![]));
+    cases.push(("fade effect", Transform::default(), vec![fx(&|e| (e.negative, e.rot90) = (true, false))], vec![crate::timeline::Key { x: 0.0, y: 0.0, scale_x: 100.0, scale_y: 100.0, angle: 0.0, ..mk }]));
+    cases.push(("censor moved", Transform::default(), vec![cen(crate::effects::CensorMethod::Pixelate, 10.0)], vec![crate::timeline::Key { opacity: 100.0, ..mk }]));
+    cases.push(("fx + turn frame", t(&|t| (t.rot_on, t.rot_any, t.rot_deg) = (true, true, 20.0)), vec![fx(&|e| (e.oil, e.frame_fuzzy) = (true, true))], vec![]));
+    let only = std::env::var("GPU_ONLY").ok();
+    for (ci, (name, tr, ls, keys)) in cases.into_iter().enumerate() {
+        if let Some(o) = &only {
+            if !name.contains(o.as_str()) {
+                continue;
+            }
+        }
+        let mut st = Stack::default();
+        st.transform = tr;
+        for k in ls {
+            let id = st.push(k);
+            if !keys.is_empty() {
+                st.layers.iter_mut().find(|l| l.id == id).unwrap().timing.keys = keys.clone();
+            }
+        }
+        st.layout_text(160, 120, &fonts);
+        let plan = st.plan(&base);
+        let times = crate::stack::plan_times(&plan);
+        let prep = st.prepare(&base, &fonts);
+        let cpu = st.render_frame(&base, &plan, &times, 0, &fonts, &prep);
+        let Some(job) = st.gpu_frame(&base, &plan, &times, 0, &fonts, &prep) else {
+            println!("{name:18} not on the GPU");
+            continue;
+        };
+        let tex = gpu.render(&base.frames[0].image, 1, &job, ci as u64 + 1);
+        let g = gpu.read(&tex);
+        if g.dimensions() != cpu.dimensions() {
+            println!("{name:18} SIZE gpu {:?} cpu {:?}", g.dimensions(), cpu.dimensions());
+            continue;
+        }
+        // premultiplied difference, so colour under full transparency doesn't count
+        let (mut sum, mut max, mut bad) = (0f64, 0i32, 0usize);
+        for (a, b) in g.pixels().zip(cpu.pixels()) {
+            let mut worst = 0;
+            for c in 0..4 {
+                let pa = if c == 3 { a[3] as i32 } else { a[c] as i32 * a[3] as i32 / 255 };
+                let pb = if c == 3 { b[3] as i32 } else { b[c] as i32 * b[3] as i32 / 255 };
+                worst = worst.max((pa - pb).abs());
+            }
+            sum += worst as f64;
+            max = max.max(worst);
+            if worst > 24 {
+                bad += 1;
+            }
+        }
+        let npx = (g.width() * g.height()) as f64;
+        println!("{name:18} mean {:5.2}  max {max:3}  off {:5.2}%", sum / npx, bad as f64 * 100.0 / npx);
+        if let Ok(dir) = std::env::var("GPU_OUT") {
+            let mut both = RgbaImage::new(g.width() * 2, g.height());
+            image::imageops::overlay(&mut both, &cpu, 0, 0);
+            image::imageops::overlay(&mut both, &g, g.width() as i64, 0);
+            both.save(format!("{dir}/gpu_{}.png", name.replace(' ', "_"))).unwrap();
+        }
+    }
+}
+
+/// Whole-animation flatten (what export and the compressed preview use) on
+/// the graphics card against the CPU, with timings. Needs a GPU or lavapipe.
+#[test]
+#[ignore]
+fn gpu_flatten_matches_cpu() {
+    use crate::effects::EffectSettings as E;
+    let fonts = crate::text::builtin_fonts();
+    let (w, h, n) = (320u32, 240u32, 24usize);
+    let frames = (0..n)
+        .map(|k| Frame::new(RgbaImage::from_fn(w, h, |x, y| Rgba([((x + k as u32 * 7) % 256) as u8, (y * 255 / h) as u8, ((x ^ y) % 256) as u8, if (x / 40 + y / 40) % 7 == 0 { 120 } else { 255 }])), 6))
+        .collect();
+    let base = Animation { frames, loop_count: None };
+    let mut st = Stack::default();
+    st.transform.resize_on = true;
+    st.transform.rs_pct = 90.0;
+    let fx = E { sepia: true, blur: true, swirl: true, vignette: true, polaroid: true, loop_wobble: true, intro: crate::motion::Transition::Iris, ..E::default() };
+    st.push(LayerKind::Effects(Box::new(fx)));
+    st.push(LayerKind::Text(crate::text::Annotation { text: "Export".into(), size: 30.0, x: 20, y: 30, color: [255, 255, 255, 255], ..Default::default() }));
+    st.push(LayerKind::Censor(crate::effects::CensorSettings { x: 150, y: 80, w: 80, h: 60, angle: 15.0, ..Default::default() }));
+    st.push(LayerKind::Shield(crate::effects::ShieldSettings::default()));
+    let t0 = std::time::Instant::now();
+    let cpu = st.flatten(&base, &fonts, None);
+    let tc = t0.elapsed();
+    let Some((r, name)) = crate::gpu_render::GpuRenderer::headless_named() else {
+        println!("no GPU adapter");
+        return;
+    };
+    crate::gpu_render::set_shared(r, name.clone());
+    let _ = st.flatten(&base, &fonts, None); // shaders warm up
+    let t0 = std::time::Instant::now();
+    let gpu = st.flatten(&base, &fonts, None);
+    let tg = t0.elapsed();
+    assert_eq!(cpu.len(), gpu.len());
+    let (mut worst, mut sum, mut px) = (0i32, 0f64, 0f64);
+    for (a, b) in cpu.frames.iter().zip(&gpu.frames) {
+        assert_eq!(a.image.dimensions(), b.image.dimensions());
+        assert_eq!(a.delay_cs, b.delay_cs);
+        for (p, q) in a.image.pixels().zip(b.image.pixels()) {
+            let mut d = 0;
+            for c in 0..4 {
+                let (pa, qa) = if c == 3 { (p[3] as i32, q[3] as i32) } else { (p[c] as i32 * p[3] as i32 / 255, q[c] as i32 * q[3] as i32 / 255) };
+                d = d.max((pa - qa).abs());
+            }
+            worst = worst.max(d);
+            sum += d as f64;
+            px += 1.0;
+        }
+    }
+    println!("{name}: cpu {tc:?}, gpu {tg:?}; mean {:.3} max {worst}", sum / px);
+    assert!(sum / px < 1.0, "frames drift from the CPU");
+}
+
+
+/// Ctrl+wheel reaches egui as a zoom factor, not a scroll (the timeline
+/// zooms from `zoom_delta`).
+#[test]
+fn ctrl_wheel_is_zoom() {
+    use eframe::egui;
+    let ctx = egui::Context::default();
+    let mut seen = (1.0f32, egui::Vec2::ZERO);
+    for k in 0..3 {
+        let mut raw = egui::RawInput::default();
+        raw.time = Some(k as f64 * 0.05);
+        if k == 1 {
+            raw.events.push(egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Line, delta: egui::vec2(0.0, 1.0), phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel, modifiers: egui::Modifiers::CTRL });
+        }
+        let _ = ctx.run_ui(raw, |ui| {
+            let z = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta()));
+            if z.0 != 1.0 {
+                seen = z;
+            }
+        });
+    }
+    assert!(seen.0 > 1.0, "Ctrl+wheel should zoom, got {seen:?}");
+    assert_eq!(seen.1, egui::Vec2::ZERO, "and not scroll");
+    println!("Ctrl+wheel: zoom factor {}", seen.0);
+}
+
+/// Markers, locks, keyframe easing and GIF splits survive a save.
+#[test]
+fn timeline_bits_round_trip() {
+    use crate::project::{FrameMeta, ProjectFile};
+    use crate::timeline::{Ease, Key, Marker};
+    let mut f = ProjectFile::default();
+    f.markers = vec![Marker { frame: 4, label: "Intro".into() }];
+    f.frames = vec![FrameMeta { delay: 5, enabled: true, cut: false, blank: false }, FrameMeta { delay: 5, enabled: true, cut: true, blank: true }];
+    let json = serde_json::to_string(&f).unwrap();
+    let back: ProjectFile = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.markers, f.markers);
+    assert!(back.frames[1].cut && !back.frames[0].cut);
+    let k = Key { frame: 3, ease: Ease::Hold, ..Default::default() };
+    let k2: Key = serde_json::from_str(&serde_json::to_string(&k).unwrap()).unwrap();
+    assert_eq!(k2.ease, Ease::Hold);
+    // older files: smooth true / false
+    let old: Key = serde_json::from_str(r#"{"frame":1,"smooth":false}"#).unwrap();
+    assert_eq!(old.ease, Ease::Linear);
+    // a hold key keeps its value until the next one
+    let mut t = crate::timeline::Timing::default();
+    t.keys = vec![Key { frame: 0, x: 0.0, ease: Ease::Hold, ..Default::default() }, Key { frame: 10, x: 100.0, ..Default::default() }];
+    assert_eq!(t.motion(9).dx, 0.0);
+    assert_eq!(t.motion(10).dx, 100.0);
+}
+
+/// A layer added after the layer data was prepared (a panel adding one
+/// mid-frame) renders instead of reading past the end.
+#[test]
+fn stale_prepared_layers() {
+    let fonts = crate::text::builtin_fonts();
+    let img = RgbaImage::from_pixel(40, 30, Rgba([10, 200, 30, 255]));
+    let mut base = Animation { frames: vec![Frame::new(img.clone(), 10), Frame::new(img.clone(), 10), Frame::new(img, 10)], loop_count: None };
+    base.frames[1].blank = true;
+    let mut st = Stack::default();
+    st.push(LayerKind::Text(crate::text::Annotation { text: "hi".into(), ..Default::default() }));
+    let prep = st.prepare(&base, &fonts);
+    st.push(LayerKind::Effects(Box::new(crate::effects::EffectSettings { anim: true, counter: true, ..Default::default() })));
+    let plan = st.plan(&base);
+    let times = crate::stack::plan_times(&plan);
+    for i in 0..plan.len() {
+        let f = st.render_frame(&base, &plan, &times, i, &fonts, &prep);
+        assert_eq!(f.dimensions(), (40, 30));
+        assert!(st.gpu_frame(&base, &plan, &times, i, &fonts, &prep).is_none());
+    }
 }

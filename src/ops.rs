@@ -381,7 +381,7 @@ pub fn crossfade(anim: &Animation, steps: usize, wrap: bool) -> Animation {
         out.push(base);
         for s in 1..=steps {
             let t = s as f32 / (steps + 1) as f32;
-            out.push(Frame { image: std::sync::Arc::new(lerp_image(&f.image, &next.image, t)), delay_cs: d, enabled: f.enabled });
+            out.push(Frame { image: std::sync::Arc::new(lerp_image(&f.image, &next.image, t)), delay_cs: d, enabled: f.enabled, cut: false, blank: false });
         }
     }
     Animation { frames: out, loop_count: anim.loop_count }

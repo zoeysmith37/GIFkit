@@ -45,11 +45,13 @@ enum Tool {
     Markup,
     Emoji,
     Presets,
+    Animation,
 }
 
 impl Tool {
-    const ALL: [Tool; 18] = [
+    const ALL: [Tool; 19] = [
         Tool::Effects,
+        Tool::Animation,
         Tool::Text,
         Tool::Shapes,
         Tool::Emoji,
@@ -88,6 +90,7 @@ impl Tool {
             Tool::Markup => "Markup",
             Tool::Emoji => "Emoji",
             Tool::Presets => "Presets",
+            Tool::Animation => "Animation",
         }
     }
     /// Breeze icon name.
@@ -111,6 +114,7 @@ impl Tool {
             Tool::Markup => "draw-freehand",
             Tool::Emoji => "smiley",
             Tool::Presets => "bookmarks",
+            Tool::Animation => "animation-stage",
         }
     }
     fn tip(self) -> &'static str {
@@ -133,6 +137,7 @@ impl Tool {
             Tool::Emoji => "Emoji stickers",
             Tool::Markup => "Draw and highlight with a pen",
             Tool::Presets => "Save edits to reuse on other files",
+            Tool::Animation => "Intros, outros, looping motion and a timer",
         }
     }
     fn title(self) -> &'static str {
@@ -148,6 +153,7 @@ impl Tool {
     fn layer_kind(self) -> Option<Kind> {
         match self {
             Tool::Effects => Some(Kind::Effects),
+            Tool::Animation => Some(Kind::Animation),
             Tool::Text => Some(Kind::Text),
             Tool::Censor => Some(Kind::Censor),
             Tool::AddImage => Some(Kind::Overlay),
@@ -168,6 +174,7 @@ impl Tool {
 fn kind_tool(k: Kind) -> Tool {
     match k {
         Kind::Effects => Tool::Effects,
+        Kind::Animation => Tool::Animation,
         Kind::Text => Tool::Text,
         Kind::Censor => Tool::Censor,
         Kind::Overlay => Tool::AddImage,
@@ -328,6 +335,44 @@ struct Snapshot {
     gif: GifOptions,
     /// the edit made after this state (shown in History)
     label: String,
+}
+
+/// A picture to show: one egui made from pixels, or one the graphics card
+/// rendered (kept alive by the cache that owns it).
+#[derive(Clone)]
+struct Tex {
+    id: egui::TextureId,
+    size: Vec2,
+}
+
+impl Tex {
+    fn id(&self) -> egui::TextureId {
+        self.id
+    }
+    fn size_vec2(&self) -> Vec2 {
+        self.size
+    }
+}
+
+impl From<TextureHandle> for Tex {
+    fn from(t: TextureHandle) -> Tex {
+        // the handle's cache keeps the texture; egui frees it when the cache drops it
+        Tex { id: t.id(), size: t.size_vec2() }
+    }
+}
+
+/// Graphics memory the views' rendered frames may hold.
+const GPU_FRAMES_BUDGET: usize = 512 << 20;
+
+/// Frames the graphics card rendered for the views, registered with egui.
+struct GpuFrames {
+    key: u64,
+    map: HashMap<usize, (eframe::wgpu::Texture, egui::TextureId, u64)>,
+    /// the frame last put on screen, kept after its key went stale so the
+    /// view never shows a freed texture while the new one is made
+    shown: Option<(eframe::wgpu::Texture, egui::TextureId)>,
+    bytes: usize,
+    tick: u64,
 }
 
 /// Frame thumbnails, made in the background and only for frames someone
@@ -664,6 +709,8 @@ pub struct GifKitApp {
 
     stack: Stack,
     fx_draft: EffectSettings,
+    /// the Animation panel's settings before its layer exists
+    anim_draft: EffectSettings,
     sel: HashMap<&'static str, u64>,
 
     plan: Vec<PlanFrame>,
@@ -745,6 +792,10 @@ pub struct GifKitApp {
     // layout
     sidebar_compact: bool,
     layers_collapsed: bool,
+    /// the layer panel's height when open, to slide back to
+    layers_open_h: f32,
+    /// the timeline's height when shown, to slide back to
+    timeline_open_h: f32,
     layer_drag: Option<u64>,
     export_open: bool,
     export_fmt: ExportFormat,
@@ -765,7 +816,11 @@ pub struct GifKitApp {
     committed: Option<(u64, Stack, GifOptions)>,
     pending_sig: u64,
     commit_since: f64,
-    last_comp: Option<(usize, TextureHandle)>,
+    last_comp: Option<(usize, Tex)>,
+    /// rendering on the graphics card, when the window draws with wgpu
+    gpu: Option<(crate::gpu_render::GpuRenderer, std::sync::Arc<egui::mutex::RwLock<eframe::egui_wgpu::Renderer>>)>,
+    gpu_frames: GpuFrames,
+
     last_tick: Option<f64>,
     /// while playing, the original view keeps its own time (seconds into
     /// the original), so cut or skipped frames in the edit don't make it jump
@@ -805,6 +860,51 @@ pub struct GifKitApp {
     show_timeline: bool,
     /// pixels per frame (0 fits the whole animation)
     tl_zoom: f32,
+    /// pixels per frame that fit the whole animation, and the zoom now (last drawn)
+    tl_fit: f32,
+    tl_zoom_now: f32,
+    /// a zoom the toolbar asked for, applied about the playhead
+    tl_zoom_to: Option<f32>,
+    /// middle-button panning, and dragging the scroll bar (grab offset in frames)
+    tl_pan: bool,
+    tl_bar_drag: Option<f32>,
+    /// where a GIF clip being dragged would go (an output frame boundary)
+    tl_gif_drop: Option<usize>,
+    /// the track whose name was right-clicked (its menu is the layer's)
+    tl_menu_head: Option<u64>,
+    /// more selected clips besides the main one, as (track, first frame)
+    tl_sel: Vec<(u64, usize)>,
+    /// clips moving together: (track, clip index, first, last) when the drag began
+    tl_group: Vec<(u64, usize, usize, usize)>,
+    /// a rubber band selection started here
+    tl_box: Option<Pos2>,
+    /// copied clips or a keyframe
+    tl_board: Option<timeline_ui::TlBoard>,
+    /// snap edges and keys to things nearby while dragging; the frame snapped to
+    tl_snap: bool,
+    tl_snap_line: Option<usize>,
+    /// in and out points (output frames), and whether playback loops between them
+    tl_in: Option<usize>,
+    tl_out: Option<usize>,
+    tl_zone_loop: bool,
+    /// show only this layer in the live view
+    tl_solo: Option<u64>,
+    /// track heights, and the track whose bottom edge is being dragged
+    tl_gif_h: f32,
+    tl_row_h: f32,
+    tl_row_drag: Option<usize>,
+    /// a marker being moved, renamed, or right-clicked
+    tl_marker_drag: Option<usize>,
+    tl_marker_edit: Option<(usize, String)>,
+    tl_menu_marker: Option<usize>,
+    /// where the timeline is, and whether it was clicked last (Copy, Paste
+    /// and Duplicate then work on its clips rather than on layers)
+    tl_area: Rect,
+    tl_focus: bool,
+    /// layers Copy put aside
+    layer_board: Vec<stack::Layer>,
+    /// files or a browser picture from the last Ctrl+V
+    paste_in: Option<crate::paste::Pasted>,
     /// first frame shown, and how far the tracks are scrolled
     tl_x0: f32,
     tl_y0: f32,
@@ -834,6 +934,15 @@ pub struct GifKitApp {
     keymap: crate::keys::Keymap,
     /// the action whose new key is being waited for (shortcuts window)
     key_capture: Option<crate::keys::Action>,
+    /// the shortcuts dialog's search text
+    keys_filter: String,
+    /// the tool panel's search text, and the tool it was typed for
+    panel_find: String,
+    panel_find_tool: Option<Tool>,
+    /// the layer list's search text, and whether its box is showing
+    layer_find: String,
+    layer_find_open: bool,
+    layer_find_fresh: bool,
     /// previews of big pictures are made from frames shrunk to this long
     /// side (0 = always full size)
     preview_max: u32,
@@ -1072,6 +1181,23 @@ fn key_label(key: &str) -> String {
         "dup" | "duplicate" => "Duplicate frame".into(),
         "skip" | "toggle" => "Skip / enable frame".into(),
         "left" | "right" | "move" => "Move frame".into(),
+        "tl" => match key.trim_start_matches("tl-").chars().take_while(|c| c.is_ascii_alphabetic()).collect::<String>().as_str() {
+            "split" | "razor" => "Split clip".into(),
+            "del" => "Delete clip".into(),
+            "delkey" => "Delete keyframe".into(),
+            "add" => "Add clip".into(),
+            "key" | "keyedit" => "Keyframe".into(),
+            "drag" => "Move clip".into(),
+            "gifmove" => "Move frames".into(),
+            "join" => "Join clips".into(),
+            "reorder" => "Reorder layers".into(),
+            "lengthen" => "Make longer".into(),
+            "clearkeys" => "Clear keyframes".into(),
+            "full" => "Show on every frame".into(),
+            "marker" => "Marker".into(),
+            "lock" => "Lock layer".into(),
+            _ => "Timeline".into(),
+        },
         "" => "Edit".into(),
         w => {
             let mut c = w.chars();
@@ -1148,6 +1274,7 @@ fn describe_edit(os: &Stack, og: &GifOptions, ns: &Stack, ng: &GifOptions) -> St
                     let what = changed_fields(&o.kind, &l.kind);
                     let name = match l.kind() {
                         Kind::Effects => "Effects".to_string(),
+                        Kind::Animation => "Animation".to_string(),
                         _ => short(l),
                     };
                     parts.push(if what.is_empty() { format!("Edit {name}") } else { format!("{name}: {what}") });
@@ -1191,6 +1318,7 @@ fn describe_edit(os: &Stack, og: &GifOptions, ns: &Stack, ng: &GifOptions) -> St
 fn kind_key(k: Kind) -> &'static str {
     match k {
         Kind::Effects => "fx",
+        Kind::Animation => "anim",
         Kind::Text => "text",
         Kind::Censor => "censor",
         Kind::Overlay => "overlay",
@@ -1205,7 +1333,7 @@ fn kind_key(k: Kind) -> &'static str {
 // ---------------------------------------------------------------- Breeze-ish widgets
 
 /// A collapsible Breeze group box: clickable title row above a framed area.
-fn group<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> Option<R> {
+fn group<R>(ui: &mut egui::Ui, title: &str, add: impl FnMut(&mut egui::Ui) -> R) -> Option<R> {
     group_ex(ui, title, true, None, add)
 }
 
@@ -1221,13 +1349,34 @@ fn clear_group_command(ctx: &egui::Context) {
 }
 
 /// Collapsible group with a default state and an optional badge (e.g. number of active options).
-fn group_ex<R>(ui: &mut egui::Ui, title: &str, default_open: bool, badge: Option<String>, add: impl FnOnce(&mut egui::Ui) -> R) -> Option<R> {
+fn group_ex<R>(ui: &mut egui::Ui, title: &str, default_open: bool, badge: Option<String>, mut add: impl FnMut(&mut egui::Ui) -> R) -> Option<R> {
     // KDE settings pages are flat: a heading with a thin line under it, then the form
     let pal = *p();
     if title.is_empty() {
         let r = add(ui);
         ui.add_space(GROUP_GAP);
         return Some(r);
+    }
+    // searching: the group shows, open, if its title or anything in it matches
+    let mut forced = false;
+    let mut all = false;
+    if find_on() {
+        let probing = FIND.with(|f| f.borrow().probing);
+        if probing {
+            let all = find_matches(title);
+            if all {
+                find_note(title);
+            }
+            return Some(find_scoped(Some(""), all, false, || add(ui)));
+        }
+        all = find_matches(title);
+        if !all {
+            let (_, hit) = find_scoped(Some(""), false, false, || find_probe(ui, &mut add));
+            if !hit {
+                return None;
+            }
+        }
+        forced = true;
     }
     let id = ui.make_persistent_id(("grp", title));
     let cmd: Option<bool> = ui.ctx().data(|d| d.get_temp::<Option<bool>>(egui::Id::unique(GROUP_CMD))).flatten();
@@ -1236,10 +1385,12 @@ fn group_ex<R>(ui: &mut egui::Ui, title: &str, default_open: bool, badge: Option
         open = c;
     }
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
-    if resp.clicked() {
+    if resp.clicked() && !forced {
         open = !open;
     }
     ui.ctx().data_mut(|d| d.insert_persisted(id, open));
+    // open while it's a search result, without changing how it's left
+    let open = open || forced;
     let painter = ui.painter();
     let col = if resp.hovered() { pal.fg } else { pal.fg_muted };
     crate::icons::paint(painter, if open { "go-down" } else { "go-next" }, pos2(rect.left() + 8.0, rect.center().y), 16.0, col);
@@ -1252,13 +1403,37 @@ fn group_ex<R>(ui: &mut egui::Ui, title: &str, default_open: bool, badge: Option
     painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, pal.border));
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     let _ = resp;
-    if !open {
+    let t = theme::openness(ui.ctx(), id.with("anim"), open);
+    if t <= 0.0 {
         ui.add_space(6.0);
         return None;
     }
-    ui.add_space(8.0);
-    let r = add(ui);
-    ui.add_space(GROUP_GAP + 4.0);
+    let h_id = id.with("height");
+    let mut body = |ui: &mut egui::Ui| if forced { find_scoped(Some(""), all, false, || add(ui)) } else { add(ui) };
+    if t >= 1.0 {
+        ui.add_space(8.0);
+        let top = ui.cursor().top();
+        let r = body(ui);
+        let h = ui.cursor().top() - top;
+        ui.ctx().data_mut(|d| d.insert_temp(h_id, h));
+        ui.add_space(GROUP_GAP + 4.0);
+        return Some(r);
+    }
+    // sliding open or shut: the body drawn whole but clipped to the part showing
+    let full: f32 = ui.ctx().data(|d| d.get_temp(h_id)).unwrap_or(160.0);
+    let total = 8.0 + full + GROUP_GAP + 4.0;
+    let shown = (6.0 + (total - 6.0) * t).max(0.0);
+    let w = ui.available_width();
+    let at = ui.cursor().min;
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(at, vec2(w, total.max(1.0) + 2000.0))).layout(*ui.layout()));
+    child.set_clip_rect(Rect::from_min_size(at, vec2(w, shown)).intersect(ui.clip_rect()));
+    child.add_space(8.0);
+    let top = child.cursor().top();
+    let r = body(&mut child);
+    let h = child.cursor().top() - top;
+    ui.ctx().data_mut(|d| d.insert_temp(h_id, h));
+    ui.allocate_exact_size(vec2(w, shown), Sense::hover());
+    ui.ctx().request_repaint();
     Some(r)
 }
 
@@ -1304,6 +1479,9 @@ fn sel_btn<'a>(b: egui::Button<'a>, on: bool) -> egui::Button<'a> {
 fn seg_row<T: PartialEq + Copy>(ui: &mut egui::Ui, current: &mut T, items: &[(T, &str)]) -> egui::Response {
     let mut out: Option<egui::Response> = None;
     let labels: Vec<&str> = items.iter().map(|i| i.1).collect();
+    for l in &labels {
+        find_note(l);
+    }
     // rows wrap evenly rather than cutting labels short
     let min_w = label_w(ui, &labels);
     even_grid(ui, items.len(), min_w, |ui, i, size| {
@@ -1360,6 +1538,15 @@ fn label_w(ui: &egui::Ui, labels: &[&str]) -> f32 {
 
 /// Toggle buttons in even rows.
 fn toggle_grid(ui: &mut egui::Ui, min_w: f32, items: &mut [(&mut bool, &str, &str)]) {
+    FIND.with(|f| f.borrow_mut().choice = true);
+    // a search that matched some of these shows just those
+    if FIND.with(|f| f.borrow().items) {
+        let total = items.len();
+        let mut some: Vec<(&mut bool, &str, &str)> = items.iter_mut().filter(|i| find_matches(i.1)).map(|(b, l, t)| (&mut **b, *l, *t)).collect();
+        if !some.is_empty() && some.len() < total {
+            return find_scoped(None, false, false, || toggle_grid(ui, min_w, &mut some));
+        }
+    }
     let n = items.len();
     let labels: Vec<&str> = items.iter().map(|i| i.1).collect();
     let min_w = min_w.max(label_w(ui, &labels));
@@ -1558,7 +1745,203 @@ const FORM_LABEL_W: f32 = 86.0;
 /// One row of a KDE-style form: a right-aligned label in a fixed column on the
 /// left and the controls in a column that fills the rest. The controls get a
 /// vertical ui of a fixed width, so nothing in them can widen the panel.
-fn form_row<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+// ------------------------------------------------------------ panel search
+//
+// The search box over the tool panel filters its rows as they're drawn. A
+// row shows when its label matches, when the heading it sits under matches
+// (a group title or an effect's own sub-heading, so "squeeze" brings its
+// strength, reverse and centre along), or when anything inside it does (a
+// checkbox in a grid, say). For that last case the row is drawn once out of
+// sight to see what it holds, then for real if something matched.
+
+#[derive(Default)]
+struct Find {
+    /// lower case; empty: not searching
+    q: String,
+    /// drawing out of sight to see what matches
+    probing: bool,
+    hit: bool,
+    /// the sub-heading rows sit under
+    ctx: String,
+    /// the group's title matched: everything in it shows
+    group_all: bool,
+    /// grids show only their matching items
+    items: bool,
+    /// rows shown for the search so far
+    shown: usize,
+    /// a row in this group matched by something in it (a checkbox, say):
+    /// the settings after it go with it
+    follow: bool,
+    /// the row being probed is a set of on/off choices
+    choice: bool,
+}
+
+thread_local! {
+    static FIND: std::cell::RefCell<Find> = std::cell::RefCell::new(Find::default());
+}
+
+fn find_on() -> bool {
+    FIND.with(|f| !f.borrow().q.is_empty())
+}
+
+fn find_matches(text: &str) -> bool {
+    FIND.with(|f| {
+        let f = f.borrow();
+        !f.q.is_empty() && text.to_lowercase().contains(&f.q)
+    })
+}
+
+/// A piece of text in what's being drawn: while probing, a match counts.
+fn find_note(text: &str) {
+    if find_matches(text) {
+        FIND.with(|f| f.borrow_mut().hit = true);
+    }
+}
+
+/// Is a row with this label shown as it is (by its label or what it sits under)?
+fn find_row_shown(label: &str) -> bool {
+    let (on, probing, ctx, all) = FIND.with(|f| {
+        let f = f.borrow();
+        (!f.q.is_empty(), f.probing, f.ctx.clone(), f.group_all)
+    });
+    if !on {
+        return true;
+    }
+    let by = find_matches(label) || (!ctx.is_empty() && find_matches(&ctx)) || all;
+    if probing {
+        if by {
+            FIND.with(|f| f.borrow_mut().hit = true);
+        }
+        return true;
+    }
+    by
+}
+
+/// A row shown for real while searching.
+fn find_count() {
+    FIND.with(|f| {
+        let mut f = f.borrow_mut();
+        if !f.q.is_empty() && !f.probing {
+            f.shown += 1;
+        }
+    });
+}
+
+/// Draw without taking any room or showing anything.
+fn find_hidden<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let rect = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width().max(1.0), 2000.0));
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(*ui.layout()).invisible());
+    add(&mut child)
+}
+
+/// Draw out of sight and report whether anything in it matched.
+fn find_probe<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> (R, bool) {
+    let (r, hit, _) = find_probe_choice(ui, add);
+    (r, hit)
+}
+
+/// `find_probe`, also saying whether what was drawn is a grid of on/off choices.
+fn find_probe_choice<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> (R, bool, bool) {
+    let (was_p, was_h, was_c) = FIND.with(|f| {
+        let mut f = f.borrow_mut();
+        let w = (f.probing, f.hit, f.choice);
+        f.probing = true;
+        f.hit = false;
+        f.choice = false;
+        w
+    });
+    let r = find_hidden(ui, add);
+    let (hit, choice) = FIND.with(|f| {
+        let mut f = f.borrow_mut();
+        let h = (f.hit, f.choice);
+        f.probing = was_p;
+        f.hit = was_h || h.0;
+        f.choice = was_c;
+        h
+    });
+    (r, hit, choice)
+}
+
+fn find_follow() -> bool {
+    FIND.with(|f| {
+        let f = f.borrow();
+        !f.q.is_empty() && !f.probing && f.follow
+    })
+}
+
+/// Run `add` with the search's per-group state set, then put it back.
+fn find_scoped<R>(ctx: Option<&str>, all: bool, items: bool, add: impl FnOnce() -> R) -> R {
+    let old = FIND.with(|f| {
+        let mut f = f.borrow_mut();
+        let old = (f.ctx.clone(), f.group_all, f.items, f.follow);
+        if let Some(c) = ctx {
+            // a new group or heading: nothing to follow yet
+            f.ctx = c.to_string();
+            f.follow = false;
+        }
+        f.group_all = all;
+        f.items = items;
+        old
+    });
+    let r = add();
+    FIND.with(|f| {
+        let mut f = f.borrow_mut();
+        (f.ctx, f.group_all, f.items, f.follow) = old;
+    });
+    r
+}
+
+/// A search field with Breeze's find icon and a clear button.
+fn search_box(ui: &mut egui::Ui, text: &mut String, hint_text: &str, id: egui::Id) -> egui::Response {
+    let pal = *p();
+    let r = ui.add(egui::TextEdit::singleline(text).id(id).hint_text(hint_text).margin(egui::Margin { left: 26, right: 26, top: 4, bottom: 4 }).desired_width(ui.available_width()));
+    crate::icons::paint(ui.painter(), "edit-find", pos2(r.rect.left() + 13.0, r.rect.center().y), 16.0, pal.fg_muted);
+    if !text.is_empty() {
+        let cr = Rect::from_center_size(pos2(r.rect.right() - 13.0, r.rect.center().y), vec2(20.0, 20.0));
+        let c = ui.interact(cr, r.id.with("clear"), Sense::click()).on_hover_text("Clear");
+        crate::icons::paint(ui.painter(), "edit-clear", cr.center(), 16.0, if c.hovered() { pal.fg } else { pal.fg_muted });
+        if c.clicked() {
+            text.clear();
+        }
+    }
+    r
+}
+
+/// A form row: the label in its column, the controls beside it.
+fn form_row<R>(ui: &mut egui::Ui, label: &str, mut add: impl FnMut(&mut egui::Ui) -> R) -> R {
+    if find_row_shown(label) {
+        find_count();
+        return form_row_raw(ui, label, &mut add);
+    }
+    // not by its label: see whether anything in it matches
+    let (r, hit, choice) = find_probe_choice(ui, |ui| form_row_raw(ui, label, &mut add));
+    if !hit {
+        // after a match in this group its settings come along, but not
+        // other sets of choices
+        if find_follow() && !choice {
+            find_count();
+            return form_row_raw(ui, label, &mut add);
+        }
+        return r;
+    }
+    let all = FIND.with(|f| f.borrow().group_all);
+    find_count();
+    let r = find_scoped(None, all, true, || form_row_raw(ui, label, &mut add));
+    FIND.with(|f| f.borrow_mut().follow = true);
+    r
+}
+
+/// A form row shown only by its label (its controls can only be drawn once).
+fn form_row_once<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    if find_row_shown(label) || find_follow() {
+        find_count();
+        form_row_raw(ui, label, add)
+    } else {
+        find_hidden(ui, |ui| form_row_raw(ui, label, add))
+    }
+}
+
+fn form_row_raw<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
         let (r, _) = ui.allocate_exact_size(vec2(FORM_LABEL_W, CHIP_H), Sense::hover());
         if !label.is_empty() {
@@ -1686,7 +2069,7 @@ fn fill_slider(ui: &mut egui::Ui, s: egui::Slider<'_>) -> egui::Response {
 
 /// A labelled slider row.
 fn slider_row(ui: &mut egui::Ui, label: &str, s: egui::Slider<'_>) -> egui::Response {
-    form_row(ui, label, |ui| fill_slider(ui, s))
+    form_row_once(ui, label, |ui| fill_slider(ui, s))
 }
 
 /// Drop shadow switch and its look, greyed out while it's off.
@@ -1702,7 +2085,7 @@ fn shadow_rows(ui: &mut egui::Ui, on: &mut bool, sh: &mut crate::shapes::Shadow)
 
 /// A labelled row with an on/off checkbox; the rest stays in place and greys out when off.
 fn opt_row<R>(ui: &mut egui::Ui, label: &str, on: &mut bool, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    form_row(ui, label, |ui| {
+    form_row_once(ui, label, |ui| {
         ui.horizontal(|ui| {
             check(ui, on, "");
             let en = *on;
@@ -1747,6 +2130,7 @@ fn combo<T: PartialEq + Copy>(ui: &mut egui::Ui, id: &str, current: &mut T, item
 fn radio(ui: &mut egui::Ui, on: bool, text: impl Into<egui::WidgetText>) -> egui::Response {
     let pal = *p();
     let text: egui::WidgetText = text.into();
+    find_note(text.text());
     let d = 16.0;
     let gap = 7.0;
     let wrap_w = (ui.available_width() - d - gap).max(10.0);
@@ -1777,12 +2161,16 @@ fn radio(ui: &mut egui::Ui, on: bool, text: impl Into<egui::WidgetText>) -> egui
 fn check(ui: &mut egui::Ui, on: &mut bool, text: impl Into<egui::WidgetText>) -> egui::Response {
     let pal = *p();
     let text: egui::WidgetText = text.into();
+    find_note(text.text());
     let box_s = 16.0;
     let gap = 7.0;
     // long labels are cut short rather than pushing the panel wider
     let wrap_w = (ui.available_width() - box_s - gap).max(10.0);
     let galley = text.into_galley(ui, Some(egui::TextWrapMode::Truncate), wrap_w, egui::TextStyle::Body);
-    let size = vec2(box_s + gap + galley.size().x, galley.size().y.max(box_s).max(22.0));
+    // on its own in a form row it's as tall as the row, so it lines up with
+    // the row's label; in a row of other controls those centre it
+    let min_h = if ui.layout().is_horizontal() { 22.0 } else { CHIP_H };
+    let size = vec2(box_s + gap + galley.size().x, galley.size().y.max(box_s).max(min_h));
     let (rect, mut resp) = ui.allocate_exact_size(size, Sense::click());
     if resp.clicked() {
         *on = !*on;
@@ -2097,8 +2485,25 @@ fn small_icon(ui: &mut egui::Ui, icon: &str, tip: &str) -> bool {
 impl GifKitApp {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
         theme::install(&cc.egui_ctx);
+        if std::env::var_os("GIFKIT_PERF").is_some() {
+            match &cc.wgpu_render_state {
+                Some(rs) => eprintln!("renderer: wgpu on {:?} ({:?})", rs.adapter.get_info().name, rs.adapter.get_info().backend),
+                None => eprintln!("renderer: OpenGL"),
+            }
+        }
         if let Some(z) = theme::get_setting("ui_scale").and_then(|v| v.parse::<f32>().ok()).filter(|z| (0.5..=3.0).contains(z)) {
             cc.egui_ctx.set_zoom_factor(z);
+        }
+        // a renderer for background work (export, the compressed preview),
+        // on a device of its own: long jobs then never hold up the window's
+        // device (resizing waits for it to go idle). Made off the UI thread
+        // since the shaders compile first.
+        if std::env::var_os("GIFKIT_CPU_PREVIEW").is_none() {
+            std::thread::spawn(|| {
+                if let Some((r, name)) = crate::gpu_render::GpuRenderer::headless_named() {
+                    crate::gpu_render::set_shared(r, name);
+                }
+            });
         }
         theme::load_toolbar_choice();
         let theme_choice = match std::env::var("GIFKIT_THEME").as_deref() {
@@ -2122,6 +2527,7 @@ impl GifKitApp {
             last_coalesce: None,
             stack: Stack::default(),
             fx_draft: EffectSettings::default(),
+            anim_draft: EffectSettings { anim: true, ..Default::default() },
             sel: HashMap::new(),
             plan: Vec::new(),
             plan_times: Vec::new(),
@@ -2194,6 +2600,8 @@ impl GifKitApp {
             view_single: ViewSource::Edit,
             sidebar_compact: theme::get_setting("sidebar_compact").as_deref() != Some("0"),
             layers_collapsed: false,
+            layers_open_h: 380.0,
+            timeline_open_h: 270.0,
             layer_drag: None,
             export_open: false,
             export_fmt: ExportFormat::Gif,
@@ -2214,6 +2622,8 @@ impl GifKitApp {
             commit_since: 0.0,
             pending_sig: 0,
             last_comp: None,
+            gpu: cc.wgpu_render_state.as_ref().filter(|rs| std::env::var_os("GIFKIT_CPU_PREVIEW").is_none() && crate::gpu_render::worth_using(&rs.adapter.get_info())).map(|rs| (crate::gpu_render::GpuRenderer::new(rs.device.clone(), rs.queue.clone()), rs.renderer.clone())),
+            gpu_frames: GpuFrames { key: 0, map: HashMap::new(), shown: None, bytes: 0, tick: 0 },
             last_tick: None,
             orig_clock: 0.0,
             resize_by_pct: true,
@@ -2238,6 +2648,33 @@ impl GifKitApp {
             win_title: String::new(),
             show_timeline: theme::get_setting("show_timeline").as_deref() != Some("0"),
             tl_zoom: 0.0,
+            tl_fit: 1.0,
+            tl_zoom_now: 1.0,
+            tl_zoom_to: None,
+            tl_pan: false,
+            tl_bar_drag: None,
+            tl_gif_drop: None,
+            tl_menu_head: None,
+            tl_sel: Vec::new(),
+            tl_group: Vec::new(),
+            tl_box: None,
+            tl_board: None,
+            tl_snap: theme::get_setting("tl_snap").map(|v| v != "0").unwrap_or(true),
+            tl_snap_line: None,
+            tl_in: None,
+            tl_out: None,
+            tl_zone_loop: true,
+            tl_solo: None,
+            tl_gif_h: theme::get_setting("tl_gif_h").and_then(|v| v.parse().ok()).unwrap_or(40.0),
+            tl_row_h: theme::get_setting("tl_row_h").and_then(|v| v.parse().ok()).unwrap_or(28.0),
+            tl_row_drag: None,
+            tl_marker_drag: None,
+            tl_marker_edit: None,
+            tl_menu_marker: None,
+            tl_area: Rect::NOTHING,
+            tl_focus: false,
+            layer_board: Vec::new(),
+            paste_in: None,
             tl_x0: 0.0,
             tl_y0: 0.0,
             tl_track: None,
@@ -2256,6 +2693,12 @@ impl GifKitApp {
             tl_trim: None,
             keymap: crate::keys::Keymap::load(),
             key_capture: None,
+            keys_filter: String::new(),
+            panel_find: String::new(),
+            panel_find_tool: None,
+            layer_find: String::new(),
+            layer_find_open: false,
+            layer_find_fresh: false,
             preview_max: theme::get_setting("preview_max").and_then(|v| v.parse().ok()).unwrap_or(1280),
             proxy: None,
             proxy_job: None,
@@ -3242,6 +3685,41 @@ impl GifKitApp {
 
     fn handle_dropped(&mut self, ctx: &egui::Context) {
         let mut dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
+        // Ctrl+V with files or a browser picture on the clipboard
+        match self.paste_in.take() {
+            Some(crate::paste::Pasted::Files(ps)) if !self.busy() => {
+                if self.base.is_some() {
+                    if let Some(p) = ps.into_iter().next() {
+                        self.load_overlay(p, ctx);
+                    }
+                    return;
+                }
+                dropped.extend(ps);
+            }
+            Some(crate::paste::Pasted::Url(url, still)) if !self.busy() => {
+                let has_base = self.base.is_some();
+                self.spawn(ctx, "Fetch the pasted picture", 1, move |_| {
+                    let fetched = crate::paste::download(&url).and_then(|p| {
+                        let a = io::load_animation(&p);
+                        let _ = std::fs::remove_file(&p);
+                        a
+                    });
+                    // the still copy from the clipboard when it can't be fetched
+                    let a = match (fetched, still) {
+                        (Ok(a), _) => Ok(a),
+                        (Err(_), Some(img)) => Ok(Animation { frames: vec![crate::anim::Frame::new(img, 10)], loop_count: None }),
+                        (Err(e), None) => Err(e),
+                    };
+                    if has_base {
+                        JobOutput::Overlay(a.map(|a| OverlaySource { name: "Pasted image".into(), path: None, delays: a.frames.iter().map(|f| f.delay_cs).collect(), frames: a.frames.iter().map(|f| (*f.image).clone()).collect() }))
+                    } else {
+                        JobOutput::Loaded(a.map(|a| (a, None, None)))
+                    }
+                });
+                return;
+            }
+            p => self.paste_in = p.filter(|_| self.busy()),
+        }
         // Ctrl+V: copied files (a file manager's "Copy"), pasted paths, or a
         // copied picture. With nothing open they open; otherwise each one
         // becomes an image layer.
@@ -3374,7 +3852,7 @@ impl GifKitApp {
         // Delete over the picture removes the selected text, shape, emoji…
         let over_view = ctx.pointer_hover_pos().is_some_and(|p| self.views_last.iter().any(|r| r.contains(p)));
         if over_view && hit(A::DeleteObject) {
-            if let Some(li) = self.tool.layer_kind().and_then(|k| self.sel_index(k)) {
+            if let Some(li) = self.tool.layer_kind().and_then(|k| self.sel_index(k)).filter(|li| !self.stack.layers[*li].locked) {
                 let now = ctx.input(|i| i.time);
                 self.snapshot(&format!("del{now}"), now);
                 let name = self.stack.layers[li].name();
@@ -3409,6 +3887,50 @@ impl GifKitApp {
         }
         if cmp && self.base.is_some() {
             self.compare = !self.compare;
+        }
+        // copy, paste and duplicate away from the timeline (it does its own
+        // while the pointer is on it)
+        let over_tl = ctx.pointer_hover_pos().is_some_and(|p| self.tl_area.contains(p));
+        if self.base.is_some() && !over_tl {
+            let now = ctx.input(|i| i.time);
+            let (copy, paste_layers, paste_clips) = ctx.input(|i| {
+                (
+                    i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
+                    i.events.iter().any(|e| matches!(e, egui::Event::Paste(t) if t == LAYERS_TAG)),
+                    i.events.iter().any(|e| matches!(e, egui::Event::Paste(t) if t == timeline_ui::BOARD_TAG)),
+                )
+            });
+            if copy {
+                self.edit_copy(ctx);
+            }
+            if paste_layers {
+                self.paste_layers(now);
+            }
+            if paste_clips && self.tl_focus {
+                self.tl_paste(now);
+            }
+            if hit(A::Duplicate) {
+                self.edit_duplicate(ctx, now);
+            }
+        }
+        // in and out points, markers and jumps between edits work anywhere
+        if self.base.is_some() {
+            let now = ctx.input(|i| i.time);
+            if hit(A::TlIn) {
+                self.tl_set_in(Some(self.cur));
+            }
+            if hit(A::TlOut) {
+                self.tl_set_out(Some(self.cur));
+            }
+            if hit(A::TlMarker) {
+                self.tl_add_marker(now);
+            }
+            if hit(A::TlPrevEdit) {
+                self.tl_jump(false);
+            }
+            if hit(A::TlNextEdit) {
+                self.tl_jump(true);
+            }
         }
     }
 
@@ -3516,12 +4038,37 @@ impl GifKitApp {
                 break;
             }
             self.elapsed -= d;
-            self.cur = self.next_enabled(self.cur);
+            self.cur = self.next_play(self.cur);
             steps += 1;
         }
         let d = effective_delay(self.plan[self.cur].delay) as f64 / 100.0;
         let remain = ((d - self.elapsed) / self.play_speed.max(0.05) as f64).max(0.004);
         ctx.request_repaint_after(std::time::Duration::from_secs_f64(remain));
+    }
+
+    /// The frame after `from` in playback: inside the in and out points
+    /// when looping between them.
+    fn next_play(&self, from: usize) -> usize {
+        let next = self.next_enabled(from);
+        if let Some((a, b)) = self.tl_zone().filter(|_| self.tl_zone_loop) {
+            if next > b || next < a || next <= from {
+                // back to the first shown frame of the zone
+                return (a..=b).find(|&i| self.plan.get(i).is_some_and(|f| f.enabled)).unwrap_or(next);
+            }
+        }
+        next
+    }
+
+    /// The in and out points, when both are set and in order.
+    fn tl_zone(&self) -> Option<(usize, usize)> {
+        let n = self.plan.len();
+        match (self.tl_in, self.tl_out) {
+            (None, None) => None,
+            (a, b) => {
+                let (a, b) = (a.unwrap_or(0).min(n.saturating_sub(1)), b.unwrap_or(n.saturating_sub(1)).min(n.saturating_sub(1)));
+                (a <= b).then_some((a, b))
+            }
+        }
     }
 
     fn next_enabled(&self, from: usize) -> usize {
@@ -3581,7 +4128,7 @@ impl GifKitApp {
 
     fn composite_key(&self) -> u64 {
         let proxy = self.ready_proxy().map(|(s, _)| s.to_bits() as u64).unwrap_or(0);
-        hash_parts(&[self.stack.signature(), self.version, self.timing_rev, self.pixelated as u64, self.plan.len() as u64, self.stack.plan_signature(), proxy])
+        hash_parts(&[self.stack.signature(), self.version, self.timing_rev, self.pixelated as u64, self.plan.len() as u64, self.stack.plan_signature(), proxy, self.tl_solo.unwrap_or(u64::MAX)])
     }
 
     /// How much smaller preview frames are than the source (1 = full size).
@@ -3684,10 +4231,17 @@ impl GifKitApp {
     /// What previews render from: the shrunk frames with a matching stack
     /// when the source is big, else the source itself.
     fn render_inputs(&self) -> Option<(Stack, Animation)> {
-        match self.ready_proxy() {
-            Some((s, a)) => Some((self.stack.proxy(s), a.clone())),
-            None => Some((self.stack.clone(), self.base.clone()?)),
+        let (mut st, a) = match self.ready_proxy() {
+            Some((s, a)) => (self.stack.proxy(s), a.clone()),
+            None => (self.stack.clone(), self.base.clone()?),
+        };
+        // a soloed layer shows on its own in the live view (not in exports)
+        if let Some(id) = self.tl_solo {
+            for l in &mut st.layers {
+                l.visible = l.id == id;
+            }
         }
+        Some((st, a))
     }
 
     /// The output size in full-size pixels (previews may be smaller).
@@ -3700,12 +4254,14 @@ impl GifKitApp {
     /// Layer geometry / sprites for the current stack, cached per composite key.
     fn prepared(&mut self) -> Option<Arc<stack::Prepared>> {
         let key = self.comp_key;
+        let (st, base) = self.render_inputs()?;
         if let Some((k, p)) = &self.prep_cache {
-            if *k == key {
+            // the key is from the start of this frame: a panel may have
+            // added or removed a layer since
+            if *k == key && p.fits(&st) {
                 return Some(p.clone());
             }
         }
-        let (st, base) = self.render_inputs()?;
         let p = Arc::new(st.prepare(&base, &self.fonts));
         self.prep_cache = Some((key, p.clone()));
         Some(p)
@@ -3731,7 +4287,7 @@ impl GifKitApp {
         st.transform.crop_on = false;
         st.transform.resize_on = false;
         st.transform.rot_on = false;
-        if !st.needs_render() {
+        if !st.needs_render() && !self.has_blank() {
             return None;
         }
         let key = hash_parts(&[st.signature(), self.version, self.timing_rev, self.pixelated as u64, 0xC20F]);
@@ -3759,16 +4315,93 @@ impl GifKitApp {
     }
 
     /// Texture of output frame `i` with all live edits applied.
-    fn composite_texture(&mut self, ctx: &egui::Context, i: usize) -> Option<TextureHandle> {
+    /// The frame rendered on the graphics card, when it can draw everything
+    /// in the stack (else None and the CPU path takes over).
+    fn gpu_composite(&mut self, i: usize) -> Option<Tex> {
+        if self.gpu.is_none() || !self.stack.gpu_capable() || !crate::gpu_render::enabled() {
+            return None;
+        }
+        let key = self.comp_key;
+        if self.gpu_frames.key != key {
+            self.free_gpu_frames();
+            self.gpu_frames.key = key;
+        }
+        self.gpu_frames.tick += 1;
+        let tick = self.gpu_frames.tick;
+        if let Some(e) = self.gpu_frames.map.get_mut(&i) {
+            e.2 = tick;
+            return Some(Tex { id: e.1, size: vec2(e.0.width() as f32, e.0.height() as f32) });
+        }
+        let prep = self.prepared()?;
+        let (st, base) = self.render_inputs()?;
+        let src = self.plan.get(i)?.src;
+        let job = st.gpu_frame(&base, &self.plan, &self.plan_times, i, &self.fonts, &prep)?;
+        let frame = &base.frames.get(src)?.image;
+        let frame_key = hash_parts(&[self.version, src as u64, base.width() as u64, base.height() as u64]);
+        let filter = if self.pixelated { eframe::wgpu::FilterMode::Nearest } else { eframe::wgpu::FilterMode::Linear };
+        let (gpu, renderer) = self.gpu.as_mut()?;
+        if !job.fits(frame, gpu.max_side) {
+            return None;
+        }
+        let tex = gpu.render(frame, frame_key, &job, key);
+        let view = tex.create_view(&Default::default());
+        let id = renderer.write().register_native_texture(&gpu.device, &view, filter);
+        let size = vec2(tex.width() as f32, tex.height() as f32);
+        let bytes = tex.width() as usize * tex.height() as usize * 4;
+        // keep to a budget, dropping what was looked at longest ago
+        while self.gpu_frames.bytes + bytes > GPU_FRAMES_BUDGET && !self.gpu_frames.map.is_empty() {
+            let oldest = *self.gpu_frames.map.iter().min_by_key(|(_, e)| e.2).map(|(k, _)| k).unwrap();
+            if let Some((t, id, _)) = self.gpu_frames.map.remove(&oldest) {
+                self.gpu_frames.bytes -= t.width() as usize * t.height() as usize * 4;
+                if self.last_comp.as_ref().is_some_and(|c| c.1.id == id) {
+                    if let Some((old, oid)) = self.gpu_frames.shown.replace((t, id)) {
+                        renderer.write().free_texture(&oid);
+                        old.destroy();
+                    }
+                } else {
+                    renderer.write().free_texture(&id);
+                    t.destroy();
+                }
+            }
+        }
+        self.gpu_frames.bytes += bytes;
+        self.gpu_frames.map.insert(i, (tex, id, tick));
+        Some(Tex { id, size })
+    }
+
+    fn free_gpu_frames(&mut self) {
+        let Some((_, renderer)) = &self.gpu else { return };
+        let mut r = renderer.write();
+        let shown = self.last_comp.as_ref().map(|c| c.1.id);
+        for (_, (t, id, _)) in self.gpu_frames.map.drain() {
+            if Some(id) == shown {
+                // swap it in as the one kept on screen
+                if let Some((old, oid)) = self.gpu_frames.shown.replace((t, id)) {
+                    r.free_texture(&oid);
+                    old.destroy();
+                }
+            } else {
+                r.free_texture(&id);
+                t.destroy();
+            }
+        }
+        self.gpu_frames.bytes = 0;
+    }
+
+    fn composite_texture(&mut self, ctx: &egui::Context, i: usize) -> Option<Tex> {
         if self.waiting_proxy() {
             return None;
         }
-        if !self.stack.needs_render() {
+        if !self.needs_render() {
             let src = self.plan.get(i)?.src;
-            return self.base_texture(ctx, src);
+            return self.base_texture(ctx, src).map(Tex::from);
+        }
+        if let Some(t) = self.gpu_composite(i) {
+            self.last_comp = Some((i, t.clone()));
+            return Some(t);
         }
         let key = self.comp_key;
-        if let Some(t) = self.comp_tex.get(key, i) {
+        if let Some(t) = self.comp_tex.get(key, i).map(Tex::from) {
             self.last_comp = Some((i, t.clone()));
             return Some(t);
         }
@@ -3789,7 +4422,7 @@ impl GifKitApp {
                 self.live_job = None;
                 if k == key {
                     let o = self.tex_opts();
-                    let t = self.comp_tex.put(ctx, ji, &img, o, "comp");
+                    let t = Tex::from(self.comp_tex.put(ctx, ji, &img, o, "comp"));
                     if ji == i {
                         self.last_comp = Some((i, t.clone()));
                         return Some(t);
@@ -3820,7 +4453,7 @@ impl GifKitApp {
         }
         let img = self.render_composite(i)?;
         let o = self.tex_opts();
-        let t = self.comp_tex.put(ctx, i, &img, o, "comp");
+        let t = Tex::from(self.comp_tex.put(ctx, i, &img, o, "comp"));
         self.last_comp = Some((i, t.clone()));
         Some(t)
     }
@@ -3834,6 +4467,11 @@ impl GifKitApp {
             ctx.request_repaint();
             self.prerender = None;
             self.prerender_cancel.store(key, Ordering::Relaxed);
+        }
+        // frames the graphics card renders are made as they're shown
+        if self.gpu.is_some() && self.stack.gpu_capable() && crate::gpu_render::enabled() {
+            self.prerender = None;
+            return;
         }
         let mut done = false;
         if let Some(pr) = &self.prerender {
@@ -3869,7 +4507,7 @@ impl GifKitApp {
             self.comp_key_since = f64::INFINITY;
         }
         let stable = now - self.comp_key_since > 0.5;
-        if self.prerender.is_none() && stable && self.stack.needs_render() && !self.plan.is_empty() {
+        if self.prerender.is_none() && stable && self.needs_render() && !self.plan.is_empty() {
             let cached = self.comp_tex.key == key && self.comp_tex.map.len() >= self.plan.len();
             if cached {
                 return;
@@ -3912,7 +4550,7 @@ impl GifKitApp {
                 drop(tx);
             });
             self.prerender = Some(Prerender { key, rx });
-        } else if self.prerender.is_none() && !stable && self.stack.needs_render() {
+        } else if self.prerender.is_none() && !stable && self.needs_render() {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
         }
     }
@@ -3921,13 +4559,105 @@ impl GifKitApp {
 
     /// The opened GIF, when saving it as GIF would change nothing: no layers,
     /// edits, timeline changes or new settings. It's then kept as it is.
+    /// The selected layer of the open tool.
+    fn sel_layer_index(&self) -> Option<usize> {
+        self.tool.layer_kind().and_then(|k| self.sel_index(k))
+    }
+
+    /// Copy the selected layer (kept here; the clipboard gets a tag so
+    /// Ctrl+V comes back to it).
+    fn copy_layer(&mut self, ctx: &egui::Context) {
+        let Some(li) = self.sel_layer_index() else { return };
+        let l = self.stack.layers[li].clone();
+        let name = l.name();
+        self.layer_board = vec![l];
+        ctx.copy_text(LAYERS_TAG.into());
+        self.info(format!("Copied {name}"));
+    }
+
+    /// Paste copied layers above the others, a little down and to the right.
+    fn paste_layers(&mut self, now: f64) {
+        if self.layer_board.is_empty() || self.base.is_none() {
+            return;
+        }
+        self.snapshot(&format!("paste{now}"), now);
+        let board = self.layer_board.clone();
+        let mut last = None;
+        for src in board {
+            let mut kind = src.kind.clone();
+            offset_layer(&mut kind, 12);
+            let id = self.stack.push(kind);
+            if let Some(l) = self.stack.layers.iter_mut().find(|l| l.id == id) {
+                l.label = src.label.clone();
+                l.visible = src.visible;
+                l.timing = src.timing.clone();
+                l.color = src.color;
+                l.opacity = src.opacity;
+                last = Some((l.kind(), id));
+            }
+        }
+        if let Some((k, id)) = last {
+            self.select(k, id);
+            self.tool = kind_tool(k);
+        }
+        // the next paste lands a little further on
+        for l in &mut self.layer_board {
+            offset_layer(&mut l.kind, 12);
+        }
+        self.modified = true;
+    }
+
+    /// Edit ▸ Copy, Paste, Duplicate and Delete: the timeline's clips when it
+    /// was clicked last, else the selected layer.
+    fn edit_copy(&mut self, ctx: &egui::Context) {
+        if self.tl_focus {
+            self.tl_copy(ctx)
+        } else {
+            self.copy_layer(ctx)
+        }
+    }
+
+    fn edit_paste(&mut self, now: f64) {
+        if self.tl_focus {
+            self.tl_paste(now)
+        } else {
+            self.paste_layers(now)
+        }
+    }
+
+    fn edit_duplicate(&mut self, ctx: &egui::Context, now: f64) {
+        if self.tl_focus {
+            self.tl_duplicate(now);
+        } else if let Some(li) = self.sel_layer_index() {
+            self.apply_layer_act(ctx, LayerAct::Duplicate(li), now);
+        }
+    }
+
+    fn edit_delete(&mut self, ctx: &egui::Context, now: f64) {
+        if self.tl_focus {
+            self.tl_delete_selected(now);
+        } else if let Some(li) = self.sel_layer_index().filter(|li| !self.stack.layers[*li].locked) {
+            self.apply_layer_act(ctx, LayerAct::Delete(li), now);
+        }
+    }
+
+    /// Gaps on the timeline's GIF track (frames that show nothing).
+    fn has_blank(&self) -> bool {
+        self.base.as_ref().is_some_and(|b| b.frames.iter().any(|f| f.blank))
+    }
+
+    /// Frames need drawing: layers, frame edits, or gaps on the GIF track.
+    fn needs_render(&self) -> bool {
+        self.stack.needs_render() || self.has_blank()
+    }
+
     fn untouched_gif(&self) -> Option<PathBuf> {
         if self.export_fmt != ExportFormat::Gif || self.gif_opts.clone() != (GifOptions { noai_tag: self.gif_opts.noai_tag, ..self.gif_opts_open.clone() }) {
             return None;
         }
         let path = self.path.as_ref().filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("gif")))?;
         let (base, orig) = (self.base.as_ref()?, self.original.as_ref()?);
-        let same = base.len() == orig.len() && base.frames.iter().zip(&orig.frames).all(|(a, b)| a.enabled && Arc::ptr_eq(&a.image, &b.image) && a.delay_cs == b.delay_cs);
+        let same = base.len() == orig.len() && base.frames.iter().zip(&orig.frames).all(|(a, b)| a.enabled && !a.blank && Arc::ptr_eq(&a.image, &b.image) && a.delay_cs == b.delay_cs);
         let plain = self.stack.layers.iter().all(|l| !l.visible) && self.stack.transform.is_identity() && self.stack.loop_count(base) == orig.loop_count;
         (same && plain).then(|| path.clone())
     }
@@ -4060,17 +4790,10 @@ impl GifKitApp {
                 let out = match &sample {
                     None => stack.flatten(&base, &fonts, None),
                     Some(idx) => {
-                        use rayon::prelude::*;
                         let plan = stack.plan(&base);
                         let times = stack::plan_times(&plan);
                         let prep = stack.prepare(&base, &fonts);
-                        let frames: Vec<crate::anim::Frame> = idx
-                            .par_iter()
-                            .map(|&i| {
-                                let image = if stack.needs_render() { Arc::new(stack.render_frame(&base, &plan, &times, i, &fonts, &prep)) } else { base.frames[plan[i].src].image.clone() };
-                                crate::anim::Frame { image, delay_cs: plan[i].delay, enabled: plan[i].enabled }
-                            })
-                            .collect();
+                        let frames = stack.render_frames(&base, &plan, &times, idx, &fonts, &prep, None);
                         let mut a = Animation { frames, loop_count: stack.loop_count(&base) };
                         crate::effects::normalize_sizes(&mut a);
                         a
@@ -4171,8 +4894,40 @@ impl GifKitApp {
 // ================================================================ UI
 
 impl eframe::App for GifKitApp {
+    /// Ctrl+C / X / V arrive as keys (clipboard shortcuts are off in the
+    /// window options): copy and cut become egui's events, and paste reads
+    /// the clipboard here, so files and browser pictures come in whole.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        if !raw.events.iter().any(|e| matches!(e, egui::Event::Key { modifiers, .. } if modifiers.command)) {
+            return;
+        }
+        let typing = ctx.egui_wants_keyboard_input();
+        let mut out = Vec::with_capacity(raw.events.len());
+        for e in std::mem::take(&mut raw.events) {
+            match e {
+                egui::Event::Key { key: egui::Key::C, pressed: true, modifiers, .. } if modifiers.command && !modifiers.alt => out.push(egui::Event::Copy),
+                egui::Event::Key { key: egui::Key::X, pressed: true, modifiers, .. } if modifiers.command && !modifiers.alt => out.push(egui::Event::Cut),
+                egui::Event::Key { key: egui::Key::V, pressed: true, modifiers, .. } if modifiers.command && !modifiers.alt => {
+                    let (events, extra) = crate::paste::read(typing);
+                    out.extend(events);
+                    if extra.is_some() {
+                        self.paste_in = extra;
+                    }
+                }
+                // their releases go too, as with egui's own handling
+                egui::Event::Key { key: egui::Key::C | egui::Key::X | egui::Key::V, modifiers, .. } if modifiers.command && !modifiers.alt => {}
+                e => out.push(e),
+            }
+        }
+        raw.events = out;
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // what was clicked last decides what Copy and Paste work on
+        if let Some(p) = ctx.input(|i| i.pointer.any_pressed().then(|| i.pointer.press_origin()).flatten()) {
+            self.tl_focus = self.tl_area.contains(p);
+        }
         let perf_t0 = std::time::Instant::now();
         theme::refresh(&ctx, self.theme);
         self.guard_close(&ctx);
@@ -4249,12 +5004,24 @@ impl eframe::App for GifKitApp {
                 .show(ui, |ui| {
                     // the tool's settings always keep at least half the height
                     let lmax = (ui.available_height() * 0.5).clamp(140.0, 800.0);
-                    egui::Panel::bottom("layers_panel")
+                    // it slides open and shut between its header and the height it had
+                    let t = theme::openness(&ctx, egui::Id::unique("layers-open"), !self.layers_collapsed);
+                    let open_h = self.layers_open_h.clamp(140.0, lmax);
+                    let mut panel = egui::Panel::bottom("layers_panel")
                         .resizable(!self.layers_collapsed)
                         .default_size(380.0f32.min(lmax))
-                        .size_range(if self.layers_collapsed { 34.0..=34.0 } else { 140.0..=lmax })
+                        .size_range(if self.layers_collapsed { 34.0..=34.0 } else { 140.0..=lmax });
+                    let sliding = t > 0.0 && t < 1.0;
+                    if sliding {
+                        panel = panel.resizable(false).exact_size(34.0 + (open_h - 34.0) * t);
+                        ctx.request_repaint();
+                    }
+                    let shown = panel
                         .frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin { left: 8, right: 8, top: 6, bottom: 2 }))
                         .show(ui, |ui| self.layer_panel(ui, &ctx));
+                    if !sliding && !self.layers_collapsed {
+                        self.layers_open_h = shown.response.rect.height();
+                    }
                     egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin { left: 10, right: 8, top: 8, bottom: 4 })).show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let (ir, _) = ui.allocate_exact_size(vec2(22.0, 24.0), Sense::hover());
@@ -4270,9 +5037,24 @@ impl eframe::App for GifKitApp {
                                 }
                             });
                         });
+                        ui.add_space(6.0);
+                        // a new tool starts with an empty search
+                        if self.panel_find_tool != Some(self.tool) {
+                            // GIFKIT_FIND: a search to start with (for testing)
+                            self.panel_find = std::env::var("GIFKIT_FIND").unwrap_or_default();
+                            self.panel_find_tool = Some(self.tool);
+                        }
+                        search_box(ui, &mut self.panel_find, "Search settings", egui::Id::unique("panel-find"));
                         ui.add_space(8.0);
+                        let q = self.panel_find.trim().to_lowercase();
                         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                            FIND.with(|f| *f.borrow_mut() = Find { q: q.clone(), ..Default::default() });
                             ui.add_enabled_ui(!self.busy(), |ui| self.tool_panel(ui, &ctx));
+                            let shown = FIND.with(|f| std::mem::take(&mut *f.borrow_mut()).shown);
+                            if !q.is_empty() && shown == 0 {
+                                ui.add_space(8.0);
+                                hint(ui, "No settings match the search.");
+                            }
                             ui.add_space(8.0);
                         });
                     });
@@ -4293,15 +5075,31 @@ impl eframe::App for GifKitApp {
 
         if self.base.is_some() {
             // the timeline at the bottom, the play controls under the view as in Kdenlive
-            if self.show_timeline {
+            // it slides up and down from the height it had
+            let t = theme::openness(&ctx, egui::Id::unique("timeline-open"), self.show_timeline);
+            if t > 0.0 {
                 // never more than about half the height, so the view keeps room
                 let tmax = ((ui.available_height() - 60.0) * 0.5).clamp(110.0, 640.0);
-                egui::Panel::bottom("timeline")
+                let mut panel = egui::Panel::bottom("timeline")
                     .resizable(true)
                     .default_size(270.0f32.min(tmax))
-                    .size_range(110.0f32.min(tmax)..=tmax)
+                    .size_range(110.0f32.min(tmax)..=tmax);
+                let sliding = t < 1.0;
+                if sliding {
+                    let h = self.timeline_open_h.clamp(110.0f32.min(tmax), tmax) * t;
+                    panel = panel.resizable(false).size_range(0.0..=tmax).exact_size(h);
+                    ctx.request_repaint();
+                }
+                let shown = panel
                     .frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin { left: 6, right: 6, top: 6, bottom: 4 }))
-                    .show(ui, |ui| self.timeline_dock(ui, &ctx));
+                    .show(ui, |ui| {
+                        // drawn at full height and clipped while it slides
+                        ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect().expand(6.0)));
+                        self.timeline_dock(ui, &ctx)
+                    });
+                if !sliding {
+                    self.timeline_open_h = shown.response.rect.height();
+                }
             }
             egui::Panel::bottom("transport")
                 .frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin::symmetric(8, 5)))
@@ -4439,6 +5237,26 @@ impl GifKitApp {
                     self.do_redo();
                 }
                 ui.separator();
+                {
+                    // the timeline's clips when it was clicked last, else the selected layer
+                    let now = ctx.input(|i| i.time);
+                    let what = if self.tl_focus { "Clips" } else { "Layer" };
+                    let can_copy = if self.tl_focus { self.tl_clip.is_some() || self.tl_key.is_some() } else { self.sel_layer_index().is_some() };
+                    let can_paste = if self.tl_focus { self.tl_board.is_some() } else { !self.layer_board.is_empty() };
+                    if menu_item(ui, "edit-copy", &format!("&Copy {what}"), "Ctrl+C", has && can_copy) {
+                        self.edit_copy(ctx);
+                    }
+                    if menu_item(ui, "edit-paste", &format!("&Paste {what}"), "Ctrl+V", has && idle && can_paste) {
+                        self.edit_paste(now);
+                    }
+                    if menu_item(ui, "edit-duplicate", &format!("Dupli&cate {what}"), &self.keymap.text(crate::keys::Action::Duplicate), has && idle && can_copy) {
+                        self.edit_duplicate(ctx, now);
+                    }
+                    if menu_item(ui, "edit-delete", &format!("&Delete {what}"), "Del", has && idle && can_copy) {
+                        self.edit_delete(ctx, now);
+                    }
+                }
+                ui.separator();
                 if menu_item(ui, "view-history", "&History", &self.keymap.text(crate::keys::Action::History), true) {
                     self.history_open = !self.history_open;
                 }
@@ -4518,6 +5336,9 @@ impl GifKitApp {
                         colour_btn(ui, &mut self.backdrop_col);
                     });
                 });
+                if menu_check(ui, theme::animate(), "&Animate Panels", "") {
+                    theme::set_animate(ui.ctx(), !theme::animate());
+                }
                 if menu_check(ui, self.pixelated, "&Pixelated Preview", "") {
                     self.pixelated = !self.pixelated;
                     theme::set_setting("pixelated", if self.pixelated { "1" } else { "0" });
@@ -4542,17 +5363,11 @@ impl GifKitApp {
                     }
                 });
                 ui.separator();
-                let gpu = crate::gpu::enabled();
-                if menu_check(ui, gpu, "Use &Graphics Card for Video", "") {
-                    crate::gpu::set_enabled(!gpu);
-                }
-                // what was found, under the entry (GIF, WebP and APNG always use the processor)
-                if gpu {
-                    let found = crate::gpu::summary().unwrap_or_else(|| "Looking for hardware encoders…".into());
-                    ui.horizontal(|ui| {
-                        ui.add_space(36.0);
-                        ui.label(RichText::new(found).size(11.5).color(p().fg_muted));
-                    });
+                let hw = crate::gpu::enabled();
+                if menu_check(ui, hw, "Use &Hardware Acceleration", "") {
+                    crate::gpu::set_enabled(!hw);
+                    self.free_gpu_frames();
+                    self.comp_key = 0;
                 }
                 if menu_check(ui, self.sample_preview, "&Estimate Size of Long Animations", "") {
                     self.sample_preview = !self.sample_preview;
@@ -4930,7 +5745,8 @@ impl GifKitApp {
         let mut reset_all = false;
         let mut capture = self.key_capture;
         let km = self.keymap.clone();
-        dialog(ctx, "shortcuts", "Keyboard Shortcuts", vec2(520.0, 720.0), true, &mut open, |ui| {
+        let mut filter = std::mem::take(&mut self.keys_filter);
+        dialog(ctx, "shortcuts", "Keyboard Shortcuts", vec2(900.0, 680.0), true, &mut open, |ui| {
             // the next key press goes to the action waiting for one
             if let Some(a) = capture {
                 let press = ui.input(|i| {
@@ -4950,57 +5766,122 @@ impl GifKitApp {
                 }
             }
             ui.horizontal(|ui| {
-                hint(ui, "Click a shortcut and press new keys. Backspace clears it.");
+                ui.add(egui::TextEdit::singleline(&mut filter).hint_text("Search shortcuts").desired_width(220.0));
+                ui.add_space(8.0);
+                hint(ui, "Click a shortcut, then press the new keys. Backspace clears it.");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Reset All").clicked() {
                         reset_all = true;
                     }
                 });
             });
-            ui.add_space(6.0);
+            ui.add_space(8.0);
+            let q = filter.trim().to_lowercase();
+            let hit = |a: Action| q.is_empty() || a.label().to_lowercase().contains(&q) || a.group().to_lowercase().contains(&q) || km.get(a).map(|b| b.text().to_lowercase().contains(&q)).unwrap_or(false);
+            const FIXED: [(&str, &str); 10] = [
+                ("Ctrl+V", "Paste files or a picture. With an animation open it becomes an image layer."),
+                ("Alt+letter", "Open a menu by its underlined letter"),
+                ("Mouse wheel", "Zoom"),
+                ("Middle or right drag", "Pan"),
+                ("Alt+drag", "Pan in drawing tools"),
+                ("Shift+drag", "Move in straight lines"),
+                ("Shift while resizing", "Keep or free the proportions"),
+                ("Ctrl while resizing", "Scale one way. Edge handles stretch one side."),
+                ("Ctrl+wheel", "Zoom the timeline"),
+                ("Shift+wheel", "Scroll the timeline sideways"),
+            ];
+            let fixed: Vec<(&str, &str)> = FIXED.iter().copied().filter(|(k, w)| q.is_empty() || k.to_lowercase().contains(&q) || w.to_lowercase().contains(&q)).collect();
+            // each group a card; cards go into columns, each to the shortest
+            let groups: Vec<(&str, Vec<Action>)> = Action::GROUPS.iter().map(|g| (*g, Action::ALL.iter().copied().filter(|a| a.group() == *g && hit(*a)).collect::<Vec<_>>())).filter(|(_, v)| !v.is_empty()).collect();
+            let cols = ((ui.available_width() / 380.0).floor() as usize).clamp(1, 3);
+            let mut col_of = vec![Vec::new(); cols];
+            let mut heights = vec![0usize; cols];
+            for (k, (g, v)) in groups.iter().enumerate() {
+                // two columns: the short groups on the left, Edit and the
+                // long Timeline group on the right; otherwise the shortest
+                let c = if cols == 2 { usize::from(matches!(*g, "Edit" | "Timeline")) } else { (0..cols).min_by_key(|c| heights[*c]).unwrap_or(0) };
+                col_of[c].push(k);
+                heights[c] += v.len() + 2;
+            }
+            let card = |ui: &mut egui::Ui, title: &str, body: &mut dyn FnMut(&mut egui::Ui)| {
+                egui::Frame::new()
+                    .fill(mix(pal.window, pal.view, 0.55))
+                    .stroke(Stroke::new(1.0, pal.border))
+                    .corner_radius(6.0)
+                    .inner_margin(egui::Margin::symmetric(12, 10))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new(title).font(theme::medium(13.5)).color(pal.fg));
+                        ui.add_space(4.0);
+                        body(ui);
+                    });
+                ui.add_space(10.0);
+            };
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                egui::Grid::new("keys").num_columns(3).spacing([14.0, 4.0]).show(ui, |ui| {
-                    for a in Action::ALL {
-                        ui.label(RichText::new(a.label()).color(pal.fg));
-                        let waiting = capture == Some(a);
-                        let text = if waiting { "Press keys…".to_string() } else { km.get(a).map(|b| b.text()).unwrap_or_else(|| "None".into()) };
-                        let b = ui.add(sel_btn(egui::Button::new(RichText::new(text).font(theme::medium(13.0))).min_size(vec2(150.0, 26.0)), waiting));
-                        if b.clicked() {
-                            capture = if waiting { None } else { Some(a) };
+                ui.columns(cols, |cs| {
+                    for (c, ui) in cs.iter_mut().enumerate() {
+                        for &k in &col_of[c] {
+                            let (title, acts) = &groups[k];
+                            card(ui, title, &mut |ui: &mut egui::Ui| {
+                                for &a in acts {
+                                    ui.horizontal(|ui| {
+                                        ui.set_min_height(CHIP_H);
+                                        // the card already says Timeline
+                                        let full = a.label();
+                                        let name = match full.strip_prefix("Timeline: ") {
+                                            Some(r) => r[..1].to_uppercase() + &r[1..],
+                                            None => full.to_string(),
+                                        };
+                                        let room = (ui.available_width() - 166.0).max(40.0);
+                                        ui.allocate_ui_with_layout(vec2(room, CHIP_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                            ui.add(egui::Label::new(RichText::new(name).color(pal.fg)).truncate()).on_hover_text(full);
+                                        });
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            let changed = km.get(a) != a.default_binding();
+                                            let back = format!("Back to {}", a.default_binding().map(|b| b.text()).unwrap_or_else(|| "none".into()));
+                                            if ui.add_enabled(changed, egui::Button::image(crate::icons::image(ui.ctx(), "edit-undo", 16.0, pal.fg)).frame_when_inactive(false)).on_hover_text(back).clicked() {
+                                                reset = Some(a);
+                                            }
+                                            let waiting = capture == Some(a);
+                                            let text = if waiting { "Press keys…".to_string() } else { km.get(a).map(|b| b.text()).unwrap_or_else(|| "None".into()) };
+                                            let col = if km.get(a).is_some() || waiting { pal.fg } else { pal.fg_muted };
+                                            let b = ui.add(sel_btn(egui::Button::new(RichText::new(text).font(theme::medium(13.0)).color(col)).min_size(vec2(124.0, 26.0)), waiting));
+                                            if b.clicked() {
+                                                capture = if waiting { None } else { Some(a) };
+                                            }
+                                        });
+                                    });
+                                }
+                            });
                         }
-                        let changed = km.get(a) != a.default_binding();
-                        if ui.add_enabled(changed, egui::Button::image(crate::icons::image(ui.ctx(), "edit-undo", 16.0, pal.fg)).frame_when_inactive(false)).on_hover_text(format!("Back to {}", a.default_binding().map(|b| b.text()).unwrap_or_else(|| "none".into()))).clicked() {
-                            reset = Some(a);
-                        }
-                        ui.end_row();
                     }
                 });
-                ui.add_space(12.0);
-                ui.label(RichText::new("Mouse and fixed keys").font(theme::medium(13.5)).color(pal.fg));
-                ui.add_space(4.0);
-                egui::Grid::new("fixed").num_columns(2).spacing([18.0, 6.0]).show(ui, |ui| {
-                    for (k, what) in [
-                        ("Ctrl+V", "Paste files or a picture. With an animation open it becomes an image layer."),
-                        ("Alt+letter", "Open a menu by its underlined letter"),
-                        ("Mouse wheel", "Zoom"),
-                        ("Middle or right drag", "Pan"),
-                        ("Alt+drag", "Pan in drawing tools"),
-                        ("Shift+drag", "Move in straight lines"),
-                        ("Shift while resizing", "Keep or free the proportions"),
-                        ("Ctrl while resizing", "Scale one way. Edge handles stretch one side."),
-                        ("Ctrl+wheel", "Zoom the timeline"),
-                        ("Shift+wheel", "Scroll the timeline sideways"),
-                    ] {
-                        ui.label(RichText::new(k).font(theme::medium(13.0)).color(pal.fg));
-                        ui.label(RichText::new(what).color(pal.fg_muted));
-                        ui.end_row();
-                    }
-                });
+                if !fixed.is_empty() {
+                    card(ui, "Mouse and Fixed Keys", &mut |ui: &mut egui::Ui| {
+                        let fcols = if ui.available_width() > 700.0 { 2 } else { 1 };
+                        let per = fixed.len().div_ceil(fcols);
+                        ui.columns(fcols, |cs| {
+                            for (c, ui) in cs.iter_mut().enumerate() {
+                                egui::Grid::new(("fixed", c)).num_columns(2).spacing([14.0, 8.0]).show(ui, |ui| {
+                                    for (k, what) in fixed.iter().skip(c * per).take(per) {
+                                        ui.label(RichText::new(*k).font(theme::medium(13.0)).color(pal.fg));
+                                        ui.add(egui::Label::new(RichText::new(*what).color(pal.fg_muted)).wrap());
+                                        ui.end_row();
+                                    }
+                                });
+                            }
+                        });
+                    });
+                }
+                if groups.is_empty() && fixed.is_empty() {
+                    hint(ui, "No shortcuts match.");
+                }
             });
             if capture.is_some() {
                 ui.ctx().request_repaint();
             }
         });
+        self.keys_filter = filter;
         self.key_capture = capture;
         if let Some((a, b)) = set {
             if let Some(lost) = self.keymap.set(a, b) {
@@ -5111,11 +5992,58 @@ impl GifKitApp {
             if h.on_hover_text("Right-click a layer for more").clicked() {
                 self.layers_collapsed = !self.layers_collapsed;
             }
+            if !self.layers_collapsed {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let on = self.layer_find_open;
+                    let b = ui.add(sel_btn(egui::Button::image(crate::icons::image(ui.ctx(), "edit-find", 16.0, pal.fg)).frame_when_inactive(on), on)).on_hover_text(if on { "Hide the search" } else { "Search layers" });
+                    if b.clicked() {
+                        self.layer_find_open = !on;
+                        self.layer_find_fresh = !on;
+                        if on {
+                            self.layer_find.clear();
+                        }
+                    }
+                });
+            }
         });
         if self.layers_collapsed {
             return;
         }
         ui.add_space(4.0);
+        if self.layer_find_open {
+            let r = search_box(ui, &mut self.layer_find, "Search layers", egui::Id::unique("layer-find"));
+            if std::mem::take(&mut self.layer_find_fresh) {
+                r.request_focus();
+            }
+            ui.add_space(4.0);
+        }
+        // the selected layer's lock and opacity, as in Photoshop's layer panel
+        let sel_li = self.sel_layer_index();
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(sel_li.is_some(), |ui| {
+                let (locked, mut op) = sel_li.map(|i| (self.stack.layers[i].locked, self.stack.layers[i].opacity)).unwrap_or((false, 100.0));
+                let icon = crate::icons::image(ui.ctx(), if locked { "object-locked" } else { "object-unlocked" }, 16.0, pal.fg);
+                let b = ui.add(sel_btn(egui::Button::image(icon).min_size(vec2(28.0, 26.0)), locked)).on_hover_text(if locked { "Unlock the layer" } else { "Lock the layer so it can't be changed" });
+                if b.clicked() {
+                    if let Some(i) = sel_li {
+                        self.stack.layers[i].locked = !locked;
+                        self.modified = true;
+                    }
+                }
+                ui.add_space(6.0);
+                ui.label(RichText::new("Opacity:").color(if sel_li.is_some() { pal.fg } else { pal.fg_muted }));
+                ui.add_enabled_ui(!locked, |ui| {
+                    if fill_slider(ui, egui::Slider::new(&mut op, 0.0..=100.0).suffix("%").max_decimals(0)).on_hover_text("The whole layer's opacity").changed() {
+                        if let Some(i) = sel_li {
+                            self.stack.layers[i].opacity = op;
+                            self.modified = true;
+                        }
+                    }
+                });
+            });
+        });
+        ui.add_space(4.0);
+        let find = self.layer_find.trim().to_lowercase();
         // the list, with a row of buttons under it
         let mut rect = ui.available_rect_before_wrap();
         // room for the buttons: gap, a toolbar row and item spacing, so the panel never creeps taller
@@ -5127,6 +6055,7 @@ impl GifKitApp {
         let row_h = 30.0;
         let mut select: Option<(Kind, u64)> = None;
         let mut toggle: Option<usize> = None;
+        let mut lock: Option<usize> = None;
         let mut remove: Option<usize> = None;
         let mut drop_to: Option<(usize, usize)> = None;
         let mut to_frames = false;
@@ -5141,10 +6070,13 @@ impl GifKitApp {
             ui.spacing_mut().item_spacing.y = 0.0;
             let mut rows: Vec<(usize, Rect)> = Vec::new();
             for li in (0..n).rev() {
-                let (id, name, kind, visible) = {
+                let (id, name, kind, visible, locked) = {
                     let l = &self.stack.layers[li];
-                    (l.id, l.name(), l.kind(), l.visible)
+                    (l.id, l.name(), l.kind(), l.visible, l.locked)
                 };
+                if !find.is_empty() && !name.to_lowercase().contains(&find) && !kind_tool(kind).label().to_lowercase().contains(&find) {
+                    continue;
+                }
                 let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click_and_drag());
                 rows.push((li, r));
                 let selected = self.sel.get(kind_key(kind)) == Some(&id) && self.tool == kind_tool(kind);
@@ -5167,7 +6099,7 @@ impl GifKitApp {
                 }
                 // icon + name (elided)
                 paint_tool_icon(&painter, kind_tool(kind), pos2(r.left() + 38.0, r.center().y), 14.0, if visible { pal.fg } else { pal.fg_muted });
-                let del_w = 22.0;
+                let del_w = 44.0;
                 let name_w = (r.width() - 52.0 - del_w - 6.0).max(10.0);
                 let mut job = egui::text::LayoutJob::simple_singleline(elide(&name, 60), egui::FontId::proportional(13.0), if visible { pal.fg } else { pal.fg_muted });
                 job.wrap = egui::text::TextWrapping { max_width: name_w, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
@@ -5234,8 +6166,19 @@ impl GifKitApp {
                         act(LayerAct::Delete(li));
                     }
                 });
+                // the lock: always shown when on, on hover otherwise
+                let over = ui.rect_contains_pointer(r);
+                if locked || over || selected {
+                    let lock_r = Rect::from_center_size(pos2(r.right() - 36.0, r.center().y), vec2(20.0, 20.0));
+                    let lk = ui.interact(lock_r, egui::Id::unique(("layer-lock", id)), Sense::click()).on_hover_text(if locked { "Unlock" } else { "Lock" });
+                    let col = if locked || lk.hovered() { pal.fg } else { pal.fg_muted };
+                    crate::icons::paint(&painter, if locked { "object-locked" } else { "object-unlocked" }, lock_r.center(), 16.0, col);
+                    if lk.clicked() {
+                        lock = Some(li);
+                    }
+                }
                 // delete (pointer anywhere over the row – the ✕ itself takes the hover)
-                if ui.rect_contains_pointer(r) || selected {
+                if over || selected {
                     let del_r = Rect::from_center_size(pos2(r.right() - 14.0, r.center().y), vec2(20.0, 20.0));
                     let del = ui.interact(del_r, egui::Id::unique(("layer-del", id)), Sense::click()).on_hover_text("Delete layer");
                     crate::icons::paint(&painter, "window-close", del_r.center(), 16.0, if del.hovered() { pal.negative } else { pal.fg_muted });
@@ -5258,6 +6201,10 @@ impl GifKitApp {
             let mut edit_rows: Vec<(Tool, String, Option<bool>)> = self.frame_edit_rows().into_iter().map(|(t, l, on)| (t, l, Some(on))).collect();
             edit_rows.push((Tool::Frames, "Frames".to_string(), None));
             for (t, label, enabled) in edit_rows {
+                let shown = self.edit_labels.get(&t).cloned().unwrap_or_else(|| label.clone());
+                if !find.is_empty() && !shown.to_lowercase().contains(&find) && !t.label().to_lowercase().contains(&find) {
+                    continue;
+                }
                 let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h - 4.0), Sense::click());
                 let painter = ui.painter();
                 let sel = self.tool == t;
@@ -5427,6 +6374,10 @@ impl GifKitApp {
             self.stack.layers[li].visible = !self.stack.layers[li].visible;
             self.modified = true;
         }
+        if let Some(li) = lock {
+            self.stack.layers[li].locked = !self.stack.layers[li].locked;
+            self.modified = true;
+        }
         if let Some((from, pos)) = drop_to {
             self.layer_drag = None;
             if from < n && pos <= n && pos != from && pos != from + 1 {
@@ -5478,47 +6429,8 @@ impl GifKitApp {
         if to_frames {
             self.tool = Tool::Frames;
         }
-        match menu_act {
-            Some(LayerAct::Rename(li)) => {
-                let l = &self.stack.layers[li];
-                self.renaming = Some((l.id, l.name()));
-                self.rename_fresh = true;
-            }
-            Some(LayerAct::RenameEdit(t)) => {
-                self.edit_renaming = Some((t, self.edit_labels.get(&t).cloned().unwrap_or_else(|| t.label().to_string())));
-                self.rename_fresh = true;
-            }
-            Some(LayerAct::Duplicate(li)) => {
-                self.snapshot(&format!("duplicate{now}"), now);
-                let src = self.stack.layers[li].clone();
-                let id = self.stack.push(src.kind.clone());
-                if let Some(mut l) = self.stack.layers.pop() {
-                    l.label = src.label.as_ref().map(|s| format!("{s} copy"));
-                    l.visible = src.visible;
-                    self.stack.layers.insert(li + 1, l);
-                }
-                self.select(src.kind(), id);
-                self.modified = true;
-            }
-            Some(LayerAct::Toggle(li)) => {
-                self.stack.layers[li].visible = !self.stack.layers[li].visible;
-                self.modified = true;
-            }
-            Some(LayerAct::Move(from, to)) => {
-                if from != to && to < n {
-                    self.snapshot(&format!("reorder{now}"), now);
-                    let l = self.stack.layers.remove(from);
-                    self.stack.layers.insert(to, l);
-                }
-            }
-            Some(LayerAct::Delete(li)) => {
-                self.snapshot(&format!("del{now}"), now);
-                self.stack.layers.remove(li);
-            }
-            Some(LayerAct::CollapseTo(li)) => self.collapse_down(ctx, li),
-            Some(LayerAct::CollapseAll) => self.bake(ctx, false),
-            Some(LayerAct::CollapseEdits) => self.bake(ctx, true),
-            None => {}
+        if let Some(act) = menu_act {
+            self.apply_layer_act(ctx, act, now);
         }
     }
 
@@ -5529,7 +6441,7 @@ impl GifKitApp {
         if li >= self.stack.layers.len() {
             return;
         }
-        let lower = Stack { transform: Transform::default(), layers: self.stack.layers[..=li].iter().filter(|l| l.visible).cloned().collect(), next_id: self.stack.next_id };
+        let lower = Stack { transform: Transform::default(), layers: self.stack.layers[..=li].iter().filter(|l| l.visible).cloned().collect(), next_id: self.stack.next_id, ..Default::default() };
         let mut keep = self.stack.clone();
         // hidden layers in the merged part stay as they are
         keep.layers = self.stack.layers[..=li].iter().filter(|l| !l.visible).cloned().chain(self.stack.layers[li + 1..].iter().cloned()).collect();
@@ -5539,6 +6451,57 @@ impl GifKitApp {
             let out = lower.flatten(&base, &fonts, Some(p));
             JobOutput::Baked(Ok((out, keep)))
         });
+    }
+
+    /// A layer action from the layer list or the timeline.
+    fn apply_layer_act(&mut self, ctx: &egui::Context, act: LayerAct, now: f64) {
+        let n = self.stack.layers.len();
+        match act {
+            LayerAct::Rename(li) => {
+                let l = &self.stack.layers[li];
+                self.renaming = Some((l.id, l.name()));
+                self.rename_fresh = true;
+            }
+            LayerAct::RenameEdit(t) => {
+                self.edit_renaming = Some((t, self.edit_labels.get(&t).cloned().unwrap_or_else(|| t.label().to_string())));
+                self.rename_fresh = true;
+            }
+            LayerAct::Duplicate(li) => {
+                self.snapshot(&format!("duplicate{now}"), now);
+                let src = self.stack.layers[li].clone();
+                let id = self.stack.push(src.kind.clone());
+                if let Some(mut l) = self.stack.layers.pop() {
+                    l.label = src.label.as_ref().map(|s| format!("{s} copy"));
+                    l.visible = src.visible;
+                    // the copy keeps its clips, keyframes and colour
+                    l.timing = src.timing.clone();
+                    l.color = src.color;
+                    l.opacity = src.opacity;
+                    self.stack.layers.insert(li + 1, l);
+                }
+                self.select(src.kind(), id);
+                self.modified = true;
+            }
+            LayerAct::Toggle(li) => {
+                self.stack.layers[li].visible = !self.stack.layers[li].visible;
+                self.modified = true;
+            }
+            LayerAct::Move(from, to) => {
+                if from != to && to < n {
+                    self.snapshot(&format!("reorder{now}"), now);
+                    let l = self.stack.layers.remove(from);
+                    self.stack.layers.insert(to, l);
+                }
+            }
+            LayerAct::Delete(li) => {
+                self.snapshot(&format!("del{now}"), now);
+                self.stack.layers.remove(li);
+                self.modified = true;
+            }
+            LayerAct::CollapseTo(li) => self.collapse_down(ctx, li),
+            LayerAct::CollapseAll => self.bake(ctx, false),
+            LayerAct::CollapseEdits => self.bake(ctx, true),
+        }
     }
 
     /// Is a frame edit switched on?
@@ -5895,7 +6858,7 @@ impl GifKitApp {
                 let c = self.cmp.as_ref().unwrap();
                 (c.frame_for(self.cur, self.play_time(), &self.plan), vec2(c.full.0 as f32, c.full.1 as f32))
             };
-            (self.cmp_texture(ctx, i), size)
+            (self.cmp_texture(ctx, i).map(Tex::from), size)
         } else {
             let t = self.composite_texture(ctx, self.cur);
             let size = t.as_ref().map(|t| t.size_vec2()).unwrap_or(vec2(self.out_size.0, self.out_size.1));
@@ -6130,7 +7093,7 @@ impl GifKitApp {
                     LayerKind::Markup(m) => ProjLayer::Markup { markup: m.clone() },
                     LayerKind::Emoji(e) => ProjLayer::Emoji { emoji: (**e).clone() },
                 };
-                ProjLayerEntry { visible: l.visible, label: l.label.clone(), layer, timing: l.timing.clone() }
+                ProjLayerEntry { visible: l.visible, label: l.label.clone(), layer, timing: l.timing.clone(), locked: l.locked, color: l.color, opacity: l.opacity }
             })
             .collect();
         let file = ProjectFile {
@@ -6139,6 +7102,8 @@ impl GifKitApp {
             source_size: self.file_size,
             transform: self.stack.transform.clone(),
             layers,
+            markers: self.stack.markers.clone(),
+            gif_color: self.stack.gif_color,
             settings: serde_json::to_value(self.proj_settings()).unwrap_or_default(),
             ..Default::default()
         };
@@ -6196,8 +7161,13 @@ impl GifKitApp {
                 l.visible = e.visible;
                 l.label = e.label;
                 l.timing = e.timing;
+                l.locked = e.locked;
+                l.color = e.color;
+                l.opacity = e.opacity;
             }
         }
+        self.stack.markers = file.markers;
+        self.stack.gif_color = file.gif_color;
         self.stack.sync_len(n);
         if let Ok(st) = serde_json::from_value::<ProjSettings>(file.settings) {
             if let Some(v) = st.gif {
@@ -6540,7 +7510,7 @@ impl GifKitApp {
     /// Draw one viewport (view state `vi`): background, image and labels.
     /// Handles wheel zoom and panning for that viewport (or both, when linked).
     #[allow(clippy::too_many_arguments)]
-    fn viewport(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, vi: usize, rect: Rect, tex: Option<TextureHandle>, img_size: Vec2, label: Option<(String, Color32)>, badge: Option<String>, busy: bool) -> (egui::Response, Mapper) {
+    fn viewport(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, vi: usize, rect: Rect, tex: Option<Tex>, img_size: Vec2, label: Option<(String, Color32)>, badge: Option<String>, busy: bool) -> (egui::Response, Mapper) {
         let pal = *p();
         let fit = ((rect.width() - 24.0) / img_size.x).min((rect.height() - 24.0) / img_size.y).clamp(0.02, 64.0);
         self.views[vi].fit = fit;
@@ -6799,7 +7769,7 @@ impl GifKitApp {
                     let s = self.plan.get(self.cur).map(|f| f.src).unwrap_or(0);
                     let (w, h) = self.dims();
                     let live = if self.crop_live { self.crop_texture(ctx, self.cur) } else { None };
-                    (live.or_else(|| self.base_texture(ctx, s)), vec2(w as f32, h as f32))
+                    (live.or_else(|| self.base_texture(ctx, s)).map(Tex::from), vec2(w as f32, h as f32))
                 } else {
                     // laid out at full size whatever size the preview was made at
                     let tex = self.composite_texture(ctx, self.cur);
@@ -6819,7 +7789,7 @@ impl GifKitApp {
                     let o = self.original.as_ref().unwrap();
                     (vec2(o.width() as f32, o.height() as f32), (o.width(), o.height()) == self.dims())
                 };
-                let tex = self.orig_texture(ctx, i);
+                let tex = self.orig_texture(ctx, i).map(Tex::from);
                 let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, None, None, false);
                 // the original doesn't show what layers do, so only the crop is edited here
                 if same && self.tool == Tool::Crop {
@@ -6846,7 +7816,7 @@ impl GifKitApp {
                     };
                     let _ = n;
                     let sheet = self.cmp.as_ref().map(|c| c.sheet).unwrap_or(false);
-                    let tex = self.cmp_texture(ctx, i);
+                    let tex = self.cmp_texture(ctx, i).map(Tex::from);
                     let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, None, None, false);
                     // a sprite sheet doesn't share the frame's coordinates: no editing handles
                     if !crop_mode && !sheet {
@@ -6935,7 +7905,7 @@ impl GifKitApp {
             return;
         }
         let Some(kind) = self.tool.layer_kind() else { return };
-        if kind == Kind::Effects {
+        if kind == Kind::Effects || kind == Kind::Animation {
             return;
         }
         if kind == Kind::Markup {
@@ -6963,8 +7933,8 @@ impl GifKitApp {
                 LayerKind::Emoji(e) => e.w == 0 || e.applies_to(src_idx),
                 _ => true,
             };
-            // hidden by its clips on the timeline: not there to pick
-            if !applies || !l.timing.shows(self.cur, self.plan.len()) {
+            // hidden by its clips on the timeline, or locked: not there to pick
+            if !applies || !l.timing.shows(self.cur, self.plan.len()) || l.locked {
                 continue;
             }
             if let Some(b) = l.source_box(src_idx, &self.fonts) {
@@ -7613,6 +8583,15 @@ impl GifKitApp {
     fn tool_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let timed = self.tool.layer_kind().and_then(|k| self.sel_index(k)).and_then(|i| self.stack.layers.get(i)).is_some_and(|l| l.timing.clips.is_some());
         SEL_TIMED.with(|c| c.set(timed));
+        // a locked layer's settings can be seen but not changed
+        if self.sel_layer_index().is_some_and(|i| self.stack.layers[i].locked) {
+            ui.add_enabled_ui(false, |ui| self.tool_panel_inner(ui, ctx));
+            return;
+        }
+        self.tool_panel_inner(ui, ctx);
+    }
+
+    fn tool_panel_inner(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         match self.tool {
             Tool::Resize => self.ui_resize(ui, ctx),
             Tool::Crop => self.ui_crop(ui, ctx),
@@ -7621,6 +8600,7 @@ impl GifKitApp {
             Tool::Speed => self.ui_speed(ui, ctx),
             Tool::Optimize => self.ui_optimize(ui, ctx),
             Tool::Effects => self.ui_effects(ui, ctx),
+            Tool::Animation => self.ui_animation(ui),
             Tool::Text => self.ui_text(ui, ctx),
             Tool::Censor => self.ui_censor(ui, ctx),
             Tool::AddImage => self.ui_add_image(ui, ctx),
@@ -7940,7 +8920,7 @@ impl GifKitApp {
                 let text = if d < 2.0 { "⚠ Too fast for browsers".to_string() } else { format!("{} cs per frame ({:.2} fps)", d.max(1.0), 100.0 / d.max(1.0)) };
                 form_row(ui, "", |ui| {
                     if d < 2.0 {
-                        ui.label(RichText::new(text).color(p().neutral)).on_hover_text("Most browsers play delays under 2 cs at 10 cs.");
+                        ui.label(RichText::new(&text).color(p().neutral)).on_hover_text("Most browsers play delays under 2 cs at 10 cs.");
                     } else {
                         hint(ui, &text);
                     }
@@ -8014,24 +8994,31 @@ impl GifKitApp {
             Some(c) => {
                 let n = c.size;
                 let stale = c.key != cur_key;
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(c.size_text()).font(theme::medium(16.0)).color(if stale { pal.fg_muted } else { pal.positive }));
-                    if let Some(orig) = self.file_size {
-                        hint(ui, &format!("{:+.0}% vs original", (n as f64 / orig as f64 - 1.0) * 100.0));
-                    }
-                    if stale || busy {
-                        ui.spinner();
-                    }
+                // in the field column, lined up with the options below
+                form_row(ui, if c.sample.is_some() { "Estimate" } else { "Size" }, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(c.size_text()).font(theme::medium(16.0)).color(if stale { pal.fg_muted } else { pal.positive }));
+                        if let Some(orig) = self.file_size {
+                            hint(ui, &format!("{:+.0}% vs original", (n as f64 / orig as f64 - 1.0) * 100.0));
+                        }
+                        if stale || busy {
+                            ui.spinner();
+                        }
+                    });
                 });
                 if let Some(smp) = &c.sample {
-                    hint(ui, &format!("Estimated from {} of {} frames to keep editing quick", smp.len(), self.plan.len()));
-                    full = ui.add_enabled(!busy, egui::Button::new("Compress Fully").min_size(vec2(0.0, CHIP_H))).on_hover_text("Encode every frame for the exact size and preview. Takes a while on long clips.").clicked();
+                    form_row(ui, "", |ui| {
+                        hint(ui, &format!("Estimated from {} of {} frames to keep editing quick", smp.len(), self.plan.len()));
+                        full = ui.add_enabled(!busy, egui::Button::new("Compress Fully").min_size(vec2(0.0, CHIP_H))).on_hover_text("Encode every frame for the exact size and preview. Takes a while on long clips.").clicked();
+                    });
                 }
             }
             None => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    hint(ui, "Encoding…");
+                form_row(ui, "Size", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        hint(ui, "Encoding…");
+                    });
                 });
             }
         });
@@ -8242,6 +9229,36 @@ impl GifKitApp {
         effects_ui(ui, fx, transform);
         if sel.is_none() && self.fx_draft != EffectSettings::default() {
             let fx = std::mem::take(&mut self.fx_draft);
+            self.add_layer(LayerKind::Effects(Box::new(fx)));
+        }
+    }
+
+    fn ui_animation(&mut self, ui: &mut egui::Ui) {
+        let blank = EffectSettings { anim: true, ..Default::default() };
+        if add_layer_button(ui, "Add New Animation Layer") {
+            self.add_layer(LayerKind::Effects(Box::new(blank.clone())));
+        }
+        ui.add_space(GROUP_GAP);
+        let sel = self.sel_index(Kind::Animation);
+        ui.horizontal(|ui| {
+            hint(ui, if sel.is_some() { "Editing the selected animation layer" } else { "Changing anything adds an animation layer" });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(egui::Button::new("Reset").min_size(vec2(84.0, CHIP_H))).on_hover_text("Clear the animation on this layer").clicked() {
+                    match sel {
+                        Some(i) => self.stack.layers[i].kind = LayerKind::Effects(Box::new(blank.clone())),
+                        None => self.anim_draft = blank.clone(),
+                    }
+                }
+            });
+        });
+        ui.add_space(8.0);
+        let fx: &mut EffectSettings = match sel.map(|i| &mut self.stack.layers[i].kind) {
+            Some(LayerKind::Effects(f)) => f,
+            _ => &mut self.anim_draft,
+        };
+        anim_ui(ui, fx);
+        if sel.is_none() && self.anim_draft != blank {
+            let fx = std::mem::replace(&mut self.anim_draft, blank);
             self.add_layer(LayerKind::Effects(Box::new(fx)));
         }
     }
@@ -9532,7 +10549,7 @@ fn on(b: &[bool]) -> Option<String> {
     (n > 0).then(|| n.to_string())
 }
 
-fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
+fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform) {
     let d = EffectSettings::default();
     let colour_changed = fx.hue != d.hue || fx.saturation != d.saturation || fx.lightness != d.lightness || fx.brightness != d.brightness || fx.contrast != d.contrast;
     group_ex(ui, "Colour", true, colour_changed.then(|| "●".to_string()), |ui| {
@@ -9563,33 +10580,26 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
             colour_btn(ui, &mut fx.bg_color).on_hover_text("Fills transparent areas");
         });
     });
-    use crate::booth::BoothFx;
-    // older layers kept the distortion in the photo booth slot
-    if BoothFx::DISTORT.contains(&fx.booth) && fx.warp == BoothFx::None {
-        fx.warp = fx.booth;
-        fx.warp_amount = fx.booth_amount;
-        fx.warp_cx = fx.booth_cx;
-        fx.warp_cy = fx.booth_cy;
+    use crate::booth::{BoothFx, BoothItem};
+    // older layers kept one look and one distortion; they stack now
+    if fx.booth != BoothFx::None {
+        let it = BoothItem { fx: fx.booth, amount: fx.booth_amount, cx: fx.booth_cx, cy: fx.booth_cy, reverse: false };
+        if BoothFx::LOOKS.contains(&fx.booth) {
+            fx.looks.insert(0, it);
+        } else {
+            fx.warps.insert(0, it);
+        }
         fx.booth = BoothFx::None;
     }
-    // radio buttons for one of `list` (None first), in the field column
-    let pick = |ui: &mut egui::Ui, list: &[BoothFx], cur: &mut BoothFx| {
-        let mut all = vec![BoothFx::None];
-        all.extend_from_slice(list);
-        let labels: Vec<&str> = all.iter().map(|b| b.label()).collect();
-        even_grid(ui, all.len(), label_w(ui, &labels).max(84.0), |ui, i, size| {
-            let b = all[i];
-            let r = cell(ui, size, |ui| radio(ui, *cur == b, b.label()));
-            let r = if b == BoothFx::None { r } else { r.on_hover_text(b.tip()) };
-            if r.clicked() {
-                *cur = b;
-            }
-        });
-    };
-    let booth_on = fx.booth != BoothFx::None;
-    group_ex(ui, "Photo Booth", true, booth_on.then(|| "●".to_string()), |ui| {
-        form_row(ui, "Look", |ui| pick(ui, &BoothFx::LOOKS, &mut fx.booth));
-        ui.add_enabled_ui(booth_on, |ui| slider_row(ui, "Strength", egui::Slider::new(&mut fx.booth_amount, 0.0..=100.0).suffix("%").max_decimals(0)));
+    if fx.warp != BoothFx::None {
+        fx.warps.insert(0, BoothItem { fx: fx.warp, amount: fx.warp_amount, cx: fx.warp_cx, cy: fx.warp_cy, reverse: false });
+        fx.warp = BoothFx::None;
+    }
+    group_ex(ui, "Photo Booth", true, (!fx.looks.is_empty()).then(|| "●".to_string()), |ui| {
+        form_row(ui, "Look", |ui| stack_grid(ui, &BoothFx::LOOKS, &mut fx.looks, None));
+        for it in fx.looks.iter_mut() {
+            slider_row(ui, it.fx.label(), egui::Slider::new(&mut it.amount, 0.0..=100.0).suffix("%").max_decimals(0)).on_hover_text("Strength");
+        }
     });
     group_ex(ui, "Transparency", false, on(&[fx.rc_white, fx.rc_black, fx.rc_custom]), |ui| {
         form_row(ui, "Remove", |ui| toggle_grid(ui, 0.0, &mut [(&mut fx.rc_white, "White", ""), (&mut fx.rc_black, "Black", ""), (&mut fx.rc_custom, "Colour", "")]));
@@ -9614,50 +10624,12 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
             });
         });
     });
-    // reverse, boomerang and looping live in the Reverse frame edit
-    let _ = tr;
-    // the old fade switches become the Fade transition
-    {
-        use crate::motion::Transition as T;
-        if fx.fade_in && fx.intro == T::None {
-            fx.intro = T::Fade;
-        }
-        if fx.fade_out && fx.outro == T::None {
-            fx.outro = T::Fade;
-        }
-        fx.fade_in = false;
-        fx.fade_out = false;
+    // made before the Animation panel: still edited here
+    let moving = fx.intro != crate::motion::Transition::None || fx.outro != crate::motion::Transition::None || !fx.loop_fx().is_empty() || fx.fade_in || fx.fade_out;
+    if !fx.anim && (moving || fx.counter) {
+        hint(ui, "This layer animates. New animation goes in the Animation panel.");
+        anim_ui(ui, fx);
     }
-    let moving = fx.intro != crate::motion::Transition::None || fx.outro != crate::motion::Transition::None || !fx.loop_fx().is_empty();
-    group_ex(ui, "Animation", true, (moving || fx.counter).then(|| "●".to_string()), |ui| {
-        use crate::motion::Transition as T;
-        let items: Vec<(T, &str)> = T::ALL.iter().map(|t| (*t, t.label())).collect();
-        form_row(ui, "Intro", |ui| combo(ui, "fx_intro", &mut fx.intro, &items)).on_hover_text("How the animation appears");
-        form_row(ui, "Outro", |ui| combo(ui, "fx_outro", &mut fx.outro, &items)).on_hover_text("How the animation goes away");
-        ui.add_enabled_ui(fx.intro != T::None || fx.outro != T::None, |ui| {
-            form_row(ui, "Length", |ui| num_fill(ui, &mut fx.fade_frames, 1.0, |d| d.range(1..=10000).suffix(" frames")));
-        });
-        ui.add_space(6.0);
-        form_row(ui, "Loop", |ui| {
-            toggle_grid(ui, 72.0, &mut [
-                (&mut fx.loop_shake, "Shake", "Jitters about"),
-                (&mut fx.loop_pulse, "Pulse", "Grows and shrinks like a heartbeat"),
-                (&mut fx.loop_hop, "Hop", "Bounces up and down"),
-                (&mut fx.loop_wobble, "Wobble", "Rocks side to side"),
-                (&mut fx.loop_rainbow, "Rainbow", "Cycles through the colours"),
-                (&mut fx.loop_glitch, "Glitch", "Digital glitches now and then"),
-            ])
-        });
-        ui.add_enabled_ui(!fx.loop_fx().is_empty(), |ui| {
-            slider_row(ui, "Strength", egui::Slider::new(&mut fx.loop_amount, 0.0..=200.0).suffix("%").max_decimals(0));
-            form_row(ui, "Repeats", |ui| num_fill(ui, &mut fx.loop_cycles, 1.0, |d| d.range(1..=20).suffix("× per loop"))).on_hover_text("Whole numbers keep the loop seamless");
-        });
-        ui.add_space(6.0);
-        ui.add_enabled_ui(moving, |ui| {
-            form_row(ui, "Hidden parts", |ui| check(ui, &mut fx.fade_to_transparent, "Transparent").on_hover_text("Instead of black"));
-        });
-        form_row(ui, "Timer", |ui| check(ui, &mut fx.counter, "Show running time").on_hover_text("Shows a running seconds counter"));
-    });
     group_ex(ui, "Blur & Sharpen", false, on(&[fx.blur, fx.sharpen]), |ui| {
         opt_row(ui, "Blur", &mut fx.blur, |ui| fill_slider(ui, soft_slider(&mut fx.blur_sigma, 0.3..=20.0, "").max_decimals(1)));
         opt_row(ui, "Sharpen", &mut fx.sharpen, |ui| fill_slider(ui, soft_slider(&mut fx.sharpen_sigma, 0.3..=10.0, "").max_decimals(1)));
@@ -9666,7 +10638,7 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
         form_row(ui, "Method", |ui| toggle_grid(ui, 0.0, &mut [(&mut fx.ordered_dither, "Ordered", "Regular pattern dithering"), (&mut fx.error_dither, "Diffusion", "Error diffusion dithering")]));
         ui.add_enabled_ui(fx.ordered_dither || fx.error_dither, |ui| slider_row(ui, "Levels", egui::Slider::new(&mut fx.dither_levels, 2..=16).clamping(egui::SliderClamping::Never)));
     });
-    group_ex(ui, "Artistic", false, on(&[fx.oil, fx.emboss, fx.posterize, fx.solarize, fx.noise]), |ui| {
+    group_ex(ui, "Artistic", false, on(&[fx.oil, fx.emboss, fx.posterize, fx.solarize, fx.noise, fx.pixelate]), |ui| {
         form_row(ui, "Style", |ui| {
             toggle_grid(ui, 92.0, &mut [
                 (&mut fx.oil, "Oil Paint", "Smooths detail into brush-like patches"),
@@ -9674,35 +10646,68 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
                 (&mut fx.posterize, "Posterize", "Fewer colour steps"),
                 (&mut fx.solarize, "Solarize", "Inverts the brightest tones"),
                 (&mut fx.noise, "Noise", "Adds random grain"),
+                (&mut fx.pixelate, "Pixelate", "Big square pixels"),
             ])
         });
-        ui.add_enabled_ui(fx.oil, |ui| slider_row(ui, "Oil radius", egui::Slider::new(&mut fx.oil_radius, 1..=16)));
-        ui.add_enabled_ui(fx.posterize, |ui| slider_row(ui, "Levels", egui::Slider::new(&mut fx.posterize_levels, 2..=16).clamping(egui::SliderClamping::Never)));
-        ui.add_enabled_ui(fx.noise, |ui| slider_row(ui, "Noise", soft_slider(&mut fx.noise_amount, 1.0..=128.0, "").max_decimals(0)));
-    });
-    let warp_on = fx.warp != BoothFx::None;
-    group_ex(ui, "Distort", false, on(&[warp_on, fx.wave, fx.swirl, fx.implode]), |ui| {
-        form_row(ui, "Effect", |ui| pick(ui, &BoothFx::DISTORT, &mut fx.warp));
-        ui.add_enabled_ui(warp_on, |ui| slider_row(ui, "Strength", egui::Slider::new(&mut fx.warp_amount, 0.0..=100.0).suffix("%").max_decimals(0)));
-        ui.add_enabled_ui(warp_on && fx.warp.has_centre(), |ui| {
-            slider_row(ui, "Centre X", egui::Slider::new(&mut fx.warp_cx, 0.0..=100.0).suffix("%").max_decimals(0));
-            {
-                // up from the bottom, like the other Y values
-                let mut up = 100.0 - fx.warp_cy;
-                if slider_row(ui, "Centre Y", egui::Slider::new(&mut up, 0.0..=100.0).suffix("%").max_decimals(0)).changed() {
-                    fx.warp_cy = 100.0 - up;
-                }
-            }
+        if fx.oil {
+            sub_head(ui, "Oil Paint");
+            slider_row(ui, "Brush", egui::Slider::new(&mut fx.oil_radius, 1..=16).suffix(" px")).on_hover_text("How far each patch reaches");
+            slider_row(ui, "Detail", egui::Slider::new(&mut fx.oil_detail, 2..=64)).on_hover_text("How many shades it keeps apart. Fewer gives flatter patches.");
+        }
+        if fx.emboss {
+            sub_head(ui, "Emboss");
+            slider_row(ui, "Strength", egui::Slider::new(&mut fx.emboss_amount, 0.0..=100.0).suffix("%").max_decimals(0));
+            const DIRS: [(u8, &str); 8] = [(0, "Top left"), (1, "Top"), (2, "Top right"), (3, "Right"), (4, "Bottom right"), (5, "Bottom"), (6, "Bottom left"), (7, "Left")];
+            form_row(ui, "Light from", |ui| combo(ui, "fx_emboss_dir", &mut fx.emboss_dir, &DIRS));
+            form_row(ui, "", |ui| check(ui, &mut fx.emboss_colour, "Keep colours").on_hover_text("Raised relief over the picture instead of grey"));
+        }
+        if fx.posterize {
+            sub_head(ui, "Posterize");
+            slider_row(ui, "Levels", egui::Slider::new(&mut fx.posterize_levels, 2..=16).clamping(egui::SliderClamping::Never));
+        }
+        if fx.solarize {
+            sub_head(ui, "Solarize");
+            slider_row(ui, "Threshold", egui::Slider::new(&mut fx.solarize_threshold, 0.0..=255.0).max_decimals(0)).on_hover_text("Tones past this flip");
+            form_row(ui, "", |ui| check(ui, &mut fx.solarize_reverse, "Reverse").on_hover_text("Flip the dark tones instead"));
+        }
+        if fx.noise {
+            sub_head(ui, "Noise");
+            slider_row(ui, "Amount", soft_slider(&mut fx.noise_amount, 1.0..=128.0, "").max_decimals(0));
             form_row(ui, "", |ui| {
-                if wide_button(ui, egui::Button::new("Centre on Frame")).clicked() {
-                    fx.warp_cx = 50.0;
-                    fx.warp_cy = 50.0;
+                ui.horizontal(|ui| {
+                    check(ui, &mut fx.noise_mono, "Grey").on_hover_text("The same grain on every colour");
+                    check(ui, &mut fx.noise_still, "Still").on_hover_text("The same grain on every frame");
+                })
+            });
+        }
+        if fx.pixelate {
+            sub_head(ui, "Pixelate");
+            slider_row(ui, "Block size", egui::Slider::new(&mut fx.pixelate_size, 2..=64).suffix(" px").clamping(egui::SliderClamping::Never));
+        }
+    });
+    group_ex(ui, "Distort", false, on(&[!fx.warps.is_empty(), fx.wave, fx.swirl, fx.implode]), |ui| {
+        form_row(ui, "Effect", |ui| stack_grid(ui, &BoothFx::DISTORT, &mut fx.warps, Some((&mut fx.wave, "Wave", "Ripples the picture up and down"))));
+        for (k, it) in fx.warps.iter_mut().enumerate() {
+            ui.push_id(("warp", k), |ui| {
+                sub_head(ui, it.fx.label());
+                slider_row(ui, "Strength", soft_slider(&mut it.amount, 0.0..=200.0, "").suffix("%").max_decimals(0)).on_hover_text("Type a bigger number for an even stronger effect");
+                form_row(ui, "", |ui| check(ui, &mut it.reverse, "Reverse").on_hover_text(it.fx.reverse_tip()));
+                if it.fx.has_centre() {
+                    slider_row(ui, "Centre X", egui::Slider::new(&mut it.cx, 0.0..=100.0).suffix("%").max_decimals(0));
+                    // up from the bottom, like the other Y values
+                    let mut up = 100.0 - it.cy;
+                    if slider_row(ui, "Centre Y", egui::Slider::new(&mut up, 0.0..=100.0).suffix("%").max_decimals(0)).changed() {
+                        it.cy = 100.0 - up;
+                    }
                 }
             });
-        });
-        ui.add_space(6.0);
-        opt_row(ui, "Wave", &mut fx.wave, |ui| fill_slider(ui, soft_slider(&mut fx.wave_amp, 1.0..=100.0, "").max_decimals(0))).on_hover_text("Ripples the image sideways. The slider sets the height.");
-        ui.add_enabled_ui(fx.wave, |ui| slider_row(ui, "Wavelength", soft_slider(&mut fx.wave_len, 4.0..=500.0, "").max_decimals(0)));
+        }
+        if fx.wave {
+            sub_head(ui, "Wave");
+            slider_row(ui, "Height", soft_slider(&mut fx.wave_amp, 1.0..=100.0, "").suffix(" px").max_decimals(0));
+            slider_row(ui, "Wavelength", soft_slider(&mut fx.wave_len, 4.0..=500.0, "").suffix(" px").max_decimals(0));
+            form_row(ui, "", |ui| check(ui, &mut fx.wave_reverse, "Reverse").on_hover_text("The waves travel the other way"));
+        }
         // Twirl, Dent and Bulge do these now; older layers keep theirs
         if fx.swirl {
             opt_row(ui, "Swirl (old)", &mut fx.swirl, |ui| fill_slider(ui, soft_slider(&mut fx.swirl_deg, -720.0..=720.0, "").suffix("°").max_decimals(0)));
@@ -9722,6 +10727,17 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
                 (&mut fx.polaroid, "Polaroid", "White instant-photo frame"),
             ])
         });
+        for (on, name, v) in [
+            (fx.gotham, "Gotham", &mut fx.gotham_amount),
+            (fx.lomo, "Lomo", &mut fx.lomo_amount),
+            (fx.nashville, "Nashville", &mut fx.nashville_amount),
+            (fx.toaster, "Toaster", &mut fx.toaster_amount),
+            (fx.vignette, "Vignette", &mut fx.vignette_amount),
+        ] {
+            if on {
+                slider_row(ui, name, egui::Slider::new(v, 0.0..=100.0).suffix("%").max_decimals(0)).on_hover_text("Strength");
+            }
+        }
     });
     group_ex(ui, "Frame", false, on(&[fx.frame_camera, fx.frame_fuzzy, fx.frame_rounded, fx.frame_border]), |ui| {
         form_row(ui, "Style", |ui| {
@@ -9755,7 +10771,143 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, tr: &mut Transform) {
     });
 }
 
+/// A small heading inside a group, over one effect's own settings.
+fn sub_head(ui: &mut egui::Ui, text: &str) {
+    // the rows under it go with it in a search
+    FIND.with(|f| {
+        let mut f = f.borrow_mut();
+        f.ctx = text.to_string();
+        f.follow = false;
+    });
+    if find_row_shown("") {
+        ui.add_space(4.0);
+        form_row_raw(ui, "", |ui| ui.label(egui::RichText::new(text).strong()));
+    }
+}
+
+/// Checkboxes for stacked looks or distortions: ticking one adds it to
+/// `items` (kept in the order of `list`), unticking takes it out. `extra`
+/// is one more plain switch in the same grid.
+fn stack_grid(ui: &mut egui::Ui, list: &[crate::booth::BoothFx], items: &mut Vec<crate::booth::BoothItem>, extra: Option<(&mut bool, &str, &str)>) {
+    let mut on: Vec<bool> = list.iter().map(|b| items.iter().any(|i| i.fx == *b)).collect();
+    {
+        let mut rows: Vec<(&mut bool, &str, &str)> = on.iter_mut().zip(list).map(|(o, b)| (o, b.label(), b.tip())).collect();
+        if let Some(e) = extra {
+            rows.push(e);
+        }
+        toggle_grid(ui, 92.0, &mut rows);
+    }
+    for (b, o) in list.iter().zip(&on) {
+        let has = items.iter().any(|i| i.fx == *b);
+        if *o && !has {
+            items.push(crate::booth::BoothItem { fx: *b, ..Default::default() });
+        } else if !*o && has {
+            items.retain(|i| i.fx != *b);
+        }
+    }
+    items.sort_by_key(|i| list.iter().position(|b| *b == i.fx).unwrap_or(usize::MAX));
+}
+
+/// The Animation panel's settings (also shown for older effects layers that animate).
+fn anim_ui(ui: &mut egui::Ui, fx: &mut EffectSettings) {
+    use crate::motion::Transition as T;
+    // the old fade switches become the Fade transition
+    if fx.fade_in && fx.intro == T::None {
+        fx.intro = T::Fade;
+    }
+    if fx.fade_out && fx.outro == T::None {
+        fx.outro = T::Fade;
+    }
+    fx.fade_in = false;
+    fx.fade_out = false;
+    let items: Vec<(T, &str)> = T::ALL.iter().map(|t| (*t, t.label())).collect();
+    let ends = fx.intro != T::None || fx.outro != T::None;
+    group_ex(ui, "Intro & Outro", true, ends.then(|| "●".to_string()), |ui| {
+        let (mut fi, mut fo) = fx.transition_frames();
+        form_row(ui, "Intro", |ui| combo(ui, "fx_intro", &mut fx.intro, &items)).on_hover_text("How the layer's picture appears");
+        ui.add_enabled_ui(fx.intro != T::None, |ui| {
+            if form_row(ui, "Length", |ui| num_fill(ui, &mut fi, 1.0, |d| d.range(1..=10000).suffix(" frames"))).changed() {
+                fx.intro_frames = fi;
+            }
+        });
+        form_row(ui, "Outro", |ui| combo(ui, "fx_outro", &mut fx.outro, &items)).on_hover_text("How it goes away");
+        ui.add_enabled_ui(fx.outro != T::None, |ui| {
+            if form_row(ui, "Length", |ui| num_fill(ui, &mut fo, 1.0, |d| d.range(1..=10000).suffix(" frames"))).changed() {
+                fx.outro_frames = fo;
+            }
+        });
+    });
+    let looping = !fx.loop_fx().is_empty();
+    group_ex(ui, "Loop", true, looping.then(|| "●".to_string()), |ui| {
+        form_row(ui, "Motion", |ui| {
+            toggle_grid(ui, 84.0, &mut [
+                (&mut fx.loop_shake, "Shake", "Jitters about"),
+                (&mut fx.loop_pulse, "Pulse", "Grows and shrinks"),
+                (&mut fx.loop_heartbeat, "Heartbeat", "Two quick beats each time round"),
+                (&mut fx.loop_hop, "Hop", "Bounces up and down"),
+                (&mut fx.loop_float, "Float", "Bobs gently up and down"),
+                (&mut fx.loop_wobble, "Wobble", "Rocks side to side"),
+                (&mut fx.loop_spin, "Spin", "Turns all the way round"),
+                (&mut fx.loop_squash, "Squash", "Squashes and stretches"),
+            ])
+        });
+        form_row(ui, "Look", |ui| {
+            toggle_grid(ui, 84.0, &mut [
+                (&mut fx.loop_rainbow, "Rainbow", "Cycles through the colours"),
+                (&mut fx.loop_glitch, "Glitch", "Digital glitches now and then"),
+                (&mut fx.loop_blink, "Blink", "Gone for half of each time round"),
+            ])
+        });
+        ui.add_enabled_ui(looping, |ui| {
+            slider_row(ui, "Strength", egui::Slider::new(&mut fx.loop_amount, 0.0..=200.0).suffix("%").max_decimals(0));
+            form_row(ui, "Repeats", |ui| num_fill(ui, &mut fx.loop_cycles, 1.0, |d| d.range(1..=20).suffix("× per loop"))).on_hover_text("Whole numbers keep the loop seamless");
+            form_row(ui, "", |ui| check(ui, &mut fx.loop_reverse, "Reverse").on_hover_text("Turn, bob and cycle colours the other way"));
+        });
+    });
+    let moving = ends || looping;
+    group_ex(ui, "Timer", false, fx.counter.then(|| "●".to_string()), |ui| {
+        form_row(ui, "", |ui| check(ui, &mut fx.counter, "Show running time").on_hover_text("A seconds counter over the picture"));
+        ui.add_enabled_ui(fx.counter, |ui| {
+            const CORNERS: [(u8, &str); 4] = [(2, "Top left"), (3, "Top right"), (0, "Bottom left"), (1, "Bottom right")];
+            form_row(ui, "Corner", |ui| combo(ui, "fx_counter_pos", &mut fx.counter_pos, &CORNERS));
+            slider_row(ui, "Size", egui::Slider::new(&mut fx.counter_size, 2.0..=40.0).suffix("%").max_decimals(0)).on_hover_text("Of the picture's height");
+        });
+    });
+    group_ex(ui, "Hidden Parts", false, None, |ui| {
+        ui.add_enabled_ui(moving, |ui| {
+            form_row(ui, "Fill", |ui| check(ui, &mut fx.fade_to_transparent, "Transparent").on_hover_text("What shows where the picture moved away. Black otherwise."));
+        });
+    });
+}
+
 // ================================================================ helpers
+
+/// What Copy puts on the system clipboard for layers, so Ctrl+V comes back here.
+const LAYERS_TAG: &str = "GIFkit layers";
+
+/// Move a placed layer by `d` pixels right and down (pasted copies).
+fn offset_layer(k: &mut LayerKind, d: i32) {
+    match k {
+        LayerKind::Text(t) => (t.x, t.y) = (t.x + d, t.y + d),
+        LayerKind::Shape(s) => (s.x, s.y) = (s.x + d, s.y + d),
+        LayerKind::Emoji(e) => (e.x, e.y) = (e.x + d, e.y + d),
+        LayerKind::Censor(c) => (c.x, c.y) = (c.x + d, c.y + d),
+        LayerKind::Overlay(o) => {
+            for p in &mut o.placements {
+                (p.x, p.y) = (p.x + d, p.y + d);
+            }
+        }
+        LayerKind::Markup(m) => {
+            for st in &mut m.strokes {
+                for pt in &mut st.points {
+                    pt[0] += d as f32;
+                    pt[1] += d as f32;
+                }
+            }
+        }
+        _ => {}
+    }
+}
 
 /// File paths from pasted text: `file://` URIs (percent-encoded) or plain paths.
 fn paths_from_text(t: &str) -> Vec<PathBuf> {
