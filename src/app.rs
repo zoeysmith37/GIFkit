@@ -343,6 +343,9 @@ struct Snapshot {
 struct Tex {
     id: egui::TextureId,
     size: Vec2,
+    /// an egui texture stays alive while any copy of this is held (the last
+    /// picture kept on screen outlives the cache that made it)
+    _keep: Option<TextureHandle>,
 }
 
 impl Tex {
@@ -357,7 +360,7 @@ impl Tex {
 impl From<TextureHandle> for Tex {
     fn from(t: TextureHandle) -> Tex {
         // the handle's cache keeps the texture; egui frees it when the cache drops it
-        Tex { id: t.id(), size: t.size_vec2() }
+        Tex { id: t.id(), size: t.size_vec2(), _keep: Some(t) }
     }
 }
 
@@ -373,6 +376,8 @@ struct GpuFrames {
     shown: Option<(eframe::wgpu::Texture, egui::TextureId)>,
     bytes: usize,
     tick: u64,
+    /// frames in a row the last picture stayed up while the card was busy
+    since_busy: u32,
 }
 
 /// Frame thumbnails, made in the background and only for frames someone
@@ -2635,7 +2640,7 @@ impl GifKitApp {
             pending_sig: 0,
             last_comp: None,
             gpu: cc.wgpu_render_state.as_ref().filter(|rs| std::env::var_os("GIFKIT_CPU_PREVIEW").is_none() && crate::gpu_render::worth_using(&rs.adapter.get_info())).map(|rs| (crate::gpu_render::GpuRenderer::new(rs.device.clone(), rs.queue.clone()), rs.renderer.clone())),
-            gpu_frames: GpuFrames { key: 0, map: HashMap::new(), shown: None, bytes: 0, tick: 0 },
+            gpu_frames: GpuFrames { key: 0, map: HashMap::new(), shown: None, bytes: 0, tick: 0, since_busy: 0 },
             last_tick: None,
             orig_clock: 0.0,
             resize_by_pct: true,
@@ -4329,11 +4334,23 @@ impl GifKitApp {
     /// Texture of output frame `i` with all live edits applied.
     /// The frame rendered on the graphics card, when it can draw everything
     /// in the stack (else None and the CPU path takes over).
-    fn gpu_composite(&mut self, i: usize) -> Option<Tex> {
+    fn gpu_composite(&mut self, ctx: &egui::Context, i: usize) -> Option<Tex> {
         if self.gpu.is_none() || !self.stack.gpu_capable() || !crate::gpu_render::enabled() {
             return None;
         }
         let key = self.comp_key;
+        // the card is still busy with the last one: keep it up a moment longer
+        if self.gpu_frames.key != key || !self.gpu_frames.map.contains_key(&i) {
+            if let (Some((gpu, _)), Some((_, t))) = (&self.gpu, &self.last_comp) {
+                if gpu.busy() && self.gpu_frames.since_busy < 30 {
+                    self.gpu_frames.since_busy += 1;
+                    let t = t.clone();
+                    ctx.request_repaint_after(std::time::Duration::from_millis(4));
+                    return Some(t);
+                }
+            }
+            self.gpu_frames.since_busy = 0;
+        }
         if self.gpu_frames.key != key {
             self.free_gpu_frames();
             self.gpu_frames.key = key;
@@ -4342,7 +4359,7 @@ impl GifKitApp {
         let tick = self.gpu_frames.tick;
         if let Some(e) = self.gpu_frames.map.get_mut(&i) {
             e.2 = tick;
-            return Some(Tex { id: e.1, size: vec2(e.0.width() as f32, e.0.height() as f32) });
+            return Some(Tex { id: e.1, size: vec2(e.0.width() as f32, e.0.height() as f32), _keep: None });
         }
         let prep = self.prepared()?;
         let (st, base) = self.render_inputs()?;
@@ -4378,7 +4395,7 @@ impl GifKitApp {
         }
         self.gpu_frames.bytes += bytes;
         self.gpu_frames.map.insert(i, (tex, id, tick));
-        Some(Tex { id, size })
+        Some(Tex { id, size, _keep: None })
     }
 
     fn free_gpu_frames(&mut self) {
@@ -4408,7 +4425,7 @@ impl GifKitApp {
             let src = self.plan.get(i)?.src;
             return self.base_texture(ctx, src).map(Tex::from);
         }
-        if let Some(t) = self.gpu_composite(i) {
+        if let Some(t) = self.gpu_composite(ctx, i) {
             self.last_comp = Some((i, t.clone()));
             return Some(t);
         }

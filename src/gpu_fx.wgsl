@@ -640,8 +640,9 @@ fn fs_fx(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         case 19: {
             let r = i32(a.x);
             let lv = u32(a.y);
-            var count: array<u32, 64>;
-            var sum: array<vec3<u32>, 64>;
+            // per brightness bin: summed colour and count (one array keeps
+            // the per-pixel memory down)
+            var bins: array<vec4<u32>, 64>;
             for (var dy = -r; dy <= r; dy = dy + 1) {
                 for (var dx = -r; dx <= r; dx = dx + 1) {
                     if (dx * dx + dy * dy > r * r) {
@@ -649,21 +650,20 @@ fn fs_fx(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     }
                     let p = ld(t0, ip + vec2<i32>(dx, dy));
                     let bi = min(u32((luma(p) / 256.0) * f32(lv)), lv - 1u);
-                    count[bi] = count[bi] + 1u;
-                    sum[bi] = sum[bi] + vec3<u32>(p.rgb);
+                    bins[bi] = bins[bi] + vec4<u32>(vec3<u32>(p.rgb), 1u);
                 }
             }
             var bi = 0u;
             var bc = 0u;
             for (var k = 0u; k < lv; k = k + 1u) {
-                if (count[k] >= bc) {
-                    bc = count[k];
+                if (bins[k].w >= bc) {
+                    bc = bins[k].w;
                     bi = k;
                 }
             }
             let q = ld(t0, ip);
             if (bc > 0u) {
-                return vec4<f32>(vec3<f32>(sum[bi] / vec3<u32>(bc)), q.a) / 255.0;
+                return vec4<f32>(vec3<f32>(bins[bi].xyz / vec3<u32>(bc)), q.a) / 255.0;
             }
             return q / 255.0;
         }

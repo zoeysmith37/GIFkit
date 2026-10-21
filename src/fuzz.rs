@@ -1151,3 +1151,57 @@ fn clipping_mask() {
     assert_eq!(clipped.get_pixel(30, 20).0, free.get_pixel(30, 20).0);
     assert!(st.gpu_frame(&base, &plan, &times, 0, &fonts, &st.prepare(&base, &fonts)).is_none());
 }
+
+/// Every look, style and filter across its strength range, on both paths:
+/// neither should ever come out black or empty.
+#[test]
+#[ignore]
+fn strength_sweep() {
+    use crate::booth::{BoothFx, BoothItem};
+    use crate::effects::EffectSettings as E;
+    let gpu = crate::gpu_render::GpuRenderer::headless();
+    let mut gpu = gpu;
+    let fonts = crate::text::builtin_fonts();
+    let img = RgbaImage::from_fn(97, 61, |x, y| Rgba([(x * 2) as u8 + 40, (y * 3) as u8 + 30, ((x ^ y) * 3) as u8, 255]));
+    let base = Animation { frames: vec![Frame::new(img, 10)], loop_count: None };
+    let mut cases: Vec<(String, E)> = Vec::new();
+    for a in [0.0f32, 1.0, 13.0, 50.0, 99.0, 100.0, 101.0, 150.0, 400.0, 2000.0] {
+        for b in BoothFx::LOOKS {
+            cases.push((format!("{} {a}", b.label()), E { looks: vec![BoothItem { fx: b, amount: a, ..Default::default() }], ..Default::default() }));
+        }
+        cases.push((format!("gotham {a}"), E { gotham: true, gotham_amount: a, ..Default::default() }));
+        cases.push((format!("lomo {a}"), E { lomo: true, lomo_amount: a, ..Default::default() }));
+        cases.push((format!("nashville {a}"), E { nashville: true, nashville_amount: a, ..Default::default() }));
+        cases.push((format!("toaster {a}"), E { toaster: true, toaster_amount: a, ..Default::default() }));
+        cases.push((format!("vignette {a}"), E { vignette: true, vignette_amount: a, ..Default::default() }));
+        cases.push((format!("emboss {a}"), E { emboss: true, emboss_amount: a, ..Default::default() }));
+    }
+    let mut bad = 0;
+    for (name, fx) in cases {
+        let mut st = Stack::default();
+        st.push(LayerKind::Effects(Box::new(fx)));
+        let plan = st.plan(&base);
+        let times = crate::stack::plan_times(&plan);
+        let prep = st.prepare(&base, &fonts);
+        let cpu = st.render_frame(&base, &plan, &times, 0, &fonts, &prep);
+        let mean = |i: &RgbaImage| i.pixels().map(|p| p[0] as u64 + p[1] as u64 + p[2] as u64 + p[3] as u64).sum::<u64>() / (i.width() * i.height()) as u64;
+        let mut line = format!("{name:22} cpu {:4}", mean(&cpu));
+        if let Some(g) = gpu.as_mut() {
+            let job = st.gpu_frame(&base, &plan, &times, 0, &fonts, &prep).expect("gpu job");
+            let tex = g.render(&base.frames[0].image, 1, &job, 3);
+            let out = g.read(&tex);
+            let d: u64 = out.pixels().zip(cpu.pixels()).map(|(a, b)| (0..4).map(|k| (a[k] as i32 - b[k] as i32).unsigned_abs() as u64).sum::<u64>()).max().unwrap_or(0);
+            line += &format!(" gpu {:4} maxdiff {d}", mean(&out));
+            if d > 12 || mean(&out) < 20 {
+                bad += 1;
+                line += "  <<<";
+            }
+        }
+        if mean(&cpu) < 20 {
+            bad += 1;
+            line += "  <<< cpu";
+        }
+        println!("{line}");
+    }
+    assert_eq!(bad, 0);
+}

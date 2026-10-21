@@ -245,6 +245,8 @@ pub struct GpuRenderer {
     sprites: TexCache,
     noise: HashMap<(u8, u32, u32), wgpu::TextureView>,
     pub max_side: u32,
+    /// frames sent to the card and not finished yet
+    pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 fn tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -339,6 +341,7 @@ impl GpuRenderer {
             sprites: TexCache::new(256 << 20),
             noise: HashMap::new(),
             max_side,
+            pending: Default::default(),
         }
     }
 
@@ -664,7 +667,20 @@ impl GpuRenderer {
             cur_tex = t;
         }
         self.queue.submit([enc.finish()]);
+        let pending = self.pending.clone();
+        pending.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.queue.on_submitted_work_done(move || {
+            pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        });
         cur_tex
+    }
+
+    /// Is the card still working on a frame sent earlier? Sending more while
+    /// it is only queues work up: a heavy effect dragged about would pile up
+    /// seconds of it and stall the screen.
+    pub fn busy(&self) -> bool {
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        self.pending.load(std::sync::atomic::Ordering::Relaxed) > 0
     }
 
     /// Read rendered frames back as they are, all in one wait.

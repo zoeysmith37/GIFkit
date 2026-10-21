@@ -30,11 +30,17 @@ pub struct Plan<'a, 'f> {
     pub passes: Vec<GpuPass<'a>>,
     pub size: (u32, u32),
     pub owned: &'f mut Vec<RgbaImage>,
+    /// about how many pixel reads the slow passes make
+    pub cost: f64,
 }
+
+/// More pixel reads than this in one frame and it's made on the CPU: one
+/// pass that long can trip the driver's watchdog (the screen goes black).
+pub const MAX_COST: f64 = 6.0e8;
 
 impl<'a, 'f> Plan<'a, 'f> {
     pub fn new(size: (u32, u32), owned: &'f mut Vec<RgbaImage>) -> Self {
-        Plan { passes: Vec::new(), size, owned }
+        Plan { passes: Vec::new(), size, owned, cost: 0.0 }
     }
 
     fn wf(&self) -> (f32, f32) {
@@ -93,6 +99,7 @@ impl<'a, 'f> Plan<'a, 'f> {
     fn blur(&mut self, src: GpuIn<'a>, out: Option<u8>, size: (u32, u32), sigma: f32, region: [f32; 4]) {
         let sigma = if sigma == 0.0 { 0.8 } else { sigma };
         let n = kernel_size(sigma) as f32;
+        self.cost += size.0 as f64 * size.1 as f64 * n as f64 * 2.0;
         self.raw(16, 0.0, [Some(src), None, None], Some(T_MID), size, true, &[[n, sigma, 0.0, 0.0], region]);
         self.raw(17, 0.0, [Some(GpuIn::Tmp(T_MID)), None, None], out, size, false, &[[n, sigma, 0.0, 0.0], region]);
     }
@@ -248,6 +255,8 @@ pub fn effects<'a>(p: &mut Plan<'a, '_>, s: &EffectSettings, idx: usize, n: usiz
         p.raw(18, 0.0, [Some(GpuIn::Cur), Some(GpuIn::Tmp(T_BLUR)), None], None, size, false, &[[2.0, 0.0, 0.0, 0.0]]);
     }
     if s.oil {
+        let r = s.oil_radius.clamp(1, 16) as f64;
+        p.cost += p.size.0 as f64 * p.size.1 as f64 * (2.0 * r + 1.0).powi(2);
         p.op(19, &[[s.oil_radius.clamp(1, 16) as f32, s.oil_detail.clamp(2, 64) as f32, 0.0, 0.0]]);
     }
     if s.emboss {

@@ -1456,6 +1456,8 @@ impl Stack {
         let mut owned: Vec<RgbaImage> = Vec::new();
         // the frame's size as layers go (effects can change it)
         let mut cur = (ow, oh);
+        // the slow passes' work so far (see gpu_fx::MAX_COST)
+        let mut cost = 0.0f64;
         for (li, l) in self.layers.iter().enumerate() {
             if !l.active() || !l.timing.shows(i, n) {
                 continue;
@@ -1486,6 +1488,10 @@ impl Stack {
                     let end_t = times[s1] + if plan[s1].enabled { effective_delay(plan[s1].delay) as f32 / 100.0 } else { 0.0 };
                     let mut pl = crate::gpu_fx::Plan::new(cur, &mut owned);
                     crate::gpu_fx::effects(&mut pl, fx, shown(s0, i), shown(s0, s1 + 1).max(1), times[i] - times[s0], end_t - times[s0], fonts);
+                    cost += pl.cost;
+                    if cost > crate::gpu_fx::MAX_COST {
+                        return None;
+                    }
                     cur = pl.size;
                     let passes = pl.passes;
                     draws.push(GpuOp::Effect { passes, mix: k });
