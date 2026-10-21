@@ -68,6 +68,17 @@ pub struct ProjLayerEntry {
     /// the bar's colour on the timeline
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<[u8; 3]>,
+    /// the layer's opacity, %
+    #[serde(default = "full", skip_serializing_if = "is_full")]
+    pub opacity: f32,
+}
+
+fn full() -> f32 {
+    100.0
+}
+
+fn is_full(v: &f32) -> bool {
+    *v >= 100.0
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]

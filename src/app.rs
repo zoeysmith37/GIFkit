@@ -932,6 +932,11 @@ pub struct GifKitApp {
     key_capture: Option<crate::keys::Action>,
     /// the shortcuts dialog's search text
     keys_filter: String,
+    /// the tool panel's search text, and the tool it was typed for
+    panel_find: String,
+    panel_find_tool: Option<Tool>,
+    /// the layer list's search text
+    layer_find: String,
     /// previews of big pictures are made from frames shrunk to this long
     /// side (0 = always full size)
     preview_max: u32,
@@ -1322,7 +1327,7 @@ fn kind_key(k: Kind) -> &'static str {
 // ---------------------------------------------------------------- Breeze-ish widgets
 
 /// A collapsible Breeze group box: clickable title row above a framed area.
-fn group<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> Option<R> {
+fn group<R>(ui: &mut egui::Ui, title: &str, add: impl FnMut(&mut egui::Ui) -> R) -> Option<R> {
     group_ex(ui, title, true, None, add)
 }
 
@@ -1338,13 +1343,34 @@ fn clear_group_command(ctx: &egui::Context) {
 }
 
 /// Collapsible group with a default state and an optional badge (e.g. number of active options).
-fn group_ex<R>(ui: &mut egui::Ui, title: &str, default_open: bool, badge: Option<String>, add: impl FnOnce(&mut egui::Ui) -> R) -> Option<R> {
+fn group_ex<R>(ui: &mut egui::Ui, title: &str, default_open: bool, badge: Option<String>, mut add: impl FnMut(&mut egui::Ui) -> R) -> Option<R> {
     // KDE settings pages are flat: a heading with a thin line under it, then the form
     let pal = *p();
     if title.is_empty() {
         let r = add(ui);
         ui.add_space(GROUP_GAP);
         return Some(r);
+    }
+    // searching: the group shows, open, if its title or anything in it matches
+    let mut forced = false;
+    let mut all = false;
+    if find_on() {
+        let probing = FIND.with(|f| f.borrow().probing);
+        if probing {
+            let all = find_matches(title);
+            if all {
+                find_note(title);
+            }
+            return Some(find_scoped(Some(""), all, false, || add(ui)));
+        }
+        all = find_matches(title);
+        if !all {
+            let (_, hit) = find_scoped(Some(""), false, false, || find_probe(ui, &mut add));
+            if !hit {
+                return None;
+            }
+        }
+        forced = true;
     }
     let id = ui.make_persistent_id(("grp", title));
     let cmd: Option<bool> = ui.ctx().data(|d| d.get_temp::<Option<bool>>(egui::Id::unique(GROUP_CMD))).flatten();
@@ -1353,10 +1379,12 @@ fn group_ex<R>(ui: &mut egui::Ui, title: &str, default_open: bool, badge: Option
         open = c;
     }
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
-    if resp.clicked() {
+    if resp.clicked() && !forced {
         open = !open;
     }
     ui.ctx().data_mut(|d| d.insert_persisted(id, open));
+    // open while it's a search result, without changing how it's left
+    let open = open || forced;
     let painter = ui.painter();
     let col = if resp.hovered() { pal.fg } else { pal.fg_muted };
     crate::icons::paint(painter, if open { "go-down" } else { "go-next" }, pos2(rect.left() + 8.0, rect.center().y), 16.0, col);
@@ -1374,7 +1402,7 @@ fn group_ex<R>(ui: &mut egui::Ui, title: &str, default_open: bool, badge: Option
         return None;
     }
     ui.add_space(8.0);
-    let r = add(ui);
+    let r = if forced { find_scoped(Some(""), all, false, || add(ui)) } else { add(ui) };
     ui.add_space(GROUP_GAP + 4.0);
     Some(r)
 }
@@ -1421,6 +1449,9 @@ fn sel_btn<'a>(b: egui::Button<'a>, on: bool) -> egui::Button<'a> {
 fn seg_row<T: PartialEq + Copy>(ui: &mut egui::Ui, current: &mut T, items: &[(T, &str)]) -> egui::Response {
     let mut out: Option<egui::Response> = None;
     let labels: Vec<&str> = items.iter().map(|i| i.1).collect();
+    for l in &labels {
+        find_note(l);
+    }
     // rows wrap evenly rather than cutting labels short
     let min_w = label_w(ui, &labels);
     even_grid(ui, items.len(), min_w, |ui, i, size| {
@@ -1477,6 +1508,14 @@ fn label_w(ui: &egui::Ui, labels: &[&str]) -> f32 {
 
 /// Toggle buttons in even rows.
 fn toggle_grid(ui: &mut egui::Ui, min_w: f32, items: &mut [(&mut bool, &str, &str)]) {
+    // a search that matched some of these shows just those
+    if FIND.with(|f| f.borrow().items) {
+        let total = items.len();
+        let mut some: Vec<(&mut bool, &str, &str)> = items.iter_mut().filter(|i| find_matches(i.1)).map(|(b, l, t)| (&mut **b, *l, *t)).collect();
+        if !some.is_empty() && some.len() < total {
+            return find_scoped(None, false, false, || toggle_grid(ui, min_w, &mut some));
+        }
+    }
     let n = items.len();
     let labels: Vec<&str> = items.iter().map(|i| i.1).collect();
     let min_w = min_w.max(label_w(ui, &labels));
@@ -1675,7 +1714,173 @@ const FORM_LABEL_W: f32 = 86.0;
 /// One row of a KDE-style form: a right-aligned label in a fixed column on the
 /// left and the controls in a column that fills the rest. The controls get a
 /// vertical ui of a fixed width, so nothing in them can widen the panel.
-fn form_row<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+// ------------------------------------------------------------ panel search
+//
+// The search box over the tool panel filters its rows as they're drawn. A
+// row shows when its label matches, when the heading it sits under matches
+// (a group title or an effect's own sub-heading, so "squeeze" brings its
+// strength, reverse and centre along), or when anything inside it does (a
+// checkbox in a grid, say). For that last case the row is drawn once out of
+// sight to see what it holds, then for real if something matched.
+
+#[derive(Default)]
+struct Find {
+    /// lower case; empty: not searching
+    q: String,
+    /// drawing out of sight to see what matches
+    probing: bool,
+    hit: bool,
+    /// the sub-heading rows sit under
+    ctx: String,
+    /// the group's title matched: everything in it shows
+    group_all: bool,
+    /// grids show only their matching items
+    items: bool,
+    /// rows shown for the search so far
+    shown: usize,
+}
+
+thread_local! {
+    static FIND: std::cell::RefCell<Find> = std::cell::RefCell::new(Find::default());
+}
+
+fn find_on() -> bool {
+    FIND.with(|f| !f.borrow().q.is_empty())
+}
+
+fn find_matches(text: &str) -> bool {
+    FIND.with(|f| {
+        let f = f.borrow();
+        !f.q.is_empty() && text.to_lowercase().contains(&f.q)
+    })
+}
+
+/// A piece of text in what's being drawn: while probing, a match counts.
+fn find_note(text: &str) {
+    if find_matches(text) {
+        FIND.with(|f| f.borrow_mut().hit = true);
+    }
+}
+
+/// Is a row with this label shown as it is (by its label or what it sits under)?
+fn find_row_shown(label: &str) -> bool {
+    let (on, probing, ctx, all) = FIND.with(|f| {
+        let f = f.borrow();
+        (!f.q.is_empty(), f.probing, f.ctx.clone(), f.group_all)
+    });
+    if !on {
+        return true;
+    }
+    let by = find_matches(label) || (!ctx.is_empty() && find_matches(&ctx)) || all;
+    if probing {
+        if by {
+            FIND.with(|f| f.borrow_mut().hit = true);
+        }
+        return true;
+    }
+    by
+}
+
+/// A row shown for real while searching.
+fn find_count() {
+    FIND.with(|f| {
+        let mut f = f.borrow_mut();
+        if !f.q.is_empty() && !f.probing {
+            f.shown += 1;
+        }
+    });
+}
+
+/// Draw without taking any room or showing anything.
+fn find_hidden<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let rect = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width().max(1.0), 2000.0));
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(*ui.layout()).invisible());
+    add(&mut child)
+}
+
+/// Draw out of sight and report whether anything in it matched.
+fn find_probe<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> (R, bool) {
+    let (was_p, was_h) = FIND.with(|f| {
+        let mut f = f.borrow_mut();
+        let w = (f.probing, f.hit);
+        f.probing = true;
+        f.hit = false;
+        w
+    });
+    let r = find_hidden(ui, add);
+    let hit = FIND.with(|f| {
+        let mut f = f.borrow_mut();
+        let h = f.hit;
+        f.probing = was_p;
+        f.hit = was_h || h;
+        h
+    });
+    (r, hit)
+}
+
+/// Run `add` with the search's per-group state set, then put it back.
+fn find_scoped<R>(ctx: Option<&str>, all: bool, items: bool, add: impl FnOnce() -> R) -> R {
+    let old = FIND.with(|f| {
+        let mut f = f.borrow_mut();
+        let old = (f.ctx.clone(), f.group_all, f.items);
+        if let Some(c) = ctx {
+            f.ctx = c.to_string();
+        }
+        f.group_all = all;
+        f.items = items;
+        old
+    });
+    let r = add();
+    FIND.with(|f| {
+        let mut f = f.borrow_mut();
+        (f.ctx, f.group_all, f.items) = old;
+    });
+    r
+}
+
+/// A search field with Breeze's find icon and a clear button.
+fn search_box(ui: &mut egui::Ui, text: &mut String, hint_text: &str, id: egui::Id) -> egui::Response {
+    let pal = *p();
+    let r = ui.add(egui::TextEdit::singleline(text).id(id).hint_text(hint_text).margin(egui::Margin { left: 26, right: 26, top: 4, bottom: 4 }).desired_width(ui.available_width()));
+    crate::icons::paint(ui.painter(), "edit-find", pos2(r.rect.left() + 13.0, r.rect.center().y), 16.0, pal.fg_muted);
+    if !text.is_empty() {
+        let cr = Rect::from_center_size(pos2(r.rect.right() - 13.0, r.rect.center().y), vec2(20.0, 20.0));
+        let c = ui.interact(cr, r.id.with("clear"), Sense::click()).on_hover_text("Clear");
+        crate::icons::paint(ui.painter(), "edit-clear", cr.center(), 16.0, if c.hovered() { pal.fg } else { pal.fg_muted });
+        if c.clicked() {
+            text.clear();
+        }
+    }
+    r
+}
+
+/// A form row: the label in its column, the controls beside it.
+fn form_row<R>(ui: &mut egui::Ui, label: &str, mut add: impl FnMut(&mut egui::Ui) -> R) -> R {
+    if find_row_shown(label) {
+        find_count();
+        return form_row_raw(ui, label, &mut add);
+    }
+    // not by its label: see whether anything in it matches
+    let (r, hit) = find_probe(ui, |ui| form_row_raw(ui, label, &mut add));
+    if !hit {
+        return r;
+    }
+    let all = FIND.with(|f| f.borrow().group_all);
+    find_count();
+    find_scoped(None, all, true, || form_row_raw(ui, label, &mut add))
+}
+
+/// A form row shown only by its label (its controls can only be drawn once).
+fn form_row_once<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    if find_row_shown(label) {
+        find_count();
+        form_row_raw(ui, label, add)
+    } else {
+        find_hidden(ui, |ui| form_row_raw(ui, label, add))
+    }
+}
+
+fn form_row_raw<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
         let (r, _) = ui.allocate_exact_size(vec2(FORM_LABEL_W, CHIP_H), Sense::hover());
         if !label.is_empty() {
@@ -1803,7 +2008,7 @@ fn fill_slider(ui: &mut egui::Ui, s: egui::Slider<'_>) -> egui::Response {
 
 /// A labelled slider row.
 fn slider_row(ui: &mut egui::Ui, label: &str, s: egui::Slider<'_>) -> egui::Response {
-    form_row(ui, label, |ui| fill_slider(ui, s))
+    form_row_once(ui, label, |ui| fill_slider(ui, s))
 }
 
 /// Drop shadow switch and its look, greyed out while it's off.
@@ -1819,7 +2024,7 @@ fn shadow_rows(ui: &mut egui::Ui, on: &mut bool, sh: &mut crate::shapes::Shadow)
 
 /// A labelled row with an on/off checkbox; the rest stays in place and greys out when off.
 fn opt_row<R>(ui: &mut egui::Ui, label: &str, on: &mut bool, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    form_row(ui, label, |ui| {
+    form_row_once(ui, label, |ui| {
         ui.horizontal(|ui| {
             check(ui, on, "");
             let en = *on;
@@ -1864,6 +2069,7 @@ fn combo<T: PartialEq + Copy>(ui: &mut egui::Ui, id: &str, current: &mut T, item
 fn radio(ui: &mut egui::Ui, on: bool, text: impl Into<egui::WidgetText>) -> egui::Response {
     let pal = *p();
     let text: egui::WidgetText = text.into();
+    find_note(text.text());
     let d = 16.0;
     let gap = 7.0;
     let wrap_w = (ui.available_width() - d - gap).max(10.0);
@@ -1894,6 +2100,7 @@ fn radio(ui: &mut egui::Ui, on: bool, text: impl Into<egui::WidgetText>) -> egui
 fn check(ui: &mut egui::Ui, on: &mut bool, text: impl Into<egui::WidgetText>) -> egui::Response {
     let pal = *p();
     let text: egui::WidgetText = text.into();
+    find_note(text.text());
     let box_s = 16.0;
     let gap = 7.0;
     // long labels are cut short rather than pushing the panel wider
@@ -2424,6 +2631,9 @@ impl GifKitApp {
             keymap: crate::keys::Keymap::load(),
             key_capture: None,
             keys_filter: String::new(),
+            panel_find: String::new(),
+            panel_find_tool: None,
+            layer_find: String::new(),
             preview_max: theme::get_setting("preview_max").and_then(|v| v.parse().ok()).unwrap_or(1280),
             proxy: None,
             proxy_job: None,
@@ -4317,6 +4527,7 @@ impl GifKitApp {
                 l.visible = src.visible;
                 l.timing = src.timing.clone();
                 l.color = src.color;
+                l.opacity = src.opacity;
                 last = Some((l.kind(), id));
             }
         }
@@ -4749,9 +4960,24 @@ impl eframe::App for GifKitApp {
                                 }
                             });
                         });
+                        ui.add_space(6.0);
+                        // a new tool starts with an empty search
+                        if self.panel_find_tool != Some(self.tool) {
+                            // GIFKIT_FIND: a search to start with (for testing)
+                            self.panel_find = std::env::var("GIFKIT_FIND").unwrap_or_default();
+                            self.panel_find_tool = Some(self.tool);
+                        }
+                        search_box(ui, &mut self.panel_find, "Search settings", egui::Id::unique("panel-find"));
                         ui.add_space(8.0);
+                        let q = self.panel_find.trim().to_lowercase();
                         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                            FIND.with(|f| *f.borrow_mut() = Find { q: q.clone(), ..Default::default() });
                             ui.add_enabled_ui(!self.busy(), |ui| self.tool_panel(ui, &ctx));
+                            let shown = FIND.with(|f| std::mem::take(&mut *f.borrow_mut()).shown);
+                            if !q.is_empty() && shown == 0 {
+                                ui.add_space(8.0);
+                                hint(ui, "No settings match the search.");
+                            }
                             ui.add_space(8.0);
                         });
                     });
@@ -5474,8 +5700,10 @@ impl GifKitApp {
             let cols = ((ui.available_width() / 380.0).floor() as usize).clamp(1, 3);
             let mut col_of = vec![Vec::new(); cols];
             let mut heights = vec![0usize; cols];
-            for (k, (_, v)) in groups.iter().enumerate() {
-                let c = (0..cols).min_by_key(|c| heights[*c]).unwrap_or(0);
+            for (k, (g, v)) in groups.iter().enumerate() {
+                // two columns: the short groups on the left, Edit and the
+                // long Timeline group on the right; otherwise the shortest
+                let c = if cols == 2 { usize::from(matches!(*g, "Edit" | "Timeline")) } else { (0..cols).min_by_key(|c| heights[*c]).unwrap_or(0) };
                 col_of[c].push(k);
                 heights[c] += v.len() + 2;
             }
@@ -5673,6 +5901,35 @@ impl GifKitApp {
             return;
         }
         ui.add_space(4.0);
+        search_box(ui, &mut self.layer_find, "Search layers", egui::Id::unique("layer-find"));
+        ui.add_space(4.0);
+        // the selected layer's lock and opacity, as in Photoshop's layer panel
+        let sel_li = self.sel_layer_index();
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(sel_li.is_some(), |ui| {
+                let (locked, mut op) = sel_li.map(|i| (self.stack.layers[i].locked, self.stack.layers[i].opacity)).unwrap_or((false, 100.0));
+                let icon = crate::icons::image(ui.ctx(), if locked { "object-locked" } else { "object-unlocked" }, 16.0, pal.fg);
+                let b = ui.add(sel_btn(egui::Button::image(icon).min_size(vec2(28.0, 26.0)), locked)).on_hover_text(if locked { "Unlock the layer" } else { "Lock the layer so it can't be changed" });
+                if b.clicked() {
+                    if let Some(i) = sel_li {
+                        self.stack.layers[i].locked = !locked;
+                        self.modified = true;
+                    }
+                }
+                ui.add_space(6.0);
+                ui.label(RichText::new("Opacity:").color(if sel_li.is_some() { pal.fg } else { pal.fg_muted }));
+                ui.add_enabled_ui(!locked, |ui| {
+                    if slider(ui, egui::Slider::new(&mut op, 0.0..=100.0).suffix("%").max_decimals(0)).on_hover_text("The whole layer's opacity").changed() {
+                        if let Some(i) = sel_li {
+                            self.stack.layers[i].opacity = op;
+                            self.modified = true;
+                        }
+                    }
+                });
+            });
+        });
+        ui.add_space(4.0);
+        let find = self.layer_find.trim().to_lowercase();
         // the list, with a row of buttons under it
         let mut rect = ui.available_rect_before_wrap();
         // room for the buttons: gap, a toolbar row and item spacing, so the panel never creeps taller
@@ -5684,6 +5941,7 @@ impl GifKitApp {
         let row_h = 30.0;
         let mut select: Option<(Kind, u64)> = None;
         let mut toggle: Option<usize> = None;
+        let mut lock: Option<usize> = None;
         let mut remove: Option<usize> = None;
         let mut drop_to: Option<(usize, usize)> = None;
         let mut to_frames = false;
@@ -5698,10 +5956,13 @@ impl GifKitApp {
             ui.spacing_mut().item_spacing.y = 0.0;
             let mut rows: Vec<(usize, Rect)> = Vec::new();
             for li in (0..n).rev() {
-                let (id, name, kind, visible) = {
+                let (id, name, kind, visible, locked) = {
                     let l = &self.stack.layers[li];
-                    (l.id, l.name(), l.kind(), l.visible)
+                    (l.id, l.name(), l.kind(), l.visible, l.locked)
                 };
+                if !find.is_empty() && !name.to_lowercase().contains(&find) && !kind_tool(kind).label().to_lowercase().contains(&find) {
+                    continue;
+                }
                 let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click_and_drag());
                 rows.push((li, r));
                 let selected = self.sel.get(kind_key(kind)) == Some(&id) && self.tool == kind_tool(kind);
@@ -5724,7 +5985,7 @@ impl GifKitApp {
                 }
                 // icon + name (elided)
                 paint_tool_icon(&painter, kind_tool(kind), pos2(r.left() + 38.0, r.center().y), 14.0, if visible { pal.fg } else { pal.fg_muted });
-                let del_w = 22.0;
+                let del_w = 44.0;
                 let name_w = (r.width() - 52.0 - del_w - 6.0).max(10.0);
                 let mut job = egui::text::LayoutJob::simple_singleline(elide(&name, 60), egui::FontId::proportional(13.0), if visible { pal.fg } else { pal.fg_muted });
                 job.wrap = egui::text::TextWrapping { max_width: name_w, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
@@ -5791,8 +6052,19 @@ impl GifKitApp {
                         act(LayerAct::Delete(li));
                     }
                 });
+                // the lock: always shown when on, on hover otherwise
+                let over = ui.rect_contains_pointer(r);
+                if locked || over || selected {
+                    let lock_r = Rect::from_center_size(pos2(r.right() - 36.0, r.center().y), vec2(20.0, 20.0));
+                    let lk = ui.interact(lock_r, egui::Id::unique(("layer-lock", id)), Sense::click()).on_hover_text(if locked { "Unlock" } else { "Lock" });
+                    let col = if locked || lk.hovered() { pal.fg } else { pal.fg_muted };
+                    crate::icons::paint(&painter, if locked { "object-locked" } else { "object-unlocked" }, lock_r.center(), 16.0, col);
+                    if lk.clicked() {
+                        lock = Some(li);
+                    }
+                }
                 // delete (pointer anywhere over the row – the ✕ itself takes the hover)
-                if ui.rect_contains_pointer(r) || selected {
+                if over || selected {
                     let del_r = Rect::from_center_size(pos2(r.right() - 14.0, r.center().y), vec2(20.0, 20.0));
                     let del = ui.interact(del_r, egui::Id::unique(("layer-del", id)), Sense::click()).on_hover_text("Delete layer");
                     crate::icons::paint(&painter, "window-close", del_r.center(), 16.0, if del.hovered() { pal.negative } else { pal.fg_muted });
@@ -5984,6 +6256,10 @@ impl GifKitApp {
             self.stack.layers[li].visible = !self.stack.layers[li].visible;
             self.modified = true;
         }
+        if let Some(li) = lock {
+            self.stack.layers[li].locked = !self.stack.layers[li].locked;
+            self.modified = true;
+        }
         if let Some((from, pos)) = drop_to {
             self.layer_drag = None;
             if from < n && pos <= n && pos != from && pos != from + 1 {
@@ -6082,6 +6358,7 @@ impl GifKitApp {
                     // the copy keeps its clips, keyframes and colour
                     l.timing = src.timing.clone();
                     l.color = src.color;
+                    l.opacity = src.opacity;
                     self.stack.layers.insert(li + 1, l);
                 }
                 self.select(src.kind(), id);
@@ -6698,7 +6975,7 @@ impl GifKitApp {
                     LayerKind::Markup(m) => ProjLayer::Markup { markup: m.clone() },
                     LayerKind::Emoji(e) => ProjLayer::Emoji { emoji: (**e).clone() },
                 };
-                ProjLayerEntry { visible: l.visible, label: l.label.clone(), layer, timing: l.timing.clone(), locked: l.locked, color: l.color }
+                ProjLayerEntry { visible: l.visible, label: l.label.clone(), layer, timing: l.timing.clone(), locked: l.locked, color: l.color, opacity: l.opacity }
             })
             .collect();
         let file = ProjectFile {
@@ -6768,6 +7045,7 @@ impl GifKitApp {
                 l.timing = e.timing;
                 l.locked = e.locked;
                 l.color = e.color;
+                l.opacity = e.opacity;
             }
         }
         self.stack.markers = file.markers;
@@ -8187,6 +8465,30 @@ impl GifKitApp {
     fn tool_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let timed = self.tool.layer_kind().and_then(|k| self.sel_index(k)).and_then(|i| self.stack.layers.get(i)).is_some_and(|l| l.timing.clips.is_some());
         SEL_TIMED.with(|c| c.set(timed));
+        // a locked layer's settings can be seen but not changed
+        if let Some(li) = self.sel_layer_index().filter(|i| self.stack.layers[*i].locked) {
+            let pal = *p();
+            egui::Frame::new().fill(mix(pal.window, pal.neutral, 0.14)).stroke(Stroke::new(1.0, mix(pal.window, pal.neutral, 0.5))).corner_radius(4.0).inner_margin(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    crate::icons::paint(ui.painter(), "object-locked", ui.cursor().min + vec2(8.0, 13.0), 16.0, pal.fg);
+                    ui.add_space(22.0);
+                    ui.label(RichText::new("This layer is locked").color(pal.fg));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Unlock").clicked() {
+                            self.stack.layers[li].locked = false;
+                            self.modified = true;
+                        }
+                    });
+                });
+            });
+            ui.add_space(8.0);
+            ui.add_enabled_ui(false, |ui| self.tool_panel_inner(ui, ctx));
+            return;
+        }
+        self.tool_panel_inner(ui, ctx);
+    }
+
+    fn tool_panel_inner(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         match self.tool {
             Tool::Resize => self.ui_resize(ui, ctx),
             Tool::Crop => self.ui_crop(ui, ctx),
@@ -8515,7 +8817,7 @@ impl GifKitApp {
                 let text = if d < 2.0 { "⚠ Too fast for browsers".to_string() } else { format!("{} cs per frame ({:.2} fps)", d.max(1.0), 100.0 / d.max(1.0)) };
                 form_row(ui, "", |ui| {
                     if d < 2.0 {
-                        ui.label(RichText::new(text).color(p().neutral)).on_hover_text("Most browsers play delays under 2 cs at 10 cs.");
+                        ui.label(RichText::new(&text).color(p().neutral)).on_hover_text("Most browsers play delays under 2 cs at 10 cs.");
                     } else {
                         hint(ui, &text);
                     }
@@ -10368,8 +10670,12 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform) {
 
 /// A small heading inside a group, over one effect's own settings.
 fn sub_head(ui: &mut egui::Ui, text: &str) {
-    ui.add_space(4.0);
-    form_row(ui, "", |ui| ui.label(egui::RichText::new(text).strong()));
+    // the rows under it go with it in a search
+    FIND.with(|f| f.borrow_mut().ctx = text.to_string());
+    if find_row_shown("") {
+        ui.add_space(4.0);
+        form_row_raw(ui, "", |ui| ui.label(egui::RichText::new(text).strong()));
+    }
 }
 
 /// Checkboxes for stacked looks or distortions: ticking one adds it to

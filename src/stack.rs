@@ -405,9 +405,18 @@ pub struct Layer {
     pub locked: bool,
     /// its bar's colour on the timeline (None: by kind)
     pub color: Option<[u8; 3]>,
+    /// the whole layer's opacity, % (on top of any keyed opacity)
+    pub opacity: f32,
 }
 
 impl Layer {
+    /// Its motion at plan frame `i`, with the layer's own opacity in.
+    pub fn motion(&self, i: usize) -> crate::timeline::Motion {
+        let mut m = self.timing.motion(i);
+        m.opacity *= (self.opacity / 100.0).clamp(0.0, 1.0);
+        m
+    }
+
     pub fn kind(&self) -> Kind {
         match self.kind {
             LayerKind::Effects(ref fx) if fx.anim => Kind::Animation,
@@ -508,6 +517,9 @@ pub fn layer_signature(l: &Layer) -> u64 {
     }
     if !l.timing.is_default() {
         format!("{:?}", l.timing).hash(&mut h);
+    }
+    if l.opacity < 100.0 {
+        l.opacity.to_bits().hash(&mut h);
     }
     h.finish()
 }
@@ -628,7 +640,7 @@ impl Stack {
     pub fn push(&mut self, kind: LayerKind) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
-        self.layers.push(Layer { id, visible: true, kind, label: None, timing: Default::default(), locked: false, color: None });
+        self.layers.push(Layer { id, visible: true, kind, label: None, timing: Default::default(), locked: false, color: None, opacity: 100.0 });
         id
     }
 
@@ -826,7 +838,7 @@ impl Stack {
             if !l.active() || !l.timing.shows(i, n) {
                 continue;
             }
-            let mo = l.timing.motion(i);
+            let mo = l.motion(i);
             if mo.opacity <= 0.001 {
                 continue;
             }
@@ -1364,7 +1376,7 @@ impl Stack {
             if !l.active() || !l.timing.shows(i, n) {
                 continue;
             }
-            let mo = l.timing.motion(i);
+            let mo = l.motion(i);
             if mo.opacity <= 0.001 {
                 continue;
             }

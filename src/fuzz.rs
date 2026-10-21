@@ -281,9 +281,11 @@ fn case(seed: u64, stage: &Mutex<&'static str>) -> String {
         let id = st.push(kind);
         let tm = timing(&mut r, n);
         let vis = !r.chance(0.1);
+        let op = r.pick(&[100.0f32, 100.0, 50.0, 0.0, -10.0, 300.0]);
         if let Some(l) = st.layers.iter_mut().find(|l| l.id == id) {
             l.timing = tm;
             l.visible = vis;
+            l.opacity = op;
         }
     }
     let desc = format!("seed {seed}: {w}x{h} n={n} layers={:?}", st.layers.iter().map(|l| format!("{:?}", l.kind())).collect::<Vec<_>>());
