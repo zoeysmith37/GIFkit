@@ -860,7 +860,7 @@ pub fn encode_preview(anim: &Animation, f: &PreviewFormat) -> Result<(Animation,
             let decoded: Vec<Frame> = files
                 .par_iter()
                 .zip(frames.par_iter())
-                .map(|(b, f)| Ok(Frame { image: Arc::new(image::load_from_memory(b)?.to_rgba8()), delay_cs: f.delay_cs, enabled: true, cut: false }))
+                .map(|(b, f)| Ok(Frame { image: Arc::new(image::load_from_memory(b)?.to_rgba8()), delay_cs: f.delay_cs, enabled: true, cut: false, blank: false }))
                 .collect::<Result<_>>()?;
             // the size shown is the total of all files
             let total: Vec<u8> = files.concat();

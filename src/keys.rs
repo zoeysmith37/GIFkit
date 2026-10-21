@@ -38,10 +38,11 @@ pub enum Action {
     TlDuplicate,
     TlNudgeLeft,
     TlNudgeRight,
+    Duplicate,
 }
 
 impl Action {
-    pub const ALL: [Action; 32] = [
+    pub const ALL: [Action; 33] = [
         Action::New,
         Action::Open,
         Action::Save,
@@ -74,6 +75,7 @@ impl Action {
         Action::TlDuplicate,
         Action::TlNudgeLeft,
         Action::TlNudgeRight,
+        Action::Duplicate,
     ];
 
     pub fn label(self) -> &'static str {
@@ -110,6 +112,7 @@ impl Action {
             Action::TlDuplicate => "Timeline: duplicate the selected clips",
             Action::TlNudgeLeft => "Timeline: nudge the selection a frame earlier",
             Action::TlNudgeRight => "Timeline: nudge the selection a frame later",
+            Action::Duplicate => "Duplicate the selected layer",
         }
     }
 
@@ -148,6 +151,7 @@ impl Action {
             Action::TlDuplicate => "tl_duplicate",
             Action::TlNudgeLeft => "tl_nudge_left",
             Action::TlNudgeRight => "tl_nudge_right",
+            Action::Duplicate => "duplicate",
         }
     }
 
@@ -189,6 +193,7 @@ impl Action {
             Action::TlDuplicate => c(Key::D),
             Action::TlNudgeLeft => a(Key::ArrowLeft),
             Action::TlNudgeRight => a(Key::ArrowRight),
+            Action::Duplicate => c(Key::D),
         }
     }
 

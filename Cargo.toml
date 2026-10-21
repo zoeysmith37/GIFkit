@@ -20,6 +20,7 @@ unicode-bidi = "0.3"
 rayon = "1.10"
 pollster = "1.0"
 rfd = "0.17"
+arboard = "3.7"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

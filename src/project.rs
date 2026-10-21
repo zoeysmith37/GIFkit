@@ -33,6 +33,9 @@ pub struct FrameMeta {
     /// a GIF track clip starts here
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cut: bool,
+    /// a gap on the GIF track (shows nothing)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub blank: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -62,6 +65,9 @@ pub struct ProjLayerEntry {
     pub timing: crate::timeline::Timing,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub locked: bool,
+    /// the bar's colour on the timeline
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[u8; 3]>,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -83,6 +89,9 @@ pub struct ProjectFile {
     /// timeline markers
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub markers: Vec<crate::timeline::Marker>,
+    /// the GIF track's colour on the timeline
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gif_color: Option<[u8; 3]>,
     /// output and tool settings, kept loose so new fields never break old files
     pub settings: serde_json::Value,
 }
@@ -110,7 +119,7 @@ fn png(img: &RgbaImage) -> Result<Vec<u8>> {
 }
 
 fn meta(a: &Animation) -> Vec<FrameMeta> {
-    a.frames.iter().map(|f| FrameMeta { delay: f.delay_cs, enabled: f.enabled, cut: f.cut }).collect()
+    a.frames.iter().map(|f| FrameMeta { delay: f.delay_cs, enabled: f.enabled, cut: f.cut, blank: f.blank }).collect()
 }
 
 /// Write a project. `images` are the frames of image layers and watermark
@@ -191,7 +200,7 @@ pub fn load(path: &Path) -> Result<Project> {
             .enumerate()
             .map(|(i, m)| {
                 let img = decoded.remove(&format!("{dir}/{i:05}.png")).with_context(|| format!("{dir}/{i:05}.png is missing"))?;
-                Ok(Frame { image: Arc::new(img), delay_cs: m.delay, enabled: m.enabled, cut: m.cut })
+                Ok(Frame { image: Arc::new(img), delay_cs: m.delay, enabled: m.enabled, cut: m.cut, blank: m.blank })
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Animation { frames, loop_count })

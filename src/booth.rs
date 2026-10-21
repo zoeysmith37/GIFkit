@@ -81,6 +81,192 @@ impl BoothFx {
     }
 }
 
+/// One stacked look or distortion with its own settings. Several can be on
+/// at once (in the order of `LOOKS` and `DISTORT`).
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct BoothItem {
+    pub fx: BoothFx,
+    /// 0 and up; distortions keep getting stronger past 100
+    pub amount: f32,
+    /// centre, % of the frame
+    pub cx: f32,
+    pub cy: f32,
+    /// the other way round (pinch instead of bulge, the other spin…)
+    pub reverse: bool,
+}
+
+impl Default for BoothItem {
+    fn default() -> Self {
+        BoothItem { fx: BoothFx::None, amount: 50.0, cx: 50.0, cy: 50.0, reverse: false }
+    }
+}
+
+impl BoothFx {
+    pub fn reverse_tip(self) -> &'static str {
+        match self {
+            BoothFx::Bulge => "Pinch in instead",
+            BoothFx::Dent => "Puff out instead",
+            BoothFx::Twirl => "Spin the other way",
+            BoothFx::Squeeze => "Widen instead",
+            BoothFx::Stretch => "Narrow instead",
+            BoothFx::Mirror => "Right half onto the left",
+            BoothFx::Tunnel => "Streak in toward the middle",
+            BoothFx::FishEye => "Shrink the middle",
+            BoothFx::Kaleidoscope => "Turn the slices",
+            _ => "",
+        }
+    }
+}
+
+/// Where a distortion reads each output pixel from: the shader's
+/// `warp_from` (kinds 3–7, 9), so CPU and graphics card agree.
+pub fn warp_point(kind: i32, a: [f32; 4], b: [f32; 4], x: f32, y: f32) -> (f32, f32) {
+    let (dx, dy) = (x - a[0], y - a[1]);
+    let d = (dx * dx + dy * dy).sqrt();
+    match kind {
+        3 => {
+            if d >= a[2] || d < 1e-3 {
+                return (x, y);
+            }
+            let t = d / a[2];
+            let s = t.powf(1.0 + a[3]) / t;
+            (a[0] + dx * s, a[1] + dy * s)
+        }
+        4 => {
+            if d >= a[2] {
+                return (x, y);
+            }
+            let f = 1.0 - d / a[2];
+            let t = a[3] * f * f;
+            let (s, c) = t.sin_cos();
+            (a[0] + dx * c - dy * s, a[1] + dx * s + dy * c)
+        }
+        5 => {
+            let span = if dx < 0.0 { a[0].max(1.0) } else { (a[2] - a[0]).max(1.0) };
+            let t = (dx.abs() / span).min(1.0);
+            (a[0] + dx.signum() * t.powf(a[1]) * span, y)
+        }
+        6 => {
+            if d <= a[2] {
+                return (x, y);
+            }
+            let s = (a[2] + (d - a[2]) * a[3]) / d;
+            (a[0] + dx * s, a[1] + dy * s)
+        }
+        9 => {
+            // a tunnel the other way: the inside streaks toward the middle
+            if d >= a[2] || d < 1e-3 {
+                return (x, y);
+            }
+            let s = (a[2] - (a[2] - d) * a[3]) / d;
+            (a[0] + dx * s, a[1] + dy * s)
+        }
+        _ => {
+            // kaleidoscope: cx cy seg reach; b[0] turns the slices
+            let seg = a[2];
+            let ang = dy.atan2(dx) + PI + b[0];
+            let mut t = ang.rem_euclid(seg);
+            if t > seg / 2.0 {
+                t = seg - t;
+            }
+            let t = t - seg / 4.0;
+            let m = (d / a[3]).rem_euclid(2.0);
+            let dd = if m > 1.0 { 2.0 - m } else { m } * a[3];
+            (a[0] + dd * t.cos(), a[1] + dd * t.sin())
+        }
+    }
+}
+
+/// A distortion's warp kind and numbers for a `w`×`h` frame (None for the
+/// looks and for Mirror, which copies pixels instead).
+pub fn distort_params(it: &BoothItem, w: u32, h: u32) -> Option<(i32, [f32; 4], [f32; 4])> {
+    let a = (it.amount / 100.0).max(0.0);
+    let (wf, hf) = (w as f32, h as f32);
+    let (cx, cy) = (it.cx / 100.0 * wf, it.cy / 100.0 * hf);
+    let rad = (w.min(h) as f32 / 2.0).max(1.0);
+    let z = [0.0; 4];
+    // pulling in (a dent) stays short of folding over, however strong
+    let pinch = |a: f32| -(1.0 - 1.0 / (1.0 + a * 0.8)) * 0.95;
+    let fx = match (it.fx, it.reverse) {
+        (BoothFx::Bulge, true) => BoothFx::Dent,
+        (BoothFx::Dent, true) => BoothFx::Bulge,
+        (BoothFx::Squeeze, true) => BoothFx::Stretch,
+        (BoothFx::Stretch, true) => BoothFx::Squeeze,
+        (f, _) => f,
+    };
+    Some(match fx {
+        BoothFx::Bulge => (3, [cx, cy, rad * 1.1, a * 1.65], z),
+        BoothFx::Dent => (3, [cx, cy, rad * 1.1, pinch(a)], z),
+        BoothFx::FishEye => (3, [cx, cy, w.max(h) as f32 * 0.5, if it.reverse { pinch(a) } else { a * 1.6 }], z),
+        BoothFx::Twirl => (4, [cx, cy, rad * 1.2, (a * 540.0).to_radians() * if it.reverse { -1.0 } else { 1.0 }], z),
+        BoothFx::Squeeze => (5, [cx, 1.0 / (1.0 + a * 2.0), wf, 0.0], z),
+        BoothFx::Stretch => (5, [cx, 1.0 + a * 2.0, wf, 0.0], z),
+        BoothFx::Tunnel => {
+            let r0 = rad * (0.75 - 0.4 * a).max(0.05);
+            let squash = (1.0 - 0.96 * a).max(0.01);
+            (if it.reverse { 9 } else { 6 }, [cx, cy, r0, squash], z)
+        }
+        BoothFx::Kaleidoscope => {
+            let n = 4 + (a * 8.0).round() as i32;
+            let seg = TAU / n as f32;
+            let reach = ((wf - cx).max(cx) * 0.95).max(1.0);
+            (7, [cx, cy, seg, reach], [if it.reverse { seg / 2.0 } else { 0.0 }, 0.0, 0.0, 0.0])
+        }
+        _ => return None,
+    })
+}
+
+/// Apply one stacked item.
+pub fn apply_item(src: &RgbaImage, it: &BoothItem) -> RgbaImage {
+    let (w, h) = src.dimensions();
+    if w == 0 || h == 0 || it.fx == BoothFx::None {
+        return src.clone();
+    }
+    if BoothFx::LOOKS.contains(&it.fx) {
+        return apply(src, it.fx, it.amount.min(100.0), it.cx, it.cy);
+    }
+    if it.fx == BoothFx::Mirror {
+        let cx = it.cx / 100.0 * w as f32;
+        return mirror(src, cx, it.reverse);
+    }
+    let Some((kind, a, b)) = distort_params(it, w, h) else { return src.clone() };
+    let mut out = warp(src, true, |x, y| warp_point(kind, a, b, x, y));
+    if it.fx == BoothFx::FishEye {
+        fish_mask(&mut out, a[0], a[1], a[2], (it.amount / 100.0).clamp(0.0, 1.0));
+    }
+    out
+}
+
+/// The fish eye's round lens: dark outside the circle, soft at the edge.
+fn fish_mask(out: &mut RgbaImage, cx: f32, cy: f32, r0: f32, a: f32) {
+    let w = out.width();
+    out.par_chunks_mut(4).enumerate().for_each(|(i, o)| {
+        let (x, y) = ((i as u32 % w) as f32 + 0.5, (i as u32 / w) as f32 + 0.5);
+        let d = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
+        let m = lerp(1.0, ((r0 - d) / 1.5).clamp(0.0, 1.0), a);
+        for c in 0..3 {
+            o[c] = c8(o[c] as f32 * m);
+        }
+    });
+}
+
+/// One half reflected onto the other (`reverse`: the right onto the left).
+fn mirror(src: &RgbaImage, cx: f32, reverse: bool) -> RgbaImage {
+    let w = src.width();
+    let mut out = src.clone();
+    let mx = cx.clamp(1.0, (w as f32 - 1.0).max(1.0));
+    out.par_chunks_mut(4).enumerate().for_each(|(i, o)| {
+        let x = (i as u32 % w) as f32;
+        let y = i as u32 / w;
+        if (!reverse && x >= mx) || (reverse && x < mx) {
+            let sx = (2.0 * mx - x - 1.0).clamp(0.0, w as f32 - 1.0) as u32;
+            o.copy_from_slice(&src.get_pixel(sx, y).0);
+        }
+    });
+    out
+}
+
 fn lum(p: &Rgba<u8>) -> f32 {
     (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32) / 255.0
 }

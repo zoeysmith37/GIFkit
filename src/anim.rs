@@ -16,14 +16,16 @@ pub struct Frame {
     pub enabled: bool,
     /// A clip on the timeline's GIF track starts here (a split).
     pub cut: bool,
+    /// A gap on the GIF track: plays for its delay but shows nothing.
+    pub blank: bool,
 }
 
 impl Frame {
     pub fn new(image: RgbaImage, delay_cs: u16) -> Self {
-        Self { image: Arc::new(image), delay_cs, enabled: true, cut: false }
+        Self { image: Arc::new(image), delay_cs, enabled: true, cut: false, blank: false }
     }
     pub fn with_image(&self, image: RgbaImage) -> Self {
-        Self { image: Arc::new(image), delay_cs: self.delay_cs, enabled: self.enabled, cut: self.cut }
+        Self { image: Arc::new(image), delay_cs: self.delay_cs, enabled: self.enabled, cut: self.cut, blank: self.blank }
     }
 }
 

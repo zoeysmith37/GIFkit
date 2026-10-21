@@ -139,7 +139,7 @@ pub fn scaled(anim: &Animation, s: f32) -> Animation {
     let frames = anim
         .frames
         .par_iter()
-        .map(|f| Frame { image: Arc::new(image::imageops::resize(&*f.image, nw, nh, image::imageops::FilterType::CatmullRom)), delay_cs: f.delay_cs, enabled: f.enabled, cut: f.cut })
+        .map(|f| Frame { image: Arc::new(image::imageops::resize(&*f.image, nw, nh, image::imageops::FilterType::CatmullRom)), delay_cs: f.delay_cs, enabled: f.enabled, cut: f.cut, blank: f.blank })
         .collect();
     Animation { frames, loop_count: anim.loop_count }
 }

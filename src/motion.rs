@@ -78,6 +78,16 @@ pub enum LoopFx {
     Wobble,
     Rainbow,
     Glitch,
+    /// turns all the way round once a cycle
+    Spin,
+    /// bobs gently up and down
+    Float,
+    /// squashes and stretches
+    Squash,
+    /// two quick beats a cycle
+    Heartbeat,
+    /// gone for half of each cycle
+    Blink,
 }
 
 pub(crate) fn ease_out_cubic(t: f32) -> f32 {
@@ -131,9 +141,14 @@ fn mask(img: &mut RgbaImage, transparent: bool, cover: impl Fn(f32, f32) -> f32 
 
 /// Draw `src` scaled, turned and moved (about its centre) onto a blank frame.
 fn place(src: &RgbaImage, scale: f32, angle_deg: f32, dx: f32, dy: f32, bg: Rgba<u8>) -> RgbaImage {
+    place_xy(src, scale, scale, angle_deg, dx, dy, bg)
+}
+
+/// `place` with its own width and height scale.
+fn place_xy(src: &RgbaImage, sxs: f32, sys: f32, angle_deg: f32, dx: f32, dy: f32, bg: Rgba<u8>) -> RgbaImage {
     let (w, h) = src.dimensions();
     let mut out = RgbaImage::from_pixel(w, h, bg);
-    if scale <= 0.001 {
+    if sxs <= 0.001 || sys <= 0.001 {
         return out;
     }
     let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
@@ -143,8 +158,8 @@ fn place(src: &RgbaImage, scale: f32, angle_deg: f32, dx: f32, dy: f32, bg: Rgba
         // inverse map: output pixel to source position
         let x = (i % wu) as f32 + 0.5 - cx - dx;
         let y = (i / wu) as f32 + 0.5 - cy - dy;
-        let sx = (x * c - y * s) / scale + cx - 0.5;
-        let sy = (x * s + y * c) / scale + cy - 0.5;
+        let sx = (x * c - y * s) / sxs + cx - 0.5;
+        let sy = (x * s + y * c) / sys + cy - 0.5;
         if let Some(v) = bilinear(src, sx, sy) {
             // source over the background
             let a = v[3] as f32 / 255.0;
@@ -175,7 +190,7 @@ fn bilinear(src: &RgbaImage, x: f32, y: f32) -> Option<[u8; 4]> {
     Some(o)
 }
 
-fn pixelate(img: &mut RgbaImage, block: u32) {
+pub(crate) fn pixelate(img: &mut RgbaImage, block: u32) {
     if block <= 1 {
         return;
     }
@@ -275,40 +290,98 @@ pub(crate) fn hash(i: u64) -> f32 {
 
 /// Looping motion for frame `idx` of `n`. `amount` is 0 to 100, `cycles` how
 /// many times it repeats over the animation (whole numbers keep the loop seamless).
-pub fn looped(img: &RgbaImage, fx: &[LoopFx], idx: usize, n: usize, amount: f32, cycles: u32, transparent: bool) -> RgbaImage {
+/// Where a loop puts the picture this frame.
+pub(crate) struct LoopPlace {
+    pub sx: f32,
+    pub sy: f32,
+    pub angle: f32,
+    pub dx: f32,
+    pub dy: f32,
+    /// hidden this frame (Blink): how much
+    pub hide: f32,
+    /// the colour turn for Rainbow, degrees
+    pub hue: f32,
+}
+
+impl LoopPlace {
+    pub fn moves(&self) -> bool {
+        (self.sx, self.sy, self.angle, self.dx, self.dy) != (1.0, 1.0, 0.0, 0.0, 0.0)
+    }
+}
+
+/// The numbers `looped` works from, shared with the graphics card.
+pub(crate) fn loop_place(fx: &[LoopFx], idx: usize, n: usize, amount: f32, cycles: u32, reverse: bool, w: f32, h: f32) -> LoopPlace {
+    let k = (amount / 100.0).clamp(0.0, 2.0);
+    let cyc = cycles.max(1) as f32;
+    let phase = idx as f32 / n.max(1) as f32 * cyc * TAU;
+    let dir = if reverse { -1.0 } else { 1.0 };
+    let side = w.min(h);
+    // where in its cycle this frame is, 0..1
+    let t = (idx as f32 / n.max(1) as f32 * cyc).fract();
+    let mut l = LoopPlace { sx: 1.0, sy: 1.0, angle: 0.0, dx: 0.0, dy: 0.0, hide: 0.0, hue: 0.0 };
+    for f in fx {
+        match f {
+            LoopFx::Shake => {
+                l.dx += (hash(idx as u64 * 2) - 0.5) * side * 0.06 * k;
+                l.dy += (hash(idx as u64 * 2 + 1) - 0.5) * side * 0.06 * k;
+            }
+            LoopFx::Pulse => {
+                let g = 1.0 + 0.08 * k * (0.5 - 0.5 * phase.cos());
+                l.sx *= g;
+                l.sy *= g;
+            }
+            // |sin| makes a hop that lands and springs up again
+            LoopFx::Hop => l.dy -= side * 0.12 * k * (phase / 2.0).sin().abs() * dir,
+            LoopFx::Wobble => l.angle += 8.0 * k * phase.sin() * dir,
+            LoopFx::Spin => l.angle += t * 360.0 * dir,
+            LoopFx::Float => l.dy -= side * 0.05 * k * phase.sin() * dir,
+            LoopFx::Squash => {
+                let q = 0.12 * k * phase.sin() * dir;
+                l.sx *= 1.0 + q;
+                l.sy *= 1.0 / (1.0 + q).max(0.05);
+            }
+            LoopFx::Heartbeat => {
+                let beat = |c: f32| (-((t - c) / 0.045).powi(2)).exp();
+                let g = 1.0 + 0.12 * k * (beat(0.1) + 0.6 * beat(0.28));
+                l.sx *= g;
+                l.sy *= g;
+            }
+            LoopFx::Blink => {
+                // reversed: shown for the second half instead
+                if (t >= 0.5) != reverse {
+                    l.hide = k.min(1.0);
+                }
+            }
+            LoopFx::Rainbow => l.hue = idx as f32 / n.max(1) as f32 * cyc * 360.0 * k.min(1.0) * dir,
+            LoopFx::Glitch => {}
+        }
+    }
+    // shaking and turning would show the edges, so grow a little
+    if fx.iter().any(|f| matches!(f, LoopFx::Shake | LoopFx::Wobble | LoopFx::Float)) {
+        let g = 1.0 + 0.08 * k;
+        l.sx *= g;
+        l.sy *= g;
+    }
+    l
+}
+
+/// A looping effect at frame `idx` of `n`.
+pub fn looped(img: &RgbaImage, fx: &[LoopFx], idx: usize, n: usize, amount: f32, cycles: u32, transparent: bool, reverse: bool) -> RgbaImage {
     if fx.is_empty() || n == 0 {
         return img.clone();
     }
     let k = (amount / 100.0).clamp(0.0, 2.0);
-    let phase = idx as f32 / n as f32 * cycles.max(1) as f32 * TAU;
     let (w, h) = (img.width() as f32, img.height() as f32);
-    let side = w.min(h);
-    let (mut scale, mut angle, mut dx, mut dy) = (1.0f32, 0.0f32, 0.0f32, 0.0f32);
-    for f in fx {
-        match f {
-            LoopFx::Shake => {
-                dx += (hash(idx as u64 * 2) - 0.5) * side * 0.06 * k;
-                dy += (hash(idx as u64 * 2 + 1) - 0.5) * side * 0.06 * k;
-            }
-            LoopFx::Pulse => scale *= 1.0 + 0.08 * k * (0.5 - 0.5 * phase.cos()),
-            // |sin| makes a hop that lands and springs up again
-            LoopFx::Hop => dy -= side * 0.12 * k * (phase / 2.0).sin().abs(),
-            LoopFx::Wobble => angle += 8.0 * k * phase.sin(),
-            _ => {}
-        }
-    }
-    let mut out = if (scale, angle, dx, dy) != (1.0, 0.0, 0.0, 0.0) {
-        // pulse grows past the edges; shrinking would leave borders, so only grow
-        let grow = if fx.contains(&LoopFx::Shake) || fx.contains(&LoopFx::Wobble) { 1.0 + 0.08 * k } else { 1.0 };
-        place(img, scale * grow, angle, dx, dy, hidden_px(transparent))
-    } else {
-        img.clone()
-    };
+    let l = loop_place(fx, idx, n, amount, cycles, reverse, w, h);
+    let mut out = if l.moves() { place_xy(img, l.sx, l.sy, l.angle, l.dx, l.dy, hidden_px(transparent)) } else { img.clone() };
     if fx.contains(&LoopFx::Rainbow) {
-        hue_rotate(&mut out, idx as f32 / n as f32 * cycles.max(1) as f32 * 360.0 * k.min(1.0));
+        hue_rotate(&mut out, l.hue);
     }
     if fx.contains(&LoopFx::Glitch) && hash(idx as u64 * 7 + 3) < 0.35 * k.min(1.0) + 0.05 {
         glitch(&mut out, idx as u64, k);
+    }
+    if l.hide > 0.0 {
+        out = transition(&out, Transition::Fade, 1.0 - l.hide, transparent);
     }
     out
 }
@@ -380,10 +453,10 @@ mod tests {
     #[test]
     fn loops_are_seamless() {
         let img = solid();
-        let fx = [LoopFx::Pulse, LoopFx::Wobble, LoopFx::Hop, LoopFx::Rainbow];
+        let fx = [LoopFx::Pulse, LoopFx::Wobble, LoopFx::Hop, LoopFx::Rainbow, LoopFx::Spin, LoopFx::Float, LoopFx::Squash, LoopFx::Heartbeat, LoopFx::Blink];
         // frame n would be frame 0 again
-        let a = looped(&img, &fx, 0, 10, 50.0, 2, true);
-        let b = looped(&img, &fx, 10, 10, 50.0, 2, true);
+        let a = looped(&img, &fx, 0, 10, 50.0, 2, true, false);
+        let b = looped(&img, &fx, 10, 10, 50.0, 2, true, false);
         assert_eq!(a, b);
     }
 }
@@ -413,7 +486,7 @@ fn motion_sheet() {
     }
     for l in [LoopFx::Shake, LoopFx::Pulse, LoopFx::Hop, LoopFx::Wobble, LoopFx::Rainbow, LoopFx::Glitch] {
         for i in 0..steps.len() {
-            let f = looped(&src, &[l], i * 2, 10, 100.0, 1, false);
+            let f = looped(&src, &[l], i * 2, 10, 100.0, 1, false, false);
             image::imageops::overlay(&mut sheet, &f, (i as u32 * (w + 4)) as i64, (row * (h + 4)) as i64);
         }
         row += 1;

@@ -22,6 +22,8 @@ const T_SMALL: u8 = 3;
 const T_BIG: u8 = 4;
 const T_REGION: u8 = 5;
 const T_MID: u8 = 6;
+/// the picture before a filter, to mix back toward
+const T_PRE: u8 = 7;
 
 /// Builds the passes for one layer, keeping track of the frame's size.
 pub struct Plan<'a, 'f> {
@@ -140,9 +142,35 @@ impl<'a, 'f> Plan<'a, 'f> {
 
     /// motion::place
     fn place(&mut self, scale: f32, angle_deg: f32, dx: f32, dy: f32, transparent: bool) {
+        self.place_xy(scale, scale, angle_deg, dx, dy, transparent);
+    }
+
+    /// motion::place_xy
+    fn place_xy(&mut self, sx: f32, sy: f32, angle_deg: f32, dx: f32, dy: f32, transparent: bool) {
         let (s, c) = (-angle_deg.to_radians()).sin_cos();
         let bg = if transparent { [0.0; 4] } else { [0.0, 0.0, 0.0, 255.0] };
-        self.op(36, &[[scale, s, c, 0.0], [dx, dy, 0.0, 0.0], bg]);
+        self.op(36, &[[sx, s, c, sy], [dx, dy, 0.0, 0.0], bg]);
+    }
+
+    /// Run `f` at `amount` %: below 100 the result is mixed back toward the
+    /// picture before it (timeline::blend).
+    fn at_strength(&mut self, amount: f32, f: impl FnOnce(&mut Self)) {
+        if amount >= 99.95 {
+            f(self);
+            return;
+        }
+        let size = self.size;
+        self.raw(0, 0.0, [Some(GpuIn::Cur), None, None], Some(T_PRE), size, false, &[]);
+        f(self);
+        let size = self.size;
+        self.raw(50, 0.0, [Some(GpuIn::Cur), Some(GpuIn::Tmp(T_PRE)), None], None, size, false, &[[(amount / 100.0).clamp(0.0, 1.0), size.0 as f32, size.1 as f32, 0.0]]);
+    }
+
+    /// motion::pixelate
+    fn pixelate(&mut self, block: u32) {
+        let (wu, hu) = self.size;
+        self.blocks([0, 0, wu, hu], block, T_BLOCKS);
+        self.raw(39, 0.0, [Some(GpuIn::Cur), Some(GpuIn::Tmp(T_BLOCKS)), None], None, (wu, hu), false, &[[block as f32, 0.0, 0.0, 0.0]]);
     }
 
     /// motion's mask: kind, numbers, see-through
@@ -220,19 +248,24 @@ pub fn effects<'a>(p: &mut Plan<'a, '_>, s: &EffectSettings, idx: usize, n: usiz
         p.raw(18, 0.0, [Some(GpuIn::Cur), Some(GpuIn::Tmp(T_BLUR)), None], None, size, false, &[[2.0, 0.0, 0.0, 0.0]]);
     }
     if s.oil {
-        p.op(19, &[[s.oil_radius.clamp(1, 16) as f32, 0.0, 0.0, 0.0]]);
+        p.op(19, &[[s.oil_radius.clamp(1, 16) as f32, s.oil_detail.clamp(2, 64) as f32, 0.0, 0.0]]);
     }
     if s.emboss {
-        p.op(20, &[]);
+        let k = crate::effects::emboss_kernel(s.emboss_dir);
+        p.at_strength(s.emboss_amount, |p| p.op(20, &[[k[0], k[1], k[2], k[3]], [k[4], k[5], k[6], k[7]], [k[8], if s.emboss_colour { 1.0 } else { 0.0 }, 0.0, 0.0]]));
     }
     if s.posterize {
         p.op(21, &[[s.posterize_levels.max(2) as f32 - 1.0, 0.0, 0.0, 0.0]]);
     }
     if s.solarize {
-        p.op(22, &[]);
+        p.op(22, &[[s.solarize_threshold, if s.solarize_reverse { 1.0 } else { 0.0 }, 0.0, 0.0]]);
     }
     if s.noise {
-        p.op(23, &[[s.noise_amount, idx as f32 + 1.0, p.size.0 as f32, 0.0]]);
+        let seed = if s.noise_still { 1.0 } else { idx as f32 + 1.0 };
+        p.op(23, &[[s.noise_amount, seed, p.size.0 as f32, if s.noise_mono { 1.0 } else { 0.0 }]]);
+    }
+    if s.pixelate && s.pixelate_size > 1 {
+        p.pixelate(s.pixelate_size);
     }
     if s.swirl {
         let (w, h) = p.wf();
@@ -245,40 +278,46 @@ pub fn effects<'a>(p: &mut Plan<'a, '_>, s: &EffectSettings, idx: usize, n: usiz
         p.op_sub(24, 1.0, &[[cx, cy, cx.min(cy), s.implode_amount]]);
     }
     if s.wave {
-        let phase = idx as f32 / n.max(1) as f32 * TAU;
+        let phase = idx as f32 / n.max(1) as f32 * TAU * if s.wave_reverse { -1.0 } else { 1.0 };
         p.op_sub(24, 2.0, &[[s.wave_amp, s.wave_len.max(1.0), phase, 0.0]]);
     }
-    if s.booth != BoothFx::None {
-        booth(p, s.booth, s.booth_amount, s.booth_cx, s.booth_cy);
-    }
-    if s.warp != BoothFx::None {
-        booth(p, s.warp, s.warp_amount, s.warp_cx, s.warp_cy);
+    let (looks, warps) = s.booth_items();
+    for it in looks.iter().chain(warps.iter()) {
+        booth_item(p, it);
     }
     if s.gotham {
-        p.modulate(100.0, 10.0, 120.0);
-        p.colorize([0x22, 0x2b, 0x6d], 0.2);
-        p.gamma(0.5);
-        p.bright_contrast(0.0, 25.0);
+        p.at_strength(s.gotham_amount, |p| {
+            p.modulate(100.0, 10.0, 120.0);
+            p.colorize([0x22, 0x2b, 0x6d], 0.2);
+            p.gamma(0.5);
+            p.bright_contrast(0.0, 25.0);
+        });
     }
     if s.lomo {
-        let lo = -(0.22 * 255.0);
-        p.affine([1.0; 3], [lo, lo, 0.0], [0.56, 0.56, 1.0]);
-        p.vignette(0.85, [0, 0, 0]);
+        p.at_strength(s.lomo_amount, |p| {
+            let lo = -(0.22 * 255.0);
+            p.affine([1.0; 3], [lo, lo, 0.0], [0.56, 0.56, 1.0]);
+            p.vignette(0.85, [0, 0, 0]);
+        });
     }
     if s.nashville {
-        p.colorize([0xf7, 0xda, 0xae], 0.25);
-        p.affine([0.87, 0.87, 0.87], [0.13 * 255.0 * 0.6, 0.13 * 255.0 * 0.2, 0.13 * 255.0 * 0.3], [1.0; 3]);
-        p.bright_contrast(5.0, 15.0);
-        p.gamma(1.2);
+        p.at_strength(s.nashville_amount, |p| {
+            p.colorize([0xf7, 0xda, 0xae], 0.25);
+            p.affine([0.87, 0.87, 0.87], [0.13 * 255.0 * 0.6, 0.13 * 255.0 * 0.2, 0.13 * 255.0 * 0.3], [1.0; 3]);
+            p.bright_contrast(5.0, 15.0);
+            p.gamma(1.2);
+        });
     }
     if s.toaster {
-        p.colorize([0xf6, 0x8b, 0x1f], 0.18);
-        p.modulate(100.0, 85.0, 110.0);
-        p.gamma(1.15);
-        p.vignette(0.7, [0x50, 0x10, 0x00]);
+        p.at_strength(s.toaster_amount, |p| {
+            p.colorize([0xf6, 0x8b, 0x1f], 0.18);
+            p.modulate(100.0, 85.0, 110.0);
+            p.gamma(1.15);
+            p.vignette(0.7, [0x50, 0x10, 0x00]);
+        });
     }
     if s.vignette {
-        p.vignette(0.9, [0, 0, 0]);
+        p.vignette(0.9 * s.vignette_amount / 100.0, [0, 0, 0]);
     }
     if s.ordered_dither {
         p.op(26, &[[s.dither_levels.max(2) as f32 - 1.0, 0.0, 0.0, 0.0]]);
@@ -337,21 +376,44 @@ pub fn effects<'a>(p: &mut Plan<'a, '_>, s: &EffectSettings, idx: usize, n: usiz
     if !loops.is_empty() {
         const STEPS: usize = 3600;
         let (li, ln) = if clip_s > 0.0 { (((elapsed_s / clip_s).clamp(0.0, 1.0) * STEPS as f32).round() as usize, STEPS) } else { (idx, n) };
-        looped(p, &loops, li, ln, s.loop_amount, s.loop_cycles, s.fade_to_transparent);
+        looped(p, &loops, li, ln, s.loop_amount, s.loop_cycles, s.fade_to_transparent, s.loop_reverse);
     }
-    let ff = s.fade_frames.max(1);
+    let (fi, fo) = s.transition_frames();
     let (intro, outro) = s.transitions();
-    if intro != Transition::None && idx < ff {
-        transition(p, intro, (idx as f32 + 1.0) / (ff as f32 + 1.0), s.fade_to_transparent);
+    if intro != Transition::None && idx < fi {
+        transition(p, intro, (idx as f32 + 1.0) / (fi as f32 + 1.0), s.fade_to_transparent);
     }
-    if outro != Transition::None && n > 0 && idx + ff >= n {
-        transition(p, outro, (n - idx) as f32 / (ff as f32 + 1.0), s.fade_to_transparent);
+    if outro != Transition::None && n > 0 && idx + fo >= n {
+        transition(p, outro, (n - idx) as f32 / (fo as f32 + 1.0), s.fade_to_transparent);
     }
     if s.counter {
-        let (_, h) = p.size;
-        let size = (h as f32 * 0.07).max(12.0);
-        let txt = format!("{:.2}s", elapsed_s);
-        p.text(fonts, &txt, 6, h as i32 - size as i32 - 10, size);
+        let (w, h) = p.size;
+        if let Some((sp, x, y, o)) = crate::effects::counter_sprite(fonts, elapsed_s, w, h, s.counter_pos, s.counter_size) {
+            p.over(sp, x, y, o);
+        }
+    }
+}
+
+/// booth::apply_item as passes.
+fn booth_item(p: &mut Plan<'_, '_>, it: &crate::booth::BoothItem) {
+    let (w, h) = p.size;
+    if w == 0 || h == 0 || it.fx == BoothFx::None {
+        return;
+    }
+    if BoothFx::LOOKS.contains(&it.fx) {
+        booth(p, it.fx, it.amount.min(100.0), it.cx, it.cy);
+        return;
+    }
+    if it.fx == BoothFx::Mirror {
+        let wf = w as f32;
+        let cx = it.cx / 100.0 * wf;
+        p.op(48, &[[cx.clamp(1.0, (wf - 1.0).max(1.0)), if it.reverse { 1.0 } else { 0.0 }, 0.0, 0.0]]);
+        return;
+    }
+    let Some((kind, a, b)) = crate::booth::distort_params(it, w, h) else { return };
+    p.op_sub(24, kind as f32, &[a, b]);
+    if it.fx == BoothFx::FishEye {
+        p.op(25, &[[a[0], a[1], a[2], (it.amount / 100.0).clamp(0.0, 1.0)]]);
     }
 }
 
@@ -453,35 +515,20 @@ fn booth(p: &mut Plan<'_, '_>, fx: BoothFx, amount: f32, cx: f32, cy: f32) {
 }
 
 /// motion::looped as passes.
-fn looped(p: &mut Plan<'_, '_>, fx: &[LoopFx], idx: usize, n: usize, amount: f32, cycles: u32, transparent: bool) {
+#[allow(clippy::too_many_arguments)]
+fn looped(p: &mut Plan<'_, '_>, fx: &[LoopFx], idx: usize, n: usize, amount: f32, cycles: u32, transparent: bool, reverse: bool) {
     if fx.is_empty() || n == 0 {
         return;
     }
     use crate::motion::hash;
     let k = (amount / 100.0).clamp(0.0, 2.0);
-    let phase = idx as f32 / n as f32 * cycles.max(1) as f32 * TAU;
     let (w, h) = p.wf();
-    let side = w.min(h);
-    let (mut scale, mut angle, mut dx, mut dy) = (1.0f32, 0.0f32, 0.0f32, 0.0f32);
-    for f in fx {
-        match f {
-            LoopFx::Shake => {
-                dx += (hash(idx as u64 * 2) - 0.5) * side * 0.06 * k;
-                dy += (hash(idx as u64 * 2 + 1) - 0.5) * side * 0.06 * k;
-            }
-            LoopFx::Pulse => scale *= 1.0 + 0.08 * k * (0.5 - 0.5 * phase.cos()),
-            LoopFx::Hop => dy -= side * 0.12 * k * (phase / 2.0).sin().abs(),
-            LoopFx::Wobble => angle += 8.0 * k * phase.sin(),
-            _ => {}
-        }
-    }
-    if (scale, angle, dx, dy) != (1.0, 0.0, 0.0, 0.0) {
-        let grow = if fx.contains(&LoopFx::Shake) || fx.contains(&LoopFx::Wobble) { 1.0 + 0.08 * k } else { 1.0 };
-        p.place(scale * grow, angle, dx, dy, transparent);
+    let l = crate::motion::loop_place(fx, idx, n, amount, cycles, reverse, w, h);
+    if l.moves() {
+        p.place_xy(l.sx, l.sy, l.angle, l.dx, l.dy, transparent);
     }
     if fx.contains(&LoopFx::Rainbow) {
-        let deg = idx as f32 / n as f32 * cycles.max(1) as f32 * 360.0 * k.min(1.0);
-        let (s, c) = deg.to_radians().sin_cos();
+        let (s, c) = l.hue.to_radians().sin_cos();
         p.op(
             40,
             &[
@@ -503,6 +550,9 @@ fn looped(p: &mut Plan<'_, '_>, fx: &[LoopFx], idx: usize, n: usize, amount: f32
             u.push([y0 as f32, (y0 + bh).min(hu) as f32, shift as f32, 0.0]);
         }
         p.op(41, &u);
+    }
+    if l.hide > 0.0 {
+        transition(p, Transition::Fade, 1.0 - l.hide, transparent);
     }
 }
 
@@ -544,9 +594,7 @@ fn transition(p: &mut Plan<'_, '_>, kind: Transition, pr: f32, transparent: bool
         Transition::Pixelate => {
             let block = ((1.0 - pr) * w.min(h) / 6.0).round().max(1.0) as u32;
             if block > 1 {
-                let (wu, hu) = p.size;
-                p.blocks([0, 0, wu, hu], block, T_BLOCKS);
-                p.raw(39, 0.0, [Some(GpuIn::Cur), Some(GpuIn::Tmp(T_BLOCKS)), None], None, (wu, hu), false, &[[block as f32, 0.0, 0.0, 0.0]]);
+                p.pixelate(block);
             }
             p.mask(0, [(pr * 3.0).min(1.0), 0.0, 0.0, 0.0], z, transparent);
         }

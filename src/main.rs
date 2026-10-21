@@ -9,6 +9,7 @@ mod encode;
 mod geo;
 mod gpu;
 mod gpu_fx;
+mod paste;
 mod gpu_render;
 mod icons;
 mod io;
@@ -62,6 +63,9 @@ fn main() -> eframe::Result {
             .with_min_inner_size([960.0, 600.0])
             .with_drag_and_drop(true)
             .with_icon(app_icon()),
+        // Ctrl+C / X / V come in as keys: the app reads the clipboard itself
+        // (files, browser pictures) and passes text on to text fields
+        clipboard_shortcuts: false,
         renderer,
         ..Default::default()
     };

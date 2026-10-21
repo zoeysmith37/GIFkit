@@ -127,6 +127,49 @@ pub struct EffectSettings {
     pub warp_amount: f32,
     pub warp_cx: f32,
     pub warp_cy: f32,
+
+    /// photo booth looks, several at once (older layers: `booth`)
+    pub looks: Vec<crate::booth::BoothItem>,
+    /// distortions, several at once (older layers: `warp`)
+    pub warps: Vec<crate::booth::BoothItem>,
+    /// the waves travel the other way
+    pub wave_reverse: bool,
+    /// filter strengths, %
+    pub gotham_amount: f32,
+    pub lomo_amount: f32,
+    pub nashville_amount: f32,
+    pub toaster_amount: f32,
+    pub vignette_amount: f32,
+    /// oil paint: how many brightness steps it sorts colours into
+    pub oil_detail: u32,
+    /// emboss: %, the light's direction (0–7, clockwise from top left), in colour
+    pub emboss_amount: f32,
+    pub emboss_dir: u8,
+    pub emboss_colour: bool,
+    /// solarize: where tones flip, and flipping the dark ones instead
+    pub solarize_threshold: f32,
+    pub solarize_reverse: bool,
+    /// noise: the same on every channel; the same pattern every frame
+    pub noise_mono: bool,
+    pub noise_still: bool,
+    pub pixelate: bool,
+    pub pixelate_size: u32,
+
+    /// made in the Animation panel (shows there, named Animation)
+    pub anim: bool,
+    /// intro and outro lengths in frames (0: `fade_frames`)
+    pub intro_frames: usize,
+    pub outro_frames: usize,
+    pub loop_spin: bool,
+    pub loop_float: bool,
+    pub loop_squash: bool,
+    pub loop_blink: bool,
+    pub loop_heartbeat: bool,
+    /// loops turn, float and cycle colours the other way
+    pub loop_reverse: bool,
+    /// the timer's corner (0 bottom left, 1 bottom right, 2 top left, 3 top right) and size (% of the height)
+    pub counter_pos: u8,
+    pub counter_size: f32,
 }
 
 impl Default for EffectSettings {
@@ -221,6 +264,35 @@ impl Default for EffectSettings {
             warp_amount: 50.0,
             warp_cx: 50.0,
             warp_cy: 50.0,
+            looks: Vec::new(),
+            warps: Vec::new(),
+            wave_reverse: false,
+            gotham_amount: 100.0,
+            lomo_amount: 100.0,
+            nashville_amount: 100.0,
+            toaster_amount: 100.0,
+            vignette_amount: 100.0,
+            oil_detail: 20,
+            emboss_amount: 100.0,
+            emboss_dir: 0,
+            emboss_colour: false,
+            solarize_threshold: 127.0,
+            solarize_reverse: false,
+            noise_mono: false,
+            noise_still: false,
+            pixelate: false,
+            pixelate_size: 8,
+            anim: false,
+            intro_frames: 0,
+            outro_frames: 0,
+            loop_spin: false,
+            loop_float: false,
+            loop_squash: false,
+            loop_blink: false,
+            loop_heartbeat: false,
+            loop_reverse: false,
+            counter_pos: 0,
+            counter_size: 7.0,
         }
     }
 }
@@ -468,17 +540,32 @@ fn convolve3(img: &RgbaImage, k: [f32; 9], bias: f32, gray: bool) -> RgbaImage {
     out
 }
 
-fn oil_paint(img: &RgbaImage, radius: u32) -> RgbaImage {
+/// Emboss kernels: the light comes from one of eight directions, clockwise
+/// from the top left.
+pub(crate) fn emboss_kernel(dir: u8) -> [f32; 9] {
+    // the outer ring clockwise from the top left, and the middle
+    const RING: [(usize, usize); 8] = [(0, 0), (0, 1), (0, 2), (1, 2), (2, 2), (2, 1), (2, 0), (1, 0)];
+    const VALS: [f32; 8] = [-2.0, -1.0, 0.0, 1.0, 2.0, 1.0, 0.0, -1.0];
+    let mut k = [0f32; 9];
+    k[4] = 1.0;
+    for (j, (r, c)) in RING.iter().enumerate() {
+        k[r * 3 + c] = VALS[(j + 8 - (dir as usize % 8)) % 8];
+    }
+    k
+}
+
+fn oil_paint(img: &RgbaImage, radius: u32, levels: u32) -> RgbaImage {
     let (w, h) = img.dimensions();
     // the work grows with the square of the radius: past 16 it only gets slower
     let r = radius.clamp(1, 16) as i32;
-    const LEVELS: usize = 20;
+    const MAX: usize = 64;
+    let lv = (levels as usize).clamp(2, MAX);
     let mut out = img.clone();
     out.par_chunks_mut(4).enumerate().for_each(|(i, o)| {
         let x = (i as u32 % w) as i32;
         let y = (i as u32 / w) as i32;
-        let mut count = [0u32; LEVELS];
-        let mut sum = [[0u32; 3]; LEVELS];
+        let mut count = [0u32; MAX];
+        let mut sum = [[0u32; 3]; MAX];
         for dy in -r..=r {
             for dx in -r..=r {
                 if dx * dx + dy * dy > r * r {
@@ -487,8 +574,8 @@ fn oil_paint(img: &RgbaImage, radius: u32) -> RgbaImage {
                 let sx = (x + dx).clamp(0, w as i32 - 1) as u32;
                 let sy = (y + dy).clamp(0, h as i32 - 1) as u32;
                 let p = img.get_pixel(sx, sy);
-                let b = ((luma(p) / 256.0) * LEVELS as f32) as usize;
-                let b = b.min(LEVELS - 1);
+                let b = ((luma(p) / 256.0) * lv as f32) as usize;
+                let b = b.min(lv - 1);
                 count[b] += 1;
                 for c in 0..3 {
                     sum[b][c] += p[c] as u32;
@@ -510,14 +597,14 @@ fn posterize(img: &mut RgbaImage, levels: u8) {
     map_rgb(img, |r, g, b| ((r / 255.0 * l).round() / l * 255.0, (g / 255.0 * l).round() / l * 255.0, (b / 255.0 * l).round() / l * 255.0));
 }
 
-fn solarize(img: &mut RgbaImage) {
+fn solarize(img: &mut RgbaImage, thr: f32, reverse: bool) {
     map_rgb(img, |r, g, b| {
-        let f = |v: f32| if v > 127.0 { 255.0 - v } else { v };
+        let f = |v: f32| if (v > thr) != reverse { 255.0 - v } else { v };
         (f(r), f(g), f(b))
     });
 }
 
-fn add_noise(img: &mut RgbaImage, amount: f32, seed: u64) {
+fn add_noise(img: &mut RgbaImage, amount: f32, seed: u64, mono: bool) {
     let w = img.width() as u64;
     img.par_chunks_mut(4).enumerate().for_each(|(i, p)| {
         // hash-based per-pixel noise so it is deterministic and parallel
@@ -526,8 +613,7 @@ fn add_noise(img: &mut RgbaImage, amount: f32, seed: u64) {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
         z ^= z >> 31;
         let n1 = ((z & 0xffff) as f32 / 65535.0) - 0.5;
-        let n2 = (((z >> 16) & 0xffff) as f32 / 65535.0) - 0.5;
-        let n3 = (((z >> 32) & 0xffff) as f32 / 65535.0) - 0.5;
+        let (n2, n3) = if mono { (n1, n1) } else { ((((z >> 16) & 0xffff) as f32 / 65535.0) - 0.5, (((z >> 32) & 0xffff) as f32 / 65535.0) - 0.5) };
         let a = amount * 2.0;
         p[0] = c8(p[0] as f32 + n1 * a);
         p[1] = c8(p[1] as f32 + n2 * a);
@@ -819,19 +905,26 @@ pub fn apply_frame(src: &RgbaImage, idx: usize, n: usize, elapsed_s: f32, clip_s
         img = imageops::unsharpen(&img, s.sharpen_sigma.max(0.1), 2);
     }
     if s.oil {
-        img = oil_paint(&img, s.oil_radius);
+        img = oil_paint(&img, s.oil_radius, s.oil_detail);
     }
     if s.emboss {
-        img = convolve3(&img, [-2.0, -1.0, 0.0, -1.0, 1.0, 1.0, 0.0, 1.0, 2.0], 0.0, true);
+        let mut e = convolve3(&img, emboss_kernel(s.emboss_dir), 0.0, !s.emboss_colour);
+        if s.emboss_amount < 99.95 {
+            crate::timeline::blend(&mut e, &img, s.emboss_amount / 100.0);
+        }
+        img = e;
     }
     if s.posterize {
         posterize(&mut img, s.posterize_levels);
     }
     if s.solarize {
-        solarize(&mut img);
+        solarize(&mut img, s.solarize_threshold, s.solarize_reverse);
     }
     if s.noise {
-        add_noise(&mut img, s.noise_amount, idx as u64 + 1);
+        add_noise(&mut img, s.noise_amount, if s.noise_still { 1 } else { idx as u64 + 1 }, s.noise_mono);
+    }
+    if s.pixelate && s.pixelate_size > 1 {
+        crate::motion::pixelate(&mut img, s.pixelate_size);
     }
     if s.swirl {
         img = swirl(&img, s.swirl_deg);
@@ -840,29 +933,37 @@ pub fn apply_frame(src: &RgbaImage, idx: usize, n: usize, elapsed_s: f32, clip_s
         img = implode(&img, s.implode_amount);
     }
     if s.wave {
-        let phase = idx as f32 / n.max(1) as f32 * std::f32::consts::TAU;
+        let phase = idx as f32 / n.max(1) as f32 * std::f32::consts::TAU * if s.wave_reverse { -1.0 } else { 1.0 };
         img = wave(&img, s.wave_amp, s.wave_len, phase);
     }
-    if s.booth != crate::booth::BoothFx::None {
-        img = crate::booth::apply(&img, s.booth, s.booth_amount, s.booth_cx, s.booth_cy);
+    let (looks, warps) = s.booth_items();
+    for it in looks.iter().chain(warps.iter()) {
+        img = crate::booth::apply_item(&img, it);
     }
-    if s.warp != crate::booth::BoothFx::None {
-        img = crate::booth::apply(&img, s.warp, s.warp_amount, s.warp_cx, s.warp_cy);
-    }
+    // filters at a strength: mixed back toward the picture before them
+    let strength = |img: &mut RgbaImage, amount: f32, f: &dyn Fn(&mut RgbaImage)| {
+        if amount >= 99.95 {
+            f(img);
+        } else {
+            let before = img.clone();
+            f(img);
+            crate::timeline::blend(img, &before, amount / 100.0);
+        }
+    };
     if s.gotham {
-        gotham(&mut img);
+        strength(&mut img, s.gotham_amount, &gotham);
     }
     if s.lomo {
-        lomo(&mut img);
+        strength(&mut img, s.lomo_amount, &lomo);
     }
     if s.nashville {
-        nashville(&mut img);
+        strength(&mut img, s.nashville_amount, &nashville);
     }
     if s.toaster {
-        toaster(&mut img);
+        strength(&mut img, s.toaster_amount, &toaster);
     }
     if s.vignette {
-        vignette(&mut img, 0.9, [0, 0, 0]);
+        vignette(&mut img, 0.9 * s.vignette_amount / 100.0, [0, 0, 0]);
     }
     if s.ordered_dither {
         ordered_dither(&mut img, s.dither_levels);
@@ -911,27 +1012,66 @@ pub fn apply_frame(src: &RgbaImage, idx: usize, n: usize, elapsed_s: f32, clip_s
         // position through the clip by time, in steps fine enough to look smooth
         const STEPS: usize = 3600;
         let (li, ln) = if clip_s > 0.0 { (((elapsed_s / clip_s).clamp(0.0, 1.0) * STEPS as f32).round() as usize, STEPS) } else { (idx, n) };
-        img = crate::motion::looped(&img, &loops, li, ln, s.loop_amount, s.loop_cycles, s.fade_to_transparent);
+        img = crate::motion::looped(&img, &loops, li, ln, s.loop_amount, s.loop_cycles, s.fade_to_transparent, s.loop_reverse);
     }
-    let ff = s.fade_frames.max(1);
+    let (fi, fo) = s.transition_frames();
     let (intro, outro) = s.transitions();
-    if intro != crate::motion::Transition::None && idx < ff {
-        img = crate::motion::transition(&img, intro, (idx as f32 + 1.0) / (ff as f32 + 1.0), s.fade_to_transparent);
+    if intro != crate::motion::Transition::None && idx < fi {
+        img = crate::motion::transition(&img, intro, (idx as f32 + 1.0) / (fi as f32 + 1.0), s.fade_to_transparent);
     }
-    if outro != crate::motion::Transition::None && n > 0 && idx + ff >= n {
-        img = crate::motion::transition(&img, outro, (n - idx) as f32 / (ff as f32 + 1.0), s.fade_to_transparent);
+    if outro != crate::motion::Transition::None && n > 0 && idx + fo >= n {
+        img = crate::motion::transition(&img, outro, (n - idx) as f32 / (fo as f32 + 1.0), s.fade_to_transparent);
     }
     if s.counter {
-        let size = (img.height() as f32 * 0.07).max(12.0);
-        let txt = format!("{:.2}s", elapsed_s);
-        let x = 6;
-        let y = img.height() as i32 - size as i32 - 10;
-        crate::text::draw_simple(&mut img, fonts, &txt, x, y, size);
+        if let Some((sp, x, y, o)) = counter_sprite(fonts, elapsed_s, img.width(), img.height(), s.counter_pos, s.counter_size) {
+            crate::ops::overlay_with_opacity(&mut img, &sp, x as i64, y as i64, o);
+        }
     }
     img
 }
 
+/// The running timer: its picture, where it goes and its opacity.
+pub fn counter_sprite(fonts: &[FontEntry], elapsed_s: f32, w: u32, h: u32, pos: u8, size_pct: f32) -> Option<(RgbaImage, i32, i32, f32)> {
+    if fonts.is_empty() {
+        return None;
+    }
+    let size = (h as f32 * size_pct / 100.0).max(12.0);
+    let a = crate::text::Annotation { text: format!("{:.2}s", elapsed_s), size, align: crate::text::Align::Left, ..Default::default() };
+    let sp = crate::text::render_sprite(fonts, &a);
+    let (sw, sh) = (sp.width() as i32, sp.height() as i32);
+    let (w, h) = (w as i32, h as i32);
+    // the first layout (bottom left) is where the timer always was
+    let x = if pos % 2 == 1 { w - sw - 6 } else { 6 };
+    let y = if pos >= 2 { 6 } else { h - size as i32 - 10 };
+    let _ = sh;
+    Some((sp, x, y, a.opacity as f32 / 100.0))
+}
+
 impl EffectSettings {
+    /// Intro and outro lengths in frames.
+    pub fn transition_frames(&self) -> (usize, usize) {
+        let ff = self.fade_frames.max(1);
+        (if self.intro_frames > 0 { self.intro_frames } else { ff }, if self.outro_frames > 0 { self.outro_frames } else { ff })
+    }
+
+    /// Photo booth looks and distortions to apply, in order, with the
+    /// single ones older layers kept.
+    pub fn booth_items(&self) -> (Vec<crate::booth::BoothItem>, Vec<crate::booth::BoothItem>) {
+        use crate::booth::{BoothFx, BoothItem};
+        let mut looks = Vec::new();
+        let mut warps = Vec::new();
+        if self.booth != BoothFx::None {
+            let it = BoothItem { fx: self.booth, amount: self.booth_amount, cx: self.booth_cx, cy: self.booth_cy, reverse: false };
+            if BoothFx::LOOKS.contains(&self.booth) { looks.push(it) } else { warps.push(it) }
+        }
+        looks.extend(self.looks.iter().filter(|l| l.fx != BoothFx::None).copied());
+        if self.warp != BoothFx::None {
+            warps.push(BoothItem { fx: self.warp, amount: self.warp_amount, cx: self.warp_cx, cy: self.warp_cy, reverse: false });
+        }
+        warps.extend(self.warps.iter().filter(|l| l.fx != BoothFx::None).copied());
+        (looks, warps)
+    }
+
     /// The intro and outro, with the old fade in / out switches as Fade.
     pub fn transitions(&self) -> (crate::motion::Transition, crate::motion::Transition) {
         use crate::motion::Transition as T;
@@ -942,7 +1082,19 @@ impl EffectSettings {
 
     pub fn loop_fx(&self) -> Vec<crate::motion::LoopFx> {
         use crate::motion::LoopFx as L;
-        [(self.loop_shake, L::Shake), (self.loop_pulse, L::Pulse), (self.loop_hop, L::Hop), (self.loop_wobble, L::Wobble), (self.loop_rainbow, L::Rainbow), (self.loop_glitch, L::Glitch)]
+        [
+            (self.loop_shake, L::Shake),
+            (self.loop_pulse, L::Pulse),
+            (self.loop_hop, L::Hop),
+            (self.loop_wobble, L::Wobble),
+            (self.loop_spin, L::Spin),
+            (self.loop_float, L::Float),
+            (self.loop_squash, L::Squash),
+            (self.loop_heartbeat, L::Heartbeat),
+            (self.loop_blink, L::Blink),
+            (self.loop_rainbow, L::Rainbow),
+            (self.loop_glitch, L::Glitch),
+        ]
             .into_iter()
             .filter_map(|(on, f)| on.then_some(f))
             .collect()

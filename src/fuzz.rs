@@ -783,6 +783,39 @@ fn gpu_matches_cpu() {
         fxc.push((format!("booth {}", b.label()), fx(&move |e| (e.booth, e.booth_amount, e.booth_cx, e.booth_cy) = (b, 70.0, 40.0, 60.0))));
     }
     fxc.push(("warp + booth".into(), fx(&|e| (e.booth, e.warp) = (BoothFx::Comic, BoothFx::Twirl))));
+    use crate::booth::BoothItem;
+    let item = |fx: BoothFx, amount: f32, reverse: bool| BoothItem { fx, amount, cx: 40.0, cy: 60.0, reverse };
+    for b in BoothFx::DISTORT.iter() {
+        let b = *b;
+        fxc.push((format!("warp {} 250", b.label()), fx(&move |e| e.warps = vec![item(b, 250.0, false)])));
+        fxc.push((format!("warp {} reversed", b.label()), fx(&move |e| e.warps = vec![item(b, 80.0, true)])));
+    }
+    fxc.push(("looks stacked".into(), fx(&move |e| e.looks = vec![item(BoothFx::Comic, 60.0, false), item(BoothFx::Thermal, 40.0, false)])));
+    fxc.push(("warps stacked".into(), fx(&move |e| e.warps = vec![item(BoothFx::Twirl, 120.0, false), item(BoothFx::Bulge, 70.0, false), item(BoothFx::Mirror, 50.0, true)])));
+    fxc.push(("wave reversed".into(), fx(&|e| (e.wave, e.wave_reverse) = (true, true))));
+    for (nm, f) in [("gotham", 0usize), ("lomo", 1), ("nashville", 2), ("toaster", 3), ("vignette", 4)] {
+        fxc.push((format!("fx {nm} 40%"), fx(&move |e| match f {
+            0 => (e.gotham, e.gotham_amount) = (true, 40.0),
+            1 => (e.lomo, e.lomo_amount) = (true, 40.0),
+            2 => (e.nashville, e.nashville_amount) = (true, 40.0),
+            3 => (e.toaster, e.toaster_amount) = (true, 40.0),
+            _ => (e.vignette, e.vignette_amount) = (true, 40.0),
+        })));
+    }
+    fxc.push(("fx oil detail".into(), fx(&|e| (e.oil, e.oil_detail) = (true, 50))));
+    fxc.push(("fx emboss dir".into(), fx(&|e| (e.emboss, e.emboss_dir, e.emboss_amount) = (true, 3, 60.0))));
+    fxc.push(("fx emboss colour".into(), fx(&|e| (e.emboss, e.emboss_dir, e.emboss_colour) = (true, 6, true))));
+    fxc.push(("fx solarize rev".into(), fx(&|e| (e.solarize, e.solarize_threshold, e.solarize_reverse) = (true, 80.0, true))));
+    fxc.push(("fx noise mono".into(), fx(&|e| (e.noise, e.noise_mono, e.noise_still) = (true, true, true))));
+    fxc.push(("fx pixelate".into(), fx(&|e| (e.pixelate, e.pixelate_size) = (true, 7))));
+    fxc.push(("fx heartbeat".into(), fx(&|e| (e.loop_heartbeat, e.loop_amount) = (true, 150.0))));
+    fxc.push(("fx squash float".into(), fx(&|e| (e.loop_squash, e.loop_float, e.loop_reverse) = (true, true, true))));
+    fxc.push(("fx spin".into(), fx(&|e| e.loop_spin = true)));
+    fxc.push(("fx blink rev".into(), fx(&|e| (e.loop_blink, e.loop_reverse) = (true, true))));
+    fxc.push(("intro long".into(), fx(&|e| (e.intro, e.intro_frames) = (Tr::Iris, 6))));
+    for pos in 0..4u8 {
+        fxc.push((format!("counter {pos}"), fx(&move |e| (e.counter, e.counter_pos, e.counter_size) = (true, pos, 12.0))));
+    }
     for t in Tr::ALL.iter().skip(1) {
         let t = *t;
         fxc.push((format!("intro {}", t.label()), fx(&move |e| (e.intro, e.fade_frames) = (t, 3))));
@@ -947,7 +980,7 @@ fn timeline_bits_round_trip() {
     use crate::timeline::{Ease, Key, Marker};
     let mut f = ProjectFile::default();
     f.markers = vec![Marker { frame: 4, label: "Intro".into() }];
-    f.frames = vec![FrameMeta { delay: 5, enabled: true, cut: false }, FrameMeta { delay: 5, enabled: true, cut: true }];
+    f.frames = vec![FrameMeta { delay: 5, enabled: true, cut: false, blank: false }, FrameMeta { delay: 5, enabled: true, cut: true, blank: true }];
     let json = serde_json::to_string(&f).unwrap();
     let back: ProjectFile = serde_json::from_str(&json).unwrap();
     assert_eq!(back.markers, f.markers);

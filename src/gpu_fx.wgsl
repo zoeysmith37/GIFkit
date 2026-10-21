@@ -357,13 +357,24 @@ fn warp_from(kind: i32, x: f32, y: f32) -> vec2<f32> {
         let s = (a.z + (d - a.z) * a.w) / d;
         return vec2<f32>(a.x + dx * s, a.y + dy * s);
     }
+    if (kind == 9) {
+        // a tunnel the other way: cx cy r0 squash
+        let dx = x - a.x;
+        let dy = y - a.y;
+        let d = sqrt(dx * dx + dy * dy);
+        if (d >= a.z || d < 1e-3) {
+            return vec2<f32>(x, y);
+        }
+        let s = (a.z - (a.z - d) * a.w) / d;
+        return vec2<f32>(a.x + dx * s, a.y + dy * s);
+    }
     if (kind == 7) {
-        // kaleidoscope: cx cy seg reach
+        // kaleidoscope: cx cy seg reach, the slices turned by b.x
         let dx = x - a.x;
         let dy = y - a.y;
         let d = sqrt(dx * dx + dy * dy);
         let seg = a.z;
-        let ang = atan2(dy, dx) + 3.14159265;
+        let ang = atan2(dy, dx) + 3.14159265 + b.x;
         var t = ang - seg * floor(ang / seg);
         if (t > seg / 2.0) {
             t = seg - t;
@@ -625,25 +636,26 @@ fn fs_fx(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             }
             return o / 255.0;
         }
-        // 19 oil paint: radius
+        // 19 oil paint: radius, levels
         case 19: {
             let r = i32(a.x);
-            var count: array<u32, 20>;
-            var sum: array<vec3<u32>, 20>;
+            let lv = u32(a.y);
+            var count: array<u32, 64>;
+            var sum: array<vec3<u32>, 64>;
             for (var dy = -r; dy <= r; dy = dy + 1) {
                 for (var dx = -r; dx <= r; dx = dx + 1) {
                     if (dx * dx + dy * dy > r * r) {
                         continue;
                     }
                     let p = ld(t0, ip + vec2<i32>(dx, dy));
-                    let bi = min(u32((luma(p) / 256.0) * 20.0), 19u);
+                    let bi = min(u32((luma(p) / 256.0) * f32(lv)), lv - 1u);
                     count[bi] = count[bi] + 1u;
                     sum[bi] = sum[bi] + vec3<u32>(p.rgb);
                 }
             }
             var bi = 0u;
             var bc = 0u;
-            for (var k = 0u; k < 20u; k = k + 1u) {
+            for (var k = 0u; k < lv; k = k + 1u) {
                 if (count[k] >= bc) {
                     bc = count[k];
                     bi = k;
@@ -655,17 +667,22 @@ fn fs_fx(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             }
             return q / 255.0;
         }
-        // 20 emboss
+        // 20 emboss: the kernel in p[1..3], in colour (c.y)
         case 20: {
-            var k = array<f32, 9>(-2.0, -1.0, 0.0, -1.0, 1.0, 1.0, 0.0, 1.0, 2.0);
-            var acc = 0.0;
+            var k = array<f32, 9>(a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w, c.x);
+            var acc = vec3<f32>(0.0);
             for (var ky = -1; ky <= 1; ky = ky + 1) {
                 for (var kx = -1; kx <= 1; kx = kx + 1) {
-                    acc = acc + luma(ld(t0, ip + vec2<i32>(kx, ky))) * k[(ky + 1) * 3 + kx + 1];
+                    let p = ld(t0, ip + vec2<i32>(kx, ky));
+                    var v = vec3<f32>(luma(p));
+                    if (c.y > 0.5) {
+                        v = p.rgb;
+                    }
+                    acc = acc + v * k[(ky + 1) * 3 + kx + 1];
                 }
             }
             let q = ld(t0, ip);
-            return vec4<f32>(vec3<f32>(c8(acc)), q.a) / 255.0;
+            return vec4<f32>(c8(acc.x), c8(acc.y), c8(acc.z), q.a) / 255.0;
         }
         // 21 posterize: levels - 1
         case 21: {
@@ -673,10 +690,11 @@ fn fs_fx(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             let l = a.x;
             return out8(vec4<f32>(rnd4(vec4<f32>(q.rgb / 255.0 * l, 0.0)).rgb / l * 255.0, q.a));
         }
-        // 22 solarize
+        // 22 solarize: threshold, the dark ones instead
         case 22: {
             let q = ld(t0, ip);
-            let o = select(q.rgb, vec3<f32>(255.0) - q.rgb, q.rgb > vec3<f32>(127.0));
+            let hi = q.rgb > vec3<f32>(a.x);
+            let o = select(q.rgb, vec3<f32>(255.0) - q.rgb, hi != vec3<bool>(a.y > 0.5));
             return out8(vec4<f32>(o, q.a));
         }
         // 23 noise: amount seed width
@@ -692,8 +710,12 @@ fn fs_fx(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             z = mul64(z ^ shr64(z, 27u), vec2<u32>(0x133111EBu, 0x94D049BBu));
             z = z ^ shr64(z, 31u);
             let n1 = f32(z.x & 0xffffu) / 65535.0 - 0.5;
-            let n2 = f32((z.x >> 16u) & 0xffffu) / 65535.0 - 0.5;
-            let n3 = f32(z.y & 0xffffu) / 65535.0 - 0.5;
+            var n2 = f32((z.x >> 16u) & 0xffffu) / 65535.0 - 0.5;
+            var n3 = f32(z.y & 0xffffu) / 65535.0 - 0.5;
+            if (a.w > 0.5) {
+                n2 = n1;
+                n3 = n1;
+            }
             let am = a.x * 2.0;
             return out8(vec4<f32>(q.r + n1 * am, q.g + n2 * am, q.b + n3 * am, q.a));
         }
@@ -835,15 +857,20 @@ fn fs_fx(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         // 36 motion::place: scale sin cos, dx dy in b, background in c
         case 36: {
             var o = c;
-            if (a.x <= 0.001) {
+            if (a.x <= 0.001 || (a.w > 0.0 && a.w <= 0.001)) {
                 return o / 255.0;
             }
             let cx = osz.x / 2.0;
             let cy = osz.y / 2.0;
             let xx = x + 0.5 - cx - b.x;
             let yy = y + 0.5 - cy - b.y;
+            // the height's scale (a.w), the width's when not given
+            var ys = a.w;
+            if (ys <= 0.001) {
+                ys = a.x;
+            }
             let sx = (xx * a.z - yy * a.y) / a.x + cx - 0.5;
-            let sy = (xx * a.y + yy * a.z) / a.x + cy - 0.5;
+            let sy = (xx * a.y + yy * a.z) / ys + cy - 0.5;
             var ok = false;
             let v = bilinear_m(t0, sx, sy, &ok);
             if (ok) {
@@ -981,7 +1008,7 @@ fn fs_fx(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         }
         // 48 mirror: the line
         case 48: {
-            if (x >= a.x) {
+            if ((x >= a.x) != (a.y > 0.5)) {
                 let sx = i32(clamp(2.0 * a.x - x - 1.0, 0.0, osz.x - 1.0));
                 return textureLoad(t0, vec2<i32>(sx, ip.y), 0);
             }

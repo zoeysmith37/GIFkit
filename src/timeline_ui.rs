@@ -39,6 +39,29 @@ pub(super) struct TlDrag {
     orig: (usize, usize),
 }
 
+/// The timeline toolbar's actions.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum TbAct {
+    Select,
+    Razor,
+    Split,
+    Join,
+    AddClip,
+    Delete,
+    Copy,
+    Paste,
+    Duplicate,
+    KeyAdd,
+    KeyRemove,
+    PrevEdit,
+    NextEdit,
+    In,
+    Out,
+    Marker,
+    Snap,
+    Loop,
+}
+
 /// What Copy put aside: clips as (offset from the first, length), or a keyframe.
 #[derive(Clone, Debug)]
 pub(super) enum TlBoard {
@@ -47,12 +70,13 @@ pub(super) enum TlBoard {
 }
 
 /// What the timeline puts on the system clipboard, so Ctrl+V comes back here.
-const BOARD_TAG: &str = "GIFkit timeline clips";
+pub(super) const BOARD_TAG: &str = "GIFkit timeline clips";
 
 /// Track colours by layer kind, mixed into the view colour.
 fn kind_colour(k: Kind) -> Color32 {
     match k {
         Kind::Effects => Color32::from_rgb(155, 89, 182),
+        Kind::Animation => Color32::from_rgb(218, 68, 83),
         Kind::Text => Color32::from_rgb(61, 174, 233),
         Kind::Censor => Color32::from_rgb(127, 140, 141),
         Kind::Overlay => Color32::from_rgb(26, 188, 156),
@@ -73,7 +97,8 @@ impl GifKitApp {
     /// Runs of output frames the GIF actually shows (skipped source frames are gaps).
     fn gif_runs(&self) -> Vec<(usize, usize)> {
         let Some(base) = &self.base else { return Vec::new() };
-        let shown: Vec<bool> = self.plan.iter().map(|f| base.frames[f.src].enabled).collect();
+        // gaps (blank frames) and skipped frames aren't part of any clip
+        let shown: Vec<bool> = self.plan.iter().map(|f| base.frames[f.src].enabled && !base.frames[f.src].blank).collect();
         // a split starts a new clip
         let cut: Vec<bool> = self.plan.iter().map(|f| base.frames[f.src].cut).collect();
         let mut v = Vec::new();
@@ -110,11 +135,16 @@ impl GifKitApp {
         }
     }
 
-    /// Show or skip the source frames behind output frames `a..=b`.
+    /// Show the source frames behind output frames `a..=b`, or leave a gap
+    /// there: the frames keep their time but show nothing, as a timeline does.
     fn gif_set(&mut self, a: usize, b: usize, on: bool) {
         let Some(base) = self.base.as_mut() else { return };
         for i in a..=b.min(self.plan.len().saturating_sub(1)) {
-            base.frames[self.plan[i].src].enabled = on;
+            let f = &mut base.frames[self.plan[i].src];
+            f.blank = !on;
+            if on {
+                f.enabled = true;
+            }
         }
         self.timing_rev += 1;
         self.after_base_change(false);
@@ -300,6 +330,7 @@ impl GifKitApp {
 
     pub(super) fn timeline_dock(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let pal = *p();
+        self.tl_area = ui.max_rect();
         let now = ctx.input(|i| i.time);
         let n = self.plan.len();
         if n == 0 {
@@ -313,44 +344,110 @@ impl GifKitApp {
         let idle = !self.busy();
         let sel_layer = self.tl_track.filter(|t| *t != GIF);
 
-        // ---- toolbar
+        // ---- toolbar: groups that don't fit go into a menu at the end
+        let locked_sel = self.tl_track.is_some_and(|t| self.tl_locked(t));
+        let gap_here = sel_layer.is_some_and(|t| !self.track_spans(t).iter().any(|&(a, b)| self.cur >= a && self.cur <= b));
+        let on_key = sel_layer.and_then(|t| self.stack.index_of(t)).is_some_and(|li| self.stack.layers[li].timing.key_at(self.cur).is_some());
+        let layer_clips = self.tl_selected().iter().any(|c| c.0 != GIF);
+        let km = self.keymap.clone();
+        use crate::keys::Action as A;
+        let k = |a: A| {
+            let t = km.text(a);
+            if t.is_empty() { String::new() } else { format!(" ({t})") }
+        };
+        // (action, icon, menu label, tip, enabled, toggled)
+        type Item = (TbAct, &'static str, &'static str, String, bool, Option<bool>);
+        let mut groups: Vec<Vec<Item>> = vec![
+            vec![
+                (TbAct::Select, "edit-select", "Selection Tool", format!("Selection tool: move and trim clips{}", k(A::TlRazor)), true, Some(!self.tl_razor)),
+                (TbAct::Razor, "edit-cut", "Razor Tool", format!("Razor tool: click a clip to cut it there{}", k(A::TlRazor)), true, Some(self.tl_razor)),
+            ],
+            vec![
+                (TbAct::Split, "split", "Split at Playhead", format!("Split the selected track at the playhead{}", k(A::TlSplit)), idle && self.tl_track.is_some() && !locked_sel, None),
+                (TbAct::Join, "merge", "Join with Next Clip", "Join the selected clip with the one right after it".into(), idle && self.tl_can_join() && !locked_sel, None),
+                (TbAct::AddClip, "list-add", "Add Clip at Playhead", "Add a clip at the playhead (on an empty part of the selected track)".into(), idle && gap_here && !locked_sel, None),
+                (TbAct::Delete, "edit-delete", "Delete", format!("Delete the selected clips or keyframe{}. On the GIF track it leaves a gap.", k(A::TlDelete)), idle && (self.tl_clip.is_some() || self.tl_key.is_some()) && !locked_sel, None),
+            ],
+            vec![
+                (TbAct::Copy, "edit-copy", "Copy", "Copy the selected clips or keyframe (Ctrl+C)".into(), layer_clips || self.tl_key.is_some(), None),
+                (TbAct::Paste, "edit-paste", "Paste", "Paste at the playhead on the selected layer (Ctrl+V)".into(), idle && sel_layer.is_some() && self.tl_board.is_some() && !locked_sel, None),
+                (TbAct::Duplicate, "edit-duplicate", "Duplicate", format!("Put a copy of the selected clips right after them{}", k(A::TlDuplicate)), idle && layer_clips && !locked_sel, None),
+            ],
+            vec![
+                (TbAct::KeyAdd, "keyframe-add", "Add Keyframe", format!("Add a keyframe on the selected layer at the playhead{}", k(A::TlKey)), idle && sel_layer.is_some() && !locked_sel, None),
+                (TbAct::KeyRemove, "keyframe-remove", "Remove Keyframe", "Remove the keyframe at the playhead".into(), idle && on_key && !locked_sel, None),
+                (TbAct::PrevEdit, "keyframe-previous", "Previous Edit", format!("Playhead to the previous clip edge, keyframe or marker{}", k(A::TlPrevEdit)), true, None),
+                (TbAct::NextEdit, "keyframe-next", "Next Edit", format!("Playhead to the next clip edge, keyframe or marker{}", k(A::TlNextEdit)), true, None),
+            ],
+            vec![
+                (TbAct::In, "zone-in", "Set In Point", format!("Set the in point at the playhead{}", k(A::TlIn)), true, None),
+                (TbAct::Out, "zone-out", "Set Out Point", format!("Set the out point at the playhead{}", k(A::TlOut)), true, None),
+                (TbAct::Marker, "bookmark-new", "Add Marker", format!("Add a marker at the playhead{}", k(A::TlMarker)), true, None),
+            ],
+            vec![(TbAct::Snap, "snap", "Snap", "Snap: clip edges and keyframes jump to the playhead, other clips, keyframes and markers nearby (hold Shift while dragging to place freely)".into(), true, Some(self.tl_snap))],
+        ];
+        if self.tl_zone().is_some() {
+            groups.last_mut().unwrap().push((TbAct::Loop, "media-playlist-repeat", "Loop In to Out", "Loop playback between the in and out points".into(), true, Some(self.tl_zone_loop)));
+        }
+        let (_, icon_px) = theme::toolbar_style();
+        let bw = icon_px + 14.0;
+        let mut act: Option<TbAct> = None;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
+            let avail = ui.available_width();
+            // the zoom controls on the right; the slider goes first when it's narrow
+            let slider_on = avail > 560.0;
+            let right_w = bw * 3.0 + if slider_on { 100.0 } else { 0.0 } + 8.0;
+            let title_w = 76.0;
+            let group_w = |g: &Vec<Item>| g.len() as f32 * (bw + 2.0) + 11.0;
+            let total: f32 = groups.iter().map(group_w).sum();
+            let room = avail - right_w - title_w;
+            let fits_all = total <= room;
+            let mut used = 0.0;
+            let mut cut = groups.len();
+            if !fits_all {
+                for (gi, g) in groups.iter().enumerate() {
+                    if used + group_w(g) > room - bw - 6.0 {
+                        cut = gi;
+                        break;
+                    }
+                    used += group_w(g);
+                }
+            }
             ui.label(RichText::new("Timeline").font(theme::medium(13.5)).color(pal.fg));
             ui.add_space(8.0);
-            // the two tools, as in Kdenlive: select and move, or cut
-            if tb_toggle(ui, "edit-select", !self.tl_razor, "Selection tool: move and trim clips (X switches)") {
-                self.tl_razor = false;
+            for (gi, g) in groups.iter().enumerate().take(cut) {
+                if gi > 0 {
+                    toolbar_sep(ui);
+                }
+                for (a, icon, _, tip, en, tog) in g {
+                    let hit = match tog {
+                        Some(on) => ui.add_enabled_ui(*en, |ui| tb_toggle(ui, icon, *on, tip)).inner,
+                        None => tb_tool(ui, icon, "", tip, *en).clicked(),
+                    };
+                    if hit {
+                        act = Some(*a);
+                    }
+                }
             }
-            if tb_toggle(ui, "edit-cut", self.tl_razor, "Razor tool: click a clip to cut it there (X switches)") {
-                self.tl_razor = true;
-            }
-            toolbar_sep(ui);
-            if tb_tool(ui, "split", "", "Split the selected track at the playhead (S)", idle && self.tl_track.is_some()).clicked() {
-                self.tl_split(now);
-            }
-            let gap_here = sel_layer.is_some_and(|t| !self.track_spans(t).iter().any(|&(a, b)| self.cur >= a && self.cur <= b));
-            if tb_tool(ui, "list-add", "", "Add a clip at the playhead (on an empty part of the selected track)", idle && gap_here).clicked() {
-                self.tl_add_clip(now);
-            }
-            if tb_tool(ui, "edit-delete", "", "Delete the selected clips or keyframe (Delete). On the GIF track this skips its frames.", idle && (self.tl_clip.is_some() || self.tl_key.is_some())).clicked() {
-                self.tl_delete_selected(now);
-            }
-            toolbar_sep(ui);
-            if tb_tool(ui, "keyframe-add", "", "Add a keyframe on the selected layer at the playhead (K)", idle && sel_layer.is_some()).clicked() {
-                self.tl_add_key(now);
-            }
-            let on_key = sel_layer.and_then(|t| self.stack.index_of(t)).is_some_and(|li| self.stack.layers[li].timing.key_at(self.cur).is_some());
-            if tb_tool(ui, "keyframe-remove", "", "Remove the keyframe at the playhead", idle && on_key).clicked() {
-                self.tl_delete(now);
-            }
-            toolbar_sep(ui);
-            if tb_toggle(ui, "snap", self.tl_snap, "Snap: clip edges and keyframes jump to the playhead, other clips, keyframes and markers nearby (hold Shift while dragging to place freely)") {
-                self.tl_snap = !self.tl_snap;
-                theme::set_setting("tl_snap", if self.tl_snap { "1" } else { "0" });
-            }
-            if self.tl_zone().is_some() && tb_toggle(ui, "media-playlist-repeat", self.tl_zone_loop, "Loop playback between the in and out points (I and O set them)") {
-                self.tl_zone_loop = !self.tl_zone_loop;
+            if cut < groups.len() {
+                // the rest, in a menu
+                toolbar_sep(ui);
+                let r = tb_tool(ui, "overflow-menu", "", "More timeline tools", true);
+                egui::Popup::menu(&r).show(|ui| {
+                    ui.set_min_width(220.0);
+                    for (gi, g) in groups.iter().enumerate().skip(cut) {
+                        if gi > cut {
+                            ui.separator();
+                        }
+                        for (a, icon, label, _, en, tog) in g {
+                            let text = if tog == &Some(true) { format!("{label} ✓") } else { label.to_string() };
+                            if menu_item(ui, icon, &text, "", *en) {
+                                act = Some(*a);
+                            }
+                        }
+                    }
+                });
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if tb_tool(ui, "zoom-fit-best", "", "Fit the whole animation", true).clicked() {
@@ -362,24 +459,52 @@ impl GifKitApp {
                 if tb_tool(ui, "zoom-in", "", "Zoom in (Ctrl+wheel)", cur_z < top * 0.999).clicked() {
                     self.tl_zoom_to = Some(cur_z * 1.5);
                 }
-                // a zoom slider, as in Kdenlive: fit at the left, closest at the right
-                let mut t = ((cur_z / fit).ln() / (top / fit).ln()).clamp(0.0, 1.0);
-                ui.spacing_mut().slider_width = 90.0;
-                if ui.add(egui::Slider::new(&mut t, 0.0..=1.0).show_value(false)).on_hover_text("Zoom the timeline (Ctrl+wheel). Drag with the middle button to pan.").changed() {
-                    self.tl_zoom_to = Some(fit * (top / fit).powf(t));
+                if slider_on {
+                    // a zoom slider, as in Kdenlive: fit at the left, closest at the right
+                    let mut t = ((cur_z / fit).ln() / (top / fit).ln()).clamp(0.0, 1.0);
+                    ui.spacing_mut().slider_width = 90.0;
+                    if slider(ui, egui::Slider::new(&mut t, 0.0..=1.0).show_value(false)).on_hover_text("Zoom the timeline (Ctrl+wheel). Drag with the middle button to pan.").changed() {
+                        self.tl_zoom_to = Some(fit * (top / fit).powf(t));
+                    }
                 }
                 if tb_tool(ui, "zoom-out", "", "Zoom out (Ctrl+wheel)", cur_z > fit * 1.001).clicked() {
                     self.tl_zoom_to = Some(cur_z / 1.5);
                 }
-                let t = self.plan_time(self.cur);
-                let text = RichText::new(format!("{:.2} s · frame {} of {n}", t.max(0.0), self.cur + 1)).monospace().size(12.0).color(pal.fg_muted);
-                // only when it fits beside the buttons
-                let w = ui.painter().layout_no_wrap(text.text().to_string(), egui::FontId::monospace(12.0), pal.fg).size().x;
-                if ui.available_width() > w + 12.0 {
-                    ui.label(text);
+                if fits_all {
+                    let t = self.plan_time(self.cur);
+                    let text = RichText::new(format!("{:.2} s · frame {} of {n}", t.max(0.0), self.cur + 1)).monospace().size(12.0).color(pal.fg_muted);
+                    // only when it fits beside the buttons
+                    let w = ui.painter().layout_no_wrap(text.text().to_string(), egui::FontId::monospace(12.0), pal.fg).size().x;
+                    if ui.available_width() > w + 12.0 {
+                        ui.label(text);
+                    }
                 }
             });
         });
+        match act {
+            Some(TbAct::Select) => self.tl_razor = false,
+            Some(TbAct::Razor) => self.tl_razor = true,
+            Some(TbAct::Split) => self.tl_split(now),
+            Some(TbAct::Join) => self.tl_join(now),
+            Some(TbAct::AddClip) => self.tl_add_clip(now),
+            Some(TbAct::Delete) => self.tl_delete_selected(now),
+            Some(TbAct::Copy) => self.tl_copy(ctx),
+            Some(TbAct::Paste) => self.tl_paste(now),
+            Some(TbAct::Duplicate) => self.tl_duplicate(now),
+            Some(TbAct::KeyAdd) => self.tl_add_key(now),
+            Some(TbAct::KeyRemove) => self.tl_delete(now),
+            Some(TbAct::PrevEdit) => self.tl_jump(false),
+            Some(TbAct::NextEdit) => self.tl_jump(true),
+            Some(TbAct::In) => self.tl_set_in(Some(self.cur)),
+            Some(TbAct::Out) => self.tl_set_out(Some(self.cur)),
+            Some(TbAct::Marker) => self.tl_add_marker(now),
+            Some(TbAct::Snap) => {
+                self.tl_snap = !self.tl_snap;
+                theme::set_setting("tl_snap", if self.tl_snap { "1" } else { "0" });
+            }
+            Some(TbAct::Loop) => self.tl_zone_loop = !self.tl_zone_loop,
+            None => {}
+        }
         // the selected layer's motion at the playhead. Changing a value makes
         // a keyframe there if there isn't one (auto key), so the row never
         // greys out or changes shape.
@@ -411,53 +536,104 @@ impl GifKitApp {
         // auto key: a record button, as in other animation tools
         let mut auto = self.tl_autokey;
         let editable = sel_li.is_some_and(|li| !self.stack.layers[li].locked) && (auto || key_here.is_some());
-        // wraps onto a second line in a narrow window
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            let b = ui
-                .add(sel_btn(egui::Button::new("").frame_when_inactive(auto).min_size(vec2(CHIP_H, CHIP_H)), auto))
-                .on_hover_text(if auto { "Auto key is on: changing a value adds a keyframe at the playhead. Click to turn it off." } else { "Auto key is off: only keyframes already there can be changed. Click to turn it on." });
-            crate::icons::paint(ui.painter(), "keyframe-record", b.rect.center(), 16.0, if auto { pal.fg } else { pal.fg_muted });
-            if b.clicked() {
-                auto = !auto;
+        // whole groups wrap onto more lines in a narrow window (never a
+        // label without its fields)
+        let field = |ui: &mut egui::Ui, prefix: &str, v: &mut f32, suffix: &str, step: f64, w: f32| {
+            spin(ui, vec2(w, CHIP_H), v, step, |d| d.speed(0.5).max_decimals(1).prefix(prefix.to_string()).suffix(suffix.to_string()));
+        };
+        let text_w = |t: &str| ui.painter().layout_no_wrap(t.into(), egui::TextStyle::Body.resolve(ui.style()), pal.fg).size().x;
+        let gap = 6.0;
+        // (group, width): 0 auto key, 1 position, 2 scale, 3 angle, 4 opacity, 5 ease
+        let widths = [
+            CHIP_H + gap + 16.0,
+            text_w("Position:") + gap * 2.0 + 108.0 * 2.0,
+            text_w("Scale:") + gap * 2.0 + 88.0 * 2.0,
+            text_w("Angle:") + gap + 70.0,
+            text_w("Opacity:") + gap + 80.0,
+            96.0,
+        ];
+        let avail = ui.available_width();
+        let mut lines: Vec<Vec<usize>> = vec![Vec::new()];
+        let mut used = 0.0;
+        for (g, w) in widths.iter().enumerate() {
+            let need = w + if lines.last().unwrap().is_empty() { 0.0 } else { 14.0 };
+            if used + need > avail && !lines.last().unwrap().is_empty() {
+                lines.push(Vec::new());
+                used = 0.0;
             }
-            ui.add_enabled_ui(editable, |ui| {
-                let (r, _) = ui.allocate_exact_size(vec2(16.0, CHIP_H), Sense::hover());
-                // filled on a keyframe, hollow between them
-                if key_here.is_some() {
-                    diamond(ui.painter(), r.center(), 6.0, pal.highlight, Stroke::NONE);
-                } else {
-                    diamond(ui.painter(), r.center(), 5.5, Color32::TRANSPARENT, Stroke::new(1.3, pal.fg_muted));
-                }
-                ui.label("Motion:").on_hover_text(if self.tl_autokey { "Changing a value adds a keyframe at the playhead" } else { "Values of the keyframe at the playhead. Turn on auto key to add keyframes by changing values." });
-                let field = |ui: &mut egui::Ui, prefix: &str, v: &mut f32, suffix: &str, step: f64, w: f32| {
-                    spin(ui, vec2(w, CHIP_H), v, step, |d| d.speed(0.5).max_decimals(1).prefix(prefix.to_string()).suffix(suffix.to_string()));
-                };
-                // effects, watermarks and the AI shield cover the whole frame: they only fade
-                ui.add_enabled_ui(placed.is_some(), |ui| {
-                    ui.label("Position:").on_hover_text("The layer's left edge, and its bottom edge up from the bottom of the frame, in pixels");
-                    field(ui, "X  ", &mut px, " px", 1.0, 108.0);
-                    field(ui, "Y  ", &mut py, " px", 1.0, 108.0);
-                    ui.label("Scale:").on_hover_text("Width and height, % of the size it was placed at");
-                    field(ui, "X  ", &mut key.scale_x, "%", 5.0, 88.0);
-                    field(ui, "Y  ", &mut key.scale_y, "%", 5.0, 88.0);
-                    ui.label("Angle:");
-                    field(ui, "", &mut key.angle, "°", 5.0, 70.0);
-                });
-                ui.label("Opacity:");
-                spin(ui, vec2(80.0, CHIP_H), &mut key.opacity, 5.0, |d| d.range(0.0..=100.0).max_decimals(0).suffix("%"));
-                egui::ComboBox::from_id_salt("tl-ease")
-                    .selected_text(key.ease.label())
-                    .width(86.0)
-                    .show_ui(ui, |ui| {
-                        for e in Ease::ALL {
-                            ui.selectable_value(&mut key.ease, e, e.label());
+            used += if lines.last().unwrap().is_empty() { *w } else { need };
+            lines.last_mut().unwrap().push(g);
+        }
+        let pos_on = editable && placed.is_some();
+        for line in lines {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for (k, g) in line.into_iter().enumerate() {
+                    if k > 0 {
+                        ui.add_space(8.0);
+                    }
+                    match g {
+                        0 => {
+                            let b = ui
+                                .add(sel_btn(egui::Button::new("").frame_when_inactive(auto).min_size(vec2(CHIP_H, CHIP_H)), auto))
+                                .on_hover_text(if auto { "Auto key is on: changing a value adds a keyframe at the playhead. Click to turn it off." } else { "Auto key is off: only keyframes already there can be changed. Click to turn it on." });
+                            crate::icons::paint(ui.painter(), "keyframe-record", b.rect.center(), 16.0, if auto { pal.fg } else { pal.fg_muted });
+                            if b.clicked() {
+                                auto = !auto;
+                            }
+                            let (r, _) = ui.allocate_exact_size(vec2(16.0, CHIP_H), Sense::hover());
+                            // filled on a keyframe, hollow between them
+                            if key_here.is_some() {
+                                diamond(ui.painter(), r.center(), 6.0, pal.highlight, Stroke::NONE);
+                            } else {
+                                diamond(ui.painter(), r.center(), 5.5, Color32::TRANSPARENT, Stroke::new(1.3, pal.fg_muted));
+                            }
                         }
-                    })
-                    .response
-                    .on_hover_text("How the motion arrives at and leaves this keyframe. Hold keeps it still until the next one.");
+                        // effects, watermarks and the AI shield cover the whole frame: they only fade
+                        1 => {
+                            ui.add_enabled_ui(pos_on, |ui| {
+                                ui.label("Position:").on_hover_text("The layer's left edge, and its bottom edge up from the bottom of the frame, in pixels");
+                                field(ui, "X  ", &mut px, " px", 1.0, 108.0);
+                                field(ui, "Y  ", &mut py, " px", 1.0, 108.0);
+                            });
+                        }
+                        2 => {
+                            ui.add_enabled_ui(pos_on, |ui| {
+                                ui.label("Scale:").on_hover_text("Width and height, % of the size it was placed at");
+                                field(ui, "X  ", &mut key.scale_x, "%", 5.0, 88.0);
+                                field(ui, "Y  ", &mut key.scale_y, "%", 5.0, 88.0);
+                            });
+                        }
+                        3 => {
+                            ui.add_enabled_ui(pos_on, |ui| {
+                                ui.label("Angle:");
+                                field(ui, "", &mut key.angle, "°", 5.0, 70.0);
+                            });
+                        }
+                        4 => {
+                            ui.add_enabled_ui(editable, |ui| {
+                                ui.label("Opacity:");
+                                spin(ui, vec2(80.0, CHIP_H), &mut key.opacity, 5.0, |d| d.range(0.0..=100.0).max_decimals(0).suffix("%"));
+                            });
+                        }
+                        _ => {
+                            ui.add_enabled_ui(editable, |ui| {
+                                egui::ComboBox::from_id_salt("tl-ease")
+                                    .selected_text(key.ease.label())
+                                    .width(86.0)
+                                    .show_ui(ui, |ui| {
+                                        for e in Ease::ALL {
+                                            ui.selectable_value(&mut key.ease, e, e.label());
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text("How the motion arrives at and leaves this keyframe. Hold keeps it still until the next one.");
+                            });
+                        }
+                    }
+                }
             });
-        });
+        }
         // back from where it is to how far it moved
         if let Some(b) = placed {
             if px != px0 {
@@ -676,8 +852,9 @@ impl GifKitApp {
             } else if resp.clicked() && hovered_pos.is_some_and(|p| head.contains(p)) {
                 header_click = Some(id);
             }
-            // clips
-            let col = kind.map(kind_colour).unwrap_or(pal.highlight);
+            // clips, in the track's own colour when one was picked
+            let picked = if id == GIF { self.stack.gif_color } else { self.stack.index_of(id).and_then(|li| self.stack.layers[li].color) };
+            let col = picked.map(|c| Color32::from_rgb(c[0], c[1], c[2])).unwrap_or_else(|| kind.map(kind_colour).unwrap_or(pal.highlight));
             let spans = self.track_spans(id);
             let lp = tp.with_clip_rect(track_clip.intersect(lane));
             for (ci, &(a, b)) in spans.iter().enumerate() {
@@ -737,7 +914,7 @@ impl GifKitApp {
             // keyframes
             if let Some(li) = (id != GIF).then(|| self.stack.index_of(id)).flatten() {
                 for (k, key) in self.stack.layers[li].timing.keys.iter().enumerate() {
-                    let c = pos2(fx(key.frame as f32 + 0.5), top + h / 2.0);
+                    let c = pos2(fx(key.frame as f32), top + h / 2.0);
                     let on = selected && self.tl_key == Some(k);
                     let (r, fill, stroke) = (if on { 6.5 } else { 5.0 }, if on { pal.highlight } else { Color32::WHITE }, Stroke::new(1.0, Color32::from_black_alpha(160)));
                     // a hold key is square: nothing moves until the next one
@@ -780,8 +957,8 @@ impl GifKitApp {
             painter.rect_filled(thumb, 3.0, mix(pal.view, if over { pal.highlight } else { pal.fg }, if over { 0.6 } else { 0.35 }));
         }
 
-        // playhead
-        let px = fx(self.cur as f32 + 0.5);
+        // playhead, at the start of its frame (on the frame's tick)
+        let px = fx(self.cur as f32);
         if px >= lanes.min.x && px <= area.max.x {
             painter.vline(px, area.min.y..=area.max.y, Stroke::new(1.5, pal.negative));
             painter.add(egui::Shape::convex_polygon(vec![pos2(px - 5.0, area.min.y), pos2(px + 5.0, area.min.y), pos2(px, area.min.y + 7.0)], pal.negative, Stroke::NONE));
@@ -928,7 +1105,8 @@ impl GifKitApp {
         if press && self.tl_drag.is_none() && !self.tl_head_drag && self.tl_bar_drag.is_none() && self.tl_row_drag.is_none() && self.tl_marker_drag.is_none() {
             if let Some(p) = ui.input(|i| i.pointer.press_origin()).or(hovered_pos).filter(|p| lanes.contains(*p) && !(scrolls && bar.expand(2.0).contains(*p))) {
                 let f = frame_at(p.x);
-                let fi = (f.floor().max(0.0) as usize).min(n - 1);
+                // clicks pick the nearest frame start, where the playhead sits
+                let fi = (f.round().max(0.0) as usize).min(n - 1);
                 if p.y < tracks_top {
                     if let Some(mi) = marker_at(self, p.x) {
                         // a marker: the playhead goes there, and it can be dragged
@@ -951,7 +1129,7 @@ impl GifKitApp {
                     let cy = row_top(t) + row_h(t) / 2.0;
                     // keyframes first, they sit on top
                     let key = (id != GIF).then(|| self.stack.index_of(id)).flatten().and_then(|li| {
-                        self.stack.layers[li].timing.keys.iter().position(|k| (fx(k.frame as f32 + 0.5) - p.x).abs() < 7.0 && (cy - p.y).abs() < 8.0)
+                        self.stack.layers[li].timing.keys.iter().position(|k| (fx(k.frame as f32) - p.x).abs() < 7.0 && (cy - p.y).abs() < 8.0)
                     });
                     let hit = spans.iter().position(|&(a, b)| p.x >= fx(a as f32) - EDGE && p.x <= fx(b as f32 + 1.0) + EDGE);
                     // what was selected, for Shift+click and moving several at once
@@ -1107,7 +1285,7 @@ impl GifKitApp {
             let clamp = |v: i64, lo: usize, hi: usize| v.clamp(lo as i64, hi as i64) as usize;
             match d.grab {
                 TlGrab::Playhead => {
-                    self.cur = clamp(f.floor() as i64, 0, n - 1);
+                    self.cur = clamp(f.round() as i64, 0, n - 1);
                     self.playing = false;
                 }
                 TlGrab::Key(k) => {
@@ -1401,6 +1579,17 @@ impl GifKitApp {
                 return;
             }
             let layer = self.tl_track.filter(|t| *t != GIF).and_then(|t| self.stack.index_of(t));
+            if self.tl_menu_head == Some(GIF) {
+                if menu_item(ui, "split", "&Split at Playhead", &km.text(A::TlSplit), true) {
+                    self.tl_split(now);
+                }
+                if menu_item(ui, "list-add", "Make &Longer by 1 Second", "", idle) {
+                    let d = self.plan.last().map(|f| effective_delay(f.delay)).unwrap_or(10).max(2) as usize;
+                    self.tl_lengthen((100 / d).max(1), now);
+                }
+                self.tl_colour_menu(ui, GIF, now);
+                return;
+            }
             if let (Some(_), Some(li)) = (self.tl_menu_head, layer) {
                 let (visible, locked, id) = (self.stack.layers[li].visible, self.stack.layers[li].locked, self.stack.layers[li].id);
                 let mut act = None;
@@ -1422,6 +1611,7 @@ impl GifKitApp {
                     self.stack.layers[li].locked = !locked;
                     self.modified = true;
                 }
+                self.tl_colour_menu(ui, id, now);
                 ui.separator();
                 if menu_item(ui, "edit-delete", "D&elete Layer", "", idle) {
                     act = Some(LayerAct::Delete(li));
@@ -1493,6 +1683,10 @@ impl GifKitApp {
                 let d = self.plan.last().map(|f| effective_delay(f.delay)).unwrap_or(10).max(2) as usize;
                 self.tl_lengthen((100 / d).max(1), now);
             }
+            if let Some(t) = self.tl_track {
+                ui.separator();
+                self.tl_colour_menu(ui, t, now);
+            }
             if let Some(li) = layer {
                 ui.separator();
                 let locked = self.stack.layers[li].locked;
@@ -1537,6 +1731,61 @@ impl GifKitApp {
         }
     }
 
+    /// A track's colour choices: Breeze's palette, the default, or any colour.
+    fn tl_colour_menu(&mut self, ui: &mut egui::Ui, track: u64, now: f64) {
+        const SWATCHES: [[u8; 3]; 12] = [
+            [61, 174, 233],
+            [29, 153, 243],
+            [26, 188, 156],
+            [39, 174, 96],
+            [241, 196, 15],
+            [253, 188, 75],
+            [246, 116, 0],
+            [218, 68, 83],
+            [233, 30, 99],
+            [155, 89, 182],
+            [142, 68, 173],
+            [127, 140, 141],
+        ];
+        let cur = if track == GIF { self.stack.gif_color } else { self.stack.index_of(track).and_then(|li| self.stack.layers[li].color) };
+        let mut pick: Option<Option<[u8; 3]>> = None;
+        sub_menu(ui, "format-fill-color", "C&olour", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.set_max_width(6.0 * 28.0);
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                for c in SWATCHES {
+                    let col = Color32::from_rgb(c[0], c[1], c[2]);
+                    let (r, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
+                    let on = cur == Some(c);
+                    ui.painter().rect(r.shrink(2.0), 3.0, col, Stroke::new(if on || resp.hovered() { 2.0 } else { 1.0 }, if on { p().fg } else { mix(col, Color32::BLACK, 0.3) }), egui::StrokeKind::Inside);
+                    if resp.clicked() {
+                        pick = Some(Some(c));
+                    }
+                }
+            });
+            ui.separator();
+            let mut c = cur.unwrap_or([61, 174, 233]);
+            ui.horizontal(|ui| {
+                if egui::color_picker::color_edit_button_srgb(ui, &mut c).changed() {
+                    pick = Some(Some(c));
+                }
+                ui.label("Other colour");
+            });
+            if menu_item(ui, "edit-clear-all", "&Default Colour", "", cur.is_some()) {
+                pick = Some(None);
+            }
+        });
+        if let Some(c) = pick {
+            self.snapshot(&format!("tl-colour{track}"), now);
+            if track == GIF {
+                self.stack.gif_color = c;
+            } else if let Some(li) = self.stack.index_of(track) {
+                self.stack.layers[li].color = c;
+            }
+            self.modified = true;
+        }
+    }
+
     // ---- selection, clipboard and edits on several clips
 
     /// Every selected clip as (track, first, last): the main one and the rest.
@@ -1567,7 +1816,7 @@ impl GifKitApp {
     }
 
     /// Delete every selected clip (the GIF's skip their frames).
-    fn tl_delete_selected(&mut self, now: f64) {
+    pub(super) fn tl_delete_selected(&mut self, now: f64) {
         let sel = self.tl_selected();
         if sel.len() < 2 {
             self.tl_delete(now);
@@ -1592,7 +1841,7 @@ impl GifKitApp {
     }
 
     /// Ctrl+C: the selected layer clips (or the keyframe) go aside.
-    fn tl_copy(&mut self, ctx: &egui::Context) {
+    pub(super) fn tl_copy(&mut self, ctx: &egui::Context) {
         if let (Some(k), Some(li)) = (self.tl_key, self.tl_track.and_then(|t| self.stack.index_of(t))) {
             if let Some(key) = self.stack.layers[li].timing.keys.get(k) {
                 self.tl_board = Some(TlBoard::Key(*key));
@@ -1636,7 +1885,7 @@ impl GifKitApp {
 
     /// Ctrl+V: copied clips on the selected layer at the playhead, or the
     /// copied keyframe's values at the playhead.
-    fn tl_paste(&mut self, now: f64) {
+    pub(super) fn tl_paste(&mut self, now: f64) {
         let Some(track) = self.tl_track.filter(|t| *t != GIF && !self.tl_locked(*t)) else {
             self.info("Select a layer's track to paste onto");
             return;
@@ -1663,7 +1912,7 @@ impl GifKitApp {
     }
 
     /// Ctrl+D: copies of the selected layer clips, right after them.
-    fn tl_duplicate(&mut self, now: f64) {
+    pub(super) fn tl_duplicate(&mut self, now: f64) {
         let sel: Vec<(u64, usize, usize)> = self.tl_selected().into_iter().filter(|c| c.0 != GIF && !self.tl_locked(c.0)).collect();
         if sel.is_empty() {
             return;

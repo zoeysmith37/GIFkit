@@ -380,6 +380,8 @@ pub enum LayerKind {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Effects,
+    /// an effects layer made in the Animation panel
+    Animation,
     Text,
     Censor,
     Overlay,
@@ -401,11 +403,14 @@ pub struct Layer {
     pub timing: crate::timeline::Timing,
     /// can't be moved or changed on the timeline or the picture
     pub locked: bool,
+    /// its bar's colour on the timeline (None: by kind)
+    pub color: Option<[u8; 3]>,
 }
 
 impl Layer {
     pub fn kind(&self) -> Kind {
         match self.kind {
+            LayerKind::Effects(ref fx) if fx.anim => Kind::Animation,
             LayerKind::Effects(_) => Kind::Effects,
             LayerKind::Text(_) => Kind::Text,
             LayerKind::Censor(_) => Kind::Censor,
@@ -420,7 +425,7 @@ impl Layer {
     pub fn active(&self) -> bool {
         self.visible
             && match &self.kind {
-                LayerKind::Effects(fx) => **fx != EffectSettings::default(),
+                LayerKind::Effects(fx) => **fx != EffectSettings { anim: fx.anim, ..Default::default() },
                 LayerKind::Text(t) => !t.text.is_empty(),
                 LayerKind::Censor(c) => c.w > 0 && c.h > 0,
                 LayerKind::Overlay(_) => true,
@@ -467,6 +472,7 @@ impl Layer {
             return l.clone();
         }
         match &self.kind {
+            LayerKind::Effects(fx) if fx.anim => "Animation".into(),
             LayerKind::Effects(_) => "Effects".into(),
             LayerKind::Text(t) => t.text.lines().next().unwrap_or("").to_string(),
             LayerKind::Censor(c) => format!("Censor · {:?}", c.method),
@@ -514,6 +520,8 @@ pub struct Stack {
     pub next_id: u64,
     /// named points on the timeline (output frames), sorted
     pub markers: Vec<crate::timeline::Marker>,
+    /// the GIF track's bar colour on the timeline (None: the accent)
+    pub gif_color: Option<[u8; 3]>,
 }
 
 /// Size of a preview frame `s` times the source size.
@@ -612,7 +620,7 @@ impl Stack {
     pub fn push(&mut self, kind: LayerKind) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
-        self.layers.push(Layer { id, visible: true, kind, label: None, timing: Default::default(), locked: false });
+        self.layers.push(Layer { id, visible: true, kind, label: None, timing: Default::default(), locked: false, color: None });
         id
     }
 
@@ -780,7 +788,14 @@ impl Stack {
 
     /// The transformed frame before any layer (geometry only).
     pub fn geometry_frame(&self, base: &Animation, plan: &[PlanFrame], i: usize) -> RgbaImage {
-        let src = &base.frames[plan[i].src].image;
+        let f = &base.frames[plan[i].src];
+        if f.blank {
+            // a gap on the GIF track: nothing, through the same frame edits
+            let empty = RgbaImage::new(f.image.width(), f.image.height());
+            let t = self.eff_transform(true);
+            return if t.geometry_identity() { empty } else { t.apply_geometry(&empty) };
+        }
+        let src = &f.image;
         let t = self.eff_transform(true);
         if t.geometry_identity() { (**src).clone() } else { t.apply_geometry(src) }
     }
@@ -1100,7 +1115,7 @@ impl Stack {
     /// every core. Untouched frames share the source image.
     #[allow(clippy::too_many_arguments)]
     pub fn render_frames(&self, base: &Animation, plan: &[PlanFrame], times: &[f32], idx: &[usize], fonts: &[FontEntry], prep: &Prepared, progress: Option<&AtomicUsize>) -> Vec<Frame> {
-        let render = self.needs_render();
+        let render = self.needs_render() || base.frames.iter().any(|f| f.blank);
         if render && self.gpu_capable() {
             if let Some(Some(f)) = crate::gpu_render::with_shared(|gpu| self.render_frames_gpu(gpu, base, plan, times, idx, fonts, prep, progress)) {
                 if std::env::var_os("GIFKIT_PERF").is_some() {
@@ -1115,7 +1130,7 @@ impl Stack {
                 if let Some(p) = progress {
                     p.fetch_add(1, Ordering::Relaxed);
                 }
-                Frame { image, delay_cs: plan[i].delay, enabled: plan[i].enabled, cut: false }
+                Frame { image, delay_cs: plan[i].delay, enabled: plan[i].enabled, cut: false, blank: false }
             })
             .collect()
     }
@@ -1160,7 +1175,7 @@ impl Stack {
                 if let Some(p) = progress {
                     p.fetch_add(1, Ordering::Relaxed);
                 }
-                out.push(Frame { image, delay_cs: plan[i].delay, enabled: plan[i].enabled, cut: false });
+                out.push(Frame { image, delay_cs: plan[i].delay, enabled: plan[i].enabled, cut: false, blank: false });
             }
         }
         Some(out)
@@ -1288,6 +1303,7 @@ impl Stack {
             rot_bg: if turned && !t.rot_bg_transparent { [t.rot_bg[0], t.rot_bg[1], t.rot_bg[2], 255] } else { [0; 4] },
             nearest: t.resize_on && t.rs_filter == ResizeFilter::Nearest,
             resize: None,
+            blank: base.frames[src].blank,
         };
         // the size change apply_geometry makes, and the picture it makes
         let mut geo = geo;

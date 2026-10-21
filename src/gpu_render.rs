@@ -26,6 +26,8 @@ pub struct GpuGeo {
     pub nearest: bool,
     /// a size change, done first as the CPU does it (see `GpuResize`)
     pub resize: Option<GpuResize>,
+    /// a gap on the GIF track: the frame shows nothing
+    pub blank: bool,
 }
 
 /// Resizing the shown part of the frame (`crop`) to `size`, with one of the
@@ -471,8 +473,14 @@ impl GpuRenderer {
         let (w, h) = (f.size.0.max(1), f.size.1.max(1));
         let out = self.target(w, h, wgpu::TextureFormat::Rgba8Unorm);
         let out_view = out.create_view(&Default::default());
-        let src_view = self.sources.get_or_upload(&self.device, &self.queue, frame_key, frame);
         let mut g = f.geo;
+        // a gap: a see-through pixel stands in for the picture
+        let src_view = if g.blank {
+            g.resize = None;
+            self.blank.clone()
+        } else {
+            self.sources.get_or_upload(&self.device, &self.queue, frame_key, frame)
+        };
         let mut enc = self.device.create_command_encoder(&Default::default());
         // a size change first, in two passes like the CPU (down, then across)
         let mut src_view = src_view;
