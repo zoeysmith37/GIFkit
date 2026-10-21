@@ -322,6 +322,19 @@ impl GpuRenderer {
 
     /// A device of its own, for tests and for machines where the window
     /// draws with OpenGL.
+    pub fn headless_named() -> Option<(Self, String)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() })).ok()?;
+        let info = adapter.get_info();
+        if !worth_using(&info) {
+            return None;
+        }
+        let name = info.name;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()?;
+        Some((Self::new(device, queue), name))
+    }
+
+    #[allow(dead_code)]
     pub fn headless() -> Option<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
@@ -445,6 +458,16 @@ impl GpuRenderer {
     /// Sprites are cached by their address, so `sprite_gen` must change
     /// whenever the layers that own them do.
     pub fn render(&mut self, frame: &RgbaImage, frame_key: u64, f: &GpuFrame, sprite_gen: u64) -> wgpu::Texture {
+        self.render_as(frame, frame_key, f, sprite_gen, false)
+    }
+
+    /// As `render`, but straight alpha (for files): no rounding through
+    /// premultiplied pixels when the last layer is an effect.
+    pub fn render_straight(&mut self, frame: &RgbaImage, frame_key: u64, f: &GpuFrame, sprite_gen: u64) -> wgpu::Texture {
+        self.render_as(frame, frame_key, f, sprite_gen, true)
+    }
+
+    fn render_as(&mut self, frame: &RgbaImage, frame_key: u64, f: &GpuFrame, sprite_gen: u64, want_straight: bool) -> wgpu::Texture {
         let (w, h) = (f.size.0.max(1), f.size.1.max(1));
         let out = self.target(w, h, wgpu::TextureFormat::Rgba8Unorm);
         let out_view = out.create_view(&Default::default());
@@ -479,7 +502,7 @@ impl GpuRenderer {
         let g = &g;
         let foot = footprint(&g.inv);
         // an effect straight after the frame edits takes straight pixels
-        let straight_first = matches!(f.ops.first(), Some(GpuOp::Effect { .. }));
+        let straight_first = matches!(f.ops.first(), Some(GpuOp::Effect { .. })) || (want_straight && f.ops.is_empty());
         let geo_bind = self.bind(
             &src_view,
             &uniform_block(&[
@@ -499,6 +522,8 @@ impl GpuRenderer {
         let (mut cur_tex, mut cur_view, mut cur_size) = (out, out_view, (w, h));
         let mut quads: Vec<wgpu::BindGroup> = Vec::new();
         let mut straight = straight_first;
+        // the result is already straight (an effect came last)
+        let mut out_straight = straight_first && f.ops.is_empty();
         let u8f = wgpu::TextureFormat::Rgba8Unorm;
         for op in &f.ops {
             match op {
@@ -525,7 +550,7 @@ impl GpuRenderer {
                         me.pass(enc, &v, &me.fx, &b);
                         (t, v)
                     };
-                    let mut s_view = if straight { cur_view.clone() } else { fx_pass(self, &mut enc, 1.0, [&cur_view, &self.blank, &self.blank], cur_size, &[]).1 };
+                    let (mut s_tex, mut s_view) = if straight { (cur_tex.clone(), cur_view.clone()) } else { fx_pass(self, &mut enc, 1.0, [&cur_view, &self.blank, &self.blank], cur_size, &[]) };
                     straight = false;
                     let mut s_size = cur_size;
                     let before = (*mix < 0.999).then(|| (s_view.clone(), s_size));
@@ -579,6 +604,7 @@ impl GpuRenderer {
                         self.pass(&mut enc, &v, pipe, &b);
                         match p.out {
                             None => {
+                                s_tex = t;
                                 s_view = v;
                                 s_size = p.size;
                             }
@@ -589,48 +615,125 @@ impl GpuRenderer {
                     }
                     // a keyed fade mixes the result with what was under it
                     if let Some((bv, bs)) = before {
-                        let (_, v) = fx_pass(self, &mut enc, 50.0, [&s_view, &bv, &self.blank], s_size, &[[*mix, bs.0 as f32, bs.1 as f32, 0.0]]);
-                        s_view = v;
+                        (s_tex, s_view) = fx_pass(self, &mut enc, 50.0, [&s_view, &bv, &self.blank], s_size, &[[*mix, bs.0 as f32, bs.1 as f32, 0.0]]);
                     }
-                    let (t, v) = fx_pass(self, &mut enc, 2.0, [&s_view, &self.blank, &self.blank], s_size, &[]);
-                    cur_tex = t;
-                    cur_view = v;
                     cur_size = s_size;
+                    if want_straight && std::ptr::eq(op, f.ops.last().unwrap()) {
+                        (cur_tex, cur_view) = (s_tex, s_view);
+                        out_straight = true;
+                    } else {
+                        (cur_tex, cur_view) = fx_pass(self, &mut enc, 2.0, [&s_view, &self.blank, &self.blank], s_size, &[]);
+                    }
                 }
             }
         }
         self.draw_quads(&mut enc, &cur_view, &quads);
+        if want_straight && !out_straight {
+            let t = self.target(cur_size.0, cur_size.1, u8f);
+            let v = t.create_view(&Default::default());
+            let b = self.bind3([&cur_view, &self.blank, &self.blank], &uniform_block(&[[1.0, 0.0, cur_size.0 as f32, cur_size.1 as f32]]));
+            self.pass(&mut enc, &v, &self.fx, &b);
+            cur_tex = t;
+        }
         self.queue.submit([enc.finish()]);
         cur_tex
     }
 
-    /// Read a rendered frame back (for export and tests), straight alpha.
-    pub fn read(&self, tex: &wgpu::Texture) -> RgbaImage {
-        let (w, h) = (tex.width(), tex.height());
-        let row = (4 * w).div_ceil(256) * 256;
-        let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("gifkit-read"), size: (row * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+    /// Read rendered frames back as they are, all in one wait.
+    pub fn read_raw(&self, texs: &[wgpu::Texture]) -> Vec<RgbaImage> {
         let mut enc = self.device.create_command_encoder(&Default::default());
-        enc.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) } },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        );
+        let bufs: Vec<(wgpu::Buffer, u32, u32, u32)> = texs
+            .iter()
+            .map(|tex| {
+                let (w, h) = (tex.width(), tex.height());
+                let row = (4 * w).div_ceil(256) * 256;
+                let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("gifkit-read"), size: (row * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+                enc.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) } },
+                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                );
+                (buf, w, h, row)
+            })
+            .collect();
         self.queue.submit([enc.finish()]);
-        let slice = buf.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
+        for (buf, ..) in &bufs {
+            buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        }
         let _ = self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
-        let Ok(data) = slice.get_mapped_range() else { return RgbaImage::new(w, h) };
-        let mut img = RgbaImage::new(w, h);
-        for y in 0..h as usize {
-            let line = &data[y * row as usize..y * row as usize + 4 * w as usize];
-            for (x, p) in line.chunks_exact(4).enumerate() {
-                let a = p[3];
-                let un = |c: u8| if a == 0 { 0 } else { ((c as u32 * 255 + a as u32 / 2) / a as u32).min(255) as u8 };
-                img.put_pixel(x as u32, y as u32, image::Rgba([un(p[0]), un(p[1]), un(p[2]), a]));
+        bufs.iter()
+            .map(|(buf, w, h, row)| {
+                let (w, h, row) = (*w as usize, *h as usize, *row as usize);
+                let mut px = vec![0u8; w * h * 4];
+                if let Ok(data) = buf.slice(..).get_mapped_range() {
+                    for y in 0..h {
+                        px[y * w * 4..(y + 1) * w * 4].copy_from_slice(&data[y * row..y * row + w * 4]);
+                    }
+                }
+                buf.unmap();
+                RgbaImage::from_raw(w as u32, h as u32, px).unwrap_or_else(|| RgbaImage::new(w as u32, h as u32))
+            })
+            .collect()
+    }
+
+    /// Read a frame `render` made back, straight alpha.
+    #[allow(dead_code)]
+    pub fn read(&self, tex: &wgpu::Texture) -> RgbaImage {
+        let mut img = self.read_raw(std::slice::from_ref(tex)).pop().unwrap_or_default();
+        for p in img.pixels_mut() {
+            let a = p[3] as u32;
+            for c in 0..3 {
+                p[c] = if a == 0 { 0 } else { ((p[c] as u32 * 255 + a / 2) / a).min(255) as u8 };
             }
         }
-        drop(data);
-        buf.unmap();
         img
     }
+
+}
+
+// ---- a renderer shared by background work (export, the compressed preview)
+
+static SHARED: std::sync::Mutex<Option<GpuRenderer>> = std::sync::Mutex::new(None);
+static SHARED_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Hand background work a renderer (on the window's device, or its own).
+pub fn set_shared(r: GpuRenderer, name: String) {
+    if let Ok(mut s) = SHARED.lock() {
+        *s = Some(r);
+        let _ = SHARED_NAME.set(name);
+    }
+}
+
+/// A real graphics card: software ones (llvmpipe, WARP) are slower than
+/// the CPU path, which spreads over every core (GIFKIT_SOFT_GPU=1 allows them,
+/// for tests).
+pub fn worth_using(info: &wgpu::AdapterInfo) -> bool {
+    info.device_type != wgpu::DeviceType::Cpu || std::env::var_os("GIFKIT_SOFT_GPU").is_some()
+}
+
+/// The card background work runs on, once there is one.
+pub fn shared_name() -> Option<String> {
+    SHARED_NAME.get().cloned()
+}
+
+/// Run `f` with the shared renderer, when there is one and it's turned on.
+/// One job at a time: its caches are only good for the job that filled them.
+pub fn with_shared<T>(f: impl FnOnce(&mut GpuRenderer) -> T) -> Option<T> {
+    if !enabled() {
+        return None;
+    }
+    let mut g = SHARED.lock().ok()?;
+    let r = g.as_mut()?;
+    r.clear_sources();
+    r.clear_sprites();
+    Some(f(r))
+}
+
+/// Settings ▸ Use Graphics Card for Effects (on unless turned off).
+pub fn enabled() -> bool {
+    std::env::var_os("GIFKIT_CPU_PREVIEW").is_none() && crate::theme::get_setting("gpu_render").map(|v| v != "0").unwrap_or(true)
+}
+
+pub fn set_enabled(on: bool) {
+    crate::theme::set_setting("gpu_render", if on { "1" } else { "0" });
 }

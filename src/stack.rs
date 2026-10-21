@@ -1084,21 +1084,81 @@ impl Stack {
         let plan = self.plan(base);
         let times = plan_times(&plan);
         let prep = self.prepare(base, fonts);
+        let idx: Vec<usize> = (0..plan.len()).collect();
+        let frames = self.render_frames(base, &plan, &times, &idx, fonts, &prep, progress);
+        let mut out = Animation { frames, loop_count: self.loop_count(base) };
+        effects::normalize_sizes(&mut out);
+        out
+    }
+
+    /// Output frames `idx` of `plan`: on the graphics card when one is free
+    /// for background work and can draw this stack, else on the CPU across
+    /// every core. Untouched frames share the source image.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_frames(&self, base: &Animation, plan: &[PlanFrame], times: &[f32], idx: &[usize], fonts: &[FontEntry], prep: &Prepared, progress: Option<&AtomicUsize>) -> Vec<Frame> {
         let render = self.needs_render();
-        let frames: Vec<Frame> = (0..plan.len())
-            .into_par_iter()
-            .map(|i| {
-                // untouched frames share the source image rather than copying it
-                let image = if render && !stopped(progress) { Arc::new(self.render_frame(base, &plan, &times, i, fonts, &prep)) } else { base.frames[plan[i].src].image.clone() };
+        if render && self.gpu_capable() {
+            if let Some(Some(f)) = crate::gpu_render::with_shared(|gpu| self.render_frames_gpu(gpu, base, plan, times, idx, fonts, prep, progress)) {
+                if std::env::var_os("GIFKIT_PERF").is_some() {
+                    eprintln!("frames: {} on the graphics card", f.len());
+                }
+                return f;
+            }
+        }
+        idx.par_iter()
+            .map(|&i| {
+                let image = if render && !stopped(progress) { Arc::new(self.render_frame(base, plan, times, i, fonts, prep)) } else { base.frames[plan[i].src].image.clone() };
                 if let Some(p) = progress {
                     p.fetch_add(1, Ordering::Relaxed);
                 }
                 Frame { image, delay_cs: plan[i].delay, enabled: plan[i].enabled }
             })
-            .collect();
-        let mut out = Animation { frames, loop_count: self.loop_count(base) };
-        effects::normalize_sizes(&mut out);
-        out
+            .collect()
+    }
+
+    /// `render_frames` on the card: a batch of frames goes out, then all of
+    /// them come back in one wait. A frame the card can't take (too big)
+    /// renders on the CPU. None if nothing could be drawn there.
+    #[allow(clippy::too_many_arguments)]
+    fn render_frames_gpu(&self, gpu: &mut crate::gpu_render::GpuRenderer, base: &Animation, plan: &[PlanFrame], times: &[f32], idx: &[usize], fonts: &[FontEntry], prep: &Prepared, progress: Option<&AtomicUsize>) -> Option<Vec<Frame>> {
+        static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let gen = GEN.fetch_add(1, Ordering::Relaxed);
+        let mut out: Vec<Frame> = Vec::with_capacity(idx.len());
+        // about 256 MB of frames in flight
+        let (bw, bh) = (base.width().max(1) as usize, base.height().max(1) as usize);
+        let batch = ((256usize << 20) / (bw * bh * 4 * 2)).clamp(1, 32);
+        for chunk in idx.chunks(batch) {
+            let mut texs = Vec::new();
+            let mut slots: Vec<Option<Arc<RgbaImage>>> = Vec::with_capacity(chunk.len());
+            for &i in chunk {
+                let src = plan[i].src;
+                let frame = &base.frames[src].image;
+                if stopped(progress) {
+                    slots.push(Some(frame.clone()));
+                    continue;
+                }
+                let job = self.gpu_frame(base, plan, times, i, fonts, prep).filter(|j| j.size.0.max(j.size.1) <= gpu.max_side && frame.width().max(frame.height()) <= gpu.max_side);
+                match job {
+                    Some(job) => {
+                        texs.push(gpu.render_straight(frame, src as u64 + 1, &job, gen));
+                        slots.push(None);
+                    }
+                    None => slots.push(Some(Arc::new(self.render_frame(base, plan, times, i, fonts, prep)))),
+                }
+            }
+            let mut read = gpu.read_raw(&texs).into_iter();
+            for (k, &i) in chunk.iter().enumerate() {
+                let image = match slots[k].take() {
+                    Some(img) => img,
+                    None => Arc::new(read.next()?),
+                };
+                if let Some(p) = progress {
+                    p.fetch_add(1, Ordering::Relaxed);
+                }
+                out.push(Frame { image, delay_cs: plan[i].delay, enabled: plan[i].enabled });
+            }
+        }
+        Some(out)
     }
 
     /// Keep per-frame data in sync with the number of source frames.

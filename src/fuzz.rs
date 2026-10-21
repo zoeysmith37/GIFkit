@@ -861,3 +861,56 @@ fn gpu_matches_cpu() {
         }
     }
 }
+
+/// Whole-animation flatten (what export and the compressed preview use) on
+/// the graphics card against the CPU, with timings. Needs a GPU or lavapipe.
+#[test]
+#[ignore]
+fn gpu_flatten_matches_cpu() {
+    use crate::effects::EffectSettings as E;
+    let fonts = crate::text::builtin_fonts();
+    let (w, h, n) = (320u32, 240u32, 24usize);
+    let frames = (0..n)
+        .map(|k| Frame::new(RgbaImage::from_fn(w, h, |x, y| Rgba([((x + k as u32 * 7) % 256) as u8, (y * 255 / h) as u8, ((x ^ y) % 256) as u8, if (x / 40 + y / 40) % 7 == 0 { 120 } else { 255 }])), 6))
+        .collect();
+    let base = Animation { frames, loop_count: None };
+    let mut st = Stack::default();
+    st.transform.resize_on = true;
+    st.transform.rs_pct = 90.0;
+    let fx = E { sepia: true, blur: true, swirl: true, vignette: true, polaroid: true, loop_wobble: true, intro: crate::motion::Transition::Iris, ..E::default() };
+    st.push(LayerKind::Effects(Box::new(fx)));
+    st.push(LayerKind::Text(crate::text::Annotation { text: "Export".into(), size: 30.0, x: 20, y: 30, color: [255, 255, 255, 255], ..Default::default() }));
+    st.push(LayerKind::Censor(crate::effects::CensorSettings { x: 150, y: 80, w: 80, h: 60, angle: 15.0, ..Default::default() }));
+    st.push(LayerKind::Shield(crate::effects::ShieldSettings::default()));
+    let t0 = std::time::Instant::now();
+    let cpu = st.flatten(&base, &fonts, None);
+    let tc = t0.elapsed();
+    let Some((r, name)) = crate::gpu_render::GpuRenderer::headless_named() else {
+        println!("no GPU adapter");
+        return;
+    };
+    crate::gpu_render::set_shared(r, name.clone());
+    let _ = st.flatten(&base, &fonts, None); // shaders warm up
+    let t0 = std::time::Instant::now();
+    let gpu = st.flatten(&base, &fonts, None);
+    let tg = t0.elapsed();
+    assert_eq!(cpu.len(), gpu.len());
+    let (mut worst, mut sum, mut px) = (0i32, 0f64, 0f64);
+    for (a, b) in cpu.frames.iter().zip(&gpu.frames) {
+        assert_eq!(a.image.dimensions(), b.image.dimensions());
+        assert_eq!(a.delay_cs, b.delay_cs);
+        for (p, q) in a.image.pixels().zip(b.image.pixels()) {
+            let mut d = 0;
+            for c in 0..4 {
+                let (pa, qa) = if c == 3 { (p[3] as i32, q[3] as i32) } else { (p[c] as i32 * p[3] as i32 / 255, q[c] as i32 * q[3] as i32 / 255) };
+                d = d.max((pa - qa).abs());
+            }
+            worst = worst.max(d);
+            sum += d as f64;
+            px += 1.0;
+        }
+    }
+    println!("{name}: cpu {tc:?}, gpu {tg:?}; mean {:.3} max {worst}", sum / px);
+    assert!(sum / px < 1.0, "frames drift from the CPU");
+}
+

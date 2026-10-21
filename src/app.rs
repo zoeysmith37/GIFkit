@@ -2148,6 +2148,24 @@ impl GifKitApp {
         if let Some(z) = theme::get_setting("ui_scale").and_then(|v| v.parse::<f32>().ok()).filter(|z| (0.5..=3.0).contains(z)) {
             cc.egui_ctx.set_zoom_factor(z);
         }
+        // a renderer for background work (export, the compressed preview):
+        // on the window's card, or a device of its own when the window uses
+        // OpenGL. Made off the UI thread since the shaders compile first.
+        if std::env::var_os("GIFKIT_CPU_PREVIEW").is_none() {
+            // a software card (llvmpipe, WARP) is slower than the CPU path
+            let rs = cc.wgpu_render_state.as_ref().filter(|rs| crate::gpu_render::worth_using(&rs.adapter.get_info())).map(|rs| (rs.device.clone(), rs.queue.clone(), rs.adapter.get_info().name));
+            let window_soft = cc.wgpu_render_state.is_some() && rs.is_none();
+            std::thread::spawn(move || {
+                let r = match rs {
+                    Some((d, q, name)) => Some((crate::gpu_render::GpuRenderer::new(d, q), name)),
+                    None if window_soft => None,
+                    None => crate::gpu_render::GpuRenderer::headless_named(),
+                };
+                if let Some((r, name)) = r {
+                    crate::gpu_render::set_shared(r, name);
+                }
+            });
+        }
         theme::load_toolbar_choice();
         let theme_choice = match std::env::var("GIFKIT_THEME").as_deref() {
             Ok("dark") => ThemeChoice::Dark,
@@ -2262,7 +2280,7 @@ impl GifKitApp {
             commit_since: 0.0,
             pending_sig: 0,
             last_comp: None,
-            gpu: cc.wgpu_render_state.as_ref().filter(|_| std::env::var_os("GIFKIT_CPU_PREVIEW").is_none()).map(|rs| (crate::gpu_render::GpuRenderer::new(rs.device.clone(), rs.queue.clone()), rs.renderer.clone())),
+            gpu: cc.wgpu_render_state.as_ref().filter(|rs| std::env::var_os("GIFKIT_CPU_PREVIEW").is_none() && crate::gpu_render::worth_using(&rs.adapter.get_info())).map(|rs| (crate::gpu_render::GpuRenderer::new(rs.device.clone(), rs.queue.clone()), rs.renderer.clone())),
             gpu_frames: GpuFrames { key: 0, map: HashMap::new(), shown: None, bytes: 0, tick: 0 },
             last_tick: None,
             orig_clock: 0.0,
@@ -3812,7 +3830,7 @@ impl GifKitApp {
     /// The frame rendered on the graphics card, when it can draw everything
     /// in the stack (else None and the CPU path takes over).
     fn gpu_composite(&mut self, i: usize) -> Option<Tex> {
-        if self.gpu.is_none() || !self.stack.gpu_capable() {
+        if self.gpu.is_none() || !self.stack.gpu_capable() || !crate::gpu_render::enabled() {
             return None;
         }
         let key = self.comp_key;
@@ -3963,7 +3981,7 @@ impl GifKitApp {
             self.prerender_cancel.store(key, Ordering::Relaxed);
         }
         // frames the graphics card renders are made as they're shown
-        if self.gpu.is_some() && self.stack.gpu_capable() {
+        if self.gpu.is_some() && self.stack.gpu_capable() && crate::gpu_render::enabled() {
             self.prerender = None;
             return;
         }
@@ -4192,17 +4210,10 @@ impl GifKitApp {
                 let out = match &sample {
                     None => stack.flatten(&base, &fonts, None),
                     Some(idx) => {
-                        use rayon::prelude::*;
                         let plan = stack.plan(&base);
                         let times = stack::plan_times(&plan);
                         let prep = stack.prepare(&base, &fonts);
-                        let frames: Vec<crate::anim::Frame> = idx
-                            .par_iter()
-                            .map(|&i| {
-                                let image = if stack.needs_render() { Arc::new(stack.render_frame(&base, &plan, &times, i, &fonts, &prep)) } else { base.frames[plan[i].src].image.clone() };
-                                crate::anim::Frame { image, delay_cs: plan[i].delay, enabled: plan[i].enabled }
-                            })
-                            .collect();
+                        let frames = stack.render_frames(&base, &plan, &times, idx, &fonts, &prep, None);
                         let mut a = Animation { frames, loop_count: stack.loop_count(&base) };
                         crate::effects::normalize_sizes(&mut a);
                         a
@@ -4684,6 +4695,19 @@ impl GifKitApp {
                     ui.horizontal(|ui| {
                         ui.add_space(36.0);
                         ui.label(RichText::new(found).size(11.5).color(p().fg_muted));
+                    });
+                }
+                let fx_gpu = crate::gpu_render::enabled();
+                if menu_check(ui, fx_gpu, "Use Graphics Card for E&ffects", "") {
+                    crate::gpu_render::set_enabled(!fx_gpu);
+                    self.free_gpu_frames();
+                    self.comp_key = 0;
+                }
+                if fx_gpu {
+                    let on = crate::gpu_render::shared_name().map(|n| format!("Preview, export and size estimates on {n}")).unwrap_or_else(|| "No graphics card found · using the processor".into());
+                    ui.horizontal(|ui| {
+                        ui.add_space(36.0);
+                        ui.label(RichText::new(on).size(11.5).color(p().fg_muted));
                     });
                 }
                 if menu_check(ui, self.sample_preview, "&Estimate Size of Long Animations", "") {
