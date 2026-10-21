@@ -110,6 +110,26 @@ pub struct GpuFrame<'a> {
     pub owned: Vec<RgbaImage>,
 }
 
+impl GpuFrame<'_> {
+    /// Can a card whose pictures go up to `max` pixels a side make this
+    /// frame from `src`? Anything bigger (a huge text sprite, say) would be
+    /// refused by the card, so those frames are made on the CPU instead.
+    pub fn fits(&self, src: &RgbaImage, max: u32) -> bool {
+        let ok = |w: u32, h: u32| w.max(h) <= max;
+        let img_ok = |i: &RgbaImage| ok(i.width(), i.height());
+        if !ok(self.size.0, self.size.1) || !img_ok(src) || self.geo.resize.is_some_and(|r| !ok(r.size.0, r.size.1)) || !self.owned.iter().all(img_ok) {
+            return false;
+        }
+        self.ops.iter().all(|op| match op {
+            GpuOp::Draw(d) => match d.src {
+                GpuSrc::Img(i) => img_ok(i),
+                GpuSrc::Solid(..) => true,
+            },
+            GpuOp::Effect { passes, .. } => passes.iter().all(|p| ok(p.size.0, p.size.1) && p.ins.iter().all(|i| !matches!(i, Some(GpuIn::Img(i)) if !img_ok(i)))),
+        })
+    }
+}
+
 /// The CPU's `sin`-hash jitter (effects::fuzzy, booth's pencil), exactly.
 fn noise_values(kind: u8, w: u32, h: u32) -> Vec<f32> {
     let f = (w.min(h) as f32 * 0.08).max(2.0);

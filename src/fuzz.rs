@@ -32,7 +32,7 @@ impl Rng {
     }
 }
 
-const VARIANTS: &[&str] = &["ActualSize","Apng","Arrow","Avif","Bicubic","Bilinear","Blinds","Blur","Bottom","BottomLeft","BottomRight","Bubble","Bulge","Burst","Censor","Center","CenterCrop","Comic","Dark","DelayAll","DeleteObject","Dent","Drop","Effects","Ellipse","Emoji","Export","Fade","FishEye","Fit","FitPad","Fps","FullScreen","Gif","Glitch","Glow","Handbook","Heart","Heavy","Highlighter","History","Hop","Iris","Kaleidoscope","Lanczos3","Left","Light","Line","Markup","Mirror","Mp4","Nearest","New","NextFrame","None","Open","Overlay","Pen","Pencil","Percent","Pixelate","PlayPause","Png","PopArt","PrevFrame","Pulse","Quit","Rainbow","Rect","Redo","Right","Rounded","Save","SaveAs","Shake","Shape","Shield","SlideDown","SlideLeft","SlideRight","SlideUp","Solid","Speech","Spin","SplitView","Squeeze","Star","Stretch","System","Text","Thermal","Thought","TlDelete","TlKey","TlRazor","TlSplit","Top","TopLeft","TopRight","Triangle","Tunnel","Twirl","Undo","Watermark","WebmAlpha","WipeDown","WipeLeft","WipeRight","WipeUp","Wobble","XRay","Zoom","ZoomIn","ZoomOut",];
+const VARIANTS: &[&str] = &["ActualSize","Apng","Arrow","Avif","Bicubic","Bilinear","Blinds","Blur","Bottom","BottomLeft","BottomRight","Bubble","Bulge","Burst","Censor","Center","CenterCrop","Comic","Dark","DelayAll","DeleteObject","Dent","Drop","Effects","Ellipse","Emoji","Export","Fade","Float","Heartbeat","Blink","Squash","Hold","Linear","Smooth","FishEye","Fit","FitPad","Fps","FullScreen","Gif","Glitch","Glow","Handbook","Heart","Heavy","Highlighter","History","Hop","Iris","Kaleidoscope","Lanczos3","Left","Light","Line","Markup","Mirror","Mp4","Nearest","New","NextFrame","None","Open","Overlay","Pen","Pencil","Percent","Pixelate","PlayPause","Png","PopArt","PrevFrame","Pulse","Quit","Rainbow","Rect","Redo","Right","Rounded","Save","SaveAs","Shake","Shape","Shield","SlideDown","SlideLeft","SlideRight","SlideUp","Solid","Speech","Spin","SplitView","Squeeze","Star","Stretch","System","Text","Thermal","Thought","TlDelete","TlKey","TlRazor","TlSplit","Top","TopLeft","TopRight","Triangle","Tunnel","Twirl","Undo","Watermark","WebmAlpha","WipeDown","WipeLeft","WipeRight","WipeUp","Wobble","XRay","Zoom","ZoomIn","ZoomOut",];
 const TEXTS: &[&str] = &["", " ", "Hello", "a\nb\n\nc", "🔥🔥 emoji 👍🏽", "مرحبا بالعالم", "日本語のテキスト", "x", "averyveryveryverylongwordwithoutanyspacesatallthatkeepsgoing and then some more words to wrap around the canvas edge"];
 
 fn perturb(v: &mut Value, r: &mut Rng, p: f64, key: &str) {
@@ -130,6 +130,9 @@ fn anim(r: &mut Rng) -> Animation {
             });
             let mut f = Frame::new(img, r.pick(&delays));
             f.enabled = !r.chance(0.15);
+            // gaps and clip starts from splitting the GIF row
+            f.blank = r.chance(0.2);
+            f.cut = r.chance(0.2);
             f
         })
         .collect();
@@ -139,7 +142,7 @@ fn anim(r: &mut Rng) -> Animation {
 fn layer(r: &mut Rng, w: u32, h: u32, n: usize, p: f64) -> LayerKind {
     use crate::{effects, shapes, text};
     match r.below(10) {
-        0 | 1 => LayerKind::Effects(Box::new(fuzz(&effects::EffectSettings::default(), r, p))),
+        0 | 1 => LayerKind::Effects(Box::new(fuzz(&effects_base(r), r, p))),
         2 => LayerKind::Text(fuzz(&text::Annotation::default(), r, p)),
         3 => LayerKind::Censor(fuzz(&effects::CensorSettings::default(), r, p)),
         4 => {
@@ -173,6 +176,62 @@ fn layer(r: &mut Rng, w: u32, h: u32, n: usize, p: f64) -> LayerKind {
         }
         _ => LayerKind::Emoji(Box::new(fuzz(&shapes::EmojiSettings::default(), r, p))),
     }
+}
+
+/// Effects with stacked looks and distortions and some animation on, so the
+/// fuzzing has lists and switches to work on.
+fn effects_base(r: &mut Rng) -> crate::effects::EffectSettings {
+    use crate::booth::{BoothFx, BoothItem};
+    let mut e = crate::effects::EffectSettings::default();
+    let item = |r: &mut Rng, list: &[BoothFx]| BoothItem {
+        fx: r.pick(list),
+        amount: r.pick(&[0.0, 1.0, 50.0, 100.0, 250.0, 5000.0, 1e7, -40.0]),
+        cx: r.pick(&[0.0, 50.0, 100.0, -20.0, 300.0]),
+        cy: r.pick(&[0.0, 50.0, 100.0, -20.0]),
+        reverse: r.chance(0.5),
+    };
+    for _ in 0..r.below(3) {
+        let it = item(r, &BoothFx::LOOKS);
+        e.looks.push(it);
+    }
+    for _ in 0..r.below(4) {
+        let it = item(r, &BoothFx::DISTORT);
+        e.warps.push(it);
+    }
+    e.anim = r.chance(0.4);
+    e.counter = r.chance(0.4);
+    e.counter_pos = r.pick(&[0u8, 1, 2, 3, 9]);
+    e.counter_size = r.pick(&[0.0, 7.0, 40.0, 500.0]);
+    e.intro = crate::motion::Transition::ALL[r.below(crate::motion::Transition::ALL.len())];
+    e.outro = crate::motion::Transition::ALL[r.below(crate::motion::Transition::ALL.len())];
+    e.intro_frames = r.pick(&[0usize, 1, 3, 1000]);
+    e.outro_frames = r.pick(&[0usize, 2, 1000]);
+    e.loop_spin = r.chance(0.3);
+    e.loop_float = r.chance(0.3);
+    e.loop_squash = r.chance(0.3);
+    e.loop_heartbeat = r.chance(0.3);
+    e.loop_blink = r.chance(0.3);
+    e.loop_reverse = r.chance(0.5);
+    e.loop_amount = r.pick(&[0.0, 50.0, 200.0, 1000.0]);
+    e.wave = r.chance(0.2);
+    e.wave_reverse = r.chance(0.5);
+    e.pixelate = r.chance(0.2);
+    e.pixelate_size = r.pick(&[0u32, 1, 2, 9, 100000]);
+    e.oil = r.chance(0.1);
+    e.oil_detail = r.pick(&[0u32, 2, 64, 1000]);
+    e.emboss = r.chance(0.2);
+    e.emboss_dir = r.pick(&[0u8, 3, 7, 200]);
+    e.emboss_colour = r.chance(0.5);
+    e.solarize = r.chance(0.2);
+    e.solarize_threshold = r.pick(&[-5.0, 0.0, 127.0, 255.0, 900.0]);
+    e.noise = r.chance(0.2);
+    e.noise_mono = r.chance(0.5);
+    e.noise_still = r.chance(0.5);
+    for (on, v) in [(&mut e.gotham, &mut e.gotham_amount), (&mut e.lomo, &mut e.lomo_amount), (&mut e.toaster, &mut e.toaster_amount), (&mut e.vignette, &mut e.vignette_amount)] {
+        *on = r.chance(0.2);
+        *v = r.pick(&[0.0, 40.0, 100.0, 300.0, -50.0]);
+    }
+    e
 }
 
 fn timing(r: &mut Rng, n: usize) -> crate::timeline::Timing {
@@ -266,6 +325,8 @@ fn case(seed: u64, stage: &Mutex<&'static str>) -> String {
         let img = st.render_frame(&base, &plan, &times, i, &fonts, &prep);
         assert!(img.width() > 0 && img.height() > 0, "empty frame");
     }
+    set("gpu");
+    gpu_check(&st, &base, &plan, &times, &fonts, &prep, &desc);
     set("proxy");
     if w > 4 && h > 4 {
         let s = 0.5;
@@ -294,12 +355,47 @@ fn case(seed: u64, stage: &Mutex<&'static str>) -> String {
     ];
     for (name, f) in fmts {
         set(name);
-        if shown == 0 {
+        // effects that turn the frame can still make it enormous; encoding
+        // those only finds out how much memory this machine has
+        if shown == 0 || flat.width() as u64 * flat.height() as u64 > 16_000_000 {
             continue;
         }
         let _ = crate::io::encode_preview(&flat, &f);
     }
     desc
+}
+
+thread_local! {
+    static FUZZ_GPU: std::cell::RefCell<Option<Option<crate::gpu_render::GpuRenderer>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The same frames on the graphics card (when there is one, FUZZ_GPU=1):
+/// they must come out the size the CPU makes them.
+#[allow(clippy::too_many_arguments)]
+fn gpu_check(st: &Stack, base: &Animation, plan: &[crate::stack::PlanFrame], times: &[f32], fonts: &[crate::text::FontEntry], prep: &crate::stack::Prepared, desc: &str) {
+    if std::env::var_os("FUZZ_GPU").is_none() {
+        return;
+    }
+    FUZZ_GPU.with(|g| {
+        let mut g = g.borrow_mut();
+        let gpu = g.get_or_insert_with(crate::gpu_render::GpuRenderer::headless);
+        let Some(gpu) = gpu.as_mut() else { return };
+        for i in 0..plan.len().min(4) {
+            let Some(job) = st.gpu_frame(base, plan, times, i, fonts, prep) else { continue };
+            let src = plan[i].src;
+            let frame = &base.frames[src].image;
+            if !job.fits(frame, gpu.max_side) {
+                continue;
+            }
+            // keys unique to this run: the renderer keeps pictures by key
+            static KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let key = KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tex = gpu.render(frame, key, &job, key);
+            let out = gpu.read(&tex);
+            let cpu = st.render_frame(base, plan, times, i, fonts, prep);
+            assert_eq!(out.dimensions(), cpu.dimensions(), "gpu size differs, frame {i}: {desc}");
+        }
+    });
 }
 
 #[test]
@@ -996,4 +1092,25 @@ fn timeline_bits_round_trip() {
     t.keys = vec![Key { frame: 0, x: 0.0, ease: Ease::Hold, ..Default::default() }, Key { frame: 10, x: 100.0, ..Default::default() }];
     assert_eq!(t.motion(9).dx, 0.0);
     assert_eq!(t.motion(10).dx, 100.0);
+}
+
+/// A layer added after the layer data was prepared (a panel adding one
+/// mid-frame) renders instead of reading past the end.
+#[test]
+fn stale_prepared_layers() {
+    let fonts = crate::text::builtin_fonts();
+    let img = RgbaImage::from_pixel(40, 30, Rgba([10, 200, 30, 255]));
+    let mut base = Animation { frames: vec![Frame::new(img.clone(), 10), Frame::new(img.clone(), 10), Frame::new(img, 10)], loop_count: None };
+    base.frames[1].blank = true;
+    let mut st = Stack::default();
+    st.push(LayerKind::Text(crate::text::Annotation { text: "hi".into(), ..Default::default() }));
+    let prep = st.prepare(&base, &fonts);
+    st.push(LayerKind::Effects(Box::new(crate::effects::EffectSettings { anim: true, counter: true, ..Default::default() })));
+    let plan = st.plan(&base);
+    let times = crate::stack::plan_times(&plan);
+    for i in 0..plan.len() {
+        let f = st.render_frame(&base, &plan, &times, i, &fonts, &prep);
+        assert_eq!(f.dimensions(), (40, 30));
+        assert!(st.gpu_frame(&base, &plan, &times, i, &fonts, &prep).is_none());
+    }
 }

@@ -578,6 +578,14 @@ pub struct Prepared {
     stamps: Vec<Vec<StrokeSprite>>,
 }
 
+impl Prepared {
+    /// Was this made for `st`'s layers? (one entry per layer)
+    pub fn fits(&self, st: &Stack) -> bool {
+        let n = st.layers.len();
+        self.maps.len() == n && self.sprites.len() == n && self.watermarks.len() == n && self.stamps.len() == n
+    }
+}
+
 /// Run the calling thread at a lower priority, so long background renders
 /// never starve the desktop compositor or the app's own UI.
 pub fn lower_thread_priority() {
@@ -802,6 +810,15 @@ impl Stack {
 
     /// Render output frame `i` of `plan`.
     pub fn render_frame(&self, base: &Animation, plan: &[PlanFrame], times: &[f32], i: usize, fonts: &[FontEntry], prep: &Prepared) -> RgbaImage {
+        // made for another layer list (one was just added or removed):
+        // make it again rather than read past its end
+        let fresh;
+        let prep = if prep.fits(self) {
+            prep
+        } else {
+            fresh = self.prepare(base, fonts);
+            &fresh
+        };
         let n = plan.len();
         let src = plan[i].src;
         let mut img = self.geometry_frame(base, plan, i);
@@ -1157,7 +1174,7 @@ impl Stack {
                     slots.push(Some(frame.clone()));
                     continue;
                 }
-                let job = self.gpu_frame(base, plan, times, i, fonts, prep).filter(|j| j.size.0.max(j.size.1) <= gpu.max_side && frame.width().max(frame.height()) <= gpu.max_side);
+                let job = self.gpu_frame(base, plan, times, i, fonts, prep).filter(|j| j.fits(frame, gpu.max_side));
                 match job {
                     Some(job) => {
                         texs.push(gpu.render_straight(frame, src as u64 + 1, &job, gen));
@@ -1256,6 +1273,9 @@ impl Stack {
     pub fn gpu_frame<'a>(&'a self, base: &Animation, plan: &[PlanFrame], times: &[f32], i: usize, fonts: &[FontEntry], prep: &'a Prepared) -> Option<crate::gpu_render::GpuFrame<'a>> {
         use crate::geo::Affine;
         use crate::gpu_render::{GpuDraw, GpuFrame, GpuGeo, GpuOp, GpuSrc};
+        if !prep.fits(self) {
+            return None;
+        }
         let n = plan.len();
         let src = plan.get(i)?.src;
         let (fw, fh) = base.frames.get(src)?.image.dimensions();

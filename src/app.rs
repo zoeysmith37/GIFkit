@@ -930,6 +930,8 @@ pub struct GifKitApp {
     keymap: crate::keys::Keymap,
     /// the action whose new key is being waited for (shortcuts window)
     key_capture: Option<crate::keys::Action>,
+    /// the shortcuts dialog's search text
+    keys_filter: String,
     /// previews of big pictures are made from frames shrunk to this long
     /// side (0 = always full size)
     preview_max: u32,
@@ -1897,7 +1899,10 @@ fn check(ui: &mut egui::Ui, on: &mut bool, text: impl Into<egui::WidgetText>) ->
     // long labels are cut short rather than pushing the panel wider
     let wrap_w = (ui.available_width() - box_s - gap).max(10.0);
     let galley = text.into_galley(ui, Some(egui::TextWrapMode::Truncate), wrap_w, egui::TextStyle::Body);
-    let size = vec2(box_s + gap + galley.size().x, galley.size().y.max(box_s).max(22.0));
+    // on its own in a form row it's as tall as the row, so it lines up with
+    // the row's label; in a row of other controls those centre it
+    let min_h = if ui.layout().is_horizontal() { 22.0 } else { CHIP_H };
+    let size = vec2(box_s + gap + galley.size().x, galley.size().y.max(box_s).max(min_h));
     let (rect, mut resp) = ui.allocate_exact_size(size, Sense::click());
     if resp.clicked() {
         *on = !*on;
@@ -2418,6 +2423,7 @@ impl GifKitApp {
             tl_trim: None,
             keymap: crate::keys::Keymap::load(),
             key_capture: None,
+            keys_filter: String::new(),
             preview_max: theme::get_setting("preview_max").and_then(|v| v.parse().ok()).unwrap_or(1280),
             proxy: None,
             proxy_job: None,
@@ -3973,12 +3979,14 @@ impl GifKitApp {
     /// Layer geometry / sprites for the current stack, cached per composite key.
     fn prepared(&mut self) -> Option<Arc<stack::Prepared>> {
         let key = self.comp_key;
+        let (st, base) = self.render_inputs()?;
         if let Some((k, p)) = &self.prep_cache {
-            if *k == key {
+            // the key is from the start of this frame: a panel may have
+            // added or removed a layer since
+            if *k == key && p.fits(&st) {
                 return Some(p.clone());
             }
         }
-        let (st, base) = self.render_inputs()?;
         let p = Arc::new(st.prepare(&base, &self.fonts));
         self.prep_cache = Some((key, p.clone()));
         Some(p)
@@ -4057,7 +4065,7 @@ impl GifKitApp {
         let frame_key = hash_parts(&[self.version, src as u64, base.width() as u64, base.height() as u64]);
         let filter = if self.pixelated { eframe::wgpu::FilterMode::Nearest } else { eframe::wgpu::FilterMode::Linear };
         let (gpu, renderer) = self.gpu.as_mut()?;
-        if job.size.0.max(job.size.1) > gpu.max_side || frame.width().max(frame.height()) > gpu.max_side {
+        if !job.fits(frame, gpu.max_side) {
             return None;
         }
         let tex = gpu.render(frame, frame_key, &job, key);
@@ -5415,7 +5423,8 @@ impl GifKitApp {
         let mut reset_all = false;
         let mut capture = self.key_capture;
         let km = self.keymap.clone();
-        dialog(ctx, "shortcuts", "Keyboard Shortcuts", vec2(520.0, 720.0), true, &mut open, |ui| {
+        let mut filter = std::mem::take(&mut self.keys_filter);
+        dialog(ctx, "shortcuts", "Keyboard Shortcuts", vec2(900.0, 680.0), true, &mut open, |ui| {
             // the next key press goes to the action waiting for one
             if let Some(a) = capture {
                 let press = ui.input(|i| {
@@ -5435,57 +5444,120 @@ impl GifKitApp {
                 }
             }
             ui.horizontal(|ui| {
-                hint(ui, "Click a shortcut and press new keys. Backspace clears it.");
+                ui.add(egui::TextEdit::singleline(&mut filter).hint_text("Search shortcuts").desired_width(220.0));
+                ui.add_space(8.0);
+                hint(ui, "Click a shortcut, then press the new keys. Backspace clears it.");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Reset All").clicked() {
                         reset_all = true;
                     }
                 });
             });
-            ui.add_space(6.0);
+            ui.add_space(8.0);
+            let q = filter.trim().to_lowercase();
+            let hit = |a: Action| q.is_empty() || a.label().to_lowercase().contains(&q) || a.group().to_lowercase().contains(&q) || km.get(a).map(|b| b.text().to_lowercase().contains(&q)).unwrap_or(false);
+            const FIXED: [(&str, &str); 10] = [
+                ("Ctrl+V", "Paste files or a picture. With an animation open it becomes an image layer."),
+                ("Alt+letter", "Open a menu by its underlined letter"),
+                ("Mouse wheel", "Zoom"),
+                ("Middle or right drag", "Pan"),
+                ("Alt+drag", "Pan in drawing tools"),
+                ("Shift+drag", "Move in straight lines"),
+                ("Shift while resizing", "Keep or free the proportions"),
+                ("Ctrl while resizing", "Scale one way. Edge handles stretch one side."),
+                ("Ctrl+wheel", "Zoom the timeline"),
+                ("Shift+wheel", "Scroll the timeline sideways"),
+            ];
+            let fixed: Vec<(&str, &str)> = FIXED.iter().copied().filter(|(k, w)| q.is_empty() || k.to_lowercase().contains(&q) || w.to_lowercase().contains(&q)).collect();
+            // each group a card; cards go into columns, each to the shortest
+            let groups: Vec<(&str, Vec<Action>)> = Action::GROUPS.iter().map(|g| (*g, Action::ALL.iter().copied().filter(|a| a.group() == *g && hit(*a)).collect::<Vec<_>>())).filter(|(_, v)| !v.is_empty()).collect();
+            let cols = ((ui.available_width() / 380.0).floor() as usize).clamp(1, 3);
+            let mut col_of = vec![Vec::new(); cols];
+            let mut heights = vec![0usize; cols];
+            for (k, (_, v)) in groups.iter().enumerate() {
+                let c = (0..cols).min_by_key(|c| heights[*c]).unwrap_or(0);
+                col_of[c].push(k);
+                heights[c] += v.len() + 2;
+            }
+            let card = |ui: &mut egui::Ui, title: &str, body: &mut dyn FnMut(&mut egui::Ui)| {
+                egui::Frame::new()
+                    .fill(mix(pal.window, pal.view, 0.55))
+                    .stroke(Stroke::new(1.0, pal.border))
+                    .corner_radius(6.0)
+                    .inner_margin(egui::Margin::symmetric(12, 10))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new(title).font(theme::medium(13.5)).color(pal.fg));
+                        ui.add_space(4.0);
+                        body(ui);
+                    });
+                ui.add_space(10.0);
+            };
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                egui::Grid::new("keys").num_columns(3).spacing([14.0, 4.0]).show(ui, |ui| {
-                    for a in Action::ALL {
-                        ui.label(RichText::new(a.label()).color(pal.fg));
-                        let waiting = capture == Some(a);
-                        let text = if waiting { "Press keys…".to_string() } else { km.get(a).map(|b| b.text()).unwrap_or_else(|| "None".into()) };
-                        let b = ui.add(sel_btn(egui::Button::new(RichText::new(text).font(theme::medium(13.0))).min_size(vec2(150.0, 26.0)), waiting));
-                        if b.clicked() {
-                            capture = if waiting { None } else { Some(a) };
+                ui.columns(cols, |cs| {
+                    for (c, ui) in cs.iter_mut().enumerate() {
+                        for &k in &col_of[c] {
+                            let (title, acts) = &groups[k];
+                            card(ui, title, &mut |ui: &mut egui::Ui| {
+                                for &a in acts {
+                                    ui.horizontal(|ui| {
+                                        ui.set_min_height(CHIP_H);
+                                        // the card already says Timeline
+                                        let full = a.label();
+                                        let name = match full.strip_prefix("Timeline: ") {
+                                            Some(r) => r[..1].to_uppercase() + &r[1..],
+                                            None => full.to_string(),
+                                        };
+                                        let room = (ui.available_width() - 166.0).max(40.0);
+                                        ui.allocate_ui_with_layout(vec2(room, CHIP_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                            ui.add(egui::Label::new(RichText::new(name).color(pal.fg)).truncate()).on_hover_text(full);
+                                        });
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            let changed = km.get(a) != a.default_binding();
+                                            let back = format!("Back to {}", a.default_binding().map(|b| b.text()).unwrap_or_else(|| "none".into()));
+                                            if ui.add_enabled(changed, egui::Button::image(crate::icons::image(ui.ctx(), "edit-undo", 16.0, pal.fg)).frame_when_inactive(false)).on_hover_text(back).clicked() {
+                                                reset = Some(a);
+                                            }
+                                            let waiting = capture == Some(a);
+                                            let text = if waiting { "Press keys…".to_string() } else { km.get(a).map(|b| b.text()).unwrap_or_else(|| "None".into()) };
+                                            let col = if km.get(a).is_some() || waiting { pal.fg } else { pal.fg_muted };
+                                            let b = ui.add(sel_btn(egui::Button::new(RichText::new(text).font(theme::medium(13.0)).color(col)).min_size(vec2(124.0, 26.0)), waiting));
+                                            if b.clicked() {
+                                                capture = if waiting { None } else { Some(a) };
+                                            }
+                                        });
+                                    });
+                                }
+                            });
                         }
-                        let changed = km.get(a) != a.default_binding();
-                        if ui.add_enabled(changed, egui::Button::image(crate::icons::image(ui.ctx(), "edit-undo", 16.0, pal.fg)).frame_when_inactive(false)).on_hover_text(format!("Back to {}", a.default_binding().map(|b| b.text()).unwrap_or_else(|| "none".into()))).clicked() {
-                            reset = Some(a);
-                        }
-                        ui.end_row();
                     }
                 });
-                ui.add_space(12.0);
-                ui.label(RichText::new("Mouse and fixed keys").font(theme::medium(13.5)).color(pal.fg));
-                ui.add_space(4.0);
-                egui::Grid::new("fixed").num_columns(2).spacing([18.0, 6.0]).show(ui, |ui| {
-                    for (k, what) in [
-                        ("Ctrl+V", "Paste files or a picture. With an animation open it becomes an image layer."),
-                        ("Alt+letter", "Open a menu by its underlined letter"),
-                        ("Mouse wheel", "Zoom"),
-                        ("Middle or right drag", "Pan"),
-                        ("Alt+drag", "Pan in drawing tools"),
-                        ("Shift+drag", "Move in straight lines"),
-                        ("Shift while resizing", "Keep or free the proportions"),
-                        ("Ctrl while resizing", "Scale one way. Edge handles stretch one side."),
-                        ("Ctrl+wheel", "Zoom the timeline"),
-                        ("Shift+wheel", "Scroll the timeline sideways"),
-                    ] {
-                        ui.label(RichText::new(k).font(theme::medium(13.0)).color(pal.fg));
-                        ui.label(RichText::new(what).color(pal.fg_muted));
-                        ui.end_row();
-                    }
-                });
+                if !fixed.is_empty() {
+                    card(ui, "Mouse and Fixed Keys", &mut |ui: &mut egui::Ui| {
+                        let fcols = if ui.available_width() > 700.0 { 2 } else { 1 };
+                        let per = fixed.len().div_ceil(fcols);
+                        ui.columns(fcols, |cs| {
+                            for (c, ui) in cs.iter_mut().enumerate() {
+                                egui::Grid::new(("fixed", c)).num_columns(2).spacing([14.0, 8.0]).show(ui, |ui| {
+                                    for (k, what) in fixed.iter().skip(c * per).take(per) {
+                                        ui.label(RichText::new(*k).font(theme::medium(13.0)).color(pal.fg));
+                                        ui.add(egui::Label::new(RichText::new(*what).color(pal.fg_muted)).wrap());
+                                        ui.end_row();
+                                    }
+                                });
+                            }
+                        });
+                    });
+                }
+                if groups.is_empty() && fixed.is_empty() {
+                    hint(ui, "No shortcuts match.");
+                }
             });
             if capture.is_some() {
                 ui.ctx().request_repaint();
             }
         });
+        self.keys_filter = filter;
         self.key_capture = capture;
         if let Some((a, b)) = set {
             if let Some(lost) = self.keymap.set(a, b) {
