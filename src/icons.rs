@@ -23,6 +23,8 @@ static ICONS: &[(&str, &str, &str)] = icon_set!(
     "sidebar-collapse-left", "sidebar-collapse-right", "smiley", "speedometer", "tools-report-bug", "tools-wizard",
     "transform-crop", "transform-scale", "view-fullscreen", "view-grid", "view-history", "view-refresh",
     "view-split-left-right", "view-hidden", "view-visible", "window-close", "zoom-fit-best", "zoom-in", "zoom-original", "zoom-out",
+    "snap", "zone-in", "zone-out", "object-locked", "object-unlocked", "edit-copy", "edit-paste", "bookmark-new", "bookmark-remove",
+    "keyframe-next", "keyframe-previous", "view-filter",
 );
 
 fn hex(c: Color32) -> String {

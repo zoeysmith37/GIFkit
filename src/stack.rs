@@ -399,6 +399,8 @@ pub struct Layer {
     pub label: Option<String>,
     /// clips and keyframes from the timeline
     pub timing: crate::timeline::Timing,
+    /// can't be moved or changed on the timeline or the picture
+    pub locked: bool,
 }
 
 impl Layer {
@@ -510,6 +512,8 @@ pub struct Stack {
     /// Bottom-most first.
     pub layers: Vec<Layer>,
     pub next_id: u64,
+    /// named points on the timeline (output frames), sorted
+    pub markers: Vec<crate::timeline::Marker>,
 }
 
 /// Size of a preview frame `s` times the source size.
@@ -608,7 +612,7 @@ impl Stack {
     pub fn push(&mut self, kind: LayerKind) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
-        self.layers.push(Layer { id, visible: true, kind, label: None, timing: Default::default() });
+        self.layers.push(Layer { id, visible: true, kind, label: None, timing: Default::default(), locked: false });
         id
     }
 

@@ -859,6 +859,31 @@ pub struct GifKitApp {
     tl_gif_drop: Option<usize>,
     /// the track whose name was right-clicked (its menu is the layer's)
     tl_menu_head: Option<u64>,
+    /// more selected clips besides the main one, as (track, first frame)
+    tl_sel: Vec<(u64, usize)>,
+    /// clips moving together: (track, clip index, first, last) when the drag began
+    tl_group: Vec<(u64, usize, usize, usize)>,
+    /// a rubber band selection started here
+    tl_box: Option<Pos2>,
+    /// copied clips or a keyframe
+    tl_board: Option<timeline_ui::TlBoard>,
+    /// snap edges and keys to things nearby while dragging; the frame snapped to
+    tl_snap: bool,
+    tl_snap_line: Option<usize>,
+    /// in and out points (output frames), and whether playback loops between them
+    tl_in: Option<usize>,
+    tl_out: Option<usize>,
+    tl_zone_loop: bool,
+    /// show only this layer in the live view
+    tl_solo: Option<u64>,
+    /// track heights, and the track whose bottom edge is being dragged
+    tl_gif_h: f32,
+    tl_row_h: f32,
+    tl_row_drag: Option<usize>,
+    /// a marker being moved, renamed, or right-clicked
+    tl_marker_drag: Option<usize>,
+    tl_marker_edit: Option<(usize, String)>,
+    tl_menu_marker: Option<usize>,
     /// first frame shown, and how far the tracks are scrolled
     tl_x0: f32,
     tl_y0: f32,
@@ -1139,6 +1164,8 @@ fn key_label(key: &str) -> String {
             "lengthen" => "Make longer".into(),
             "clearkeys" => "Clear keyframes".into(),
             "full" => "Show on every frame".into(),
+            "marker" => "Marker".into(),
+            "lock" => "Lock layer".into(),
             _ => "Timeline".into(),
         },
         "" => "Edit".into(),
@@ -2333,6 +2360,22 @@ impl GifKitApp {
             tl_bar_drag: None,
             tl_gif_drop: None,
             tl_menu_head: None,
+            tl_sel: Vec::new(),
+            tl_group: Vec::new(),
+            tl_box: None,
+            tl_board: None,
+            tl_snap: theme::get_setting("tl_snap").map(|v| v != "0").unwrap_or(true),
+            tl_snap_line: None,
+            tl_in: None,
+            tl_out: None,
+            tl_zone_loop: true,
+            tl_solo: None,
+            tl_gif_h: theme::get_setting("tl_gif_h").and_then(|v| v.parse().ok()).unwrap_or(40.0),
+            tl_row_h: theme::get_setting("tl_row_h").and_then(|v| v.parse().ok()).unwrap_or(28.0),
+            tl_row_drag: None,
+            tl_marker_drag: None,
+            tl_marker_edit: None,
+            tl_menu_marker: None,
             tl_x0: 0.0,
             tl_y0: 0.0,
             tl_track: None,
@@ -3469,7 +3512,7 @@ impl GifKitApp {
         // Delete over the picture removes the selected text, shape, emoji…
         let over_view = ctx.pointer_hover_pos().is_some_and(|p| self.views_last.iter().any(|r| r.contains(p)));
         if over_view && hit(A::DeleteObject) {
-            if let Some(li) = self.tool.layer_kind().and_then(|k| self.sel_index(k)) {
+            if let Some(li) = self.tool.layer_kind().and_then(|k| self.sel_index(k)).filter(|li| !self.stack.layers[*li].locked) {
                 let now = ctx.input(|i| i.time);
                 self.snapshot(&format!("del{now}"), now);
                 let name = self.stack.layers[li].name();
@@ -3504,6 +3547,25 @@ impl GifKitApp {
         }
         if cmp && self.base.is_some() {
             self.compare = !self.compare;
+        }
+        // in and out points, markers and jumps between edits work anywhere
+        if self.base.is_some() {
+            let now = ctx.input(|i| i.time);
+            if hit(A::TlIn) {
+                self.tl_set_in(Some(self.cur));
+            }
+            if hit(A::TlOut) {
+                self.tl_set_out(Some(self.cur));
+            }
+            if hit(A::TlMarker) {
+                self.tl_add_marker(now);
+            }
+            if hit(A::TlPrevEdit) {
+                self.tl_jump(false);
+            }
+            if hit(A::TlNextEdit) {
+                self.tl_jump(true);
+            }
         }
     }
 
@@ -3611,12 +3673,37 @@ impl GifKitApp {
                 break;
             }
             self.elapsed -= d;
-            self.cur = self.next_enabled(self.cur);
+            self.cur = self.next_play(self.cur);
             steps += 1;
         }
         let d = effective_delay(self.plan[self.cur].delay) as f64 / 100.0;
         let remain = ((d - self.elapsed) / self.play_speed.max(0.05) as f64).max(0.004);
         ctx.request_repaint_after(std::time::Duration::from_secs_f64(remain));
+    }
+
+    /// The frame after `from` in playback: inside the in and out points
+    /// when looping between them.
+    fn next_play(&self, from: usize) -> usize {
+        let next = self.next_enabled(from);
+        if let Some((a, b)) = self.tl_zone().filter(|_| self.tl_zone_loop) {
+            if next > b || next < a || next <= from {
+                // back to the first shown frame of the zone
+                return (a..=b).find(|&i| self.plan.get(i).is_some_and(|f| f.enabled)).unwrap_or(next);
+            }
+        }
+        next
+    }
+
+    /// The in and out points, when both are set and in order.
+    fn tl_zone(&self) -> Option<(usize, usize)> {
+        let n = self.plan.len();
+        match (self.tl_in, self.tl_out) {
+            (None, None) => None,
+            (a, b) => {
+                let (a, b) = (a.unwrap_or(0).min(n.saturating_sub(1)), b.unwrap_or(n.saturating_sub(1)).min(n.saturating_sub(1)));
+                (a <= b).then_some((a, b))
+            }
+        }
     }
 
     fn next_enabled(&self, from: usize) -> usize {
@@ -3676,7 +3763,7 @@ impl GifKitApp {
 
     fn composite_key(&self) -> u64 {
         let proxy = self.ready_proxy().map(|(s, _)| s.to_bits() as u64).unwrap_or(0);
-        hash_parts(&[self.stack.signature(), self.version, self.timing_rev, self.pixelated as u64, self.plan.len() as u64, self.stack.plan_signature(), proxy])
+        hash_parts(&[self.stack.signature(), self.version, self.timing_rev, self.pixelated as u64, self.plan.len() as u64, self.stack.plan_signature(), proxy, self.tl_solo.unwrap_or(u64::MAX)])
     }
 
     /// How much smaller preview frames are than the source (1 = full size).
@@ -3779,10 +3866,17 @@ impl GifKitApp {
     /// What previews render from: the shrunk frames with a matching stack
     /// when the source is big, else the source itself.
     fn render_inputs(&self) -> Option<(Stack, Animation)> {
-        match self.ready_proxy() {
-            Some((s, a)) => Some((self.stack.proxy(s), a.clone())),
-            None => Some((self.stack.clone(), self.base.clone()?)),
+        let (mut st, a) = match self.ready_proxy() {
+            Some((s, a)) => (self.stack.proxy(s), a.clone()),
+            None => (self.stack.clone(), self.base.clone()?),
+        };
+        // a soloed layer shows on its own in the live view (not in exports)
+        if let Some(id) = self.tl_solo {
+            for l in &mut st.layers {
+                l.visible = l.id == id;
+            }
         }
+        Some((st, a))
     }
 
     /// The output size in full-size pixels (previews may be smaller).
@@ -5654,7 +5748,7 @@ impl GifKitApp {
         if li >= self.stack.layers.len() {
             return;
         }
-        let lower = Stack { transform: Transform::default(), layers: self.stack.layers[..=li].iter().filter(|l| l.visible).cloned().collect(), next_id: self.stack.next_id };
+        let lower = Stack { transform: Transform::default(), layers: self.stack.layers[..=li].iter().filter(|l| l.visible).cloned().collect(), next_id: self.stack.next_id, ..Default::default() };
         let mut keep = self.stack.clone();
         // hidden layers in the merged part stay as they are
         keep.layers = self.stack.layers[..=li].iter().filter(|l| !l.visible).cloned().chain(self.stack.layers[li + 1..].iter().cloned()).collect();
@@ -6304,7 +6398,7 @@ impl GifKitApp {
                     LayerKind::Markup(m) => ProjLayer::Markup { markup: m.clone() },
                     LayerKind::Emoji(e) => ProjLayer::Emoji { emoji: (**e).clone() },
                 };
-                ProjLayerEntry { visible: l.visible, label: l.label.clone(), layer, timing: l.timing.clone() }
+                ProjLayerEntry { visible: l.visible, label: l.label.clone(), layer, timing: l.timing.clone(), locked: l.locked }
             })
             .collect();
         let file = ProjectFile {
@@ -6313,6 +6407,7 @@ impl GifKitApp {
             source_size: self.file_size,
             transform: self.stack.transform.clone(),
             layers,
+            markers: self.stack.markers.clone(),
             settings: serde_json::to_value(self.proj_settings()).unwrap_or_default(),
             ..Default::default()
         };
@@ -6370,8 +6465,10 @@ impl GifKitApp {
                 l.visible = e.visible;
                 l.label = e.label;
                 l.timing = e.timing;
+                l.locked = e.locked;
             }
         }
+        self.stack.markers = file.markers;
         self.stack.sync_len(n);
         if let Ok(st) = serde_json::from_value::<ProjSettings>(file.settings) {
             if let Some(v) = st.gif {
@@ -7137,8 +7234,8 @@ impl GifKitApp {
                 LayerKind::Emoji(e) => e.w == 0 || e.applies_to(src_idx),
                 _ => true,
             };
-            // hidden by its clips on the timeline: not there to pick
-            if !applies || !l.timing.shows(self.cur, self.plan.len()) {
+            // hidden by its clips on the timeline, or locked: not there to pick
+            if !applies || !l.timing.shows(self.cur, self.plan.len()) || l.locked {
                 continue;
             }
             if let Some(b) = l.source_box(src_idx, &self.fonts) {

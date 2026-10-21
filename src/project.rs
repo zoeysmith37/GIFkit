@@ -60,6 +60,8 @@ pub struct ProjLayerEntry {
     /// clips and keyframes (none in older projects)
     #[serde(default, skip_serializing_if = "crate::timeline::Timing::is_default")]
     pub timing: crate::timeline::Timing,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub locked: bool,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -78,6 +80,9 @@ pub struct ProjectFile {
     pub original: Option<(Vec<FrameMeta>, Option<u16>)>,
     pub transform: Transform,
     pub layers: Vec<ProjLayerEntry>,
+    /// timeline markers
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub markers: Vec<crate::timeline::Marker>,
     /// output and tool settings, kept loose so new fields never break old files
     pub settings: serde_json::Value,
 }

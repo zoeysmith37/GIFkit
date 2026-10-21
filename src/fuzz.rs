@@ -183,7 +183,7 @@ fn timing(r: &mut Rng, n: usize) -> crate::timeline::Timing {
     }
     if r.chance(0.4) {
         for _ in 0..r.below(4) {
-            t.keys.push(Key { frame: r.below(n + 4), x: r.pick(&[0.0, 30.0, -500.0]), y: r.pick(&[0.0, 12.0]), scale_x: r.pick(&[0.0, 50.0, 100.0, 400.0, -20.0]), scale_y: r.pick(&[0.0, 100.0, 250.0]), angle: r.pick(&[0.0, 90.0, 720.0]), opacity: r.pick(&[0.0, 50.0, 100.0, 300.0]), smooth: r.chance(0.5) });
+            t.keys.push(Key { frame: r.below(n + 4), x: r.pick(&[0.0, 30.0, -500.0]), y: r.pick(&[0.0, 12.0]), scale_x: r.pick(&[0.0, 50.0, 100.0, 400.0, -20.0]), scale_y: r.pick(&[0.0, 100.0, 250.0]), angle: r.pick(&[0.0, 90.0, 720.0]), opacity: r.pick(&[0.0, 50.0, 100.0, 300.0]), ease: crate::timeline::Ease::ALL[r.below(5)] });
         }
         t.sort_keys();
     }
@@ -703,7 +703,7 @@ fn gpu_matches_cpu() {
     cases.push(("layers", Transform::default(), layers(), vec![]));
     cases.push(("layers + turn", t(&|t| (t.rot_on, t.rot_any, t.rot_deg) = (true, true, -15.0)), layers(), vec![]));
     cases.push(("layers + resize", t(&|t| (t.resize_on, t.rs_pct) = (true, 60.0)), layers(), vec![]));
-    let mk = crate::timeline::Key { frame: 0, x: 15.0, y: -5.0, scale_x: 150.0, scale_y: 80.0, angle: 30.0, opacity: 60.0, smooth: false };
+    let mk = crate::timeline::Key { frame: 0, x: 15.0, y: -5.0, scale_x: 150.0, scale_y: 80.0, angle: 30.0, opacity: 60.0, ease: crate::timeline::Ease::Linear };
     cases.push(("motion", Transform::default(), layers(), vec![mk]));
     let one = |k: usize| vec![layers().remove(k)];
     for (k, nm) in ["text", "shape", "emoji", "overlay"].iter().enumerate() {
@@ -914,3 +914,53 @@ fn gpu_flatten_matches_cpu() {
     assert!(sum / px < 1.0, "frames drift from the CPU");
 }
 
+
+/// Ctrl+wheel reaches egui as a zoom factor, not a scroll (the timeline
+/// zooms from `zoom_delta`).
+#[test]
+fn ctrl_wheel_is_zoom() {
+    use eframe::egui;
+    let ctx = egui::Context::default();
+    let mut seen = (1.0f32, egui::Vec2::ZERO);
+    for k in 0..3 {
+        let mut raw = egui::RawInput::default();
+        raw.time = Some(k as f64 * 0.05);
+        if k == 1 {
+            raw.events.push(egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Line, delta: egui::vec2(0.0, 1.0), phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel, modifiers: egui::Modifiers::CTRL });
+        }
+        let _ = ctx.run_ui(raw, |ui| {
+            let z = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta()));
+            if z.0 != 1.0 {
+                seen = z;
+            }
+        });
+    }
+    assert!(seen.0 > 1.0, "Ctrl+wheel should zoom, got {seen:?}");
+    assert_eq!(seen.1, egui::Vec2::ZERO, "and not scroll");
+    println!("Ctrl+wheel: zoom factor {}", seen.0);
+}
+
+/// Markers, locks, keyframe easing and GIF splits survive a save.
+#[test]
+fn timeline_bits_round_trip() {
+    use crate::project::{FrameMeta, ProjectFile};
+    use crate::timeline::{Ease, Key, Marker};
+    let mut f = ProjectFile::default();
+    f.markers = vec![Marker { frame: 4, label: "Intro".into() }];
+    f.frames = vec![FrameMeta { delay: 5, enabled: true, cut: false }, FrameMeta { delay: 5, enabled: true, cut: true }];
+    let json = serde_json::to_string(&f).unwrap();
+    let back: ProjectFile = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.markers, f.markers);
+    assert!(back.frames[1].cut && !back.frames[0].cut);
+    let k = Key { frame: 3, ease: Ease::Hold, ..Default::default() };
+    let k2: Key = serde_json::from_str(&serde_json::to_string(&k).unwrap()).unwrap();
+    assert_eq!(k2.ease, Ease::Hold);
+    // older files: smooth true / false
+    let old: Key = serde_json::from_str(r#"{"frame":1,"smooth":false}"#).unwrap();
+    assert_eq!(old.ease, Ease::Linear);
+    // a hold key keeps its value until the next one
+    let mut t = crate::timeline::Timing::default();
+    t.keys = vec![Key { frame: 0, x: 0.0, ease: Ease::Hold, ..Default::default() }, Key { frame: 10, x: 100.0, ..Default::default() }];
+    assert_eq!(t.motion(9).dx, 0.0);
+    assert_eq!(t.motion(10).dx, 100.0);
+}

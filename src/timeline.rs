@@ -40,13 +40,51 @@ pub struct Key {
     pub angle: f32,
     /// 0..=100
     pub opacity: f32,
-    /// ease into and out of this key instead of moving at a steady speed
-    pub smooth: bool,
+    /// how the motion arrives at and leaves this key
+    pub ease: Ease,
+}
+
+/// How motion moves through a keyframe.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Ease {
+    /// slows down arriving and leaving
+    #[default]
+    Smooth,
+    /// a steady speed
+    Linear,
+    /// slows down arriving here
+    In,
+    /// starts slowly leaving here
+    Out,
+    /// stays put until the next key, then jumps
+    Hold,
+}
+
+impl Ease {
+    pub const ALL: [Ease; 5] = [Ease::Smooth, Ease::Linear, Ease::In, Ease::Out, Ease::Hold];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Ease::Smooth => "Smooth",
+            Ease::Linear => "Linear",
+            Ease::In => "Ease in",
+            Ease::Out => "Ease out",
+            Ease::Hold => "Hold",
+        }
+    }
+
+    fn slow_arriving(self) -> bool {
+        matches!(self, Ease::Smooth | Ease::In)
+    }
+
+    fn slow_leaving(self) -> bool {
+        matches!(self, Ease::Smooth | Ease::Out)
+    }
 }
 
 impl Default for Key {
     fn default() -> Self {
-        Key { frame: 0, x: 0.0, y: 0.0, scale_x: 100.0, scale_y: 100.0, angle: 0.0, opacity: 100.0, smooth: true }
+        Key { frame: 0, x: 0.0, y: 0.0, scale_x: 100.0, scale_y: 100.0, angle: 0.0, opacity: 100.0, ease: Ease::Smooth }
     }
 }
 
@@ -62,20 +100,23 @@ struct KeyFile {
     scale_y: Option<f32>,
     angle: f32,
     opacity: f32,
-    smooth: bool,
+    /// older projects: smooth or linear
+    smooth: Option<bool>,
+    ease: Option<Ease>,
 }
 
 impl Default for KeyFile {
     fn default() -> Self {
         let k = Key::default();
-        KeyFile { frame: 0, x: 0.0, y: 0.0, scale: None, scale_x: None, scale_y: None, angle: k.angle, opacity: k.opacity, smooth: k.smooth }
+        KeyFile { frame: 0, x: 0.0, y: 0.0, scale: None, scale_x: None, scale_y: None, angle: k.angle, opacity: k.opacity, smooth: None, ease: None }
     }
 }
 
 impl From<KeyFile> for Key {
     fn from(f: KeyFile) -> Key {
         let s = f.scale.unwrap_or(100.0);
-        Key { frame: f.frame, x: f.x, y: f.y, scale_x: f.scale_x.unwrap_or(s), scale_y: f.scale_y.unwrap_or(s), angle: f.angle, opacity: f.opacity, smooth: f.smooth }
+        let ease = f.ease.unwrap_or(if f.smooth.unwrap_or(true) { Ease::Smooth } else { Ease::Linear });
+        Key { frame: f.frame, x: f.x, y: f.y, scale_x: f.scale_x.unwrap_or(s), scale_y: f.scale_y.unwrap_or(s), angle: f.angle, opacity: f.opacity, ease }
     }
 }
 
@@ -156,9 +197,12 @@ impl Timing {
         }
         let j = k.iter().position(|q| q.frame > i).unwrap_or(k.len() - 1);
         let (a, b) = (k[j - 1], k[j]);
+        if a.ease == Ease::Hold {
+            return m(&a);
+        }
         let mut t = (i - a.frame) as f32 / (b.frame - a.frame).max(1) as f32;
-        // smooth keys slow down as the layer leaves or arrives
-        let (ea, eb) = (a.smooth, b.smooth);
+        // eased keys slow down as the layer leaves or arrives
+        let (ea, eb) = (a.ease.slow_leaving(), b.ease.slow_arriving());
         t = match (ea, eb) {
             (true, true) => t * t * (3.0 - 2.0 * t),
             (true, false) => 1.0 - (1.0 - t) * (1.0 - t),
@@ -180,7 +224,7 @@ impl Timing {
             return i;
         }
         let m = self.motion(frame);
-        let k = Key { frame, x: m.dx, y: m.dy, scale_x: m.sx * 100.0, scale_y: m.sy * 100.0, angle: m.angle, opacity: m.opacity * 100.0, smooth: true };
+        let k = Key { frame, x: m.dx, y: m.dy, scale_x: m.sx * 100.0, scale_y: m.sy * 100.0, angle: m.angle, opacity: m.opacity * 100.0, ease: Ease::Smooth };
         self.keys.push(k);
         self.sort_keys();
         self.key_at(frame).unwrap_or(0)
@@ -324,14 +368,14 @@ mod tests {
     #[test]
     fn keys_tween_and_hold() {
         let mut t = Timing::default();
-        t.keys = vec![Key { frame: 10, x: 0.0, smooth: false, ..Default::default() }, Key { frame: 20, x: 100.0, opacity: 0.0, smooth: false, ..Default::default() }];
+        t.keys = vec![Key { frame: 10, x: 0.0, ease: Ease::Linear, ..Default::default() }, Key { frame: 20, x: 100.0, opacity: 0.0, ease: Ease::Linear, ..Default::default() }];
         assert_eq!(t.motion(0).dx, 0.0, "holds before the first key");
         assert!((t.motion(15).dx - 50.0).abs() < 0.01);
         assert!((t.motion(15).opacity - 0.5).abs() < 0.01);
         assert_eq!(t.motion(30).dx, 100.0, "holds after the last key");
         // a smooth key starts slower
-        t.keys[0].smooth = true;
-        t.keys[1].smooth = true;
+        t.keys[0].ease = Ease::Smooth;
+        t.keys[1].ease = Ease::Smooth;
         assert!(t.motion(12).dx < 20.0);
         // adding a key between keeps the motion where it was
         let before = t.motion(15);
@@ -362,4 +406,11 @@ mod tests {
         let (o, _, _) = transform_sprite(&img, 0, 0, (5.0, 5.0), (0.0, 0.0), motion_matrix(2.0, 2.0, 0.0, 45.0)).unwrap();
         assert!(o.width() > 25, "doubled and turned it needs more room");
     }
+}
+
+/// A named point on the timeline (output frame).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Marker {
+    pub frame: usize,
+    pub label: String,
 }

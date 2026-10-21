@@ -30,10 +30,18 @@ pub enum Action {
     TlKey,
     TlRazor,
     TlDelete,
+    TlIn,
+    TlOut,
+    TlMarker,
+    TlPrevEdit,
+    TlNextEdit,
+    TlDuplicate,
+    TlNudgeLeft,
+    TlNudgeRight,
 }
 
 impl Action {
-    pub const ALL: [Action; 24] = [
+    pub const ALL: [Action; 32] = [
         Action::New,
         Action::Open,
         Action::Save,
@@ -58,6 +66,14 @@ impl Action {
         Action::TlKey,
         Action::TlRazor,
         Action::TlDelete,
+        Action::TlIn,
+        Action::TlOut,
+        Action::TlMarker,
+        Action::TlPrevEdit,
+        Action::TlNextEdit,
+        Action::TlDuplicate,
+        Action::TlNudgeLeft,
+        Action::TlNudgeRight,
     ];
 
     pub fn label(self) -> &'static str {
@@ -86,6 +102,14 @@ impl Action {
             Action::TlKey => "Timeline: add a keyframe",
             Action::TlRazor => "Timeline: selection or razor tool",
             Action::TlDelete => "Timeline: delete clip or keyframe",
+            Action::TlIn => "Timeline: set the in point",
+            Action::TlOut => "Timeline: set the out point",
+            Action::TlMarker => "Timeline: add a marker",
+            Action::TlPrevEdit => "Timeline: go to the previous edit",
+            Action::TlNextEdit => "Timeline: go to the next edit",
+            Action::TlDuplicate => "Timeline: duplicate the selected clips",
+            Action::TlNudgeLeft => "Timeline: nudge the selection a frame earlier",
+            Action::TlNudgeRight => "Timeline: nudge the selection a frame later",
         }
     }
 
@@ -116,6 +140,14 @@ impl Action {
             Action::TlKey => "tl_key",
             Action::TlRazor => "tl_razor",
             Action::TlDelete => "tl_delete",
+            Action::TlIn => "tl_in",
+            Action::TlOut => "tl_out",
+            Action::TlMarker => "tl_marker",
+            Action::TlPrevEdit => "tl_prev_edit",
+            Action::TlNextEdit => "tl_next_edit",
+            Action::TlDuplicate => "tl_duplicate",
+            Action::TlNudgeLeft => "tl_nudge_left",
+            Action::TlNudgeRight => "tl_nudge_right",
         }
     }
 
@@ -123,6 +155,7 @@ impl Action {
         let c = |key| Some(Binding { ctrl: true, shift: false, alt: false, key });
         let cs = |key| Some(Binding { ctrl: true, shift: true, alt: false, key });
         let k = |key| Some(Binding { ctrl: false, shift: false, alt: false, key });
+        let a = |key| Some(Binding { ctrl: false, shift: false, alt: true, key });
         match self {
             Action::New => c(Key::N),
             Action::Open => c(Key::O),
@@ -148,13 +181,21 @@ impl Action {
             Action::TlKey => k(Key::K),
             Action::TlRazor => k(Key::X),
             Action::TlDelete => k(Key::Delete),
+            Action::TlIn => k(Key::I),
+            Action::TlOut => k(Key::O),
+            Action::TlMarker => k(Key::M),
+            Action::TlPrevEdit => k(Key::ArrowUp),
+            Action::TlNextEdit => k(Key::ArrowDown),
+            Action::TlDuplicate => c(Key::D),
+            Action::TlNudgeLeft => a(Key::ArrowLeft),
+            Action::TlNudgeRight => a(Key::ArrowRight),
         }
     }
 
     /// Timeline keys only work with the pointer over the timeline, so they can
     /// share letters with the rest.
     pub fn timeline(self) -> bool {
-        matches!(self, Action::TlSplit | Action::TlKey | Action::TlRazor | Action::TlDelete)
+        matches!(self, Action::TlSplit | Action::TlKey | Action::TlRazor | Action::TlDelete | Action::TlDuplicate | Action::TlNudgeLeft | Action::TlNudgeRight)
     }
 }
 
