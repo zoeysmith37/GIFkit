@@ -1288,3 +1288,21 @@ fn gif_same_with_gpu_mapping() {
         assert!(cpu == gpu, "the files differ");
     }
 }
+
+/// An outro sits at the end of a layer however its clips are cut up and
+/// moved, not at the end of each clip.
+#[test]
+fn outro_at_the_layers_end() {
+    let fonts = crate::text::builtin_fonts();
+    let base = Animation { frames: (0..20).map(|_| Frame::new(RgbaImage::from_pixel(8, 8, Rgba([200, 200, 200, 255])), 10)).collect(), loop_count: None };
+    let mut st = Stack::default();
+    let id = st.push(LayerKind::Effects(Box::new(crate::effects::EffectSettings { anim: true, outro: crate::motion::Transition::Fade, fade_frames: 3, ..Default::default() })));
+    let l = st.layers.iter_mut().find(|l| l.id == id).unwrap();
+    l.timing.clips = Some(vec![Clip { start: 0, end: Some(9) }, Clip { start: 10, end: None }]);
+    let plan = st.plan(&base);
+    let times = crate::stack::plan_times(&plan);
+    let prep = st.prepare(&base, &fonts);
+    let px = |i: usize| st.render_frame(&base, &plan, &times, i, &fonts, &prep).get_pixel(4, 4).0;
+    assert_eq!(px(9), [200, 200, 200, 255], "the first clip's end isn't faded");
+    assert_ne!(px(19), [200, 200, 200, 255], "the layer's end is");
+}

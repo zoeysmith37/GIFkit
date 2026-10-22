@@ -1007,8 +1007,9 @@ impl Stack {
         match &l.kind {
             LayerKind::Effects(fx) => {
                 let fx = over.unwrap_or(fx);
-                // effects run over their own clip, so an intro starts where the clip does
-                let (s0, s1) = l.timing.clip_at(i, n).filter(|_| l.timing.clips.is_some()).unwrap_or((0, n.saturating_sub(1)));
+                // effects run from the layer's first frame to its last, across its clips, so
+                // an intro is at its start and an outro at its end wherever clips move
+                let (s0, s1) = l.timing.extent(n);
                 // count only frames that show: skipped ones (trims, speed-ups)
                 // would otherwise swallow the start of an intro or the end of an outro
                 let shown = |a: usize, b: usize| plan[a..b].iter().filter(|f| f.enabled).count();
@@ -1597,8 +1598,8 @@ impl Stack {
             let mk = |sp: &'a RgbaImage, x: i64, y: i64, alpha: f32| GpuOp::Draw(GpuDraw { src: GpuSrc::Img(sp), m: place(sp, x, y), opacity: alpha * k });
             match &l.kind {
                 LayerKind::Effects(fx) => {
-                    // as render_frame: the clip's own frame count and time
-                    let (s0, s1) = l.timing.clip_at(i, n).filter(|_| l.timing.clips.is_some()).unwrap_or((0, n.saturating_sub(1)));
+                    // as render_frame: from the layer's first frame to its last
+                    let (s0, s1) = l.timing.extent(n);
                     let shown = |a: usize, b: usize| plan[a..b].iter().filter(|f| f.enabled).count();
                     let end_t = times[s1] + if plan[s1].enabled { effective_delay(plan[s1].delay) as f32 / 100.0 } else { 0.0 };
                     let mut pl = crate::gpu_fx::Plan::new(cur, &mut owned);

@@ -930,6 +930,8 @@ pub struct GifKitApp {
     /// the menu bar, where clicks don't change what Copy and Paste work on
     menubar_rect: Rect,
     tl_extend: usize,
+    /// a layer clip dragged over others: the edge it goes in at
+    tl_layer_drop: Option<usize>,
     /// what making the GIF longer adds
     tl_extend_mode: timeline_ui::Extend,
     /// asking whether to save first, and what to do after
@@ -2707,6 +2709,7 @@ impl GifKitApp {
             tl_head_drag: false,
             tl_reorder: None,
             tl_extend: 0,
+            tl_layer_drop: None,
             menubar_rect: Rect::NOTHING,
             tl_extend_mode: timeline_ui::Extend::load(),
             confirm: None,

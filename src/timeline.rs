@@ -178,8 +178,15 @@ impl Timing {
     }
 
     /// The clip frame `i` falls in, as (first, last).
-    pub fn clip_at(&self, i: usize, n: usize) -> Option<(usize, usize)> {
-        self.spans(n).into_iter().find(|(a, b)| i >= *a && i <= *b)
+    /// From the first frame it shows to the last, across all its clips:
+    /// what intros, outros and loops run over, so moving clips about never
+    /// carries a fade into the middle.
+    pub fn extent(&self, n: usize) -> (usize, usize) {
+        let sp = self.spans(n);
+        match (sp.first(), sp.iter().map(|s| s.1).max()) {
+            (Some(f), Some(l)) => (f.0, l),
+            _ => (0, n.saturating_sub(1)),
+        }
     }
 
     pub fn motion(&self, i: usize) -> Motion {
@@ -396,7 +403,7 @@ mod tests {
         assert!(t.shows(3, 10) && !t.shows(5, 10) && t.shows(9, 10));
         assert!(t.split(8, 10));
         assert_eq!(t.spans(10), vec![(2, 4), (7, 7), (8, 9)]);
-        assert_eq!(t.clip_at(8, 10), Some((8, 9)));
+        assert_eq!(t.spans(10).into_iter().find(|(a, b)| 8 >= *a && 8 <= *b), Some((8, 9)));
     }
 
     #[test]
