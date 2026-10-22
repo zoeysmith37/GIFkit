@@ -944,6 +944,21 @@ fn gpu_matches_cpu() {
     cases.push(("fade effect", Transform::default(), vec![fx(&|e| (e.negative, e.rot90) = (true, false))], vec![crate::timeline::Key { x: 0.0, y: 0.0, scale_x: 100.0, scale_y: 100.0, angle: 0.0, ..mk }]));
     cases.push(("censor moved", Transform::default(), vec![cen(crate::effects::CensorMethod::Pixelate, 10.0)], vec![crate::timeline::Key { opacity: 100.0, ..mk }]));
     cases.push(("fx + turn frame", t(&|t| (t.rot_on, t.rot_any, t.rot_deg) = (true, true, 20.0)), vec![fx(&|e| (e.oil, e.frame_fuzzy) = (true, true))], vec![]));
+    // clipping: layers whose name ends in '^' are clipped to the one below
+    let clip_cases: Vec<(&str, Vec<(LayerKind, bool)>)> = vec![
+        ("clip fx to text", vec![(LayerKind::Text(text.clone()), false), (fx(&|e| e.negative = true), true)]),
+        ("clip glow to shape", vec![(LayerKind::Shape(Box::new(shape.clone())), false), (fx(&|e| e.looks = vec![crate::booth::BoothItem { fx: BoothFx::Glow, amount: 80.0, ..Default::default() }]), true)]),
+        ("clip shape to emoji", vec![(LayerKind::Emoji(Box::new(emoji.clone())), false), (LayerKind::Shape(Box::new(shape.clone())), true)]),
+        ("clip two to text", vec![(LayerKind::Text(text.clone()), false), (fx(&|e| e.grayscale = true), true), (LayerKind::Shape(Box::new(shape.clone())), true)]),
+        ("clip to effect", vec![(fx(&|e| e.sepia = true), false), (fx(&|e| e.negative = true), true)]),
+        ("clip fx to overlay", vec![(overlay.clone(), false), (fx(&|e| e.blur = true), true)]),
+        ("clip then unclipped", vec![(LayerKind::Text(text.clone()), false), (fx(&|e| e.negative = true), true), (LayerKind::Emoji(Box::new(emoji.clone())), false)]),
+    ];
+    for (nm, ls) in clip_cases {
+        let clips: Vec<bool> = ls.iter().map(|l| l.1).collect();
+        let kinds: Vec<LayerKind> = ls.into_iter().map(|l| l.0).collect();
+        cases.push((Box::leak(format!("{nm}^{}", clips.iter().map(|c| if *c { '1' } else { '0' }).collect::<String>()).into_boxed_str()), Transform::default(), kinds, vec![]));
+    }
     let only = std::env::var("GPU_ONLY").ok();
     for (ci, (name, tr, ls, keys)) in cases.into_iter().enumerate() {
         if let Some(o) = &only {
@@ -953,11 +968,14 @@ fn gpu_matches_cpu() {
         }
         let mut st = Stack::default();
         st.transform = tr;
-        for k in ls {
-            let id = st.push(k);
+        let clips: Vec<bool> = name.rsplit_once('^').map(|(_, c)| c.chars().map(|c| c == '1').collect()).unwrap_or_default();
+        for (k, kind) in ls.into_iter().enumerate() {
+            let id = st.push(kind);
+            let l = st.layers.iter_mut().find(|l| l.id == id).unwrap();
             if !keys.is_empty() {
-                st.layers.iter_mut().find(|l| l.id == id).unwrap().timing.keys = keys.clone();
+                l.timing.keys = keys.clone();
             }
+            l.clip = clips.get(k).copied().unwrap_or(false);
         }
         st.layout_text(160, 120, &fonts);
         let plan = st.plan(&base);
@@ -1149,7 +1167,7 @@ fn clipping_mask() {
     assert_ne!(free.get_pixel(2, 2).0, [200, 40, 40, 255]);
     // inside: inverted like the unclipped effect
     assert_eq!(clipped.get_pixel(30, 20).0, free.get_pixel(30, 20).0);
-    assert!(st.gpu_frame(&base, &plan, &times, 0, &fonts, &st.prepare(&base, &fonts)).is_none());
+    assert!(st.gpu_frame(&base, &plan, &times, 0, &fonts, &st.prepare(&base, &fonts)).is_some());
 }
 
 /// Every look, style and filter across its strength range, on both paths:

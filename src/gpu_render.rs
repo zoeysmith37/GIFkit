@@ -98,6 +98,12 @@ pub struct GpuPass<'a> {
 pub enum GpuOp<'a> {
     Draw(GpuDraw<'a>),
     Effect { passes: Vec<GpuPass<'a>>, mix: f32 },
+    /// a clipping base's coverage: these draws alone, kept as mask `slot`
+    Mask { draws: Vec<GpuDraw<'a>>, slot: usize },
+    /// a clipped layer starts: the frame as it is now is kept
+    ClipBegin,
+    /// and ends: its result shows only where mask `slot` is
+    ClipEnd { slot: usize },
 }
 
 /// Everything needed to make one output frame.
@@ -120,11 +126,14 @@ impl GpuFrame<'_> {
         if !ok(self.size.0, self.size.1) || !img_ok(src) || self.geo.resize.is_some_and(|r| !ok(r.size.0, r.size.1)) || !self.owned.iter().all(img_ok) {
             return false;
         }
+        let draw_ok = |d: &GpuDraw| match d.src {
+            GpuSrc::Img(i) => img_ok(i),
+            GpuSrc::Solid(..) => true,
+        };
         self.ops.iter().all(|op| match op {
-            GpuOp::Draw(d) => match d.src {
-                GpuSrc::Img(i) => img_ok(i),
-                GpuSrc::Solid(..) => true,
-            },
+            GpuOp::Draw(d) => draw_ok(d),
+            GpuOp::Mask { draws, .. } => draws.iter().all(draw_ok),
+            GpuOp::ClipBegin | GpuOp::ClipEnd { .. } => true,
             GpuOp::Effect { passes, .. } => passes.iter().all(|p| ok(p.size.0, p.size.1) && p.ins.iter().all(|i| !matches!(i, Some(GpuIn::Img(i)) if !img_ok(i)))),
         })
     }
@@ -460,6 +469,29 @@ impl GpuRenderer {
     }
 
     /// Draw `quads` over `target` (kept, not cleared).
+    /// The bind group that draws `d` onto a frame of `size`.
+    fn quad(&mut self, d: &GpuDraw, size: (u32, u32), sprite_gen: u64) -> wgpu::BindGroup {
+        let inv = d.m.inverse();
+        let foot = footprint(&inv);
+        let (view, sz, col, solid) = match d.src {
+            GpuSrc::Img(img) => (self.sprite_view(img, sprite_gen), (img.width() as f32, img.height() as f32), [0.0; 4], 0.0),
+            GpuSrc::Solid(c, s) => (self.blank.clone(), s, rgba(c), 1.0),
+        };
+        let (ow, oh) = (size.0 as f32, size.1 as f32);
+        self.bind(&view, &uniform_block(&[[d.m.a, d.m.b, d.m.c, d.m.d], [d.m.tx, d.m.ty, sz.0, sz.1], [inv.a, inv.b, inv.c, inv.d], [inv.tx, inv.ty, ow, oh], col, [d.opacity, solid, foot.0, foot.1]]))
+    }
+
+    /// One effects-shader pass of `op` over `views` into a new picture.
+    fn fx_raw(&self, enc: &mut wgpu::CommandEncoder, op: f32, views: [&wgpu::TextureView; 3], size: (u32, u32), more: &[[f32; 4]]) -> (wgpu::Texture, wgpu::TextureView) {
+        let t = self.target(size.0, size.1, wgpu::TextureFormat::Rgba8Unorm);
+        let v = t.create_view(&Default::default());
+        let mut u = vec![[op, 0.0, size.0 as f32, size.1 as f32]];
+        u.extend_from_slice(more);
+        let b = self.bind3(views, &uniform_block(&u));
+        self.pass(enc, &v, &self.fx, &b);
+        (t, v)
+    }
+
     fn draw_quads(&self, enc: &mut wgpu::CommandEncoder, target: &wgpu::TextureView, quads: &[wgpu::BindGroup]) {
         if quads.is_empty() {
             return;
@@ -556,17 +588,41 @@ impl GpuRenderer {
         // the result is already straight (an effect came last)
         let mut out_straight = straight_first && f.ops.is_empty();
         let u8f = wgpu::TextureFormat::Rgba8Unorm;
+        // clipping: bases' coverage, and the frame as it was before each clipped layer
+        let mut masks: HashMap<usize, (wgpu::TextureView, (u32, u32))> = HashMap::new();
+        let mut kept: Vec<(wgpu::TextureView, (u32, u32))> = Vec::new();
         for op in &f.ops {
             match op {
                 GpuOp::Draw(d) => {
-                    let inv = d.m.inverse();
-                    let foot = footprint(&inv);
-                    let (view, size, col, solid) = match d.src {
-                        GpuSrc::Img(img) => (self.sprite_view(img, sprite_gen), (img.width() as f32, img.height() as f32), [0.0; 4], 0.0),
-                        GpuSrc::Solid(c, s) => (self.blank.clone(), s, rgba(c), 1.0),
-                    };
-                    let (ow, oh) = (cur_size.0 as f32, cur_size.1 as f32);
-                    quads.push(self.bind(&view, &uniform_block(&[[d.m.a, d.m.b, d.m.c, d.m.d], [d.m.tx, d.m.ty, size.0, size.1], [inv.a, inv.b, inv.c, inv.d], [inv.tx, inv.ty, ow, oh], col, [d.opacity, solid, foot.0, foot.1]])));
+                    let q = self.quad(d, cur_size, sprite_gen);
+                    quads.push(q);
+                }
+                GpuOp::Mask { draws, slot } => {
+                    let t = self.target(cur_size.0, cur_size.1, u8f);
+                    let v = t.create_view(&Default::default());
+                    // a clear pass, then the base's draws alone
+                    let b = self.bind3([&self.blank, &self.blank, &self.blank], &uniform_block(&[[53.0, 0.0, cur_size.0 as f32, cur_size.1 as f32]]));
+                    self.pass(&mut enc, &v, &self.fx, &b);
+                    let qs: Vec<wgpu::BindGroup> = draws.iter().map(|d| self.quad(d, cur_size, sprite_gen)).collect();
+                    self.draw_quads(&mut enc, &v, &qs);
+                    masks.insert(*slot, (v, cur_size));
+                }
+                GpuOp::ClipBegin => {
+                    self.draw_quads(&mut enc, &cur_view, &quads);
+                    quads.clear();
+                    let (_, v) = self.fx_raw(&mut enc, 0.0, [&cur_view, &self.blank, &self.blank], cur_size, &[]);
+                    kept.push((v, cur_size));
+                }
+                GpuOp::ClipEnd { slot } => {
+                    self.draw_quads(&mut enc, &cur_view, &quads);
+                    quads.clear();
+                    let before = kept.pop();
+                    if let (Some((bv, bs)), Some((mv, ms))) = (before, masks.get(slot)) {
+                        // as the CPU: only when nothing changed the frame's size
+                        if bs == cur_size && *ms == cur_size {
+                            (cur_tex, cur_view) = self.fx_raw(&mut enc, 52.0, [&cur_view, &bv, mv], cur_size, &[]);
+                        }
+                    }
                 }
                 GpuOp::Effect { passes, mix } => {
                     self.draw_quads(&mut enc, &cur_view, &quads);

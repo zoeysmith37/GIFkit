@@ -451,6 +451,17 @@ fn cover(kind: i32, x: f32, y: f32) -> f32 {
     return (a.x - (y % a.y)) / 1.5;
 }
 
+// a premultiplied pixel as straight 0..255, rounded as op 1 does it
+fn unpremul8(v: vec4<f32>) -> vec4<f32> {
+    let q = rnd4(v * 255.0);
+    if (q.a <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    let qa = u32(q.a);
+    let un = (vec3<u32>(q.rgb) * 255u + vec3<u32>(qa / 2u)) / vec3<u32>(qa);
+    return vec4<f32>(min(vec3<f32>(un), vec3<f32>(255.0)), q.a);
+}
+
 @fragment
 fn fs_fx(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let ip = vec2<i32>(pos.xy);
@@ -1077,6 +1088,19 @@ fn fs_fx(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             }
             let sq = i32(c.z);
             return textureLoad(t1, (ip - vec2<i32>(i32(a.x), i32(a.y))) / sq, 0);
+        }
+        // 52 a clipped layer (t0, premultiplied) shown only where the mask
+        // (t2's alpha) is, over the frame before it (t1), mixed straight
+        case 52: {
+            let qs = unpremul8(textureLoad(t0, ip, 0));
+            let ps = unpremul8(textureLoad(t1, ip, 0));
+            let m = round(textureLoad(t2, ip, 0).a * 255.0) / 255.0;
+            let o = rnd4(ps + (qs - ps) * m);
+            return vec4<f32>(rnd4(vec4<f32>(o.rgb * o.a / 255.0, o.a))) / 255.0;
+        }
+        // 53 clear to transparent
+        case 53: {
+            return vec4<f32>(0.0);
         }
         default: {
             return textureLoad(t0, ip, 0);

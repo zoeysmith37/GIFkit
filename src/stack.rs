@@ -1355,13 +1355,9 @@ pub fn frame_at_time(a: &Animation, t: f32) -> usize {
 impl Stack {
     /// Every layer is one the graphics card can draw.
     pub fn gpu_capable(&self) -> bool {
-        !self.layers.iter().any(|l| l.active() && matches!(&l.kind, LayerKind::Effects(fx) if !crate::gpu_fx::effects_ok(fx))) && !self.has_clipping()
+        !self.layers.iter().any(|l| l.active() && matches!(&l.kind, LayerKind::Effects(fx) if !crate::gpu_fx::effects_ok(fx)))
     }
 
-    /// Is any showing layer clipped to one below it? (CPU only for now)
-    pub fn has_clipping(&self) -> bool {
-        self.layers.iter().enumerate().any(|(li, l)| l.clip && l.active() && li > 0)
-    }
 
     /// Frame `i` as work for the graphics card, or None when something in
     /// it only renders on the CPU (then the whole frame does, so it never
@@ -1369,7 +1365,7 @@ impl Stack {
     pub fn gpu_frame<'a>(&'a self, base: &Animation, plan: &[PlanFrame], times: &[f32], i: usize, fonts: &[FontEntry], prep: &'a Prepared) -> Option<crate::gpu_render::GpuFrame<'a>> {
         use crate::geo::Affine;
         use crate::gpu_render::{GpuDraw, GpuFrame, GpuGeo, GpuOp, GpuSrc};
-        if !prep.fits(self) || self.has_clipping() {
+        if !prep.fits(self) {
             return None;
         }
         let n = plan.len();
@@ -1458,13 +1454,58 @@ impl Stack {
         let mut cur = (ow, oh);
         // the slow passes' work so far (see gpu_fx::MAX_COST)
         let mut cost = 0.0f64;
+        // clipping, as render_frame: each clipped layer's base, and the bases
+        // that drew here (their coverage is the mask)
+        let mut base_of: Vec<Option<usize>> = vec![None; self.layers.len()];
+        let mut last = None;
         for (li, l) in self.layers.iter().enumerate() {
+            if l.clip {
+                base_of[li] = last;
+            } else {
+                last = Some(li);
+            }
+        }
+        let has_clips = |li: usize| self.layers.get(li + 1).is_some_and(|l| l.clip);
+        let mut masked = vec![false; self.layers.len()];
+        // a clipped layer's ops to close, or a base's draws to make a mask of
+        let mut open_clip: Option<usize> = None;
+        let mut mask_from: Option<(usize, usize)> = None;
+        let close = |draws: &mut Vec<GpuOp<'a>>, open_clip: &mut Option<usize>, mask_from: &mut Option<(usize, usize)>, masked: &mut Vec<bool>| {
+            if let Some(b) = open_clip.take() {
+                draws.push(GpuOp::ClipEnd { slot: b });
+            }
+            if let Some((b, from)) = mask_from.take() {
+                let ds: Vec<GpuDraw<'a>> = draws[from..].iter().filter_map(|o| if let GpuOp::Draw(d) = o { Some(*d) } else { None }).collect();
+                draws.push(GpuOp::Mask { draws: ds, slot: b });
+                masked[b] = true;
+            }
+        };
+        for (li, l) in self.layers.iter().enumerate() {
+            close(&mut draws, &mut open_clip, &mut mask_from, &mut masked);
             if !l.active() || !l.timing.shows(i, n) {
                 continue;
             }
             let mo = l.motion(i);
             if mo.opacity <= 0.001 {
                 continue;
+            }
+            match base_of[li].filter(|_| l.clip) {
+                Some(b) if masked[b] => {
+                    draws.push(GpuOp::ClipBegin);
+                    open_clip = Some(b);
+                }
+                // a base that doesn't draw here hides it; one that works on
+                // the whole frame (an effect) leaves it unclipped
+                Some(b) => {
+                    if !(self.layer_shows(b, i, n) && !Self::coverage_kind(&self.layers[b].kind)) {
+                        continue;
+                    }
+                }
+                None => {
+                    if has_clips(li) && Self::coverage_kind(&l.kind) {
+                        mask_from = Some((li, draws.len()));
+                    }
+                }
             }
             let m = &prep.maps[li].m;
             // a sprite at (x, y), moved the way `transform_sprite` moves it
@@ -1588,6 +1629,7 @@ impl Stack {
                 }
             }
         }
+        close(&mut draws, &mut open_clip, &mut mask_from, &mut masked);
         Some(GpuFrame { size: (ow, oh), geo, ops: draws, owned })
     }
 }
