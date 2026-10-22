@@ -3486,7 +3486,7 @@ impl GifKitApp {
                     });
                 });
                 ui.add_space(8.0);
-                ui.label("A GIF editor and optimiser that runs on your own machine.");
+                ui.label("A GIF editor and optimiser");
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
                     if ui.link("GitHub").clicked() {
@@ -5688,7 +5688,7 @@ impl GifKitApp {
             });
             top_menu(ui, "&Settings", |ui| {
                 ui.set_min_width(290.0);
-                if menu_item_tip(ui, "", "&ffmpeg…", "", true, "Where GIFkit finds ffmpeg, for video and AVIF") {
+                if menu_item_tip(ui, "", "Configure &ffmpeg…", "", true, "Where GIFkit finds ffmpeg, for video and AVIF") {
                     self.ff_msg = None;
                     self.ff_open = true;
                 }
@@ -5788,7 +5788,7 @@ impl GifKitApp {
             });
             top_menu(ui, "&Help", |ui| {
                 ui.set_min_width(250.0);
-                if menu_item(ui, "help-contents", "GIFkit &Handbook", &self.keymap.text(crate::keys::Action::Handbook), true) {
+                if menu_item(ui, "help-contents", "GIFkit &Readme", &self.keymap.text(crate::keys::Action::Handbook), true) {
                     open_external(&format!("{REPO_URL}#readme"));
                 }
                 ui.separator();
@@ -6155,7 +6155,6 @@ impl GifKitApp {
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut filter).hint_text("Search shortcuts").desired_width(220.0));
                 ui.add_space(8.0);
-                hint(ui, "Click a shortcut, then press the new keys. Backspace clears it.");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Reset All").clicked() {
                         reset_all = true;
@@ -6166,14 +6165,14 @@ impl GifKitApp {
             let q = filter.trim().to_lowercase();
             let hit = |a: Action| q.is_empty() || a.label().to_lowercase().contains(&q) || a.group().to_lowercase().contains(&q) || km.get(a).map(|b| b.text().to_lowercase().contains(&q)).unwrap_or(false);
             const FIXED: [(&str, &str); 10] = [
-                ("Ctrl+V", "Paste files or a picture. With an animation open it becomes an image layer."),
-                ("Alt+letter", "Open a menu by its underlined letter"),
+                ("Ctrl+V", "Paste files or pictures"),
+                ("Alt+letter", "Open a menu"),
                 ("Mouse wheel", "Zoom"),
                 ("Middle or right drag", "Pan"),
                 ("Alt+drag", "Pan in drawing tools"),
                 ("Shift+drag", "Move in straight lines"),
-                ("Shift while resizing", "Keep or free the proportions"),
-                ("Ctrl while resizing", "Scale one way. Edge handles stretch one side."),
+                ("Shift while resizing", "Keep or free proportions"),
+                ("Ctrl while resizing", "Scale in one direction"),
                 ("Ctrl+wheel", "Zoom the timeline"),
                 ("Shift+wheel", "Scroll the timeline sideways"),
             ];
@@ -10133,7 +10132,6 @@ impl GifKitApp {
         };
         let before = c.clone();
         if sel.is_none() {
-            hint(ui, "Drag on the image to draw a region. Changing a setting adds one in the middle.");
             ui.add_space(6.0);
         }
         group(ui, "Method", |ui| {
@@ -10186,7 +10184,6 @@ impl GifKitApp {
         let o: &mut OverlayLayer = match sel.map(|i| &mut self.stack.layers[i].kind) {
             Some(LayerKind::Overlay(o)) => o,
             _ => {
-                hint(ui, "Add a PNG, GIF, JPG or WebP. You can also drop one on the window.");
                 ui.add_space(6.0);
                 let src = OverlaySource { name: String::new(), path: None, delays: vec![10], frames: vec![RgbaImage::new(1, 1)] };
                 dummy = Some(OverlayLayer { src: Arc::new(src), placements: vec![Placement { enabled: true, x: 0, y: 0, w: 1, h: 1, angle: 0.0 }], opacity: 100.0 });
@@ -10277,10 +10274,6 @@ impl GifKitApp {
             _ => self.wm_tpl.clone(),
         };
         let before = w.clone();
-        if sel.is_none() {
-            hint(ui, "Changing anything adds a watermark layer");
-            ui.add_space(6.0);
-        }
         let mut browse = false;
         group(ui, "Content", |ui| {
             form_row(ui, "Show", |ui| seg_row(ui, &mut w.use_image, &[(false, "Text"), (true, "Image")]));
@@ -10415,7 +10408,6 @@ impl GifKitApp {
             s.add_layer(LayerKind::Shape(Box::new(sh)));
         });
         if sel.is_none() {
-            hint(ui, "Pick a shape and style, then drag on the image to draw it");
             ui.add_space(6.0);
         }
         // edit the selected shape, or the style of the next one
@@ -10786,12 +10778,6 @@ impl GifKitApp {
             let sh = s.shield_tpl.clone();
             s.add_layer(LayerKind::Shield(sh));
         });
-        hint(ui, "Faint noise that spoils frames for AI training  ℹ").on_hover_text(
-            "Not a guarantee. Much weaker than Glaze or Nightshade and heavy compression removes some of it. Pair it with the “noai” tag when exporting.",
-        );
-        if sel.is_none() {
-            hint(ui, "Changing anything adds a shield layer");
-        }
         ui.add_space(6.0);
         let mut s = match sel.map(|i| &self.stack.layers[i].kind) {
             Some(LayerKind::Shield(s)) => s.clone(),

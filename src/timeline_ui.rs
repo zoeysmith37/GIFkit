@@ -1020,8 +1020,8 @@ impl GifKitApp {
                     self.paint_gif_thumbs(ctx, &lp, r, ge, n - 1, zoom, fx);
                     lp.rect_filled(r, 3.0, Color32::from_black_alpha(130));
                     lp.rect_stroke(r, 3.0, Stroke::new(1.0, mix(col, Color32::BLACK, 0.3)), egui::StrokeKind::Inside);
-                    if r.width() > 120.0 {
-                        lp.text(pos2(r.min.x.max(lane.min.x) + 8.0, r.center().y), egui::Align2::LEFT_CENTER, "Boomerang: plays the first half back", egui::FontId::proportional(11.0), pal.fg_muted);
+                    if r.width() > 80.0 {
+                        lp.text(pos2(r.min.x.max(lane.min.x) + 8.0, r.center().y), egui::Align2::LEFT_CENTER, "Boomerang", egui::FontId::proportional(11.0), pal.fg_muted);
                     }
                 }
             }
