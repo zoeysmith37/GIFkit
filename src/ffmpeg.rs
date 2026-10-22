@@ -153,14 +153,57 @@ pub fn can_download() -> bool {
     cfg!(windows) || std::env::var_os("GIFKIT_FFMPEG_DL").is_some()
 }
 
-/// A build with everything GIFkit uses (x264, VP9 and AV1). The shared one
-/// is under half the download: ffmpeg and ffprobe share their libraries.
-fn download_url() -> &'static str {
+fn arch() -> &'static str {
     if cfg!(target_arch = "aarch64") {
-        "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-winarm64-gpl-shared.zip"
+        "winarm64"
     } else {
-        "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
+        "win64"
     }
+}
+
+/// Builds with everything GIFkit uses (x264, VP9 and AV1), best first.
+/// The shared ones are under half the download: ffmpeg and ffprobe share
+/// their libraries. The "latest" release is rebuilt every day and its files
+/// go missing for a while, so the current names come from GitHub first.
+fn download_urls() -> Vec<String> {
+    let mut v = Vec::new();
+    if let Ok(o) = crate::io::hidden_cmd("curl")
+        .args(["-sSL", "--max-time", "20", "-A", "GIFkit", "-H", "Accept: application/vnd.github+json", "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest"])
+        .output()
+    {
+        if let Ok(j) = serde_json::from_slice::<serde_json::Value>(&o.stdout) {
+            v.extend(pick_assets(&j, arch()));
+        }
+    }
+    v.push(format!("https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-{}-gpl-shared.zip", arch()));
+    v
+}
+
+/// From a release's file list: the shared GPL builds for `arch`, release
+/// versions first (newest first), then the development one.
+fn pick_assets(j: &serde_json::Value, arch: &str) -> Vec<String> {
+    let tag = format!("-{arch}-gpl-shared");
+    let mut found: Vec<(Vec<u32>, String)> = Vec::new();
+    for a in j["assets"].as_array().into_iter().flatten() {
+        let (Some(name), Some(url)) = (a["name"].as_str(), a["browser_download_url"].as_str()) else { continue };
+        let Some(rest) = name.strip_suffix(".zip").and_then(|n| n.split_once(&tag)).map(|(_, r)| r) else { continue };
+        let ver = match rest {
+            // the development build
+            "" => Vec::new(),
+            r => match r.strip_prefix('-').map(|v| v.split('.').map(|x| x.parse::<u32>()).collect::<Result<Vec<_>, _>>()) {
+                Some(Ok(v)) if !v.is_empty() => v,
+                _ => continue,
+            },
+        };
+        found.push((ver, url.to_string()));
+    }
+    // versions first, highest first; the development build (no version) last
+    found.sort_by(|a, b| match (a.0.is_empty(), b.0.is_empty()) {
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        _ => b.0.cmp(&a.0),
+    });
+    found.into_iter().map(|f| f.1).collect()
 }
 
 /// How a download is going, shared with the window showing it.
@@ -180,7 +223,40 @@ pub fn download(pr: Arc<Progress>) -> anyhow::Result<PathBuf> {
     let dir = own_dir().context("no folder to put ffmpeg in (LOCALAPPDATA isn't set)")?;
     std::fs::create_dir_all(&dir).with_context(|| format!("couldn't make {}", dir.display()))?;
     let zip_path = dir.join("download.zip");
-    let url = download_url();
+    let mut last = anyhow::anyhow!("no download found");
+    let mut done = false;
+    for url in download_urls() {
+        match fetch(&url, &zip_path, &pr) {
+            Ok(()) => {
+                done = true;
+                break;
+            }
+            Err(e) => {
+                if pr.cancel.load(Ordering::Relaxed) {
+                    return Err(e);
+                }
+                last = e;
+            }
+        }
+    }
+    if !done {
+        return Err(last);
+    }
+    pr.unpacking.store(true, Ordering::Relaxed);
+    let unpacked = unpack(&zip_path, &dir);
+    let _ = std::fs::remove_file(&zip_path);
+    unpacked?;
+    let exe = dir.join(EXE);
+    anyhow::ensure!(works(&exe), "ffmpeg was downloaded but doesn't run");
+    recheck();
+    Ok(exe)
+}
+
+/// Download `url` to `to` with curl, keeping `pr` up to date.
+fn fetch(url: &str, to: &Path, pr: &Progress) -> anyhow::Result<()> {
+    use anyhow::Context;
+    pr.got.store(0, Ordering::Relaxed);
+    pr.total.store(0, Ordering::Relaxed);
     // the size, for the progress bar (the last length after redirects)
     if let Ok(o) = crate::io::hidden_cmd("curl").args(["-sIL", "--max-time", "20", url]).output() {
         let head = String::from_utf8_lossy(&o.stdout);
@@ -189,8 +265,8 @@ pub fn download(pr: Arc<Progress>) -> anyhow::Result<PathBuf> {
         }
     }
     let mut child = crate::io::hidden_cmd("curl")
-        .args(["-sSL", "--fail", "--retry", "2", "-A", "GIFkit", "-o"])
-        .arg(&zip_path)
+        .args(["-sSL", "--fail", "--retry", "3", "--retry-delay", "2", "-A", "GIFkit", "-o"])
+        .arg(to)
         .arg(url)
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -199,10 +275,10 @@ pub fn download(pr: Arc<Progress>) -> anyhow::Result<PathBuf> {
         if pr.cancel.load(Ordering::Relaxed) {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = std::fs::remove_file(&zip_path);
+            let _ = std::fs::remove_file(to);
             anyhow::bail!("Download cancelled");
         }
-        if let Ok(m) = std::fs::metadata(&zip_path) {
+        if let Ok(m) = std::fs::metadata(to) {
             pr.got.store(m.len(), Ordering::Relaxed);
         }
         if let Some(s) = child.try_wait()? {
@@ -216,17 +292,10 @@ pub fn download(pr: Arc<Progress>) -> anyhow::Result<PathBuf> {
             use std::io::Read;
             let _ = e.read_to_string(&mut err);
         }
-        let _ = std::fs::remove_file(&zip_path);
+        let _ = std::fs::remove_file(to);
         anyhow::bail!("The download failed{}", err.lines().last().map(|l| format!(": {l}")).unwrap_or_default());
     }
-    pr.unpacking.store(true, Ordering::Relaxed);
-    let unpacked = unpack(&zip_path, &dir);
-    let _ = std::fs::remove_file(&zip_path);
-    unpacked?;
-    let exe = dir.join(EXE);
-    anyhow::ensure!(works(&exe), "ffmpeg was downloaded but doesn't run");
-    recheck();
-    Ok(exe)
+    Ok(())
 }
 
 /// Take the build's bin folder out of its zip: ffmpeg, ffprobe and the
@@ -288,6 +357,21 @@ pub fn install_hint() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn picks_builds() {
+        let j: serde_json::Value = serde_json::from_str(r#"{"assets":[
+            {"name":"ffmpeg-N-1-gabc-win64-gpl-shared.zip","browser_download_url":"u/master"},
+            {"name":"ffmpeg-N-1-gabc-win64-gpl.zip","browser_download_url":"u/static"},
+            {"name":"ffmpeg-n8.1.3-1-gabc-win64-gpl-shared-8.1.zip","browser_download_url":"u/8.1"},
+            {"name":"ffmpeg-n9.0.2-33-g4cf-win64-gpl-shared-9.0.zip","browser_download_url":"u/9.0"},
+            {"name":"ffmpeg-n9.0.2-33-g4cf-win64-lgpl-shared-9.0.zip","browser_download_url":"u/lgpl"},
+            {"name":"ffmpeg-n9.0.2-33-g4cf-winarm64-gpl-shared-9.0.zip","browser_download_url":"u/arm"},
+            {"name":"ffmpeg-N-1-gabc-linux64-gpl-shared.tar.xz","browser_download_url":"u/linux"}]}"#).unwrap();
+        assert_eq!(super::pick_assets(&j, "win64"), ["u/9.0", "u/8.1", "u/master"]);
+        assert_eq!(super::pick_assets(&j, "winarm64"), ["u/arm"]);
+        assert!(super::pick_assets(&serde_json::json!({"message": "rate limited"}), "win64").is_empty());
+    }
+
     #[test]
     fn unpacks_bin_only() {
         let dir = std::env::temp_dir().join(format!("gifkit-fftest-{}", std::process::id()));

@@ -2427,7 +2427,13 @@ fn mnemonic_pressed(ui: &egui::Ui, key: Option<egui::Key>) -> bool {
 /// A dialog in a window of its own, as KDE dialogs are, centred over the main
 /// window the first time it opens. Sets `open` to false when the user closes
 /// it from the title bar or with Esc.
-fn dialog(ctx: &egui::Context, id: &str, title: &str, size: Vec2, resizable: bool, open: &mut bool, mut add: impl FnMut(&mut egui::Ui)) {
+fn dialog(ctx: &egui::Context, id: &str, title: &str, size: Vec2, resizable: bool, open: &mut bool, add: impl FnMut(&mut egui::Ui)) {
+    dialog_ex(ctx, id, title, size, resizable, false, open, add)
+}
+
+/// `dialog`, optionally kept above other windows.
+#[allow(clippy::too_many_arguments)]
+fn dialog_ex(ctx: &egui::Context, id: &str, title: &str, size: Vec2, resizable: bool, on_top: bool, open: &mut bool, mut add: impl FnMut(&mut egui::Ui)) {
     let pal = *p();
     let vid = egui::ViewportId::from_hash_of(("gifkit-dialog", id));
     let pos_id = egui::Id::unique(("dialog-pos", id));
@@ -2440,6 +2446,9 @@ fn dialog(ctx: &egui::Context, id: &str, title: &str, size: Vec2, resizable: boo
     let mut b = egui::ViewportBuilder::default().with_title(title).with_app_id("gifkit").with_inner_size(size).with_resizable(resizable).with_minimize_button(false).with_active(true);
     if !resizable {
         b = b.with_maximize_button(false);
+    }
+    if on_top {
+        b = b.with_window_level(egui::WindowLevel::AlwaysOnTop);
     }
     if let Some(pos) = pos {
         b = b.with_position(pos);
@@ -2473,6 +2482,42 @@ fn dialog(ctx: &egui::Context, id: &str, title: &str, size: Vec2, resizable: boo
     if close {
         *open = false;
         ctx.data_mut(|d| d.remove::<Pos2>(pos_id));
+    }
+}
+
+/// A Breeze progress bar: a thin rounded groove filled with the highlight,
+/// its text above it. `None` for an unknown amount (a sliding piece).
+fn breeze_progress(ui: &mut egui::Ui, frac: Option<f32>, text: &str) {
+    let pal = *p();
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(text).color(pal.fg));
+        if let Some(f) = frac {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(format!("{:.0}%", f.clamp(0.0, 1.0) * 100.0)).color(pal.fg_muted));
+            });
+        }
+    });
+    ui.add_space(2.0);
+    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 6.0), Sense::hover());
+    let painter = ui.painter();
+    painter.rect(r, 3.0, mix(pal.view, pal.fg, 0.12), Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
+    match frac {
+        Some(f) => {
+            let w = r.width() * f.clamp(0.0, 1.0);
+            if w > 0.5 {
+                painter.rect_filled(Rect::from_min_size(r.min, vec2(w.max(6.0), r.height())), 3.0, pal.highlight);
+            }
+        }
+        None => {
+            // a piece a quarter long, going back and forth
+            let t = ui.input(|i| i.time) as f32;
+            let k = (t * 0.8).fract();
+            let k = if k < 0.5 { k * 2.0 } else { 2.0 - k * 2.0 };
+            let w = r.width() * 0.25;
+            let x = r.min.x + (r.width() - w) * k;
+            painter.rect_filled(Rect::from_min_size(pos2(x, r.min.y), vec2(w, r.height())), 3.0, pal.highlight);
+            ui.ctx().request_repaint();
+        }
     }
 }
 
@@ -3483,7 +3528,12 @@ impl GifKitApp {
         let found = crate::ffmpeg::path().filter(|_| self.ffmpeg);
         let job = self.ff_job.as_ref().map(|(pr, _)| pr.clone());
         let msg = self.ff_msg.clone();
-        dialog(ctx, "ffmpeg", "ffmpeg", vec2(470.0, 330.0), false, &mut open, |ui| {
+        // after the main window is up, so it isn't lost behind it
+        if ctx.cumulative_frame_nr() < 3 {
+            ctx.request_repaint();
+            return;
+        }
+        dialog_ex(ctx, "ffmpeg", "ffmpeg", vec2(470.0, 280.0), false, true, &mut open, |ui| {
             ui.set_width(440.0);
             let big = |ui: &mut egui::Ui, t: &str| ui.label(RichText::new(t).font(theme::medium(16.0)).color(pal.fg));
             if let Some(pr) = &job {
@@ -3492,11 +3542,11 @@ impl GifKitApp {
                 let (got, total) = (pr.got.load(std::sync::atomic::Ordering::Relaxed), pr.total.load(std::sync::atomic::Ordering::Relaxed));
                 let mb = |b: u64| b as f32 / 1_048_576.0;
                 if pr.unpacking.load(std::sync::atomic::Ordering::Relaxed) {
-                    ui.add(egui::ProgressBar::new(1.0).text("Unpacking…"));
+                    breeze_progress(ui, None, "Unpacking…");
                 } else if total > 0 {
-                    ui.add(egui::ProgressBar::new((got as f32 / total as f32).min(1.0)).text(format!("{:.0} of {:.0} MB", mb(got), mb(total))));
+                    breeze_progress(ui, Some(got as f32 / total as f32), &format!("{:.0} of {:.0} MB", mb(got), mb(total)));
                 } else {
-                    ui.add(egui::ProgressBar::new(0.0).animate(true).text(format!("{:.0} MB", mb(got))));
+                    breeze_progress(ui, None, &format!("{:.0} MB", mb(got)));
                 }
                 ui.add_space(4.0);
                 if let Some(d) = crate::ffmpeg::own_dir() {
@@ -3518,16 +3568,15 @@ impl GifKitApp {
             } else {
                 big(ui, "ffmpeg wasn't found");
                 ui.add_space(6.0);
-                ui.label("GIFkit uses ffmpeg to open videos and to save MP4, WebM and AVIF. Everything else works without it.");
+                ui.label("GIFkit uses ffmpeg to open videos and to save MP4, WebM and AVIF.");
                 ui.add_space(10.0);
                 if crate::ffmpeg::can_download() {
                     download = ui.add(egui::Button::new("Download ffmpeg").stroke(Stroke::new(1.0, pal.highlight)).min_size(vec2(0.0, 28.0))).clicked();
-                    if let Some(d) = crate::ffmpeg::own_dir() {
-                        hint(ui, &format!("About 90 MB from the FFmpeg builds on GitHub, kept in {}. Nothing else on your computer changes.", d.display()));
-                    }
                     ui.add_space(10.0);
                 }
-                ui.label("Already have it, or rather install it yourself?");
+                // the tool the command uses, past any sudo
+                let tool = crate::ffmpeg::install_hint().split_whitespace().find(|w| *w != "sudo").unwrap_or("");
+                ui.label(format!("Install via terminal ({tool}):"));
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
                     let cmd = crate::ffmpeg::install_hint();
