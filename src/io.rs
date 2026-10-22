@@ -799,6 +799,11 @@ impl Default for WebpOptions {
 
 /// Encode an animated WebP (libwebp). Delays are kept exactly.
 pub fn encode_webp(anim: &Animation, o: &WebpOptions) -> Result<Vec<u8>> {
+    encode_webp_stoppable(anim, o, None)
+}
+
+/// `encode_webp` that gives way to the user and can be stopped between frames.
+pub fn encode_webp_stoppable(anim: &Animation, o: &WebpOptions, stop: Option<&std::sync::atomic::AtomicUsize>) -> Result<Vec<u8>> {
     use webp_animation::{AnimParams, Encoder, EncoderOptions, EncodingConfig, EncodingType};
     let frames = anim.enabled_frames();
     anyhow::ensure!(!frames.is_empty(), "No enabled frames");
@@ -821,6 +826,8 @@ pub fn encode_webp(anim: &Animation, o: &WebpOptions) -> Result<Vec<u8>> {
     let mut enc = Encoder::new_with_options((w, h), opts).map_err(|e| anyhow::anyhow!("WebP: {e:?}"))?;
     let mut t = 0i32;
     for f in &frames {
+        crate::stack::yield_to_foreground(stop);
+        anyhow::ensure!(!crate::stack::stopped(stop), "Stopped");
         enc.add_frame(f.image.as_raw(), t).map_err(|e| anyhow::anyhow!("WebP frame: {e:?}"))?;
         t += crate::anim::effective_delay(f.delay_cs) as i32 * 10;
     }
@@ -845,15 +852,16 @@ pub enum PreviewFormat {
 
 /// Encode `anim` like the real export would, then decode the result so the
 /// preview shows exactly what the file will look like. Returns (decoded, bytes).
-pub fn encode_preview(anim: &Animation, f: &PreviewFormat) -> Result<(Animation, Vec<u8>)> {
+/// GIF and WebP give way to the user and can be stopped between frames.
+pub fn encode_preview(anim: &Animation, f: &PreviewFormat, stop: Option<&std::sync::atomic::AtomicUsize>) -> Result<(Animation, Vec<u8>)> {
     let (w, h) = (anim.width(), anim.height());
     match f {
         PreviewFormat::Gif(o) => {
-            let b = encode_gif(anim, o, None)?;
+            let b = encode_gif(anim, o, stop)?;
             Ok((decode_gif_bytes(&b)?, b))
         }
         PreviewFormat::Webp(o) => {
-            let b = encode_webp(anim, o)?;
+            let b = encode_webp_stoppable(anim, o, stop)?;
             Ok((load_animation_bytes(&b)?, b))
         }
         PreviewFormat::Apng => {

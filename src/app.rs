@@ -320,6 +320,8 @@ const SAMPLE_PIXELS: u64 = 60_000_000;
 struct CmpJob {
     key: u64,
     sheet: bool,
+    /// set to stop it (an edit made it out of date)
+    stop: Arc<AtomicUsize>,
     rx: Receiver<anyhow::Result<(Animation, Vec<u8>, Option<Vec<usize>>, u64, (u32, u32))>>,
 }
 
@@ -5003,15 +5005,29 @@ impl GifKitApp {
     }
 
     fn manage_compare(&mut self, ctx: &egui::Context, now: f64) {
+        // an edit made the running one out of date: stop it rather than let
+        // it finish for nothing while the user works
+        if let Some(j) = &self.cmp_job {
+            if j.key != self.cmp_key() {
+                j.stop.fetch_or(stack::STOP_BIT, Ordering::Relaxed);
+                self.cmp_job = None;
+                if std::env::var_os("GIFKIT_PERF").is_some() {
+                    eprintln!("compress: stopped, out of date");
+                }
+            }
+        }
         if let Some(j) = &self.cmp_job {
             match j.rx.try_recv() {
                 Ok(res) => {
-                    let (key, sheet) = (j.key, j.sheet);
+                    let (key, sheet, j_stop) = (j.key, j.sheet, j.stop.clone());
                     self.cmp_job = None;
                     match res {
                         Ok((anim, bytes, sample, size, full)) => {
                             self.cmp_gen += 1;
                             self.cmp = Some(CmpResult { key, sheet, anim, bytes: Arc::new(bytes), gen: self.cmp_gen, sample, size, full });
+                        }
+                        Err(e) if stack::stopped(Some(&j_stop)) => {
+                            let _ = e;
                         }
                         Err(e) => self.error(format!("Compression preview failed: {e:#}")),
                     }
@@ -5069,7 +5085,7 @@ impl GifKitApp {
                 let _ = tx.send(res);
                 ctx2.request_repaint();
             });
-            self.cmp_job = Some(CmpJob { key, sheet: false, rx });
+            self.cmp_job = Some(CmpJob { key, sheet: false, stop: Arc::new(AtomicUsize::new(0)), rx });
             return;
         }
         let base = self.base.clone().unwrap();
@@ -5098,24 +5114,28 @@ impl GifKitApp {
         });
         let (tx, rx) = channel();
         let ctx2 = ctx.clone();
+        let stop = Arc::new(AtomicUsize::new(0));
+        let stop2 = stop.clone();
         std::thread::spawn(move || {
             stack::lower_thread_priority();
+            let stop = Some(&*stop2);
             let res = stack::bg_pool().install(|| {
                 let t0 = std::time::Instant::now();
                 let out = match &sample {
-                    None => stack.flatten(&base, &fonts, None),
+                    None => stack.flatten(&base, &fonts, stop),
                     Some(idx) => {
                         let plan = stack.plan(&base);
                         let times = stack::plan_times(&plan);
                         let prep = stack.prepare(&base, &fonts);
-                        let frames = stack.render_frames(&base, &plan, &times, idx, &fonts, &prep, None);
+                        let frames = stack.render_frames(&base, &plan, &times, idx, &fonts, &prep, stop);
                         let mut a = Animation { frames, loop_count: stack.loop_count(&base) };
                         crate::effects::normalize_sizes(&mut a);
                         a
                     }
                 };
                 let t1 = t0.elapsed();
-                let (anim, bytes) = io::encode_preview(&out, &pf)?;
+                anyhow::ensure!(!stack::stopped(stop), "Stopped");
+                let (anim, bytes) = io::encode_preview(&out, &pf, stop)?;
                 // shrink big results here, off the UI thread, for the screen
                 let full = (anim.width(), anim.height());
                 let side = full.0.max(full.1);
@@ -5148,7 +5168,7 @@ impl GifKitApp {
             let _ = tx.send(res);
             ctx2.request_repaint();
         });
-        self.cmp_job = Some(CmpJob { key, sheet: is_sheet, rx });
+        self.cmp_job = Some(CmpJob { key, sheet: is_sheet, stop, rx });
     }
 
     fn orig_texture(&mut self, ctx: &egui::Context, i: usize) -> Option<TextureHandle> {
@@ -5251,6 +5271,12 @@ impl eframe::App for GifKitApp {
             }
         }
         let perf_t0 = std::time::Instant::now();
+        stack::mark_ui_thread();
+        // background work gives way while the user is clicking, dragging,
+        // scrolling or typing (and for a moment after)
+        if ctx.input(|i| i.pointer.any_down() || i.events.iter().any(|e| matches!(e, egui::Event::Key { .. } | egui::Event::MouseWheel { .. } | egui::Event::Text(_)))) {
+            stack::foreground_busy(300);
+        }
         theme::refresh(&ctx, self.theme);
         self.guard_close(&ctx);
         self.thumbs.pump(&ctx);

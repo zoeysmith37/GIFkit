@@ -659,6 +659,7 @@ pub fn encode_gif(anim: &Animation, opt: &GifOptions, progress: Option<&AtomicUs
             if let Some(p) = progress {
                 p.fetch_add(1, Ordering::Relaxed);
             }
+            crate::stack::yield_to_foreground(progress);
             if crate::stack::stopped(progress) {
                 anyhow::bail!("Stopped");
             }

@@ -364,7 +364,7 @@ fn case(seed: u64, stage: &Mutex<&'static str>) -> String {
         if shown == 0 || flat.width() as u64 * flat.height() as u64 > 16_000_000 {
             continue;
         }
-        let _ = crate::io::encode_preview(&flat, &f);
+        let _ = crate::io::encode_preview(&flat, &f, None);
     }
     desc
 }
@@ -585,7 +585,7 @@ fn extremes() {
             let flat = st.flatten(&base, &fonts, None);
             let f = fmt.unwrap_or(crate::io::PreviewFormat::Gif(Default::default()));
             let (w, h) = (flat.width(), flat.height());
-            let enc = if flat.frames.iter().any(|f| f.enabled) { crate::io::encode_preview(&flat, &f).map(|(_, b)| b.len()).map_err(|e| e.to_string()) } else { Err("no frames".into()) };
+            let enc = if flat.frames.iter().any(|f| f.enabled) { crate::io::encode_preview(&flat, &f, None).map(|(_, b)| b.len()).map_err(|e| e.to_string()) } else { Err("no frames".into()) };
             format!("{w}x{h} x{} -> {:?}", flat.len(), enc)
         }));
         let dt = t0.elapsed().as_secs_f32();

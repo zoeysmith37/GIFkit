@@ -754,7 +754,7 @@ fn preview_every_format() {
         fmts.push(P::Video(io::VideoFormat::WebmAlpha, [0, 0, 0]));
     }
     for f in fmts {
-        let (dec, bytes) = io::encode_preview(&a, &f).unwrap_or_else(|e| panic!("{f:?}: {e:#}"));
+        let (dec, bytes) = io::encode_preview(&a, &f, None).unwrap_or_else(|e| panic!("{f:?}: {e:#}"));
         assert!(!bytes.is_empty());
         assert_eq!((dec.width(), dec.height()), (a.width(), a.height()), "{f:?}");
         assert!((dec.duration_secs() - a.duration_secs()).abs() < 0.2, "{f:?}: {} vs {}", dec.duration_secs(), a.duration_secs());
@@ -767,7 +767,7 @@ fn preview_alpha_probe() {
     use io::PreviewFormat as P;
     let a = synth(true);
     for f in [P::Avif(60), P::Video(io::VideoFormat::WebmAlpha, [0, 0, 0]), P::Webp(io::WebpOptions::default())] {
-        let (dec, _) = io::encode_preview(&a, &f).unwrap();
+        let (dec, _) = io::encode_preview(&a, &f, None).unwrap();
         eprintln!("{f:?}: corner alpha {} square {:?}", dec.frames[0].image.get_pixel(90, 2)[3], dec.frames[0].image.get_pixel(5, 30));
     }
 }
@@ -808,9 +808,9 @@ fn sheet_pow2_and_indexed_png() {
     let q = io::encode_png(&grad, &io::PngOptions { colors: 16, noai: false }).unwrap();
     assert_eq!(image::load_from_memory(&q).unwrap().to_rgba8().dimensions(), (64, 64));
     // previews
-    let (dec, _) = io::encode_preview(&a, &io::PreviewFormat::Sheet(o.clone())).unwrap();
+    let (dec, _) = io::encode_preview(&a, &io::PreviewFormat::Sheet(o.clone()), None).unwrap();
     assert_eq!((dec.width(), dec.height()), (cw, ch));
-    let (dec, bytes) = io::encode_preview(&a, &io::PreviewFormat::Frames(io::SplitFormat::Png, io::PngOptions { colors: 64, noai: false }, GifOptions::default())).unwrap();
+    let (dec, bytes) = io::encode_preview(&a, &io::PreviewFormat::Frames(io::SplitFormat::Png, io::PngOptions { colors: 64, noai: false }, GifOptions::default()), None).unwrap();
     assert_eq!(dec.len(), a.len());
     assert!(!bytes.is_empty());
 }

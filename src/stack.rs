@@ -674,6 +674,42 @@ pub fn lower_thread_priority() {
     }
 }
 
+/// Background work steps aside while the user is working: the UI marks
+/// itself busy for a moment on each input, and long jobs wait between frames
+/// until it's been quiet. On a laptop the CPU, its graphics and their power
+/// budget are shared, so a busy encoder otherwise slows every redraw.
+static FG_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn clock_ms() -> u64 {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+thread_local! {
+    static IS_UI: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The UI thread: never waits in `yield_to_foreground`.
+pub fn mark_ui_thread() {
+    IS_UI.with(|c| c.set(true));
+}
+
+/// The user is doing something: background work waits for `ms`.
+pub fn foreground_busy(ms: u64) {
+    FG_UNTIL.fetch_max(clock_ms() + ms, Ordering::Relaxed);
+}
+
+/// In background work, between frames: wait while the user is busy (or
+/// until the job is stopped).
+pub fn yield_to_foreground(progress: Option<&AtomicUsize>) {
+    if IS_UI.with(|c| c.get()) {
+        return;
+    }
+    while clock_ms() < FG_UNTIL.load(Ordering::Relaxed) && !stopped(progress) {
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+}
+
 /// Thread pool for background work (pre-rendering, compression, exports) so
 /// it never competes with preview rendering on the UI thread's pool.
 pub fn bg_pool() -> &'static rayon::ThreadPool {
@@ -1300,6 +1336,7 @@ impl Stack {
         }
         idx.par_iter()
             .map(|&i| {
+                yield_to_foreground(progress);
                 let image = if render && !stopped(progress) { Arc::new(self.render_frame(base, plan, times, i, fonts, prep)) } else { base.frames[plan[i].src].image.clone() };
                 if let Some(p) = progress {
                     p.fetch_add(1, Ordering::Relaxed);
@@ -1324,6 +1361,7 @@ impl Stack {
         for chunk in idx.chunks(batch) {
             let mut texs = Vec::new();
             let mut slots: Vec<Option<Arc<RgbaImage>>> = Vec::with_capacity(chunk.len());
+            yield_to_foreground(progress);
             for &i in chunk {
                 let src = plan[i].src;
                 let frame = &base.frames[src].image;
