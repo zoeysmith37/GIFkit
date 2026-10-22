@@ -2521,6 +2521,16 @@ fn breeze_progress(ui: &mut egui::Ui, frac: Option<f32>, text: &str) {
     }
 }
 
+/// Recently opened files, newest first. Saved as a JSON list on one line
+/// (older versions wrote one path a line, which kept only the first).
+fn load_recent() -> Vec<PathBuf> {
+    let v = theme::get_setting("recent").unwrap_or_default();
+    match serde_json::from_str::<Vec<String>>(&v) {
+        Ok(l) => l.into_iter().filter(|l| !l.is_empty()).map(PathBuf::from).collect(),
+        Err(_) => v.split('\n').filter(|l| !l.is_empty()).map(PathBuf::from).collect(),
+    }
+}
+
 /// Shorten to `max` characters with an ellipsis.
 fn elide(s: &str, max: usize) -> String {
     let s = s.lines().next().unwrap_or("");
@@ -2795,7 +2805,7 @@ impl GifKitApp {
             views_last: Vec::new(),
             show_toolbar: theme::get_setting("show_toolbar").as_deref() != Some("0"),
             show_statusbar: theme::get_setting("show_statusbar").as_deref() != Some("0"),
-            recent: theme::get_setting("recent").unwrap_or_default().split('\n').filter(|l| !l.is_empty()).map(PathBuf::from).collect(),
+            recent: load_recent(),
             project_path: None,
             shape_tpl: ShapeSettings::default(),
             text_tpl: Annotation { text: "Your text".into(), ..Default::default() },
@@ -5307,7 +5317,12 @@ impl eframe::App for GifKitApp {
             egui::Panel::bottom("status").frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin::symmetric(10, 3))).show(ui, |ui| self.status_bar(ui));
         }
 
-        let rail_w = if self.sidebar_compact { 40.0 } else { 140.0 };
+        // the names slide in and out
+        let names = theme::openness(&ctx, egui::Id::unique("rail-names"), !self.sidebar_compact);
+        let rail_w = (40.0 + 100.0 * names).round();
+        if names > 0.0 && names < 1.0 {
+            ctx.request_repaint();
+        }
         if self.base.is_some() {
             egui::Panel::right("inspector")
                 .resizable(true)
@@ -5782,7 +5797,8 @@ impl GifKitApp {
         self.recent.insert(0, p);
         self.recent.truncate(10);
         let list: Vec<String> = self.recent.iter().map(|r| r.display().to_string()).collect();
-        theme::set_setting("recent", &list.join("\n"));
+        // one line: the settings file has a setting a line
+        theme::set_setting("recent", &serde_json::to_string(&list).unwrap_or_default());
     }
 
     fn save_backdrop(&self) {
@@ -6249,6 +6265,8 @@ impl GifKitApp {
     fn rail(&mut self, ui: &mut egui::Ui) {
         let pal = *p();
         let compact = self.sidebar_compact;
+        // how far the names are shown (0 icons only .. 1 names), while it slides
+        let names = theme::openness(ui.ctx(), egui::Id::unique("rail-names"), !compact);
         egui::ScrollArea::vertical().auto_shrink([false, false]).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             let divider = |ui: &mut egui::Ui| {
@@ -6261,16 +6279,17 @@ impl GifKitApp {
                 if matches!(t, Tool::Resize | Tool::Frames | Tool::Presets) {
                     divider(ui);
                 }
-                self.rail_row(ui, Some(t), compact);
+                self.rail_row(ui, Some(t), names);
             }
-            self.rail_row(ui, None, compact);
+            self.rail_row(ui, None, names);
             divider(ui);
             let (icon, tip) = if compact { ("sidebar-collapse-right", "Show tool names") } else { ("sidebar-collapse-left", "Hide tool names") };
             let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
             if resp.hovered() {
                 ui.painter().rect_filled(r, 4.0, mix(pal.window, pal.highlight, 0.12));
             }
-            crate::icons::paint(ui.painter(), icon, if compact { r.center() } else { pos2(r.left() + 16.0, r.center().y) }, 16.0, pal.fg_muted);
+            let x = r.center().x + (r.left() + 16.0 - r.center().x) * names;
+            crate::icons::paint(ui.painter(), icon, pos2(x, r.center().y), 16.0, pal.fg_muted);
             if resp.on_hover_text(tip).clicked() {
                 self.set_rail_compact(!compact);
             }
@@ -6278,7 +6297,9 @@ impl GifKitApp {
     }
 
     /// One rail entry. `None` is the History window toggle.
-    fn rail_row(&mut self, ui: &mut egui::Ui, t: Option<Tool>, compact: bool) {
+    fn rail_row(&mut self, ui: &mut egui::Ui, t: Option<Tool>, names: f32) {
+        // tool tips name the tool once the names are mostly hidden
+        let compact = names < 0.5;
         let pal = *p();
         let has = self.base.is_some();
         let sel = match t {
@@ -6299,17 +6320,22 @@ impl GifKitApp {
             None => ("view-history", "History", "Every change, with jumps back and forth (Ctrl+H)"),
         };
         let icon_col = if sel { Color32::WHITE } else if has || t.is_none() { pal.fg } else { pal.fg_muted };
-        let icon_size = if compact { 22.0 } else { 16.0 };
-        let icon_x = if compact { r.center().x } else { r.left() + 15.0 };
+        // icons go from big and centred to small at the left as the names come in
+        let icon_size = 22.0 - 6.0 * names;
+        let icon_x = r.center().x + (r.left() + 15.0 - r.center().x) * names;
         crate::icons::paint(painter, icon, pos2(icon_x, r.center().y), icon_size, icon_col);
-        if !compact {
-            painter.text(r.left_center() + vec2(30.0, 0.0), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(13.0), icon_col);
-        }
-        // how many layers of this kind there are, in muted text when the names show
-        if let (false, Some(k)) = (compact, t.and_then(|t| t.layer_kind())) {
-            let n = self.stack.count(k);
-            if n > 0 {
-                painter.text(r.right_center() - vec2(8.0, 0.0), egui::Align2::RIGHT_CENTER, n.to_string(), egui::FontId::proportional(12.0), if sel { Color32::WHITE } else { pal.fg_muted });
+        if names > 0.0 {
+            // names fade in, cut off at the rail's edge while it's narrow
+            let tp = painter.with_clip_rect(r.intersect(painter.clip_rect()));
+            // just right of the icon, wherever it is on its way
+            tp.text(pos2(icon_x + icon_size / 2.0 + 7.0, r.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(13.0), icon_col.gamma_multiply(names));
+            // how many layers of this kind there are, in muted text
+            if let Some(k) = t.and_then(|t| t.layer_kind()) {
+                let n = self.stack.count(k);
+                if n > 0 && names > 0.9 {
+                    let c = if sel { Color32::WHITE } else { pal.fg_muted };
+                    tp.text(r.right_center() - vec2(8.0, 0.0), egui::Align2::RIGHT_CENTER, n.to_string(), egui::FontId::proportional(12.0), c.gamma_multiply((names - 0.9) * 10.0));
+                }
             }
         }
         let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
