@@ -927,7 +927,11 @@ pub struct GifKitApp {
     /// a layer track being dragged to a new place in the stack
     tl_reorder: Option<usize>,
     /// frames the GIF will grow by when the drag past its end lets go
+    /// the menu bar, where clicks don't change what Copy and Paste work on
+    menubar_rect: Rect,
     tl_extend: usize,
+    /// what making the GIF longer adds
+    tl_extend_mode: timeline_ui::Extend,
     /// asking whether to save first, and what to do after
     confirm: Option<Pending>,
     /// the same, once a save started from the question finishes
@@ -2703,6 +2707,8 @@ impl GifKitApp {
             tl_head_drag: false,
             tl_reorder: None,
             tl_extend: 0,
+            menubar_rect: Rect::NOTHING,
+            tl_extend_mode: timeline_ui::Extend::load(),
             confirm: None,
             after_save: None,
             quitting: false,
@@ -3910,6 +3916,10 @@ impl GifKitApp {
         let over_tl = ctx.pointer_hover_pos().is_some_and(|p| self.tl_area.contains(p));
         if self.base.is_some() && !over_tl {
             let now = ctx.input(|i| i.time);
+            let cut = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Cut))) && !ctx.egui_wants_keyboard_input();
+            if cut {
+                self.edit_cut(ctx, now);
+            }
             let (copy, paste_layers, paste_clips) = ctx.input(|i| {
                 (
                     i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
@@ -4661,6 +4671,15 @@ impl GifKitApp {
         }
     }
 
+    fn edit_cut(&mut self, ctx: &egui::Context, now: f64) {
+        if self.tl_focus {
+            self.tl_cut_clips(ctx, now);
+        } else if let Some(li) = self.sel_layer_index().filter(|li| !self.stack.layers[*li].locked) {
+            self.copy_layer(ctx);
+            self.apply_layer_act(ctx, LayerAct::Delete(li), now);
+        }
+    }
+
     fn edit_paste(&mut self, now: f64) {
         if self.tl_focus {
             self.tl_paste(now)
@@ -4977,7 +4996,11 @@ impl eframe::App for GifKitApp {
         let ctx = ui.ctx().clone();
         // what was clicked last decides what Copy and Paste work on
         if let Some(p) = ctx.input(|i| i.pointer.any_pressed().then(|| i.pointer.press_origin()).flatten()) {
-            self.tl_focus = self.tl_area.contains(p);
+            // not the menu bar or an open menu: those act on what was clicked before
+            let in_menu = self.menubar_rect.contains(p) || ctx.layer_id_at(p).is_some_and(|l| l.order != egui::Order::Background);
+            if !in_menu {
+                self.tl_focus = self.tl_area.contains(p);
+            }
         }
         let perf_t0 = std::time::Instant::now();
         theme::refresh(&ctx, self.theme);
@@ -5032,9 +5055,10 @@ impl eframe::App for GifKitApp {
         let pal = *p();
 
         // KDE layout: menu bar, then the main toolbar, both on the header colour
-        egui::Panel::top("menubar")
+        let mb = egui::Panel::top("menubar")
             .frame(egui::Frame::new().fill(pal.header).inner_margin(egui::Margin { left: 4, right: 4, top: 2, bottom: 0 }))
             .show(ui, |ui| self.menubar(ui, &ctx));
+        self.menubar_rect = mb.response.rect;
         if self.show_toolbar {
             egui::Panel::top("toolbar")
                 .frame(egui::Frame::new().fill(pal.header).inner_margin(egui::Margin { left: 6, right: 8, top: 3, bottom: 4 }))
@@ -5317,6 +5341,9 @@ impl GifKitApp {
                     let what = if self.tl_focus { "Clips" } else { "Layer" };
                     let can_copy = if self.tl_focus { self.tl_clip.is_some() || self.tl_key.is_some() } else { self.sel_layer_index().is_some() };
                     let can_paste = if self.tl_focus { self.tl_board.is_some() } else { !self.layer_board.is_empty() };
+                    if menu_item(ui, "edit-cut", &format!("Cu&t {what}"), "Ctrl+X", has && idle && can_copy) {
+                        self.edit_cut(ctx, now);
+                    }
                     if menu_item(ui, "edit-copy", &format!("&Copy {what}"), "Ctrl+C", has && can_copy) {
                         self.edit_copy(ctx);
                     }

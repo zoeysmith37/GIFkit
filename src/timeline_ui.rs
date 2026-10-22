@@ -63,10 +63,80 @@ enum TbAct {
 }
 
 /// What Copy put aside: clips as (offset from the first, length), or a keyframe.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(super) enum TlBoard {
     Clips(Vec<(usize, usize)>),
     Key(Key),
+    /// GIF clips: their frames, and each image layer's placements on them
+    Frames(Vec<crate::anim::Frame>, Vec<(u64, Vec<crate::overlay::Placement>)>),
+}
+
+/// What making the GIF longer adds (the GIF row's right-click menu).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Extend {
+    /// the last frame stays up
+    Hold,
+    /// it plays again from the start
+    Loop,
+    /// the same frames, spread over the longer time
+    Stretch,
+}
+
+impl Extend {
+    pub(super) fn load() -> Extend {
+        match theme::get_setting("tl_extend").as_deref() {
+            Some("loop") => Extend::Loop,
+            Some("stretch") => Extend::Stretch,
+            _ => Extend::Hold,
+        }
+    }
+    fn key(self) -> &'static str {
+        match self {
+            Extend::Hold => "hold",
+            Extend::Loop => "loop",
+            Extend::Stretch => "stretch",
+        }
+    }
+}
+
+/// Where a clip `len` frames long fits among `spans` (others on its row,
+/// itself left out) nearest to starting at `want`: anywhere when `after`
+/// is false, else the first room at or after it.
+fn free_slot(spans: &[(usize, usize)], len: usize, want: usize, n: usize, after: bool) -> Option<usize> {
+    if len == 0 || len > n {
+        return None;
+    }
+    let fits = |a: usize| a + len <= n && !spans.iter().any(|&(x, y)| a <= y && a + len - 1 >= x);
+    let last = n - len;
+    let want = want.min(last);
+    if fits(want) {
+        return Some(want);
+    }
+    // the room around each clip's ends is where a fit starts
+    let mut cands: Vec<usize> = vec![0, last];
+    for &(x, y) in spans {
+        cands.push(y + 1);
+        if x >= len {
+            cands.push(x - len);
+        }
+    }
+    cands.into_iter().filter(|&a| a <= last && fits(a) && (!after || a >= want)).min_by_key(|&a| a.abs_diff(want))
+}
+
+/// Keep the Cut edit on the same frames after `k` frames went in (or out,
+/// when negative) before source frame `at`.
+fn shift_cut(t: &mut crate::stack::Transform, at: usize, k: isize) {
+    if !t.cut_on || t.cut_by_time {
+        return;
+    }
+    let sh = |v: usize| (v as isize + k).max(1) as usize;
+    // cut_start / cut_end count from 1; 0 at the end means "to the last"
+    if at + 1 < t.cut_start {
+        t.cut_start = sh(t.cut_start);
+    }
+    if t.cut_end != 0 && at <= t.cut_end {
+        t.cut_end = sh(t.cut_end);
+    }
 }
 
 /// What the timeline puts on the system clipboard, so Ctrl+V comes back here.
@@ -348,7 +418,8 @@ impl GifKitApp {
         let locked_sel = self.tl_track.is_some_and(|t| self.tl_locked(t));
         let gap_here = sel_layer.is_some_and(|t| !self.track_spans(t).iter().any(|&(a, b)| self.cur >= a && self.cur <= b));
         let on_key = sel_layer.and_then(|t| self.stack.index_of(t)).is_some_and(|li| self.stack.layers[li].timing.key_at(self.cur).is_some());
-        let layer_clips = self.tl_selected().iter().any(|c| c.0 != GIF);
+        let any_clips = !self.tl_selected().is_empty();
+        let gif_board = matches!(self.tl_board, Some(TlBoard::Frames(..)));
         let km = self.keymap.clone();
         use crate::keys::Action as A;
         let k = |a: A| {
@@ -369,9 +440,9 @@ impl GifKitApp {
                 (TbAct::Delete, "edit-delete", "Delete", format!("Delete the selected clips or keyframe{}. On the GIF track it leaves a gap.", k(A::TlDelete)), idle && (self.tl_clip.is_some() || self.tl_key.is_some()) && !locked_sel, None),
             ],
             vec![
-                (TbAct::Copy, "edit-copy", "Copy", "Copy the selected clips or keyframe (Ctrl+C)".into(), layer_clips || self.tl_key.is_some(), None),
-                (TbAct::Paste, "edit-paste", "Paste", "Paste at the playhead on the selected layer (Ctrl+V)".into(), idle && sel_layer.is_some() && self.tl_board.is_some() && !locked_sel, None),
-                (TbAct::Duplicate, "edit-duplicate", "Duplicate", format!("Put a copy of the selected clips right after them{}", k(A::TlDuplicate)), idle && layer_clips && !locked_sel, None),
+                (TbAct::Copy, "edit-copy", "Copy", "Copy the selected clips or keyframe (Ctrl+C). GIF clips copy their frames.".into(), any_clips || self.tl_key.is_some(), None),
+                (TbAct::Paste, "edit-paste", "Paste", "Paste at the playhead (Ctrl+V). GIF frames go in after the clip under the playhead.".into(), idle && self.tl_board.is_some() && (gif_board || (sel_layer.is_some() && !locked_sel)), None),
+                (TbAct::Duplicate, "edit-duplicate", "Duplicate", format!("Put a copy of the selected clips right after them{}", k(A::TlDuplicate)), idle && any_clips && !locked_sel, None),
             ],
             vec![
                 (TbAct::KeyAdd, "keyframe-add", "Add Keyframe", format!("Add a keyframe on the selected layer at the playhead{}", k(A::TlKey)), idle && sel_layer.is_some() && !locked_sel, None),
@@ -1372,6 +1443,14 @@ impl GifKitApp {
                         self.tl_extend = (d.orig.1 as i64 + delta - (n as i64 - 1)).clamp(0, (n as i64 * 4).max(250)) as usize;
                     }
                     let (na, nb) = match grab {
+                        // a layer clip can go past the others into any room on its row
+                        TlGrab::Body if d.track != GIF => {
+                            let others: Vec<(usize, usize)> = spans.iter().enumerate().filter(|(j, _)| *j != d.clip).map(|(_, s)| *s).collect();
+                            let want = clamp(d.orig.0 as i64 + delta, 0, n - 1 - len);
+                            let here = spans.get(d.clip).map(|s| s.0).unwrap_or(d.orig.0);
+                            let a = free_slot(&others, len + 1, want, n, false).unwrap_or(here);
+                            (a, a + len)
+                        }
                         TlGrab::Body => {
                             let a = clamp(d.orig.0 as i64 + delta, lo, hi - len);
                             (a, a + len)
@@ -1411,6 +1490,12 @@ impl GifKitApp {
                                 cl.sort_by_key(|c| c.start);
                                 if let Some(c) = cl.get_mut(d.clip) {
                                     *c = Clip { start: na, end: if nb + 1 >= n { None } else { Some(nb) } };
+                                }
+                                // past another clip, its place in the row changes: follow it
+                                cl.sort_by_key(|c| c.start);
+                                if let Some(j) = cl.iter().position(|c| c.start == na) {
+                                    self.tl_drag = Some(TlDrag { clip: j, ..d });
+                                    self.tl_clip = Some(j);
                                 }
                             }
                             self.modified = true;
@@ -1500,7 +1585,10 @@ impl GifKitApp {
             let km = &self.keymap;
             let (s, del, k, x, dup, nl, nr) = ui.input(|i| (km.pressed(i, A::TlSplit), km.pressed(i, A::TlDelete), km.pressed(i, A::TlKey), km.pressed(i, A::TlRazor), km.pressed(i, A::TlDuplicate), km.pressed(i, A::TlNudgeLeft), km.pressed(i, A::TlNudgeRight)));
             // Ctrl+C and Ctrl+V reach us as clipboard events
-            let (copy, paste) = ui.input(|i| (i.events.iter().any(|e| matches!(e, egui::Event::Copy)), i.events.iter().any(|e| matches!(e, egui::Event::Paste(t) if t == BOARD_TAG))));
+            let (copy, paste, cut) = ui.input(|i| (i.events.iter().any(|e| matches!(e, egui::Event::Copy)), i.events.iter().any(|e| matches!(e, egui::Event::Paste(t) if t == BOARD_TAG)), i.events.iter().any(|e| matches!(e, egui::Event::Cut))));
+            if cut {
+                self.tl_cut_clips(ctx, now);
+            }
             if s {
                 self.tl_split(now);
             }
@@ -1601,6 +1689,7 @@ impl GifKitApp {
                     let d = self.plan.last().map(|f| effective_delay(f.delay)).unwrap_or(10).max(2) as usize;
                     self.tl_lengthen((100 / d).max(1), now);
                 }
+                self.tl_extend_menu(ui);
                 self.tl_colour_menu(ui, GIF, now);
                 return;
             }
@@ -1652,14 +1741,17 @@ impl GifKitApp {
                 self.tl_delete_selected(now);
             }
             ui.separator();
-            let layer_clips = self.tl_selected().iter().any(|c| c.0 != GIF);
-            if menu_item(ui, "edit-copy", "&Copy", "Ctrl+C", layer_clips || self.tl_key.is_some()) {
+            let any_clips = !self.tl_selected().is_empty();
+            if menu_item(ui, "edit-cut", "Cu&t", "Ctrl+X", (any_clips || self.tl_key.is_some()) && !locked) {
+                self.tl_cut_clips(ctx, now);
+            }
+            if menu_item(ui, "edit-copy", "&Copy", "Ctrl+C", any_clips || self.tl_key.is_some()) {
                 self.tl_copy(ctx);
             }
             if menu_item(ui, "edit-paste", "&Paste", "Ctrl+V", has && self.tl_board.is_some()) {
                 self.tl_paste(now);
             }
-            if menu_item(ui, "edit-duplicate", "D&uplicate", &km.text(A::TlDuplicate), layer_clips && !locked) {
+            if menu_item(ui, "edit-duplicate", "D&uplicate", &km.text(A::TlDuplicate), any_clips && !locked) {
                 self.tl_duplicate(now);
             }
             ui.separator();
@@ -1746,6 +1838,19 @@ impl GifKitApp {
     }
 
     /// A track's colour choices: Breeze's palette, the default, or any colour.
+    /// How dragging the GIF's end (or Make Longer) adds frames.
+    fn tl_extend_menu(&mut self, ui: &mut egui::Ui) {
+        sub_menu(ui, "", "When Made L&onger", |ui| {
+            ui.set_min_width(240.0);
+            for (m, label) in [(Extend::Hold, "&Hold the Last Frame"), (Extend::Loop, "&Play Again from the Start"), (Extend::Stretch, "&Stretch Over the Time")] {
+                if menu_check(ui, self.tl_extend_mode == m, label, "") {
+                    self.tl_extend_mode = m;
+                    theme::set_setting("tl_extend", m.key());
+                }
+            }
+        });
+    }
+
     fn tl_colour_menu(&mut self, ui: &mut egui::Ui, track: u64, now: f64) {
         const SWATCHES: [[u8; 3]; 12] = [
             [61, 174, 233],
@@ -1864,7 +1969,26 @@ impl GifKitApp {
                 return;
             }
         }
-        let clips: Vec<(usize, usize)> = self.tl_selected().into_iter().filter(|c| c.0 != GIF).map(|c| (c.1, c.2)).collect();
+        let sel = self.tl_selected();
+        // GIF clips: their frames themselves
+        let mut gif: Vec<(usize, usize)> = sel.iter().filter(|c| c.0 == GIF).map(|c| (c.1, c.2)).collect();
+        if !gif.is_empty() {
+            gif.sort();
+            match self.gif_frames(&gif) {
+                Some(b) => {
+                    let k = match &b {
+                        TlBoard::Frames(f, _) => f.len(),
+                        _ => 0,
+                    };
+                    self.tl_board = Some(b);
+                    ctx.copy_text(BOARD_TAG.into());
+                    self.info(format!("Copied {k} frames of the GIF"));
+                }
+                None => self.info("GIF clips copy when the animation plays forwards (turn off Reverse and Boomerang)"),
+            }
+            return;
+        }
+        let clips: Vec<(usize, usize)> = sel.into_iter().filter(|c| c.0 != GIF).map(|c| (c.1, c.2)).collect();
         let Some(first) = clips.iter().map(|c| c.0).min() else { return };
         let n = clips.len();
         self.tl_board = Some(TlBoard::Clips(clips.into_iter().map(|(a, b)| (a - first, b - a + 1)).collect()));
@@ -1878,15 +2002,14 @@ impl GifKitApp {
         let n = self.plan.len();
         let mut put = 0;
         for &(off, len) in clips {
-            let a = at + off;
-            if a >= n {
+            let want = at + off;
+            if want >= n || len == 0 {
                 continue;
             }
-            let b = (a + len - 1).min(n - 1);
             let spans = self.track_spans(track);
-            if spans.iter().any(|&(x, y)| a <= y && b >= x) {
-                continue;
-            }
+            // where it was asked for, or the first room after that
+            let Some(a) = free_slot(&spans, len, want, n, true) else { continue };
+            let b = (a + len - 1).min(n - 1);
             if let Some(l) = self.tl_layer_mut(track) {
                 let cl = l.timing.clips.get_or_insert_with(Vec::new);
                 cl.push(Clip { start: a, end: if b + 1 >= n { None } else { Some(b) } });
@@ -1900,6 +2023,19 @@ impl GifKitApp {
     /// Ctrl+V: copied clips on the selected layer at the playhead, or the
     /// copied keyframe's values at the playhead.
     pub(super) fn tl_paste(&mut self, now: f64) {
+        // GIF frames go into the GIF, after the clip under the playhead
+        if let Some(TlBoard::Frames(frames, places)) = self.tl_board.clone() {
+            if !self.gif_forwards() {
+                self.info("GIF clips paste when the animation plays forwards (turn off Reverse and Boomerang)");
+                return;
+            }
+            self.snapshot(&format!("tl-paste{now}"), now);
+            let at = self.gif_after_playhead();
+            let k = frames.len();
+            self.gif_insert(at, frames, &places);
+            self.info(format!("Pasted {k} frames into the GIF"));
+            return;
+        }
         let Some(track) = self.tl_track.filter(|t| *t != GIF && !self.tl_locked(*t)) else {
             self.info("Select a layer's track to paste onto");
             return;
@@ -1919,14 +2055,32 @@ impl GifKitApp {
                 self.snapshot(&format!("tl-add{now}"), now);
                 let put = self.tl_place_clips(track, self.cur, &c);
                 self.modified |= put > 0;
-                self.info(if put == c.len() { format!("Pasted {put} clip{}", if put == 1 { "" } else { "s" }) } else { format!("Pasted {put} of {} clips (the rest would overlap)", c.len()) });
+                self.info(if put == c.len() { format!("Pasted {put} clip{}", if put == 1 { "" } else { "s" }) } else { format!("Pasted {put} of {} clips (no room left after the playhead)", c.len()) });
             }
-            None => {}
+            Some(TlBoard::Frames(..)) | None => {}
         }
     }
 
     /// Ctrl+D: copies of the selected layer clips, right after them.
     pub(super) fn tl_duplicate(&mut self, now: f64) {
+        // GIF clips: a copy of their frames right after each
+        let mut gif: Vec<(usize, usize)> = self.tl_selected().into_iter().filter(|c| c.0 == GIF).map(|c| (c.1, c.2)).collect();
+        if !gif.is_empty() {
+            if !self.gif_forwards() {
+                self.info("GIF clips duplicate when the animation plays forwards (turn off Reverse and Boomerang)");
+                return;
+            }
+            self.snapshot(&format!("tl-dup{now}"), now);
+            // from the last, so earlier positions stay put
+            gif.sort();
+            for &(a, b) in gif.iter().rev() {
+                if let Some(TlBoard::Frames(frames, places)) = self.gif_frames(&[(a, b)]) {
+                    let at = self.plan[b].src + 1;
+                    self.gif_insert(at, frames, &places);
+                }
+            }
+            return;
+        }
         let sel: Vec<(u64, usize, usize)> = self.tl_selected().into_iter().filter(|c| c.0 != GIF && !self.tl_locked(c.0)).collect();
         if sel.is_empty() {
             return;
@@ -2147,6 +2301,11 @@ impl GifKitApp {
         if k == 0 || self.busy() {
             return;
         }
+        if self.tl_extend_mode != Extend::Hold && self.gif_forwards() && !self.plan.is_empty() {
+            self.snapshot(&format!("tl-lengthen{now}"), now);
+            self.gif_extend(k, self.tl_extend_mode);
+            return;
+        }
         self.snapshot(&format!("tl-lengthen{now}"), now);
         let mut k = k;
         if let Some(b) = &self.base {
@@ -2174,6 +2333,172 @@ impl GifKitApp {
         self.after_base_change(false);
         self.stack.sync_len(self.base.as_ref().map(|b| b.len()).unwrap_or(0));
         self.info(format!("Added {k} frames"));
+    }
+
+    /// Ctrl+X: copy the selected clips (or keyframe), then take them out.
+    pub(super) fn tl_cut_clips(&mut self, ctx: &egui::Context, now: f64) {
+        let before = self.tl_board.is_some();
+        self.tl_copy(ctx);
+        if self.tl_board.is_some() || before {
+            self.tl_delete_selected(now);
+        }
+    }
+
+    /// GIF clips (output frames, in order) as frames to paste, with each
+    /// image layer's placements on them. None unless it plays forwards.
+    fn gif_frames(&self, clips: &[(usize, usize)]) -> Option<TlBoard> {
+        let base = self.base.as_ref()?;
+        if !self.gif_forwards() {
+            return None;
+        }
+        let mut srcs: Vec<usize> = Vec::new();
+        for &(a, b) in clips {
+            for i in a..=b.min(self.plan.len().saturating_sub(1)) {
+                let s = self.plan[i].src;
+                if srcs.last() != Some(&s) {
+                    srcs.push(s);
+                }
+            }
+        }
+        let mut frames: Vec<crate::anim::Frame> = srcs.iter().filter_map(|&s| base.frames.get(s).cloned()).collect();
+        if let Some(f) = frames.first_mut() {
+            f.cut = true;
+        }
+        let places = self
+            .stack
+            .layers
+            .iter()
+            .filter_map(|l| match &l.kind {
+                LayerKind::Overlay(o) => Some((l.id, srcs.iter().map(|&s| o.placements.get(s).copied().unwrap_or_else(|| o.placements.last().copied().unwrap_or_default())).collect())),
+                _ => None,
+            })
+            .collect();
+        Some(TlBoard::Frames(frames, places))
+    }
+
+    /// The source frame to paste GIF frames before: after the clip under
+    /// the playhead, or at the playhead in a gap.
+    fn gif_after_playhead(&self) -> usize {
+        let n = self.plan.len();
+        if n == 0 {
+            return 0;
+        }
+        let cur = self.cur.min(n - 1);
+        match self.gif_runs().into_iter().find(|&(a, b)| cur >= a && cur <= b) {
+            Some((_, b)) => self.plan[b].src + 1,
+            None => self.plan[cur].src,
+        }
+    }
+
+    /// Put `frames` into the animation before source frame `at`, as a clip
+    /// of their own. Image layers get the placements given (or keep the one
+    /// beside), and the Cut edit keeps the same frames.
+    fn gif_insert(&mut self, at: usize, frames: Vec<crate::anim::Frame>, places: &[(u64, Vec<crate::overlay::Placement>)]) {
+        let k = frames.len();
+        let Some(base) = self.base.as_mut() else { return };
+        if k == 0 {
+            return;
+        }
+        let at = at.min(base.frames.len());
+        let mut frames = frames;
+        frames[0].cut = true;
+        base.frames.splice(at..at, frames);
+        if let Some(f) = base.frames.get_mut(at + k) {
+            f.cut = true;
+        }
+        for l in &mut self.stack.layers {
+            if let LayerKind::Overlay(o) = &mut l.kind {
+                let new: Vec<crate::overlay::Placement> = match places.iter().find(|p| p.0 == l.id) {
+                    Some((_, v)) if v.len() == k => v.clone(),
+                    _ => {
+                        let p = o.placements.get(at.saturating_sub(1)).or(o.placements.last()).copied().unwrap_or_default();
+                        vec![p; k]
+                    }
+                };
+                let i = at.min(o.placements.len());
+                o.placements.splice(i..i, new);
+            }
+        }
+        shift_cut(&mut self.stack.transform, at, k as isize);
+        self.frames_changed();
+    }
+
+    /// Make the GIF `k` output frames longer by playing it again from its
+    /// start, or by spreading its frames over the longer time.
+    fn gif_extend(&mut self, k: usize, how: Extend) {
+        let srcs: Vec<usize> = {
+            let mut v: Vec<usize> = Vec::new();
+            for f in &self.plan {
+                if v.last() != Some(&f.src) {
+                    v.push(f.src);
+                }
+            }
+            v
+        };
+        let Some(base) = self.base.as_ref() else { return };
+        // what plays: frames that show, in order
+        let shown: Vec<usize> = srcs.iter().copied().filter(|&s| base.frames[s].enabled && !base.frames[s].blank).collect();
+        if shown.is_empty() {
+            return;
+        }
+        match how {
+            Extend::Loop => {
+                let frames: Vec<crate::anim::Frame> = (0..k).map(|j| crate::anim::Frame { cut: false, ..base.frames[shown[j % shown.len()]].clone() }).collect();
+                let places: Vec<(u64, Vec<crate::overlay::Placement>)> = self
+                    .stack
+                    .layers
+                    .iter()
+                    .filter_map(|l| match &l.kind {
+                        LayerKind::Overlay(o) => Some((l.id, (0..k).map(|j| o.placements.get(shown[j % shown.len()]).copied().unwrap_or_default()).collect())),
+                        _ => None,
+                    })
+                    .collect();
+                let at = *srcs.last().unwrap() + 1;
+                self.gif_insert(at, frames, &places);
+                // it carries on the same clip
+                if let Some(b) = self.base.as_mut() {
+                    b.frames[at].cut = false;
+                }
+                self.info(format!("Added {k} frames, playing it again from the start"));
+            }
+            Extend::Stretch => {
+                // the source frames from the first shown to the last, resampled
+                let (s0, s1) = (*srcs.first().unwrap(), *srcs.last().unwrap());
+                let len = s1 - s0 + 1;
+                let new_len = len + k;
+                let pick: Vec<usize> = (0..new_len).map(|i| s0 + i * len / new_len).collect();
+                let Some(base) = self.base.as_mut() else { return };
+                let mut made: Vec<crate::anim::Frame> = pick.iter().map(|&s| base.frames[s].clone()).collect();
+                // a split stays where it was: only the first copy of a frame keeps it
+                for i in 1..made.len() {
+                    if pick[i] == pick[i - 1] {
+                        made[i].cut = false;
+                    }
+                }
+                base.frames.splice(s0..=s1, made);
+                for l in &mut self.stack.layers {
+                    if let LayerKind::Overlay(o) = &mut l.kind {
+                        if o.placements.len() > s1 {
+                            let v: Vec<crate::overlay::Placement> = pick.iter().map(|&s| o.placements[s]).collect();
+                            o.placements.splice(s0..=s1, v);
+                        }
+                    }
+                }
+                shift_cut(&mut self.stack.transform, s1 + 1, k as isize);
+                self.frames_changed();
+                self.info(format!("Stretched {len} frames over {new_len}"));
+            }
+            Extend::Hold => {}
+        }
+    }
+
+    /// The animation's frames were added or reordered.
+    fn frames_changed(&mut self) {
+        self.bump();
+        self.after_base_change(false);
+        self.stack.sync_len(self.base.as_ref().map(|b| b.len()).unwrap_or(0));
+        self.timing_rev += 1;
+        self.modified = true;
     }
 
     /// Select a track: its layer becomes the selected one, with its tool open.
@@ -2222,5 +2547,41 @@ impl GifKitApp {
     /// Seconds from the start to output frame `i` (skipped frames take no time).
     fn plan_time(&self, i: usize) -> f32 {
         self.plan.iter().take(i).filter(|f| f.enabled).map(|f| effective_delay(f.delay) as f32 / 100.0).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn free_slot_finds_room() {
+        // clips at 10..=19 and 30..=39 on 50 frames
+        let sp = [(10, 19), (30, 39)];
+        assert_eq!(free_slot(&sp, 5, 0, 50, false), Some(0));
+        // asked to overlap: the nearest room
+        assert_eq!(free_slot(&sp, 5, 12, 50, false), Some(5));
+        assert_eq!(free_slot(&sp, 5, 17, 50, false), Some(20));
+        // only after the playhead
+        assert_eq!(free_slot(&sp, 5, 12, 50, true), Some(20));
+        // too long for any room after
+        assert_eq!(free_slot(&sp, 11, 12, 50, true), None);
+        // past the end: the last place it fits
+        assert_eq!(free_slot(&sp, 5, 48, 50, false), Some(45));
+        assert_eq!(free_slot(&[], 60, 0, 50, false), None);
+    }
+
+    #[test]
+    fn cut_follows_inserted_frames() {
+        let mut t = crate::stack::Transform { cut_on: true, cut_start: 5, cut_end: 20, ..Default::default() };
+        // after the kept range: nothing changes
+        shift_cut(&mut t, 25, 3);
+        assert_eq!((t.cut_start, t.cut_end), (5, 20));
+        // right after the last kept frame (source 19): it joins the kept range
+        shift_cut(&mut t, 20, 3);
+        assert_eq!((t.cut_start, t.cut_end), (5, 23));
+        // before the kept range: both move
+        shift_cut(&mut t, 0, 2);
+        assert_eq!((t.cut_start, t.cut_end), (7, 25));
     }
 }
