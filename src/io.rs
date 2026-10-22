@@ -142,7 +142,7 @@ impl VideoImport {
 
 /// Size, frame rate and length of a video via ffprobe.
 pub fn probe_video(path: &Path) -> Result<VideoInfo> {
-    anyhow::ensure!(ffmpeg_available(), "Opening videos needs ffmpeg installed and on PATH");
+    anyhow::ensure!(ffmpeg_available(), "Opening videos needs ffmpeg (Settings → ffmpeg…)");
     let out = crate::io::hidden_cmd("ffprobe")
         .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,avg_frame_rate,r_frame_rate,duration:stream_tags=rotate:stream_side_data=rotation:format=duration", "-of", "json"])
         .arg(path)
@@ -297,7 +297,7 @@ fn load_video_dec(path: &Path, max_side: Option<u32>, crop_to: Option<(u32, u32)
 }
 
 fn load_video_dec_with(path: &Path, max_side: Option<u32>, crop_to: Option<(u32, u32)>, decoder: Option<&str>, hw: bool) -> Result<Animation> {
-    anyhow::ensure!(ffmpeg_available(), "Opening videos needs ffmpeg installed and on PATH");
+    anyhow::ensure!(ffmpeg_available(), "Opening videos needs ffmpeg (Settings → ffmpeg…)");
     let src_fps = probe_fps(path).unwrap_or(25.0);
     // GIF delays are whole 1/100 s: pick the fastest exact rate not above the source
     let delay_cs = [2u16, 3, 4, 5, 6, 8, 10].into_iter().find(|d| 100.0 / *d as f64 <= src_fps + 0.01).unwrap_or(10);
@@ -753,25 +753,16 @@ pub fn export_spritesheet(anim: &Animation, png_path: &Path, opt: &SheetOptions)
     Ok(written.join(", "))
 }
 
-/// Is ffmpeg on the PATH? Asked once; the answer is kept.
+/// Is ffmpeg there (on the PATH, where the user pointed, or GIFkit's own copy)?
 pub fn ffmpeg_available() -> bool {
-    static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *HAS.get_or_init(|| {
-        hidden_cmd("ffmpeg")
-            .arg("-version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    })
+    crate::ffmpeg::path().is_some()
 }
 
 /// A command for a console tool (ffmpeg, ffprobe, curl). On Windows each
 /// would otherwise open a console window for as long as it runs.
 pub fn hidden_cmd(program: &str) -> std::process::Command {
     #[allow(unused_mut)]
-    let mut cmd = std::process::Command::new(program);
+    let mut cmd = std::process::Command::new(crate::ffmpeg::program(program));
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

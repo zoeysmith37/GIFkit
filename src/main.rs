@@ -6,6 +6,7 @@ mod booth;
 mod bundled;
 mod effects;
 mod encode;
+mod ffmpeg;
 mod geo;
 mod gpu;
 mod gpu_fx;

@@ -834,6 +834,14 @@ pub struct GifKitApp {
     orig_clock: f64,
     resize_by_pct: bool,
     about_open: bool,
+    /// the ffmpeg set-up window
+    ff_open: bool,
+    /// a download of ffmpeg under way
+    ff_job: Option<(Arc<crate::ffmpeg::Progress>, std::sync::mpsc::Receiver<Result<PathBuf, String>>)>,
+    /// what the last try said (an error, or where it was found)
+    ff_msg: Option<(bool, String)>,
+    /// a video to open once ffmpeg is set up
+    ff_then: Option<PathBuf>,
     /// layer being renamed (id, text) and whether its field still needs focus
     renaming: Option<(u64, String)>,
     rename_fresh: bool,
@@ -2653,6 +2661,10 @@ impl GifKitApp {
             orig_clock: 0.0,
             resize_by_pct: true,
             about_open: false,
+            ff_open: false,
+            ff_job: None,
+            ff_msg: None,
+            ff_then: None,
             renaming: None,
             rename_fresh: false,
             edit_rows_shown: Default::default(),
@@ -2795,6 +2807,10 @@ impl GifKitApp {
         }
         if std::env::var("GIFKIT_ABOUT").is_ok() {
             app.about_open = true;
+        }
+        // Windows doesn't come with ffmpeg: offer to set it up (once, unless asked to again)
+        if (cfg!(windows) || std::env::var_os("GIFKIT_FFMPEG_ASK").is_some()) && !app.ffmpeg && theme::get_setting("ffmpeg_ask").as_deref() != Some("no") {
+            app.ff_open = true;
         }
         if std::env::var("GIFKIT_HISTORY").is_ok() {
             app.history_open = true;
@@ -3345,10 +3361,16 @@ impl GifKitApp {
             ui.set_min_width(200.0);
             for f in ExportFormat::ALL {
                 let en = !f.needs_ffmpeg() || self.ffmpeg;
-                let b = ui.add_enabled(en, egui::Button::selectable(self.export_fmt == f, f.label()));
-                let b = if en { b.on_hover_text(f.tip()) } else { b.on_disabled_hover_text("Needs ffmpeg on PATH") };
+                let label = if en { RichText::new(f.label()) } else { RichText::new(format!("{}  (needs ffmpeg)", f.label())).color(p().fg_muted) };
+                let b = ui.add(egui::Button::selectable(self.export_fmt == f, label));
+                let b = if en { b.on_hover_text(f.tip()) } else { b.on_hover_text("Needs ffmpeg. Click to set it up.") };
                 if b.clicked() {
-                    pick = Some(f);
+                    if en {
+                        pick = Some(f);
+                    } else {
+                        self.ff_open = true;
+                        ui.close();
+                    }
                 }
             }
         });
@@ -3437,6 +3459,160 @@ impl GifKitApp {
             });
         if !open {
             self.about_open = false;
+        }
+    }
+
+    /// Setting ffmpeg up: point at it, or (on Windows) download a copy.
+    fn ffmpeg_window(&mut self, ctx: &egui::Context) {
+        // a download finishing
+        if let Some(r) = self.ff_job.as_ref().and_then(|(_, rx)| rx.try_recv().ok()) {
+            self.ff_job = None;
+            match r {
+                Ok(_) => self.ffmpeg_ready(ctx),
+                Err(e) => self.ff_msg = Some((false, e)),
+            }
+        }
+        if !self.ff_open {
+            return;
+        }
+        let pal = *p();
+        let mut open = true;
+        let (mut download, mut locate, mut recheck, mut cancel, mut close) = (false, false, false, false, false);
+        let mut ask = theme::get_setting("ffmpeg_ask").as_deref() != Some("no");
+        let ask_before = ask;
+        let found = crate::ffmpeg::path().filter(|_| self.ffmpeg);
+        let job = self.ff_job.as_ref().map(|(pr, _)| pr.clone());
+        let msg = self.ff_msg.clone();
+        dialog(ctx, "ffmpeg", "ffmpeg", vec2(470.0, 330.0), false, &mut open, |ui| {
+            ui.set_width(440.0);
+            let big = |ui: &mut egui::Ui, t: &str| ui.label(RichText::new(t).font(theme::medium(16.0)).color(pal.fg));
+            if let Some(pr) = &job {
+                big(ui, "Downloading ffmpeg…");
+                ui.add_space(8.0);
+                let (got, total) = (pr.got.load(std::sync::atomic::Ordering::Relaxed), pr.total.load(std::sync::atomic::Ordering::Relaxed));
+                let mb = |b: u64| b as f32 / 1_048_576.0;
+                if pr.unpacking.load(std::sync::atomic::Ordering::Relaxed) {
+                    ui.add(egui::ProgressBar::new(1.0).text("Unpacking…"));
+                } else if total > 0 {
+                    ui.add(egui::ProgressBar::new((got as f32 / total as f32).min(1.0)).text(format!("{:.0} of {:.0} MB", mb(got), mb(total))));
+                } else {
+                    ui.add(egui::ProgressBar::new(0.0).animate(true).text(format!("{:.0} MB", mb(got))));
+                }
+                ui.add_space(4.0);
+                if let Some(d) = crate::ffmpeg::own_dir() {
+                    hint(ui, &format!("Going into {}", d.display()));
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    cancel = ui.button("Cancel").clicked();
+                });
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                return;
+            }
+            if let Some(f) = &found {
+                big(ui, "ffmpeg is set up");
+                ui.add_space(6.0);
+                ui.label("Videos open, and MP4, WebM and AVIF can be saved.");
+                ui.add_space(4.0);
+                hint(ui, &format!("Using {}", f.display()));
+            } else {
+                big(ui, "ffmpeg wasn't found");
+                ui.add_space(6.0);
+                ui.label("GIFkit uses ffmpeg to open videos and to save MP4, WebM and AVIF. Everything else works without it.");
+                ui.add_space(10.0);
+                if crate::ffmpeg::can_download() {
+                    download = ui.add(egui::Button::new("Download ffmpeg").stroke(Stroke::new(1.0, pal.highlight)).min_size(vec2(0.0, 28.0))).clicked();
+                    if let Some(d) = crate::ffmpeg::own_dir() {
+                        hint(ui, &format!("About 90 MB from the FFmpeg builds on GitHub, kept in {}. Nothing else on your computer changes.", d.display()));
+                    }
+                    ui.add_space(10.0);
+                }
+                ui.label("Already have it, or rather install it yourself?");
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    let cmd = crate::ffmpeg::install_hint();
+                    ui.label(RichText::new(cmd).monospace().color(pal.fg));
+                    if ui.small_button("Copy").on_hover_text("Copy the install command").clicked() {
+                        ui.ctx().copy_text(cmd.into());
+                    }
+                });
+            }
+            if let Some((ok, m)) = &msg {
+                ui.add_space(6.0);
+                ui.label(RichText::new(m).color(if *ok { pal.fg_muted } else { Color32::from_rgb(218, 68, 83) }));
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let what = if cfg!(windows) { "Locate ffmpeg.exe…" } else { "Locate ffmpeg…" };
+                locate = ui.button(if found.is_some() { "Use Another…" } else { what }).clicked();
+                if found.is_none() {
+                    recheck = ui.button("Check Again").on_hover_text("Look again, after installing it").clicked();
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    close = ui.button(if found.is_some() { "Close" } else { "Not Now" }).clicked();
+                });
+            });
+            if found.is_none() && cfg!(windows) {
+                ui.add_space(6.0);
+                ui.checkbox(&mut ask, "Ask when GIFkit starts");
+            }
+        });
+        if ask != ask_before {
+            theme::set_setting("ffmpeg_ask", if ask { "yes" } else { "no" });
+        }
+        if cancel {
+            if let Some((pr, _)) = &self.ff_job {
+                pr.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        if download && self.ff_job.is_none() {
+            self.ff_msg = None;
+            let pr = Arc::new(crate::ffmpeg::Progress::default());
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (pr2, ctx2) = (pr.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::ffmpeg::download(pr2).map_err(|e| e.to_string()));
+                ctx2.request_repaint();
+            });
+            self.ff_job = Some((pr, rx));
+        }
+        if locate {
+            let mut d = rfd::FileDialog::new().set_title("Where is ffmpeg?");
+            if cfg!(windows) {
+                d = d.add_filter("ffmpeg", &["exe"]);
+            }
+            if let Some(f) = d.pick_file() {
+                match crate::ffmpeg::use_file(&f) {
+                    Ok(()) => self.ffmpeg_ready(ctx),
+                    Err(e) => self.ff_msg = Some((false, e.to_string())),
+                }
+            }
+        }
+        if recheck {
+            if crate::ffmpeg::recheck() {
+                self.ffmpeg_ready(ctx);
+            } else {
+                self.ff_msg = Some((false, "Still not found. If you just installed it, try Locate, or restart GIFkit.".into()));
+            }
+        }
+        if close || !open {
+            if let Some((pr, _)) = &self.ff_job {
+                pr.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.ff_open = false;
+            self.ff_then = None;
+        }
+    }
+
+    /// ffmpeg works now: turn on what needs it, and open the video that was waiting.
+    fn ffmpeg_ready(&mut self, ctx: &egui::Context) {
+        self.ffmpeg = true;
+        crate::gpu::warm_up();
+        self.ff_msg = None;
+        self.info("ffmpeg is set up");
+        if let Some(p) = self.ff_then.take() {
+            self.ff_open = false;
+            self.open_path_now(p, ctx);
         }
     }
 
@@ -3593,6 +3769,13 @@ impl GifKitApp {
         self.add_recent(&p);
         if crate::project::is_project(&p) {
             self.spawn_in(ctx, "Open project", 1, false, move |_| JobOutput::ProjectLoaded(crate::project::load(&p).map(|pr| (pr, p.clone()))));
+            return;
+        }
+        if io::is_video(&p) && !self.ffmpeg {
+            // set ffmpeg up, then open it
+            self.ff_then = Some(p);
+            self.ff_open = true;
+            self.info("Opening videos needs ffmpeg");
             return;
         }
         if io::is_video(&p) {
@@ -5014,7 +5197,7 @@ impl eframe::App for GifKitApp {
         self.thumbs.pump(&ctx);
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true) || std::env::var_os("GIFKIT_ASSUME_FOCUS").is_some();
         // a dialog of ours having focus still counts as the app being active
-        let dialog_open = self.export_open || self.history_open || self.about_open || self.shortcuts_open || self.video_import.is_some();
+        let dialog_open = self.export_open || self.history_open || self.about_open || self.ff_open || self.shortcuts_open || self.video_import.is_some();
         theme::set_focused(&ctx, focused || dialog_open, self.theme);
         self.views_last = self.drop_views.drain(..).map(|v| v.0).collect();
         // text that follows the canvas (wrapping, centring, caption bars)
@@ -5237,6 +5420,7 @@ impl eframe::App for GifKitApp {
         self.history_window(&ctx);
         self.confirm_window(&ctx);
         self.about_window(&ctx);
+        self.ffmpeg_window(&ctx);
         mark("canvas");
         self.emoji_drag_drop(&ctx);
         self.track_live_edits(&ctx, now);
@@ -5414,6 +5598,11 @@ impl GifKitApp {
             });
             top_menu(ui, "&Settings", |ui| {
                 ui.set_min_width(290.0);
+                if menu_item_tip(ui, "", "&ffmpeg…", "", true, "Where GIFkit finds ffmpeg, for video and AVIF") {
+                    self.ff_msg = None;
+                    self.ff_open = true;
+                }
+                ui.separator();
                 if menu_check(ui, self.show_toolbar, "Show &Toolbar", "") {
                     self.show_toolbar = !self.show_toolbar;
                     theme::set_setting("show_toolbar", if self.show_toolbar { "1" } else { "0" });
