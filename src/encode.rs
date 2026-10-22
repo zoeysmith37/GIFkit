@@ -30,6 +30,9 @@ pub struct GifOptions {
     pub quant_speed: i32,
     /// Floyd–Steinberg dither when mapping to the palette.
     pub dither: bool,
+    /// Ordered (Bayer) dither instead, when `dither` is off: a regular
+    /// pattern, made on the graphics card.
+    pub ordered_dither: bool,
     /// Merge consecutive identical frames into one (delays summed).
     pub merge_duplicates: bool,
     /// Alpha below this is treated as fully transparent.
@@ -49,6 +52,7 @@ impl Default for GifOptions {
             lossy: 0,
             quant_speed: 10,
             dither: false,
+            ordered_dither: false,
             merge_duplicates: true,
             alpha_threshold: 128,
             force_custom_lzw: false,
@@ -189,6 +193,39 @@ impl Palette {
         }
     }
 
+    /// The palette as the graphics card searches it.
+    fn gpu_table(&self) -> crate::gpu_render::QuantTable {
+        match &self.nq {
+            Some(nq) => {
+                let entries: Vec<[i32; 4]> = nq.color_map_rgba().chunks_exact(4).map(|c| [c[0] as i32, c[1] as i32, c[2] as i32, c[3] as i32]).collect();
+                // NeuQuant's index by green (its colour map is already sorted by green)
+                let mut netindex = [0u32; 256];
+                let (mut prev, mut start) = (0usize, 0usize);
+                for (i, e) in entries.iter().enumerate() {
+                    let g = e[1].clamp(0, 255) as usize;
+                    if g != prev {
+                        netindex[prev] = ((start + i) >> 1) as u32;
+                        for v in netindex.iter_mut().take(g).skip(prev + 1) {
+                            *v = i as u32;
+                        }
+                        prev = g;
+                        start = i;
+                    }
+                }
+                let max = entries.len().saturating_sub(1);
+                netindex[prev] = ((start + max) >> 1) as u32;
+                for v in netindex.iter_mut().skip(prev + 1) {
+                    *v = max as u32;
+                }
+                crate::gpu_render::QuantTable { mode: 0, entries, netindex }
+            }
+            None => {
+                let entries = (0..self.opaque_len()).map(|i| [self.rgb[i * 3] as i32, self.rgb[i * 3 + 1] as i32, self.rgb[i * 3 + 2] as i32, 255]).collect();
+                crate::gpu_render::QuantTable { mode: 1, entries, netindex: [0; 256] }
+            }
+        }
+    }
+
     fn color(&self, i: u8) -> [u8; 3] {
         let i = i as usize * 3;
         [self.rgb[i], self.rgb[i + 1], self.rgb[i + 2]]
@@ -207,22 +244,43 @@ fn map_region(
     mask: Option<&[bool]>,
     thr: u8,
     dither: bool,
+    ordered: bool,
 ) -> Vec<u8> {
     let mut out = vec![0u8; (w * h) as usize];
     let tidx = pal.transparent;
     if !dither {
-        out.par_chunks_mut(w as usize).enumerate().for_each(|(yy, row)| {
-            for xx in 0..w as usize {
-                let p = img.get_pixel(x0 + xx as u32, y0 + yy as u32);
-                let i = yy * w as usize + xx;
-                let keep = mask.map(|m| m[i]).unwrap_or(true);
-                row[xx] = if !keep || p[3] < thr {
-                    tidx.unwrap_or_else(|| pal.index_of(p[0], p[1], p[2]))
-                } else {
-                    pal.index_of(p[0], p[1], p[2])
-                };
+        // the card maps big regions; small ones aren't worth the trip
+        let gpu = if (w as u64 * h as u64) >= GPU_MAP_MIN && crate::gpu_render::enabled() {
+            let t = pal.gpu_table();
+            crate::gpu_render::with_shared_keep(|g| g.map_palette(img, x0, y0, w, h, &t, ordered)).flatten()
+        } else {
+            None
+        };
+        match gpu {
+            Some(v) if v.len() == out.len() => out = v,
+            _ => {
+                out.par_chunks_mut(w as usize).enumerate().for_each(|(yy, row)| {
+                    for (xx, o) in row.iter_mut().enumerate() {
+                        let (x, y) = (x0 + xx as u32, y0 + yy as u32);
+                        let p = img.get_pixel(x, y);
+                        let [r, g, b] = if ordered { bayer(x, y, [p[0], p[1], p[2]]) } else { [p[0], p[1], p[2]] };
+                        *o = pal.index_of(r, g, b);
+                    }
+                });
             }
-        });
+        }
+        // see-through pixels, and ones the mask leaves out
+        if let Some(t) = tidx {
+            out.par_chunks_mut(w as usize).enumerate().for_each(|(yy, row)| {
+                for (xx, o) in row.iter_mut().enumerate() {
+                    let i = yy * w as usize + xx;
+                    let keep = mask.map(|m| m[i]).unwrap_or(true);
+                    if !keep || img.get_pixel(x0 + xx as u32, y0 + yy as u32)[3] < thr {
+                        *o = t;
+                    }
+                }
+            });
+        }
         return out;
     }
     // Floyd–Steinberg (sequential).
@@ -259,6 +317,21 @@ fn map_region(
         std::mem::swap(&mut err_cur, &mut err_next);
     }
     out
+}
+
+/// Regions this many pixels or more are mapped on the graphics card.
+const GPU_MAP_MIN: u64 = 1 << 16;
+
+/// The ordered dither's 8×8 Bayer matrix.
+const BAYER8: [u8; 64] = [
+    0, 32, 8, 40, 2, 34, 10, 42, 48, 16, 56, 24, 50, 18, 58, 26, 12, 44, 4, 36, 14, 46, 6, 38, 60, 28, 52, 20, 62, 30, 54, 22, 3, 35, 11, 43, 1, 33, 9, 41, 51, 19, 59, 27, 49, 17, 57, 25, 15, 47, 7, 39, 13, 45, 5, 37, 63, 31, 55, 23, 61, 29, 53, 21,
+];
+
+/// A pixel nudged by the ordered dither at (x, y), as gpu_quant.wgsl does
+/// it: offsets are quarter steps, so rounding never lands on a half.
+fn bayer(x: u32, y: u32, c: [u8; 3]) -> [u8; 3] {
+    let d = (BAYER8[((y % 8) * 8 + x % 8) as usize] as f32 + 0.5) / 64.0 - 0.5;
+    c.map(|v| (v as f32 + d * 32.0).round().clamp(0.0, 255.0) as u8)
 }
 
 fn same_image(a: &RgbaImage, b: &RgbaImage) -> bool {
@@ -541,9 +614,9 @@ pub fn encode_gif(anim: &Animation, opt: &GifOptions, progress: Option<&AtomicUs
                         None => global.as_ref().unwrap(),
                     };
                     let m = if masked { mask_ref } else { None };
-                    let indices = map_region(img, x0, y0, rw, rh, pal, m, thr, opt.dither);
+                    let indices = map_region(img, x0, y0, rw, rh, pal, m, thr, opt.dither, opt.ordered_dither);
                     let (data, indices) = if wildcard {
-                        let full = map_region(img, x0, y0, rw, rh, pal, None, thr, opt.dither);
+                        let full = map_region(img, x0, y0, rw, rh, pal, None, thr, opt.dither, opt.ordered_dither);
                         crate::lzw::encode_ex(&indices, Some(&full), &pal.rgb, pal.transparent, max_dist)
                     } else {
                         (crate::lzw::encode(&indices, &pal.rgb, pal.transparent, max_dist), indices)
@@ -705,4 +778,36 @@ pub fn tag_gif(b: Vec<u8>) -> Vec<u8> {
     out.push(0);
     out.extend_from_slice(&b[p..]);
     out
+}
+
+/// The card picks exactly the palette entries the CPU does, NeuQuant and
+/// exact palettes, plain and with the ordered dither; and how long each takes.
+#[cfg(test)]
+#[test]
+#[ignore]
+fn gpu_mapping_matches_cpu() {
+    let Some(mut gpu) = crate::gpu_render::GpuRenderer::headless() else {
+        println!("no GPU adapter");
+        return;
+    };
+    let (w, h) = (1280u32, 720u32);
+    let img = RgbaImage::from_fn(w, h, |x, y| image::Rgba([(x * 255 / w) as u8, (y * 255 / h) as u8, (((x ^ y) * 7) % 256) as u8, 255]));
+    let samples: Vec<u8> = img.pixels().step_by(41).flat_map(|p| p.0).collect();
+    let nq_pal = Palette::build(&samples, 256, true, 10);
+    let few: Vec<[u8; 3]> = (0..40u8).map(|i| [i * 6, 255 - i * 6, (i * 37) % 255]).collect();
+    let exact = Palette::exact(&few, false);
+    for (name, pal) in [("neuquant", &nq_pal), ("exact", &exact)] {
+        for ordered in [false, true] {
+            let t0 = std::time::Instant::now();
+            let cpu = map_region(&img, 13, 7, w - 20, h - 9, pal, None, 128, false, ordered);
+            let tc = t0.elapsed();
+            let t = pal.gpu_table();
+            let t1 = std::time::Instant::now();
+            let g = gpu.map_palette(&img, 13, 7, w - 20, h - 9, &t, ordered).expect("gpu map");
+            let tg = t1.elapsed();
+            let diff = cpu.iter().zip(&g).filter(|(a, b)| a != b).count();
+            println!("{name} ordered={ordered}: {diff} differ of {}  cpu {:?} gpu {:?}", cpu.len(), tc, tg);
+            assert_eq!(diff, 0);
+        }
+    }
 }

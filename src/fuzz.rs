@@ -952,6 +952,11 @@ fn gpu_matches_cpu() {
         ("clip two to text", vec![(LayerKind::Text(text.clone()), false), (fx(&|e| e.grayscale = true), true), (LayerKind::Shape(Box::new(shape.clone())), true)]),
         ("clip to effect", vec![(fx(&|e| e.sepia = true), false), (fx(&|e| e.negative = true), true)]),
         ("clip fx to overlay", vec![(overlay.clone(), false), (fx(&|e| e.blur = true), true)]),
+        ("anim shake on emoji", vec![(LayerKind::Emoji(Box::new(emoji.clone())), false), (fx(&|e| (e.anim, e.loop_shake, e.loop_amount) = (true, true, 200.0)), true)]),
+        ("anim spin on shape", vec![(LayerKind::Shape(Box::new(shape.clone())), false), (fx(&|e| (e.anim, e.loop_spin, e.loop_cycles) = (true, true, 3)), true)]),
+        ("anim intro on text", vec![(LayerKind::Text(text.clone()), false), (fx(&|e| (e.anim, e.intro, e.fade_frames) = (true, Tr::SlideLeft, 4)), true)]),
+        ("grey then anim", vec![(LayerKind::Shape(Box::new(shape.clone())), false), (fx(&|e| e.grayscale = true), true), (fx(&|e| (e.anim, e.loop_wobble, e.loop_amount) = (true, true, 300.0)), true), (fx(&|e| e.negative = true), true)]),
+        ("anim on image", vec![(overlay.clone(), false), (fx(&|e| (e.anim, e.loop_float, e.loop_amount) = (true, true, 400.0)), true)]),
         ("clip then unclipped", vec![(LayerKind::Text(text.clone()), false), (fx(&|e| e.negative = true), true), (LayerKind::Emoji(Box::new(emoji.clone())), false)]),
     ];
     for (nm, ls) in clip_cases {
@@ -1222,4 +1227,64 @@ fn strength_sweep() {
         println!("{line}");
     }
     assert_eq!(bad, 0);
+}
+
+/// An animation clipped to a layer moves that layer: where it was, the
+/// picture underneath shows again (no ghost of it left behind).
+#[test]
+fn clipped_animation_moves_its_base() {
+    let fonts = crate::text::builtin_fonts();
+    let img = RgbaImage::from_pixel(80, 60, Rgba([200, 40, 40, 255]));
+    let base = Animation { frames: vec![Frame::new(img, 10)], loop_count: None };
+    let mut st = Stack::default();
+    let shape = crate::shapes::ShapeSettings { x: 30, y: 20, w: 20, h: 20, fill: [0, 0, 255], stroke_on: false, ..Default::default() };
+    st.push(LayerKind::Shape(Box::new(shape)));
+    // slides in from the left: on its first frame the shape is far to the left
+    let id = st.push(LayerKind::Effects(Box::new(crate::effects::EffectSettings { anim: true, intro: crate::motion::Transition::SlideRight, fade_frames: 4, ..Default::default() })));
+    st.layers.iter_mut().find(|l| l.id == id).unwrap().clip = true;
+    st.layout_text(80, 60, &fonts);
+    let plan = st.plan(&base);
+    let times = crate::stack::plan_times(&plan);
+    let prep = st.prepare(&base, &fonts);
+    let out = st.render_frame(&base, &plan, &times, 0, &fonts, &prep);
+    // where the shape was: the background, not the shape and not black
+    assert_eq!(out.get_pixel(40, 30).0, [200, 40, 40, 255], "ghost left behind");
+    // the rest of the frame untouched
+    assert_eq!(out.get_pixel(2, 2).0, [200, 40, 40, 255]);
+}
+
+/// The card's preview shrink is the CPU's triangle resize.
+#[test]
+#[ignore]
+fn gpu_shrink_matches_cpu() {
+    let Some(mut gpu) = crate::gpu_render::GpuRenderer::headless() else { return };
+    let img = RgbaImage::from_fn(333, 211, |x, y| Rgba([(x * 3) as u8, (y * 5) as u8, ((x * y) % 251) as u8, if (x + y) % 9 == 0 { 70 } else { 255 }]));
+    for (w, h) in [(166u32, 105u32), (100, 63), (333, 211), (40, 25)] {
+        let cpu = image::imageops::resize(&img, w, h, image::imageops::FilterType::Triangle);
+        let g = gpu.resize_triangle(&[&img], w, h).unwrap().pop().unwrap();
+        let max = cpu.pixels().zip(g.pixels()).map(|(a, b)| (0..4).map(|k| (a[k] as i32 - b[k] as i32).abs()).max().unwrap()).max().unwrap();
+        println!("{w}x{h}: max diff {max}");
+        assert!(max <= 1, "{w}x{h} differs by {max}");
+    }
+}
+
+/// A GIF made with the card mapping colours is byte for byte the one the
+/// CPU makes.
+#[test]
+#[ignore]
+fn gif_same_with_gpu_mapping() {
+    let frames: Vec<Frame> = (0..4u32).map(|k| Frame::new(RgbaImage::from_fn(400, 300, move |x, y| Rgba([((x + k * 9) % 256) as u8, (y % 256) as u8, ((x ^ y) % 256) as u8, if x < 5 { 0 } else { 255 }])), 6)).collect();
+    let anim = Animation { frames, loop_count: Some(0) };
+    for ordered in [false, true] {
+        let opt = crate::encode::GifOptions { ordered_dither: ordered, ..Default::default() };
+        let cpu = crate::encode::encode_gif(&anim, &opt, None).unwrap();
+        let Some((r, name)) = crate::gpu_render::GpuRenderer::headless_named() else { return };
+        crate::gpu_render::set_shared(r, name);
+        let before = crate::gpu_render::MAPPED.load(std::sync::atomic::Ordering::Relaxed);
+        let gpu = crate::encode::encode_gif(&anim, &opt, None).unwrap();
+        crate::gpu_render::clear_shared();
+        assert!(crate::gpu_render::MAPPED.load(std::sync::atomic::Ordering::Relaxed) > before, "the card wasn't used");
+        println!("ordered {ordered}: cpu {} bytes, gpu {} bytes", cpu.len(), gpu.len());
+        assert!(cpu == gpu, "the files differ");
+    }
 }

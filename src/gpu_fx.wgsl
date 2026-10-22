@@ -1098,6 +1098,30 @@ fn fs_fx(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             let o = rnd4(ps + (qs - ps) * m);
             return vec4<f32>(rnd4(vec4<f32>(o.rgb * o.a / 255.0, o.a))) / 255.0;
         }
+        // 54 lift a clipping base off what's under it (stack::lift): t0 the
+        // frame (premultiplied), t1 the frame under the base, t2 its coverage;
+        // straight out
+        case 54: {
+            let p = unpremul8(textureLoad(t0, ip, 0)) / 255.0;
+            let u = unpremul8(textureLoad(t1, ip, 0)) / 255.0;
+            let a = round(textureLoad(t2, ip, 0).a * 255.0) / 255.0;
+            if (a <= 0.0) {
+                return vec4<f32>(0.0);
+            }
+            let ba = clamp(p.a - u.a * (1.0 - a), 0.0, 1.0);
+            if (ba <= 0.0) {
+                return vec4<f32>(0.0);
+            }
+            let bp = max(p.rgb * 255.0 * p.a - u.rgb * 255.0 * u.a * (1.0 - a), vec3<f32>(0.0));
+            let rgb = clamp(round(bp / ba), vec3<f32>(0.0), vec3<f32>(255.0));
+            return vec4<f32>(rgb, round(ba * 255.0)) / 255.0;
+        }
+        // 55 t0 (straight) over t1 (premultiplied); premultiplied out
+        case 55: {
+            let g = ld(t0, ip) / 255.0;
+            let u = textureLoad(t1, ip, 0);
+            return vec4<f32>(g.rgb * g.a + u.rgb * (1.0 - g.a), g.a + u.a * (1.0 - g.a));
+        }
         // 53 clear to transparent
         case 53: {
             return vec4<f32>(0.0);

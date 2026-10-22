@@ -3213,7 +3213,7 @@ impl GifKitApp {
             Self::png_colours_ui(ui, &mut self.frames_png);
         } else {
             slider_row(ui, "Colours", egui::Slider::new(&mut self.gif_opts.colors, 2..=256));
-            form_row(ui, "", |ui| check(ui, &mut self.gif_opts.dither, "Dither"));
+            dither_row(ui, &mut self.gif_opts);
         }
     }
 
@@ -4217,22 +4217,27 @@ impl GifKitApp {
         std::thread::spawn(move || {
             stack::lower_thread_priority();
             let out = stack::bg_pool().install(|| {
-                use rayon::prelude::*;
                 let shrink = |a: &Animation| {
                     let (w, h) = stack::proxy_size(a.width(), a.height(), s);
-                    let frames = a.frames.par_iter().map(|f| crate::anim::Frame { image: Arc::new(image::imageops::resize(&*f.image, w, h, image::imageops::FilterType::Triangle)), ..f.clone() }).collect();
+                    let imgs: Vec<&RgbaImage> = a.frames.iter().map(|f| &*f.image).collect();
+                    let small = stack::shrink_images(&imgs, w, h);
+                    let frames = a.frames.iter().zip(small).map(|(f, i)| crate::anim::Frame { image: Arc::new(i), ..f.clone() }).collect();
                     Animation { frames, loop_count: a.loop_count }
                 };
                 let small = shrink(&base);
                 // the original mostly shares the source's frames: reuse those
                 let orig = original.map(|o| {
                     let (w, h) = stack::proxy_size(o.width(), o.height(), s);
+                    let shared: Vec<Option<usize>> = o.frames.iter().map(|f| base.frames.iter().position(|b| Arc::ptr_eq(&b.image, &f.image))).collect();
+                    let own: Vec<&RgbaImage> = o.frames.iter().zip(&shared).filter(|(_, k)| k.is_none()).map(|(f, _)| &*f.image).collect();
+                    let mut made = stack::shrink_images(&own, w, h).into_iter();
                     let frames = o
                         .frames
-                        .par_iter()
-                        .map(|f| match base.frames.iter().position(|b| Arc::ptr_eq(&b.image, &f.image)) {
-                            Some(k) => crate::anim::Frame { image: small.frames[k].image.clone(), ..f.clone() },
-                            None => crate::anim::Frame { image: Arc::new(image::imageops::resize(&*f.image, w, h, image::imageops::FilterType::Triangle)), ..f.clone() },
+                        .iter()
+                        .zip(&shared)
+                        .map(|(f, k)| match k {
+                            Some(k) => crate::anim::Frame { image: small.frames[*k].image.clone(), ..f.clone() },
+                            None => crate::anim::Frame { image: Arc::new(made.next().unwrap_or_else(|| image::imageops::resize(&*f.image, w, h, image::imageops::FilterType::Triangle))), ..f.clone() },
                         })
                         .collect();
                     Animation { frames, loop_count: o.loop_count }
@@ -4783,7 +4788,11 @@ impl GifKitApp {
                     let side = full.0.max(full.1);
                     let anim = if side > TEX_MAX_SIDE {
                         let (w, h) = stack::proxy_size(full.0, full.1, TEX_MAX_SIDE as f32 / side as f32);
-                        Animation { frames: orig.frames.iter().map(|f| crate::anim::Frame { image: Arc::new(image::imageops::resize(&*f.image, w, h, image::imageops::FilterType::Triangle)), ..f.clone() }).collect(), loop_count: orig.loop_count }
+                        {
+                            let imgs: Vec<&RgbaImage> = orig.frames.iter().map(|f| &*f.image).collect();
+                            let small = stack::shrink_images(&imgs, w, h);
+                            Animation { frames: orig.frames.iter().zip(small).map(|(f, i)| crate::anim::Frame { image: Arc::new(i), ..f.clone() }).collect(), loop_count: orig.loop_count }
+                        }
                     } else {
                         orig
                     };
@@ -4844,9 +4853,12 @@ impl GifKitApp {
                 let full = (anim.width(), anim.height());
                 let side = full.0.max(full.1);
                 let anim = if side > TEX_MAX_SIDE {
-                    use rayon::prelude::*;
                     let (w, h) = stack::proxy_size(full.0, full.1, TEX_MAX_SIDE as f32 / side as f32);
-                    Animation { frames: anim.frames.par_iter().map(|f| crate::anim::Frame { image: Arc::new(image::imageops::resize(&*f.image, w, h, image::imageops::FilterType::Triangle)), ..f.clone() }).collect(), loop_count: anim.loop_count }
+                    {
+                            let imgs: Vec<&RgbaImage> = anim.frames.iter().map(|f| &*f.image).collect();
+                            let small = stack::shrink_images(&imgs, w, h);
+                            Animation { frames: anim.frames.iter().zip(small).map(|(f, i)| crate::anim::Frame { image: Arc::new(i), ..f.clone() }).collect(), loop_count: anim.loop_count }
+                        }
                 } else {
                     anim
                 };
@@ -9282,8 +9294,8 @@ impl GifKitApp {
             slider_row(ui, "Quantizer", egui::Slider::new(&mut o.quant_speed, 1..=30)).on_hover_text("Speed of the palette search. 1 gives the best palette and 30 is fastest.");
             form_row(ui, "", |ui| {
                 check(ui, &mut o.global_palette, "One palette for all frames").on_hover_text("Smaller files but may show banding on varied footage");
-                check(ui, &mut o.dither, "Dither");
             });
+            dither_row(ui, o);
         });
         let drop_nth = &mut self.opt_drop_nth;
         let mut drop_go = false;
@@ -10879,6 +10891,15 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform) {
         });
         opt_row(ui, "Rotate", &mut fx.rot_any, |ui| num_fill(ui, &mut fx.rot_deg, 1.0, |d| d.speed(0.5).suffix("°")));
     });
+}
+
+/// GIF dithering: off, error diffusion or an ordered pattern.
+fn dither_row(ui: &mut egui::Ui, o: &mut crate::encode::GifOptions) {
+    let mut mode = if o.dither { 1u8 } else if o.ordered_dither { 2 } else { 0 };
+    let r = form_row(ui, "Dither", |ui| seg_row(ui, &mut mode, &[(0, "None"), (1, "Diffusion"), (2, "Ordered")]));
+    r.on_hover_text("Diffusion scatters the error between colours and looks smoothest. Ordered uses a fixed pattern: faster on the graphics card, often smaller, and steady between frames.");
+    o.dither = mode == 1;
+    o.ordered_dither = mode == 2;
 }
 
 /// A small heading inside a group, over one effect's own settings.

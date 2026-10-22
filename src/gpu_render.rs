@@ -102,6 +102,11 @@ pub enum GpuOp<'a> {
     Mask { draws: Vec<GpuDraw<'a>>, slot: usize },
     /// a clipped layer starts: the frame as it is now is kept
     ClipBegin,
+    /// before a clipping base draws: the frame under it, kept as `slot`
+    Under { slot: usize },
+    /// an animation clipped to base `slot`: the base is lifted off what's
+    /// under it, animated alone and put back
+    AnimClip { slot: usize, passes: Vec<GpuPass<'a>>, mix: f32 },
     /// and ends: its result shows only where mask `slot` is
     ClipEnd { slot: usize },
 }
@@ -133,7 +138,8 @@ impl GpuFrame<'_> {
         self.ops.iter().all(|op| match op {
             GpuOp::Draw(d) => draw_ok(d),
             GpuOp::Mask { draws, .. } => draws.iter().all(draw_ok),
-            GpuOp::ClipBegin | GpuOp::ClipEnd { .. } => true,
+            GpuOp::ClipBegin | GpuOp::ClipEnd { .. } | GpuOp::Under { .. } => true,
+            GpuOp::AnimClip { passes, .. } => passes.iter().all(|p| ok(p.size.0, p.size.1) && p.ins.iter().all(|i| !matches!(i, Some(GpuIn::Img(i)) if !img_ok(i)))),
             GpuOp::Effect { passes, .. } => passes.iter().all(|p| ok(p.size.0, p.size.1) && p.ins.iter().all(|i| !matches!(i, Some(GpuIn::Img(i)) if !img_ok(i)))),
         })
     }
@@ -256,6 +262,17 @@ pub struct GpuRenderer {
     pub max_side: u32,
     /// frames sent to the card and not finished yet
     pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// GIF colour mapping, made the first time it's needed
+    quant: Option<wgpu::ComputePipeline>,
+}
+
+/// A GIF palette as the card searches it (see gpu_quant.wgsl).
+pub struct QuantTable {
+    /// 0 NeuQuant's search, 1 nearest by RGB
+    pub mode: u32,
+    /// RGBA entries, as NeuQuant keeps them (sorted by green in mode 0)
+    pub entries: Vec<[i32; 4]>,
+    pub netindex: [u32; 256],
 }
 
 fn tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -351,6 +368,7 @@ impl GpuRenderer {
             noise: HashMap::new(),
             max_side,
             pending: Default::default(),
+            quant: None,
         }
     }
 
@@ -469,6 +487,176 @@ impl GpuRenderer {
     }
 
     /// Draw `quads` over `target` (kept, not cleared).
+    /// Palette indices for the `w`×`h` region at (x0, y0) of `img`, the way
+    /// the GIF encoder's CPU path picks them; `ordered` adds its Bayer dither.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_palette(&mut self, img: &RgbaImage, x0: u32, y0: u32, w: u32, h: u32, t: &QuantTable, ordered: bool) -> Option<Vec<u8>> {
+        if w == 0 || h == 0 || img.width().max(img.height()) > self.max_side || t.entries.is_empty() {
+            return None;
+        }
+        if self.quant.is_none() {
+            let m = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("gifkit-quant"), source: wgpu::ShaderSource::Wgsl(include_str!("gpu_quant.wgsl").into()) });
+            self.quant = Some(self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("gifkit-quant"), layout: None, module: &m, entry_point: Some("cs_map"), compilation_options: Default::default(), cache: None }));
+        }
+        let pipe = self.quant.as_ref()?;
+        let src = upload(&self.device, &self.queue, img, "gifkit-quant-src").create_view(&Default::default());
+        let total = w as u64 * h as u64;
+        let words = total.div_ceil(4);
+        let groups = words.div_ceil(64);
+        let gx = groups.min(65535) as u32;
+        let gy = groups.div_ceil(gx as u64) as u32;
+        if gy > 65535 {
+            return None;
+        }
+        let stride = gx * 64;
+        let mut uni: Vec<u8> = Vec::new();
+        for v in [w, h, x0, y0, t.mode, t.entries.len().min(256) as u32, u32::from(ordered), stride] {
+            uni.extend_from_slice(&v.to_le_bytes());
+        }
+        uni.extend_from_slice(&32.0f32.to_le_bytes());
+        uni.resize(48, 0);
+        let mut pal: Vec<u8> = Vec::with_capacity(256 * 16);
+        for k in 0..256 {
+            let e = t.entries.get(k).copied().unwrap_or([0; 4]);
+            for c in e {
+                pal.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        let net: Vec<u8> = t.netindex.iter().flat_map(|v| v.to_le_bytes()).collect();
+        use wgpu::util::DeviceExt;
+        let ub = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: &uni, usage: wgpu::BufferUsages::UNIFORM });
+        let pb = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: &pal, usage: wgpu::BufferUsages::STORAGE });
+        let nb = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: &net, usage: wgpu::BufferUsages::STORAGE });
+        let size = words * 4;
+        let ob = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("gifkit-quant-out"), size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let rb = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("gifkit-quant-read"), size, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipe.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src) },
+                wgpu::BindGroupEntry { binding: 1, resource: ub.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: pb.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: nb.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: ob.as_entire_binding() },
+            ],
+        });
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("gifkit-quant"), timestamp_writes: None });
+            cp.set_pipeline(pipe);
+            cp.set_bind_group(0, &bg, &[]);
+            cp.dispatch_workgroups(gx, gy, 1);
+        }
+        enc.copy_buffer_to_buffer(&ob, 0, &rb, 0, size);
+        self.queue.submit([enc.finish()]);
+        rb.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).ok()?;
+        let data = rb.slice(..).get_mapped_range().ok()?;
+        let out = data[..total as usize].to_vec();
+        drop(data);
+        MAPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        rb.unmap();
+        Some(out)
+    }
+
+    /// Shrink pictures to `w`×`h` with the CPU's triangle filter
+    /// (imageops::resize), several at a time.
+    pub fn resize_triangle(&mut self, imgs: &[&RgbaImage], w: u32, h: u32) -> Option<Vec<RgbaImage>> {
+        if w == 0 || h == 0 || imgs.iter().any(|i| i.width().max(i.height()) > self.max_side || i.width() == 0 || i.height() == 0) {
+            return None;
+        }
+        let axis = |a: u32, b: u32| {
+            let ratio = a as f32 / b as f32;
+            let sratio = ratio.max(1.0);
+            [ratio, sratio, sratio, 1.0]
+        };
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        let mut outs = Vec::with_capacity(imgs.len());
+        for img in imgs {
+            let (fw, fh) = img.dimensions();
+            let src = upload(&self.device, &self.queue, img, "gifkit-shrink").create_view(&Default::default());
+            let mid = self.target(fw, h, wgpu::TextureFormat::Rgba32Float);
+            let mv = mid.create_view(&Default::default());
+            let b = self.bind3([&src, &self.blank, &self.blank], &uniform_block(&[axis(fh, h), [0.0, fh as f32, 0.0, 1.0]]));
+            self.pass(&mut enc, &mv, &self.resize_v, &b);
+            let out = self.target(w, h, wgpu::TextureFormat::Rgba8Unorm);
+            let ov = out.create_view(&Default::default());
+            let b = self.bind3([&mv, &self.blank, &self.blank], &uniform_block(&[axis(fw, w), [0.0, fw as f32, 0.0, 0.0]]));
+            self.pass(&mut enc, &ov, &self.resize_h, &b);
+            outs.push(out);
+        }
+        self.queue.submit([enc.finish()]);
+        Some(self.read_raw(&outs))
+    }
+
+    /// An effect's passes, from the straight picture `start`; the result, straight.
+    fn run_passes(&mut self, enc: &mut wgpu::CommandEncoder, start: (wgpu::Texture, wgpu::TextureView, (u32, u32)), passes: &[GpuPass], f: &GpuFrame, sprite_gen: u64) -> (wgpu::Texture, wgpu::TextureView, (u32, u32)) {
+        let (mut s_tex, mut s_view, mut s_size) = start;
+        let u8f = wgpu::TextureFormat::Rgba8Unorm;
+        let mut enc = enc;
+        let mut tmps: HashMap<u8, wgpu::TextureView> = HashMap::new();
+        for p in passes {
+            let mut views: Vec<wgpu::TextureView> = Vec::with_capacity(3);
+            for i in p.ins {
+                views.push(match i {
+                    None => self.blank.clone(),
+                    Some(GpuIn::Cur) => s_view.clone(),
+                    Some(GpuIn::Tmp(k)) => tmps.get(&k).cloned().unwrap_or_else(|| self.blank.clone()),
+                    Some(GpuIn::Img(img)) => self.sprite_view(img, sprite_gen),
+                    Some(GpuIn::Owned(k)) => match f.owned.get(k) {
+                        Some(img) => upload(&self.device, &self.queue, img, "gifkit-owned").create_view(&Default::default()),
+                        None => self.blank.clone(),
+                    },
+                    Some(GpuIn::Noise(k)) => self.noise_view(k, p.size.0, p.size.1),
+                });
+            }
+            let vs = [&views[0], &views[1], &views[2]];
+            if p.kind == PassKind::Hist {
+                enc.clear_buffer(&self.hist, 0, None);
+                let buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: &floats(&uniform_block(&p.u)), usage: wgpu::BufferUsages::UNIFORM });
+                let b = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &self.hist_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(vs[0]) },
+                        wgpu::BindGroupEntry { binding: 1, resource: buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 4, resource: self.hist.as_entire_binding() },
+                    ],
+                });
+                let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("gifkit-hist"), timestamp_writes: None });
+                cp.set_bind_group(0, &b, &[]);
+                cp.set_pipeline(&self.hist_count);
+                cp.dispatch_workgroups(p.size.0.div_ceil(16), p.size.1.div_ceil(16), 1);
+                cp.set_pipeline(&self.hist_cuts);
+                cp.dispatch_workgroups(1, 1, 1);
+                continue;
+            }
+            let format = if p.float { wgpu::TextureFormat::Rgba32Float } else { u8f };
+            let t = self.target(p.size.0, p.size.1, format);
+            let v = t.create_view(&Default::default());
+            let pipe = match (p.kind, p.float) {
+                (PassKind::ResizeV, _) => &self.resize_v,
+                (PassKind::ResizeH, _) => &self.resize_h,
+                (_, true) => &self.fx_f32,
+                _ => &self.fx,
+            };
+            let b = self.bind3(vs, &uniform_block(&p.u));
+            self.pass(&mut enc, &v, pipe, &b);
+            match p.out {
+                None => {
+                    s_tex = t;
+                    s_view = v;
+                    s_size = p.size;
+                }
+                Some(k) => {
+                    tmps.insert(k, v);
+                }
+            }
+        }
+        (s_tex, s_view, s_size)
+    }
+
     /// The bind group that draws `d` onto a frame of `size`.
     fn quad(&mut self, d: &GpuDraw, size: (u32, u32), sprite_gen: u64) -> wgpu::BindGroup {
         let inv = d.m.inverse();
@@ -591,6 +779,7 @@ impl GpuRenderer {
         // clipping: bases' coverage, and the frame as it was before each clipped layer
         let mut masks: HashMap<usize, (wgpu::TextureView, (u32, u32))> = HashMap::new();
         let mut kept: Vec<(wgpu::TextureView, (u32, u32))> = Vec::new();
+        let mut unders: HashMap<usize, (wgpu::TextureView, (u32, u32))> = HashMap::new();
         for op in &f.ops {
             match op {
                 GpuOp::Draw(d) => {
@@ -606,6 +795,34 @@ impl GpuRenderer {
                     let qs: Vec<wgpu::BindGroup> = draws.iter().map(|d| self.quad(d, cur_size, sprite_gen)).collect();
                     self.draw_quads(&mut enc, &v, &qs);
                     masks.insert(*slot, (v, cur_size));
+                }
+                GpuOp::Under { slot } => {
+                    self.draw_quads(&mut enc, &cur_view, &quads);
+                    quads.clear();
+                    let (_, v) = self.fx_raw(&mut enc, 0.0, [&cur_view, &self.blank, &self.blank], cur_size, &[]);
+                    unders.insert(*slot, (v, cur_size));
+                }
+                GpuOp::AnimClip { slot, passes, mix } => {
+                    self.draw_quads(&mut enc, &cur_view, &quads);
+                    quads.clear();
+                    let (Some((uv, us)), Some((mv, ms))) = (unders.get(slot).cloned(), masks.get(slot).cloned()) else { continue };
+                    if us != cur_size || ms != cur_size {
+                        continue;
+                    }
+                    // the base on its own, straight
+                    let (gt, gv) = self.fx_raw(&mut enc, 54.0, [&cur_view, &uv, &mv], cur_size, &[]);
+                    let before = (*mix < 0.999).then(|| gv.clone());
+                    let (mut at, mut av, asz) = self.run_passes(&mut enc, (gt, gv, cur_size), passes, f, sprite_gen);
+                    if asz != cur_size {
+                        continue;
+                    }
+                    if let Some(bv) = before {
+                        (at, av) = self.fx_raw(&mut enc, 50.0, [&av, &bv, &self.blank], asz, &[[*mix, asz.0 as f32, asz.1 as f32, 0.0]]);
+                    }
+                    let _ = at;
+                    (cur_tex, cur_view) = self.fx_raw(&mut enc, 55.0, [&av, &uv, &self.blank], cur_size, &[]);
+                    // later clipped layers follow it
+                    masks.insert(*slot, (av, cur_size));
                 }
                 GpuOp::ClipBegin => {
                     self.draw_quads(&mut enc, &cur_view, &quads);
@@ -641,65 +858,7 @@ impl GpuRenderer {
                     straight = false;
                     let mut s_size = cur_size;
                     let before = (*mix < 0.999).then(|| (s_view.clone(), s_size));
-                    let mut tmps: HashMap<u8, wgpu::TextureView> = HashMap::new();
-                    for p in passes {
-                        let mut views: Vec<wgpu::TextureView> = Vec::with_capacity(3);
-                        for i in p.ins {
-                            views.push(match i {
-                                None => self.blank.clone(),
-                                Some(GpuIn::Cur) => s_view.clone(),
-                                Some(GpuIn::Tmp(k)) => tmps.get(&k).cloned().unwrap_or_else(|| self.blank.clone()),
-                                Some(GpuIn::Img(img)) => self.sprite_view(img, sprite_gen),
-                                Some(GpuIn::Owned(k)) => match f.owned.get(k) {
-                                    Some(img) => upload(&self.device, &self.queue, img, "gifkit-owned").create_view(&Default::default()),
-                                    None => self.blank.clone(),
-                                },
-                                Some(GpuIn::Noise(k)) => self.noise_view(k, p.size.0, p.size.1),
-                            });
-                        }
-                        let vs = [&views[0], &views[1], &views[2]];
-                        if p.kind == PassKind::Hist {
-                            enc.clear_buffer(&self.hist, 0, None);
-                            let buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: &floats(&uniform_block(&p.u)), usage: wgpu::BufferUsages::UNIFORM });
-                            let b = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                                label: None,
-                                layout: &self.hist_layout,
-                                entries: &[
-                                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(vs[0]) },
-                                    wgpu::BindGroupEntry { binding: 1, resource: buf.as_entire_binding() },
-                                    wgpu::BindGroupEntry { binding: 4, resource: self.hist.as_entire_binding() },
-                                ],
-                            });
-                            let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("gifkit-hist"), timestamp_writes: None });
-                            cp.set_bind_group(0, &b, &[]);
-                            cp.set_pipeline(&self.hist_count);
-                            cp.dispatch_workgroups(p.size.0.div_ceil(16), p.size.1.div_ceil(16), 1);
-                            cp.set_pipeline(&self.hist_cuts);
-                            cp.dispatch_workgroups(1, 1, 1);
-                            continue;
-                        }
-                        let format = if p.float { wgpu::TextureFormat::Rgba32Float } else { u8f };
-                        let t = self.target(p.size.0, p.size.1, format);
-                        let v = t.create_view(&Default::default());
-                        let pipe = match (p.kind, p.float) {
-                            (PassKind::ResizeV, _) => &self.resize_v,
-                            (PassKind::ResizeH, _) => &self.resize_h,
-                            (_, true) => &self.fx_f32,
-                            _ => &self.fx,
-                        };
-                        let b = self.bind3(vs, &uniform_block(&p.u));
-                        self.pass(&mut enc, &v, pipe, &b);
-                        match p.out {
-                            None => {
-                                s_tex = t;
-                                s_view = v;
-                                s_size = p.size;
-                            }
-                            Some(k) => {
-                                tmps.insert(k, v);
-                            }
-                        }
-                    }
+                    (s_tex, s_view, s_size) = self.run_passes(&mut enc, (s_tex, s_view, s_size), passes, f, sprite_gen);
                     // a keyed fade mixes the result with what was under it
                     if let Some((bv, bs)) = before {
                         (s_tex, s_view) = fx_pass(self, &mut enc, 50.0, [&s_view, &bv, &self.blank], s_size, &[[*mix, bs.0 as f32, bs.1 as f32, 0.0]]);
@@ -805,11 +964,44 @@ pub fn set_shared(r: GpuRenderer, name: String) {
     }
 }
 
+/// Regions the card has colour mapped (tests check it was used).
+pub static MAPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Let go of the shared renderer (tests).
+#[cfg(test)]
+pub fn clear_shared() {
+    if let Ok(mut s) = SHARED.lock() {
+        *s = None;
+    }
+}
+
 /// A real graphics card: software ones (llvmpipe, WARP) are slower than
 /// the CPU path, which spreads over every core (GIFKIT_SOFT_GPU=1 allows them,
 /// for tests).
 pub fn worth_using(info: &wgpu::AdapterInfo) -> bool {
     info.device_type != wgpu::DeviceType::Cpu || std::env::var_os("GIFKIT_SOFT_GPU").is_some()
+}
+
+/// `resize_triangle` on the shared renderer, in batches; None when there's no
+/// card to use (the caller resizes on the CPU).
+pub fn shrink_many(imgs: &[&RgbaImage], w: u32, h: u32) -> Option<Vec<RgbaImage>> {
+    let mut out = Vec::with_capacity(imgs.len());
+    for chunk in imgs.chunks(8) {
+        let r = with_shared_keep(|g| g.resize_triangle(chunk, w, h))??;
+        out.extend(r);
+    }
+    Some(out)
+}
+
+/// `with_shared`, keeping the renderer's picture caches (for work that
+/// doesn't use them).
+pub fn with_shared_keep<T>(f: impl FnOnce(&mut GpuRenderer) -> T) -> Option<T> {
+    if !enabled() {
+        return None;
+    }
+    let mut g = SHARED.lock().ok()?;
+    let r = g.as_mut()?;
+    Some(f(r))
 }
 
 /// Run `f` with the shared renderer, when there is one and it's turned on.

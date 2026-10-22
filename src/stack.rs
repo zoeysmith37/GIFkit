@@ -604,6 +604,32 @@ impl Prepared {
     }
 }
 
+/// What a clipping base and the layers clipped to it add over `under`, on
+/// its own: `img` is under with it on top, `mask` its coverage. Straight
+/// colours, see-through elsewhere.
+fn lift(img: &RgbaImage, under: &RgbaImage, mask: &image::GrayImage) -> RgbaImage {
+    use rayon::prelude::*;
+    let mut out = RgbaImage::new(img.width(), img.height());
+    out.par_chunks_mut(4).zip(img.par_chunks(4)).zip(under.par_chunks(4)).zip(mask.as_raw().par_iter()).for_each(|(((o, p), u), m)| {
+        let a = *m as f32 / 255.0;
+        if a <= 0.0 {
+            return;
+        }
+        // premultiplied: img = base + under * (1 - a)
+        let (pa, ua) = (p[3] as f32 / 255.0, u[3] as f32 / 255.0);
+        let ba = (pa - ua * (1.0 - a)).clamp(0.0, 1.0);
+        if ba <= 0.0 {
+            return;
+        }
+        for k in 0..3 {
+            let bp = (p[k] as f32 * pa - u[k] as f32 * ua * (1.0 - a)).max(0.0);
+            o[k] = (bp / ba).round().clamp(0.0, 255.0) as u8;
+        }
+        o[3] = (ba * 255.0).round() as u8;
+    });
+    out
+}
+
 /// Mix `img` back toward `before` where `mask` is clear: a clipped layer
 /// shows only where its base drew.
 fn mask_blend(img: &mut RgbaImage, before: &RgbaImage, mask: &image::GrayImage) {
@@ -614,6 +640,15 @@ fn mask_blend(img: &mut RgbaImage, before: &RgbaImage, mask: &image::GrayImage) 
             p[k] = (q[k] as f32 + (p[k] as f32 - q[k] as f32) * a).round() as u8;
         }
     });
+}
+
+/// Pictures shrunk to `w`×`h` with the triangle filter: on the graphics card
+/// when there is one, otherwise on every core.
+pub fn shrink_images(imgs: &[&RgbaImage], w: u32, h: u32) -> Vec<RgbaImage> {
+    if let Some(v) = crate::gpu_render::shrink_many(imgs, w, h).filter(|v| v.len() == imgs.len()) {
+        return v;
+    }
+    imgs.par_iter().map(|i| image::imageops::resize(*i, w, h, image::imageops::FilterType::Triangle)).collect()
 }
 
 /// Run the calling thread at a lower priority, so long background renders
@@ -862,8 +897,10 @@ impl Stack {
             }
         }
         let has_clips = |li: usize| self.layers.get(li + 1).is_some_and(|l| l.clip);
-        // the base's coverage, made when the base is drawn
+        // the base's coverage, made when the base is drawn, and the frame
+        // under it (an animation clipped to it moves it over that)
         let mut masks: Vec<Option<image::GrayImage>> = vec![None; self.layers.len()];
+        let mut unders: Vec<Option<RgbaImage>> = vec![None; self.layers.len()];
         for li in 0..self.layers.len() {
             match base_of[li].filter(|_| self.layers[li].clip) {
                 Some(b) => {
@@ -874,6 +911,24 @@ impl Stack {
                         }
                         continue;
                     };
+                    if let (LayerKind::Effects(fx), Some(under)) = (&self.layers[li].kind, &unders[b]) {
+                        if fx.anim && under.dimensions() == img.dimensions() && mask.dimensions() == img.dimensions() {
+                            // the base itself moves: lift it off what's under it,
+                            // animate it alone and put it back down
+                            let group = lift(&img, under, mask);
+                            let mut moved = group.clone();
+                            let fx2 = EffectSettings { fade_to_transparent: true, ..(**fx).clone() };
+                            self.draw_layer_as(&mut moved, li, i, plan, times, fonts, prep, Some(&fx2));
+                            if moved.dimensions() == img.dimensions() {
+                                let mut out = under.clone();
+                                crate::ops::overlay_with_opacity(&mut out, &moved, 0, 0, 1.0);
+                                img = out;
+                                // later layers clipped to it follow it to where it moved
+                                masks[b] = Some(image::GrayImage::from_fn(img.width(), img.height(), |x, y| image::Luma([moved.get_pixel(x, y)[3]])));
+                            }
+                            continue;
+                        }
+                    }
                     let before = img.clone();
                     self.draw_layer(&mut img, li, i, plan, times, fonts, prep);
                     if img.dimensions() == before.dimensions() && img.dimensions() == mask.dimensions() {
@@ -881,7 +936,10 @@ impl Stack {
                     }
                 }
                 None => {
+                    let clips_anim = has_clips(li) && self.layers[li + 1..].iter().take_while(|l| l.clip).any(|l| matches!(&l.kind, LayerKind::Effects(fx) if fx.anim && l.active()));
+                    let under = (clips_anim && Self::coverage_kind(&self.layers[li].kind)).then(|| img.clone());
                     self.draw_layer(&mut img, li, i, plan, times, fonts, prep);
+                    unders[li] = under;
                     if has_clips(li) && Self::coverage_kind(&self.layers[li].kind) && self.layer_shows(li, i, n) {
                         // what this layer draws, on its own, as the mask for those clipped to it
                         let (w, h) = img.dimensions();
@@ -911,6 +969,12 @@ impl Stack {
     /// Draw layer `li` onto `img` for plan frame `i`.
     #[allow(clippy::too_many_arguments)]
     fn draw_layer(&self, target: &mut RgbaImage, li: usize, i: usize, plan: &[PlanFrame], times: &[f32], fonts: &[FontEntry], prep: &Prepared) {
+        self.draw_layer_as(target, li, i, plan, times, fonts, prep, None);
+    }
+
+    /// `draw_layer`, with other effect settings for an effects layer.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_layer_as(&self, target: &mut RgbaImage, li: usize, i: usize, plan: &[PlanFrame], times: &[f32], fonts: &[FontEntry], prep: &Prepared, over: Option<&EffectSettings>) {
         let n = plan.len();
         let src = plan[i].src;
         let l = &self.layers[li];
@@ -942,6 +1006,7 @@ impl Stack {
         };
         match &l.kind {
             LayerKind::Effects(fx) => {
+                let fx = over.unwrap_or(fx);
                 // effects run over their own clip, so an intro starts where the clip does
                 let (s0, s1) = l.timing.clip_at(i, n).filter(|_| l.timing.clips.is_some()).unwrap_or((0, n.saturating_sub(1)));
                 // count only frames that show: skipped ones (trims, speed-ups)
@@ -1467,6 +1532,9 @@ impl Stack {
         }
         let has_clips = |li: usize| self.layers.get(li + 1).is_some_and(|l| l.clip);
         let mut masked = vec![false; self.layers.len()];
+        // bases with an animation clipped to them: the frame under them is kept
+        let mut undered = vec![false; self.layers.len()];
+        let clips_anim = |li: usize| self.layers[li + 1..].iter().take_while(|l| l.clip).any(|l| matches!(&l.kind, LayerKind::Effects(fx) if fx.anim && l.active()));
         // a clipped layer's ops to close, or a base's draws to make a mask of
         let mut open_clip: Option<usize> = None;
         let mut mask_from: Option<(usize, usize)> = None;
@@ -1489,7 +1557,9 @@ impl Stack {
             if mo.opacity <= 0.001 {
                 continue;
             }
+            let mut anim_clip = None;
             match base_of[li].filter(|_| l.clip) {
+                Some(b) if masked[b] && undered[b] && matches!(&l.kind, LayerKind::Effects(fx) if fx.anim) => anim_clip = Some(b),
                 Some(b) if masked[b] => {
                     draws.push(GpuOp::ClipBegin);
                     open_clip = Some(b);
@@ -1503,6 +1573,10 @@ impl Stack {
                 }
                 None => {
                     if has_clips(li) && Self::coverage_kind(&l.kind) {
+                        if clips_anim(li) {
+                            draws.push(GpuOp::Under { slot: li });
+                            undered[li] = true;
+                        }
                         mask_from = Some((li, draws.len()));
                     }
                 }
@@ -1528,14 +1602,27 @@ impl Stack {
                     let shown = |a: usize, b: usize| plan[a..b].iter().filter(|f| f.enabled).count();
                     let end_t = times[s1] + if plan[s1].enabled { effective_delay(plan[s1].delay) as f32 / 100.0 } else { 0.0 };
                     let mut pl = crate::gpu_fx::Plan::new(cur, &mut owned);
+                    // a clipped animation moves its base alone: what it uncovers is see-through
+                    let lifted;
+                    let fx = if anim_clip.is_some() {
+                        lifted = EffectSettings { fade_to_transparent: true, ..(**fx).clone() };
+                        &lifted
+                    } else {
+                        &**fx
+                    };
                     crate::gpu_fx::effects(&mut pl, fx, shown(s0, i), shown(s0, s1 + 1).max(1), times[i] - times[s0], end_t - times[s0], fonts);
                     cost += pl.cost;
                     if cost > crate::gpu_fx::MAX_COST {
                         return None;
                     }
-                    cur = pl.size;
                     let passes = pl.passes;
-                    draws.push(GpuOp::Effect { passes, mix: k });
+                    match anim_clip {
+                        Some(b) => draws.push(GpuOp::AnimClip { slot: b, passes, mix: k }),
+                        None => {
+                            cur = pl.size;
+                            draws.push(GpuOp::Effect { passes, mix: k });
+                        }
+                    }
                 }
                 LayerKind::Censor(c) => {
                     if c.applies_to(src) {
