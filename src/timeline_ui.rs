@@ -123,6 +123,42 @@ fn free_slot(spans: &[(usize, usize)], len: usize, want: usize, n: usize, after:
     cands.into_iter().filter(|&a| a <= last && fits(a) && (!after || a >= want)).min_by_key(|&a| a.abs_diff(want))
 }
 
+/// The GIF's frames (as shown) with clip `a..=b` of `d0` given new edges
+/// `na..=nb`: what it gives up becomes a gap, and the gap it's pulled into
+/// fills by holding its end, playing it again or stretching it.
+fn gif_edge_fill(d0: &[crate::anim::Frame], (a, b): (usize, usize), (na, nb): (usize, usize), how: Extend) -> Vec<crate::anim::Frame> {
+    let mut d = d0.to_vec();
+    if b >= d.len() || nb >= d.len() || na > nb {
+        return d;
+    }
+    for i in a..=b {
+        if i < na || i > nb {
+            d[i].blank = true;
+        }
+    }
+    let clip = &d0[a..=b];
+    let len = clip.len();
+    if na < a || nb > b {
+        let total = nb + 1 - na;
+        // the part of the clip that stays, for stretching
+        let (k0, k1) = (na.max(a) - a, nb.min(b) - a);
+        for j in 0..total {
+            let pos = na as i64 + j as i64 - a as i64;
+            let src = match how {
+                Extend::Hold => &clip[pos.clamp(0, len as i64 - 1) as usize],
+                Extend::Loop => &clip[pos.rem_euclid(len as i64) as usize],
+                Extend::Stretch => &clip[k0 + j * (k1 + 1 - k0) / total],
+            };
+            d[na + j] = crate::anim::Frame { cut: false, blank: false, enabled: true, ..src.clone() };
+        }
+    }
+    d[na].cut = true;
+    if let Some(f) = d.get_mut(nb + 1) {
+        f.cut = true;
+    }
+    d
+}
+
 /// What the timeline puts on the system clipboard, so Ctrl+V comes back here.
 pub(super) const BOARD_TAG: &str = "GIFkit timeline clips";
 
@@ -956,23 +992,24 @@ impl GifKitApp {
                     }
                 }
             }
-            // a GIF clip being moved: where it would go
-            if let (true, Some(d)) = (id == GIF, self.tl_drag.filter(|d| d.track == GIF && d.grab == TlGrab::Body)) {
-                if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
-                    let dx = (p.x - lanes.min.x - PAD) / zoom + x0 - d.at;
-                    let r = Rect::from_min_max(pos2(fx(d.orig.0 as f32 + dx), top + 3.0), pos2(fx(d.orig.1 as f32 + 1.0 + dx), top + h - 3.0));
+            // a clip being moved: where it would go
+            if let Some(d) = self.tl_drag.filter(|d| d.track == id && d.grab == TlGrab::Body && self.tl_group.is_empty()) {
+                let len = (d.orig.1 - d.orig.0 + 1) as f32;
+                let at = match (self.tl_free_drop, ui.input(|i| i.pointer.interact_pos())) {
+                    // free room: it lands right there
+                    (Some(w), _) => Some(w as f32),
+                    (None, Some(p)) if self.tl_drop.is_some() => Some(d.orig.0 as f32 + (p.x - lanes.min.x - PAD) / zoom + x0 - d.at),
+                    _ => None,
+                };
+                if let Some(a) = at {
+                    let r = Rect::from_min_max(pos2(fx(a), top + 3.0), pos2(fx(a + len), top + h - 3.0));
                     lp.rect_filled(r, 3.0, mix(pal.view, pal.highlight, 0.35).gamma_multiply(0.85));
                     lp.rect_stroke(r, 3.0, Stroke::new(1.5, pal.highlight), egui::StrokeKind::Inside);
                 }
-                if let Some(t) = self.tl_gif_drop {
+                if let Some(t) = self.tl_drop {
                     let x = fx(t as f32);
                     lp.vline(x, (top - 1.0)..=(top + h + 1.0), Stroke::new(3.0, pal.highlight));
                 }
-            }
-            // a layer clip about to go in between others: where
-            if let (Some(t), Some(_)) = (self.tl_layer_drop, self.tl_drag.filter(|d| d.track == id && id != GIF && d.grab == TlGrab::Body)) {
-                let x = fx(t as f32);
-                lp.vline(x, (top - 1.0)..=(top + h + 1.0), Stroke::new(3.0, pal.highlight));
             }
             // Boomerang: the part played back follows the first half, greyed
             let ge = self.gif_edit_len();
@@ -1300,6 +1337,11 @@ impl GifKitApp {
                                         }
                                     }
                                 }
+                                // a GIF edge works from the frames as they were, so
+                                // going back and forth over a gap doesn't pile up
+                                self.tl_gif_d0 = (id == GIF && grab != TlGrab::Body).then(|| self.gif_display().map(|x| x.2)).flatten();
+                                self.tl_free_drop = None;
+                                self.tl_drop = None;
                                 self.tl_drag = Some(TlDrag { track: id, clip: ci, grab, at: f, orig: (a, b) });
                             }
                         }
@@ -1328,8 +1370,7 @@ impl GifKitApp {
             // snapping: the moving edge (or key) to the nearest thing within a few pixels
             self.tl_snap_line = None;
             let free = ui.input(|i| i.modifiers.shift);
-            let gif_body = d.track == GIF && d.grab == TlGrab::Body;
-            if self.tl_snap && !free && !gif_body && d.grab != TlGrab::Playhead {
+            if self.tl_snap && !free && d.grab != TlGrab::Playhead {
                 let edges: Vec<usize> = match d.grab {
                     TlGrab::Key(_) | TlGrab::Start => vec![d.orig.0],
                     TlGrab::End => vec![d.orig.1 + 1],
@@ -1418,14 +1459,28 @@ impl GifKitApp {
                     }
                     self.modified = true;
                 }
-                TlGrab::Body if d.track == GIF => {
-                    // where the clip would go: the clip boundary nearest its middle
-                    let len = (d.orig.1 - d.orig.0 + 1) as f32;
-                    let centre = d.orig.0 as f32 + (f - d.at) + len / 2.0;
-                    let mut bounds: Vec<usize> = self.gif_runs().iter().flat_map(|r| [r.0, r.1 + 1]).collect();
-                    bounds.dedup();
-                    let best = bounds.into_iter().min_by(|x, y| (*x as f32 - centre).abs().total_cmp(&(*y as f32 - centre).abs()));
-                    self.tl_gif_drop = best.filter(|&t| t < d.orig.0 || t > d.orig.1 + 1);
+                TlGrab::Body => {
+                    // into free room on the row it goes straight there; over
+                    // other clips it goes in between them and they make room
+                    let spans = self.track_spans(d.track);
+                    let ge = if d.track == GIF { self.gif_edit_len() } else { n };
+                    let len = d.orig.1 - d.orig.0;
+                    let here = spans.get(d.clip).copied().unwrap_or(d.orig);
+                    let others: Vec<(usize, usize)> = spans.iter().enumerate().filter(|(j, _)| *j != d.clip).map(|(_, s)| *s).collect();
+                    let want = clamp(d.orig.0 as i64 + delta, 0, ge.saturating_sub(len + 1));
+                    self.tl_free_drop = None;
+                    self.tl_drop = None;
+                    if want == here.0 {
+                        // where it is: nothing to do
+                    } else if free_slot(&others, len + 1, want, ge, false) == Some(want) {
+                        self.tl_free_drop = Some(want);
+                    } else {
+                        // the edge nearest its leading end
+                        let lead = if delta < 0 { want } else { want + len + 1 } as f32;
+                        let best = others.iter().flat_map(|&(x, y)| [x, y + 1]).filter(|&t| t <= here.0 || t > here.1).min_by(|x, y| (*x as f32 - lead).abs().total_cmp(&(*y as f32 - lead).abs()));
+                        self.tl_drop = best.filter(|&t| t != here.0 && t != here.1 + 1);
+                        self.tl_snap_line = None;
+                    }
                     ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
                 }
                 grab => {
@@ -1437,31 +1492,12 @@ impl GifKitApp {
                     let hi = spans.iter().filter(|s| s.0 > d.orig.1).map(|s| s.0 - 1).min().unwrap_or(ge - 1);
                     let len = d.orig.1 - d.orig.0;
                     // the GIF's last clip can be pulled past the end to make it longer
-                    let past = d.track == GIF && grab == TlGrab::End && d.orig.1 + 1 == ge;
+                    // (with a gap after it too: the gap fills first)
+                    let past = d.track == GIF && grab == TlGrab::End && !spans.iter().any(|s| s.0 > d.orig.1);
                     if past {
                         self.tl_extend = (d.orig.1 as i64 + delta - (ge as i64 - 1)).clamp(0, (ge as i64 * 4).max(250)) as usize;
                     }
                     let (na, nb) = match grab {
-                        // a layer clip can go past the others into any room on its row
-                        TlGrab::Body if d.track != GIF => {
-                            let others: Vec<(usize, usize)> = spans.iter().enumerate().filter(|(j, _)| *j != d.clip).map(|(_, s)| *s).collect();
-                            let want = clamp(d.orig.0 as i64 + delta, 0, n - 1 - len);
-                            let here = spans.get(d.clip).copied().unwrap_or(d.orig);
-                            if free_slot(&others, len + 1, want, n, false) == Some(want) {
-                                // room there: it goes there
-                                self.tl_layer_drop = None;
-                                (want, want + len)
-                            } else {
-                                // over other clips: it goes in between them when let go,
-                                // at the edge nearest its leading end, and they make room
-                                let centre = if delta < 0 { want } else { want + len + 1 } as f32;
-                                let best = others.iter().flat_map(|&(x, y)| [x, y + 1]).filter(|&t| t <= here.0 || t > here.1).min_by(|x, y| (*x as f32 - centre).abs().total_cmp(&(*y as f32 - centre).abs()));
-                                self.tl_layer_drop = best.filter(|&t| t != here.0 && t != here.1 + 1);
-                                self.tl_snap_line = None;
-                                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-                                here
-                            }
-                        }
                         TlGrab::Body => {
                             let a = clamp(d.orig.0 as i64 + delta, lo, hi - len);
                             (a, a + len)
@@ -1477,21 +1513,12 @@ impl GifKitApp {
                         if outer {
                             self.tl_trim = (na > 0 || nb + 1 < ge).then_some((na, nb));
                         } else if d.track == GIF {
-                            // trimming the GIF skips or brings back frames at its ends
-                            if let Some((a, b)) = cur {
-                                if grab != TlGrab::Body {
-                                    if na > a {
-                                        self.gif_set(a, na - 1, false);
-                                    }
-                                    if na < a {
-                                        self.gif_set(na, a - 1, true);
-                                    }
-                                    if nb < b {
-                                        self.gif_set(nb + 1, b, false);
-                                    }
-                                    if nb > b {
-                                        self.gif_set(b + 1, nb, true);
-                                    }
+                            // trimming leaves a gap; pulling an edge into a gap
+                            // fills it the way "When Made Longer" says
+                            if let (Some(d0), Some((s, e, _))) = (self.tl_gif_d0.clone(), self.gif_display()) {
+                                if d0.len() == e + 1 - s && d.orig.1 < d0.len() {
+                                    let nd = gif_edge_fill(&d0, d.orig, (na, nb), self.tl_extend_mode);
+                                    self.gif_write(s, e, nd);
                                 }
                             }
                         } else if let Some(li) = self.stack.index_of(d.track) {
@@ -1520,11 +1547,20 @@ impl GifKitApp {
                     let group = std::mem::take(&mut self.tl_group);
                     self.tl_sel = group.iter().filter(|g| !(g.0 == d.track && g.1 == d.clip)).filter_map(|&(t, j, _, _)| self.track_spans(t).get(j).map(|s| (t, s.0))).collect();
                 }
-                if let Some(t) = self.tl_gif_drop.take() {
-                    self.tl_gif_move(d.orig.0, d.orig.1, t, now);
+                self.tl_gif_d0 = None;
+                if let Some(t) = self.tl_drop.take() {
+                    if d.track == GIF {
+                        self.tl_gif_move(d.orig.0, d.orig.1, t, now);
+                    } else {
+                        self.tl_layer_reorder(d.track, d.clip, t);
+                    }
                 }
-                if let Some(t) = self.tl_layer_drop.take() {
-                    self.tl_layer_reorder(d.track, d.clip, t);
+                if let Some(w) = self.tl_free_drop.take() {
+                    if d.track == GIF {
+                        self.gif_place(d.orig.0, d.orig.1, w, now);
+                    } else {
+                        self.tl_layer_place(d.track, d.clip, w);
+                    }
                 }
                 if let Some((a, b)) = self.tl_trim.take() {
                     self.tl_cut(a, b);
@@ -2329,6 +2365,49 @@ impl GifKitApp {
         self.gif_extend(k, self.tl_extend_mode);
     }
 
+    /// Move clip `ci` of a layer's row to start at `w` (checked to be free).
+    fn tl_layer_place(&mut self, track: u64, ci: usize, w: usize) {
+        let n = self.plan.len();
+        let Some(&(a, b)) = self.track_spans(track).get(ci) else { return };
+        let nb = w + (b - a);
+        let Some(l) = self.tl_layer_mut(track) else { return };
+        if let Some(cl) = &mut l.timing.clips {
+            cl.sort_by_key(|c| c.start);
+            if let Some(c) = cl.get_mut(ci) {
+                *c = Clip { start: w, end: if nb + 1 >= n { None } else { Some(nb) } };
+            }
+            cl.sort_by_key(|c| c.start);
+        }
+        self.tl_clip = self.track_spans(track).iter().position(|s| s.0 == w);
+        self.tl_sel.clear();
+        self.modified = true;
+    }
+
+    /// Move the GIF's clip `a..=b` into the gap starting at `w`: where it
+    /// was becomes a gap, nothing else moves.
+    fn gif_place(&mut self, a: usize, b: usize, w: usize, now: f64) {
+        let Some((s, e, mut d)) = self.gif_display() else { return };
+        if b >= d.len() || w + (b - a) >= d.len() {
+            return;
+        }
+        self.snapshot(&format!("tl-gifmove{now}"), now);
+        let block: Vec<crate::anim::Frame> = d[a..=b].to_vec();
+        let len = block.len();
+        for f in &mut d[a..=b] {
+            f.blank = true;
+        }
+        for (j, f) in block.into_iter().enumerate() {
+            d[w + j] = crate::anim::Frame { blank: false, enabled: true, cut: j == 0, ..f };
+        }
+        if let Some(f) = d.get_mut(w + len) {
+            f.cut = true;
+        }
+        self.gif_write(s, e, d);
+        self.tl_clip = self.gif_runs().iter().position(|r| r.0 == w);
+        self.cur = w.min(self.plan.len().saturating_sub(1));
+        self.info(format!("Moved {len} frames"));
+    }
+
     /// Put clip `ci` of a layer's row in between its others at frame `t`:
     /// the clips it passes over move along by its length to make room.
     fn tl_layer_reorder(&mut self, track: u64, ci: usize, t: usize) {
@@ -2408,14 +2487,40 @@ impl GifKitApp {
         }
         let Some((s, e, mut d)) = self.gif_display() else { return };
         let k = frames.len();
-        let at = at.min(d.len());
+        let mut at = at.min(d.len());
         let mut frames = frames;
         frames[0].cut = true;
-        d.splice(at..at, frames);
+        for f in &mut frames {
+            f.blank = false;
+            f.enabled = true;
+        }
+        // into a gap: they fill it, and only what doesn't fit pushes on
+        let gap = |f: &crate::anim::Frame| f.blank || !f.enabled;
+        let mut fill = 0;
+        if at < d.len() && gap(&d[at]) {
+            let mut g0 = at;
+            while g0 > 0 && gap(&d[g0 - 1]) {
+                g0 -= 1;
+            }
+            let mut g1 = at;
+            while g1 < d.len() && gap(&d[g1]) {
+                g1 += 1;
+            }
+            // from the playhead if they fit, else as late in the gap as fits
+            at = if g1 - at >= k { at } else { g0.max(g1.saturating_sub(k)) };
+            fill = (g1 - at).min(k);
+        }
+        let rest = frames.split_off(fill);
+        for (j, f) in frames.into_iter().enumerate() {
+            d[at + j] = f;
+        }
+        d.splice(at + fill..at + fill, rest);
         if let Some(f) = d.get_mut(at + k) {
             f.cut = true;
         }
         self.gif_write(s, e, d);
+        self.cur = at.min(self.plan.len().saturating_sub(1));
+        self.tl_clip = self.gif_runs().iter().position(|r| r.0 == at);
     }
 
     /// Make the GIF `k` frames longer: hold its last frame, play it again
@@ -2589,6 +2694,36 @@ impl GifKitApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // frames told apart by their delay; `g` marks gaps
+    fn fr(spec: &str) -> Vec<crate::anim::Frame> {
+        spec.split(' ')
+            .map(|t| {
+                let mut f = crate::anim::Frame::new(image::RgbaImage::new(1, 1), 0);
+                f.blank = t == "g";
+                f.delay_cs = t.parse().unwrap_or(0);
+                f
+            })
+            .collect()
+    }
+    fn show(d: &[crate::anim::Frame]) -> String {
+        d.iter().map(|f| if f.blank { "g".into() } else { format!("{}{}", if f.cut { "|" } else { "" }, f.delay_cs) }).collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn edge_fills_gaps() {
+        let d = fr("1 2 3 g g g g 8");
+        assert_eq!(show(&gif_edge_fill(&d, (0, 2), (0, 5), Extend::Hold)), "|1 2 3 3 3 3 g 8");
+        assert_eq!(show(&gif_edge_fill(&d, (0, 2), (0, 6), Extend::Loop)), "|1 2 3 1 2 3 1 |8");
+        assert_eq!(show(&gif_edge_fill(&d, (0, 2), (0, 5), Extend::Stretch)), "|1 1 2 2 3 3 g 8");
+        // trimming leaves a gap, and pulling back out undoes it
+        assert_eq!(show(&gif_edge_fill(&d, (0, 2), (0, 0), Extend::Hold)), "|1 g g g g g g 8");
+        assert_eq!(show(&gif_edge_fill(&d, (0, 2), (0, 2), Extend::Hold)), "|1 2 3 g g g g 8");
+        // the start edge pulled back into a gap
+        let d = fr("g g g 4 5");
+        assert_eq!(show(&gif_edge_fill(&d, (3, 4), (1, 4), Extend::Hold)), "g |4 4 4 5");
+        assert_eq!(show(&gif_edge_fill(&d, (3, 4), (0, 4), Extend::Loop)), "|5 4 5 4 5");
+    }
 
     #[test]
     fn free_slot_finds_room() {

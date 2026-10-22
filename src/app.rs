@@ -875,8 +875,8 @@ pub struct GifKitApp {
     /// middle-button panning, and dragging the scroll bar (grab offset in frames)
     tl_pan: bool,
     tl_bar_drag: Option<f32>,
-    /// where a GIF clip being dragged would go (an output frame boundary)
-    tl_gif_drop: Option<usize>,
+    /// a clip dragged over others: the boundary it goes in at
+    tl_drop: Option<usize>,
     /// the track whose name was right-clicked (its menu is the layer's)
     tl_menu_head: Option<u64>,
     /// more selected clips besides the main one, as (track, first frame)
@@ -930,8 +930,10 @@ pub struct GifKitApp {
     /// the menu bar, where clicks don't change what Copy and Paste work on
     menubar_rect: Rect,
     tl_extend: usize,
-    /// a layer clip dragged over others: the edge it goes in at
-    tl_layer_drop: Option<usize>,
+    /// a clip dragged into free room on its row: where it starts there
+    tl_free_drop: Option<usize>,
+    /// the GIF's frames (as shown) when an edge drag began
+    tl_gif_d0: Option<Vec<crate::anim::Frame>>,
     /// what making the GIF longer adds
     tl_extend_mode: timeline_ui::Extend,
     /// asking whether to save first, and what to do after
@@ -2676,7 +2678,7 @@ impl GifKitApp {
             tl_zoom_to: None,
             tl_pan: false,
             tl_bar_drag: None,
-            tl_gif_drop: None,
+            tl_drop: None,
             tl_menu_head: None,
             tl_sel: Vec::new(),
             tl_group: Vec::new(),
@@ -2709,7 +2711,8 @@ impl GifKitApp {
             tl_head_drag: false,
             tl_reorder: None,
             tl_extend: 0,
-            tl_layer_drop: None,
+            tl_free_drop: None,
+            tl_gif_d0: None,
             menubar_rect: Rect::NOTHING,
             tl_extend_mode: timeline_ui::Extend::load(),
             confirm: None,
