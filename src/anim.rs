@@ -4,12 +4,12 @@
 //! so every tool can treat frames independently. Optimisation (frame
 //! differencing, palette reduction) only happens at export time.
 
+use crate::pixels::Pixels;
 use image::RgbaImage;
-use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct Frame {
-    pub image: Arc<RgbaImage>,
+    pub image: Pixels,
     /// Delay in 1/100 s (GIF native unit).
     pub delay_cs: u16,
     /// Disabled ("skipped") frames are hidden from playback and export.
@@ -22,10 +22,10 @@ pub struct Frame {
 
 impl Frame {
     pub fn new(image: RgbaImage, delay_cs: u16) -> Self {
-        Self { image: Arc::new(image), delay_cs, enabled: true, cut: false, blank: false }
+        Self { image: Pixels::new(image), delay_cs, enabled: true, cut: false, blank: false }
     }
     pub fn with_image(&self, image: RgbaImage) -> Self {
-        Self { image: Arc::new(image), delay_cs: self.delay_cs, enabled: self.enabled, cut: self.cut, blank: self.blank }
+        Self { image: Pixels::new(image), delay_cs: self.delay_cs, enabled: self.enabled, cut: self.cut, blank: self.blank }
     }
 }
 
@@ -74,7 +74,7 @@ impl Animation {
             .frames
             .par_iter()
             .enumerate()
-            .map(|(i, fr)| fr.with_image(f(i, &fr.image)))
+            .map(|(i, fr)| fr.with_image(f(i, &fr.image.get())))
             .collect();
         Animation { frames, loop_count: self.loop_count }
     }

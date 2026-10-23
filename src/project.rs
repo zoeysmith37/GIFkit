@@ -144,26 +144,40 @@ pub fn save(path: &Path, mut file: ProjectFile, base: &Animation, original: Opti
     file.frames = meta(base);
     file.loop_count = base.loop_count;
     // only keep the original when it isn't simply the same frames
-    let orig = original.filter(|o| o.len() != base.len() || o.frames.iter().zip(&base.frames).any(|(a, b)| !Arc::ptr_eq(&a.image, &b.image) && a.image.as_raw() != b.image.as_raw()));
+    let orig = original.filter(|o| o.len() != base.len() || o.frames.iter().zip(&base.frames).any(|(a, b)| !crate::pixels::Pixels::ptr_eq(&a.image, &b.image) && a.image.get().as_raw() != b.image.get().as_raw()));
     file.original = orig.map(|o| (meta(o), o.loop_count));
 
     // encode every image in parallel, then write them in order
-    let mut jobs: Vec<(String, &RgbaImage)> = Vec::new();
+    // frames are shared pictures, layers' are borrowed
+    enum Pic<'a> {
+        Own(std::sync::Arc<RgbaImage>),
+        Ref(&'a RgbaImage),
+    }
+    impl std::ops::Deref for Pic<'_> {
+        type Target = RgbaImage;
+        fn deref(&self) -> &RgbaImage {
+            match self {
+                Pic::Own(a) => a,
+                Pic::Ref(r) => r,
+            }
+        }
+    }
+    let mut jobs: Vec<(String, Pic)> = Vec::new();
     for (i, f) in base.frames.iter().enumerate() {
-        jobs.push((format!("frames/{i:05}.png"), &f.image));
+        jobs.push((format!("frames/{i:05}.png"), Pic::Own(f.image.get())));
     }
     if let Some(o) = orig {
         for (i, f) in o.frames.iter().enumerate() {
-            jobs.push((format!("original/{i:05}.png"), &f.image));
+            jobs.push((format!("original/{i:05}.png"), Pic::Own(f.image.get())));
         }
     }
     for (id, frames) in overlays {
         for (i, f) in frames.iter().enumerate() {
-            jobs.push((format!("overlays/{id}/{i:05}.png"), f));
+            jobs.push((format!("overlays/{id}/{i:05}.png"), Pic::Ref(f)));
         }
     }
     for (id, img) in watermarks {
-        jobs.push((format!("watermarks/{id}.png"), img));
+        jobs.push((format!("watermarks/{id}.png"), Pic::Ref(img)));
     }
     let encoded: Vec<(String, Vec<u8>)> = jobs.par_iter().map(|(n, img)| png(img).map(|b| (n.clone(), b))).collect::<Result<_>>()?;
 
@@ -214,7 +228,7 @@ pub fn load(path: &Path) -> Result<Project> {
             .enumerate()
             .map(|(i, m)| {
                 let img = decoded.remove(&format!("{dir}/{i:05}.png")).with_context(|| format!("{dir}/{i:05}.png is missing"))?;
-                Ok(Frame { image: Arc::new(img), delay_cs: m.delay, enabled: m.enabled, cut: m.cut, blank: m.blank })
+                Ok(Frame { image: crate::pixels::Pixels::new(img), delay_cs: m.delay, enabled: m.enabled, cut: m.cut, blank: m.blank })
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Animation { frames, loop_count })

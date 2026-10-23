@@ -67,13 +67,13 @@ pub const NOAI_COMMENT: &str = "noai, noimageai - not licensed for AI/ML trainin
 
 /// A frame ready for encoding, before quantisation.
 struct Prepared {
-    // shared with the source frame, not copied
-    rgba: std::sync::Arc<RgbaImage>,
+    // shared with the source frame (packed): unpacked only while it's encoded
+    rgba: crate::pixels::Pixels,
     delay: u16,
 }
 
 fn has_transparency(frames: &[Frame], thr: u8) -> bool {
-    frames.par_iter().any(|f| f.image.pixels().any(|p| p[3] < thr))
+    frames.par_iter().any(|f| f.image.any_alpha_below(thr))
 }
 
 fn collect_samples(images: &[&RgbaImage], thr: u8, max_samples: usize) -> Vec<u8> {
@@ -343,11 +343,11 @@ fn same_image(a: &RgbaImage, b: &RgbaImage) -> bool {
 fn colour_census(frames: &[Prepared], thr: u8, cap: usize) -> Option<Vec<([u8; 3], u64)>> {
     let mut map: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
     for f in frames {
-        for p in f.rgba.pixels() {
-            if p[3] >= thr {
-                *map.entry(u32::from_le_bytes([p[0], p[1], p[2], 0])).or_insert(0) += 1;
+        f.rgba.colour_counts(|c, n| {
+            if c[3] >= thr {
+                *map.entry(u32::from_le_bytes([c[0], c[1], c[2], 0])).or_insert(0) += n;
             }
-        }
+        });
         if map.len() > cap {
             return None;
         }
@@ -424,7 +424,7 @@ pub fn encode_gif(anim: &Animation, opt: &GifOptions, progress: Option<&AtomicUs
     for f in &frames {
         if opt.merge_duplicates {
             if let Some(last) = prepared.last_mut() {
-                if same_image(&last.rgba, &f.image) {
+                if crate::pixels::Pixels::ptr_eq(&last.rgba, &f.image) || same_image(&last.rgba.get(), &f.image.get()) {
                     last.delay = last.delay.saturating_add(f.delay_cs);
                     continue;
                 }
@@ -453,8 +453,14 @@ pub fn encode_gif(anim: &Animation, opt: &GifOptions, progress: Option<&AtomicUs
         // frames written without transparency can use it
         (Some(c), _) if !transparent_anim && c.len() <= opt.colors.clamp(2, 256) as usize => Some(Palette::exact(&c.iter().map(|x| x.0).collect::<Vec<_>>(), false)),
         (_, true) => {
-            let imgs: Vec<&RgbaImage> = prepared.iter().map(|p| &*p.rgba).collect();
-            let samples = collect_samples(&imgs, thr, 600_000);
+            // a frame unpacked at a time
+            let total: usize = prepared.iter().map(|p| (p.rgba.width() * p.rgba.height()) as usize).sum::<usize>().max(1);
+            let mut samples = Vec::new();
+            for p in &prepared {
+                let img = p.rgba.get();
+                let share = 600_000 * (img.width() * img.height()) as usize / total;
+                samples.extend(collect_samples(&[&*img], thr, share.max(1)));
+            }
             Some(Palette::build(&samples, opt.colors, need_transparent_idx, opt.quant_speed))
         }
         // too many colours overall: the most common ones still serve frames that only use them
@@ -482,7 +488,8 @@ pub fn encode_gif(anim: &Animation, opt: &GifOptions, progress: Option<&AtomicUs
 
         // One frame, differenced against `canvas` (what earlier frames of its run painted).
         let encode_one = |fi: usize, pf: &Prepared, canvas: &mut Vec<[u8; 4]>| -> anyhow::Result<gif::Frame<'static>> {
-            let img = &pf.rgba;
+            let img_arc = pf.rgba.get();
+            let img = &*img_arc;
             let (mut x0, mut y0, mut x1, mut y1) = (0u32, 0u32, w - 1, h - 1);
             let mut mask: Option<Vec<bool>> = None;
 

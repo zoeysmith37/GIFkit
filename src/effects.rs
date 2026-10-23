@@ -1177,7 +1177,7 @@ pub fn apply(anim: &Animation, s: &EffectSettings, fonts: &[FontEntry], progress
             if crate::stack::stopped(Some(progress)) {
                 return f.clone();
             }
-            let img = apply_frame(&f.image, i, n, times[i], total, s, fonts);
+            let img = apply_frame(&f.image.get(), i, n, times[i], total, s, fonts);
             progress.fetch_add(1, Ordering::Relaxed);
             f.with_image(img)
         })
@@ -1197,7 +1197,7 @@ pub fn normalize_sizes(a: &mut Animation) {
             let mut c = RgbaImage::new(mw, mh);
             let x = (mw - f.image.width()) / 2;
             let y = (mh - f.image.height()) / 2;
-            imageops::replace(&mut c, &*f.image, x as i64, y as i64);
+            imageops::replace(&mut c, &*f.image.get(), x as i64, y as i64);
             *f = f.with_image(c);
         }
     }

@@ -11,6 +11,7 @@ mod geo;
 mod gpu;
 mod gpu_fx;
 mod paste;
+mod pixels;
 mod gpu_render;
 mod icons;
 mod io;
