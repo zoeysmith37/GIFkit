@@ -363,7 +363,7 @@ impl GpuRenderer {
             hist_cuts,
             hist,
             blank,
-            sources: TexCache::new(768 << 20),
+            sources: TexCache::new(64 << 20),
             sprites: TexCache::new(256 << 20),
             noise: HashMap::new(),
             max_side,

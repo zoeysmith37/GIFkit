@@ -95,15 +95,16 @@ pub fn crop(anim: &Animation, x: u32, y: u32, w: u32, h: u32) -> Animation {
 /// colour of the top-left pixel of the first frame.
 pub fn auto_trim_rect(anim: &Animation, tolerance: u8) -> Option<(u32, u32, u32, u32)> {
     let first = anim.frames.first()?;
-    let bg = *first.image.get_pixel(0, 0);
+    let bg = *first.image.get().get_pixel(0, 0);
     let use_alpha = bg[3] < 255;
     let (w, h) = (anim.width(), anim.height());
     let (mut minx, mut miny, mut maxx, mut maxy) = (u32::MAX, u32::MAX, 0, 0);
     let tol = tolerance as i32;
     for f in anim.frames.iter().filter(|f| f.enabled) {
+        let img = f.image.get();
         for y in 0..h {
             for x in 0..w {
-                let p = f.image.get_pixel(x, y);
+                let p = img.get_pixel(x, y);
                 let is_bg = if use_alpha {
                     p[3] <= tolerance
                 } else {
@@ -381,7 +382,7 @@ pub fn crossfade(anim: &Animation, steps: usize, wrap: bool) -> Animation {
         out.push(base);
         for s in 1..=steps {
             let t = s as f32 / (steps + 1) as f32;
-            out.push(Frame { image: std::sync::Arc::new(lerp_image(&f.image, &next.image, t)), delay_cs: d, enabled: f.enabled, cut: false, blank: false });
+            out.push(Frame { image: crate::pixels::Pixels::new(lerp_image(&f.image.get(), &next.image.get(), t)), delay_cs: d, enabled: f.enabled, cut: false, blank: false });
         }
     }
     Animation { frames: out, loop_count: anim.loop_count }
@@ -390,7 +391,7 @@ pub fn crossfade(anim: &Animation, steps: usize, wrap: bool) -> Animation {
 /// Composite each frame over the first frame (useful for transparent sprite
 /// animations that should keep a static background).
 pub fn first_frame_as_background(anim: &Animation) -> Animation {
-    let Some(bg) = anim.frames.first().map(|f| f.image.clone()) else { return anim.clone() };
+    let Some(bg) = anim.frames.first().map(|f| f.image.get()) else { return anim.clone() };
     anim.map_images(|i, img| {
         if i == 0 {
             return img.clone();

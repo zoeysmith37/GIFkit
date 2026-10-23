@@ -10,6 +10,7 @@
 //!
 //! Layer coordinates and frame ranges refer to the output (what you see).
 
+use crate::pixels::Pixels;
 use crate::anim::{effective_delay, Animation, Frame};
 use crate::effects::{self, CensorSettings, EffectSettings, ShieldSettings, WatermarkSettings, WatermarkSprite};
 use crate::geo::{map_box, GeoMap, Obb};
@@ -644,6 +645,19 @@ fn mask_blend(img: &mut RgbaImage, before: &RgbaImage, mask: &image::GrayImage) 
 
 /// Pictures shrunk to `w`×`h` with the triangle filter: on the graphics card
 /// when there is one, otherwise on every core.
+/// `shrink_images` for stored frames: a batch at a time is unpacked, shrunk
+/// and packed again, so a long animation is never all unpacked at once.
+pub fn shrink_pixels(frames: &[&Pixels], w: u32, h: u32) -> Vec<Pixels> {
+    let mut out = Vec::with_capacity(frames.len());
+    for chunk in frames.chunks(16) {
+        let owned: Vec<Arc<RgbaImage>> = chunk.iter().map(|p| p.get()).collect();
+        let imgs: Vec<&RgbaImage> = owned.iter().map(|x| &**x).collect();
+        let small = shrink_images(&imgs, w, h);
+        out.extend(small.into_par_iter().map(|i| Pixels::new(i).packed()).collect::<Vec<_>>());
+    }
+    out
+}
+
 pub fn shrink_images(imgs: &[&RgbaImage], w: u32, h: u32) -> Vec<RgbaImage> {
     if let Some(v) = crate::gpu_render::shrink_many(imgs, w, h).filter(|v| v.len() == imgs.len()) {
         return v;
@@ -904,9 +918,9 @@ impl Stack {
             let t = self.eff_transform(true);
             return if t.geometry_identity() { empty } else { t.apply_geometry(&empty) };
         }
-        let src = &f.image;
+        let src = f.image.get();
         let t = self.eff_transform(true);
-        if t.geometry_identity() { (**src).clone() } else { t.apply_geometry(src) }
+        if t.geometry_identity() { (*src).clone() } else { t.apply_geometry(&src) }
     }
 
     /// Render output frame `i` of `plan`.
@@ -1337,7 +1351,8 @@ impl Stack {
         idx.par_iter()
             .map(|&i| {
                 yield_to_foreground(progress);
-                let image = if render && !stopped(progress) { Arc::new(self.render_frame(base, plan, times, i, fonts, prep)) } else { base.frames[plan[i].src].image.clone() };
+                // packed as it's made: a long render never sits unpacked all at once
+                let image = if render && !stopped(progress) { Pixels::new(self.render_frame(base, plan, times, i, fonts, prep)).packed() } else { base.frames[plan[i].src].image.clone() };
                 if let Some(p) = progress {
                     p.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1360,30 +1375,36 @@ impl Stack {
         let batch = ((128usize << 20) / (bw * bh * 4 * 2)).clamp(1, 8);
         for chunk in idx.chunks(batch) {
             let mut texs = Vec::new();
-            let mut slots: Vec<Option<Arc<RgbaImage>>> = Vec::with_capacity(chunk.len());
+            let mut slots: Vec<Option<Pixels>> = Vec::with_capacity(chunk.len());
             yield_to_foreground(progress);
             for &i in chunk {
                 let src = plan[i].src;
-                let frame = &base.frames[src].image;
                 if stopped(progress) {
-                    slots.push(Some(frame.clone()));
+                    slots.push(Some(base.frames[src].image.clone()));
                     continue;
                 }
-                let job = self.gpu_frame(base, plan, times, i, fonts, prep).filter(|j| j.fits(frame, gpu.max_side));
+                let frame = base.frames[src].image.get();
+                let job = self.gpu_frame(base, plan, times, i, fonts, prep).filter(|j| j.fits(&frame, gpu.max_side));
                 match job {
                     Some(job) => {
-                        texs.push(gpu.render_straight(frame, src as u64 + 1, &job, gen));
+                        texs.push(gpu.render_straight(&frame, src as u64 + 1, &job, gen));
                         slots.push(None);
                     }
-                    None => slots.push(Some(Arc::new(self.render_frame(base, plan, times, i, fonts, prep)))),
+                    None => slots.push(Some(Pixels::new(self.render_frame(base, plan, times, i, fonts, prep)).packed())),
                 }
             }
             let mut read = gpu.read_raw(&texs).into_iter();
-            for (k, &i) in chunk.iter().enumerate() {
-                let image = match slots[k].take() {
+            let mut images: Vec<Pixels> = Vec::with_capacity(chunk.len());
+            for slot in slots.iter_mut() {
+                images.push(match slot.take() {
                     Some(img) => img,
-                    None => Arc::new(read.next()?),
-                };
+                    None => Pixels::new(read.next()?),
+                });
+            }
+            // packed as they come back, on every core
+            let images: Vec<Pixels> = images.into_par_iter().map(|p| p.packed()).collect();
+            for (k, &i) in chunk.iter().enumerate() {
+                let image = images[k].clone();
                 if let Some(p) = progress {
                     p.fetch_add(1, Ordering::Relaxed);
                 }

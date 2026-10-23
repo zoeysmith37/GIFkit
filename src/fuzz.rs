@@ -335,7 +335,7 @@ fn case(seed: u64, stage: &Mutex<&'static str>) -> String {
     if w > 4 && h > 4 {
         let s = 0.5;
         let (pw, ph) = crate::stack::proxy_size(w, h, s);
-        let small = Animation { frames: base.frames.iter().map(|f| Frame { image: Arc::new(image::imageops::resize(&*f.image, pw, ph, image::imageops::FilterType::Triangle)), ..f.clone() }).collect(), loop_count: base.loop_count };
+        let small = Animation { frames: base.frames.iter().map(|f| Frame { image: crate::pixels::Pixels::new(image::imageops::resize(&*f.image.get(), pw, ph, image::imageops::FilterType::Triangle)), ..f.clone() }).collect(), loop_count: base.loop_count };
         let ps = st.proxy(s);
         let pp = ps.prepare(&small, &fonts);
         for i in 0..plan.len().min(3) {
@@ -387,7 +387,7 @@ fn gpu_check(st: &Stack, base: &Animation, plan: &[crate::stack::PlanFrame], tim
         for i in 0..plan.len().min(4) {
             let Some(job) = st.gpu_frame(base, plan, times, i, fonts, prep) else { continue };
             let src = plan[i].src;
-            let frame = &base.frames[src].image;
+            let frame = &base.frames[src].image.get();
             if !job.fits(frame, gpu.max_side) {
                 continue;
             }
@@ -991,7 +991,7 @@ fn gpu_matches_cpu() {
             println!("{name:18} not on the GPU");
             continue;
         };
-        let tex = gpu.render(&base.frames[0].image, 1, &job, ci as u64 + 1);
+        let tex = gpu.render(&base.frames[0].image.get(), 1, &job, ci as u64 + 1);
         let g = gpu.read(&tex);
         if g.dimensions() != cpu.dimensions() {
             println!("{name:18} SIZE gpu {:?} cpu {:?}", g.dimensions(), cpu.dimensions());
@@ -1060,7 +1060,7 @@ fn gpu_flatten_matches_cpu() {
     for (a, b) in cpu.frames.iter().zip(&gpu.frames) {
         assert_eq!(a.image.dimensions(), b.image.dimensions());
         assert_eq!(a.delay_cs, b.delay_cs);
-        for (p, q) in a.image.pixels().zip(b.image.pixels()) {
+        for (p, q) in a.image.get().pixels().zip(b.image.get().pixels()) {
             let mut d = 0;
             for c in 0..4 {
                 let (pa, qa) = if c == 3 { (p[3] as i32, q[3] as i32) } else { (p[c] as i32 * p[3] as i32 / 255, q[c] as i32 * q[3] as i32 / 255) };
@@ -1211,7 +1211,7 @@ fn strength_sweep() {
         let mut line = format!("{name:22} cpu {:4}", mean(&cpu));
         if let Some(g) = gpu.as_mut() {
             let job = st.gpu_frame(&base, &plan, &times, 0, &fonts, &prep).expect("gpu job");
-            let tex = g.render(&base.frames[0].image, 1, &job, 3);
+            let tex = g.render(&base.frames[0].image.get(), 1, &job, 3);
             let out = g.read(&tex);
             let d: u64 = out.pixels().zip(cpu.pixels()).map(|(a, b)| (0..4).map(|k| (a[k] as i32 - b[k] as i32).unsigned_abs() as u64).sum::<u64>()).max().unwrap_or(0);
             line += &format!(" gpu {:4} maxdiff {d}", mean(&out));
@@ -1305,4 +1305,25 @@ fn outro_at_the_layers_end() {
     let px = |i: usize| st.render_frame(&base, &plan, &times, i, &fonts, &prep).get_pixel(4, 4).0;
     assert_eq!(px(9), [200, 200, 200, 255], "the first clip's end isn't faded");
     assert_ne!(px(19), [200, 200, 200, 255], "the layer's end is");
+}
+
+/// A looping motion keeps moving over a stretch of identical frames (a
+/// held picture), whether they're separate copies or one shared picture.
+#[test]
+fn motion_continues_over_held_frames() {
+    use crate::anim::{Animation, Frame};
+    let img = image::RgbaImage::from_fn(64, 48, |x, y| image::Rgba([(x * 4) as u8, (y * 5) as u8, 90, 255]));
+    let one = Frame::new(img.clone(), 10);
+    for shared in [false, true] {
+        let frames: Vec<Frame> = (0..8).map(|_| if shared { one.clone() } else { Frame::new(img.clone(), 10) }).collect();
+        let mut base = Animation { frames, loop_count: None };
+        for f in &mut base.frames {
+            f.image = f.image.packed();
+        }
+        let mut st = crate::stack::Stack::default();
+        st.push(crate::stack::LayerKind::Effects(Box::new(crate::effects::EffectSettings { loop_hop: true, loop_amount: 100.0, loop_cycles: 2, ..Default::default() })));
+        let out = st.flatten(&base, &[], None);
+        let same = out.frames.windows(2).filter(|w| w[0].image.get().as_raw() == w[1].image.get().as_raw()).count();
+        assert!(same <= 1, "shared {shared}: {same} of 7 steps didn't move");
+    }
 }

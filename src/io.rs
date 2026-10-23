@@ -7,7 +7,6 @@ use image::{AnimationDecoder, RgbaImage};
 use std::fs::File;
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 fn delay_to_cs(d: image::Delay) -> u16 {
     let (n, dnm) = d.numer_denom_ms();
@@ -17,6 +16,7 @@ fn delay_to_cs(d: image::Delay) -> u16 {
 
 fn frames_from_decoder<'a, D: AnimationDecoder<'a>>(dec: D) -> Result<Vec<Frame>> {
     let mut out = Vec::new();
+    let mut pk = crate::pixels::Packer::default();
     for f in dec.into_frames() {
         // a damaged or cut-off file still opens with the frames before the damage,
         // as browsers show it
@@ -27,7 +27,10 @@ fn frames_from_decoder<'a, D: AnimationDecoder<'a>>(dec: D) -> Result<Vec<Frame>
         };
         let d = delay_to_cs(f.delay());
         out.push(Frame::new(f.into_buffer(), d));
+        let i = out.len() - 1;
+        pk.add(&mut out, i);
     }
+    pk.finish(&mut out);
     Ok(out)
 }
 
@@ -224,14 +227,19 @@ fn load_video_range_with(path: &Path, opt: &VideoImport, progress: Option<&std::
     let mut frames: Vec<Frame> = Vec::new();
     let limit = MERGE_LEVELS.get(opt.merge).map(|l| l.1).unwrap_or(-1.0);
     let mut buf = vec![0u8; frame_len];
+    let mut pk = crate::pixels::Packer::default();
     loop {
         match stdout.read_exact(&mut buf) {
             Ok(()) => {
                 // a frame close enough to the last one kept only adds its time to it
                 let last = frames.last_mut().filter(|f| limit >= 0.0 && f.delay_cs as u32 + (opt.delay_cs as u32) < 65535);
                 match last {
-                    Some(f) if changed_share(f.image.as_raw(), &buf, limit) <= limit => f.delay_cs += opt.delay_cs,
-                    _ => frames.push(Frame::new(RgbaImage::from_raw(w, h, std::mem::replace(&mut buf, vec![0u8; frame_len])).context("frame size")?, opt.delay_cs)),
+                    Some(f) if changed_share(f.image.get().as_raw(), &buf, limit) <= limit => f.delay_cs += opt.delay_cs,
+                    _ => {
+                        frames.push(Frame::new(RgbaImage::from_raw(w, h, std::mem::replace(&mut buf, vec![0u8; frame_len])).context("frame size")?, opt.delay_cs));
+                        let i = frames.len() - 1;
+                        pk.add(&mut frames, i);
+                    }
                 }
                 if let Some(p) = progress {
                     p.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -246,6 +254,7 @@ fn load_video_range_with(path: &Path, opt: &VideoImport, progress: Option<&std::
             Err(e) => return Err(e.into()),
         }
     }
+    pk.finish(&mut frames);
     let status = child.wait()?;
     let err = err_thread.join().unwrap_or_default();
     if !status.success() && frames.is_empty() {
@@ -368,12 +377,16 @@ pub fn load_animation_bytes(bytes: &[u8]) -> Result<Animation> {
                 let (w, h) = d.dimensions();
                 let mut prev = 0i32;
                 let mut out = Vec::new();
+                let mut pk = crate::pixels::Packer::default();
                 for f in d {
                     let img = RgbaImage::from_raw(w, h, f.data().to_vec()).context("WebP frame size")?;
                     let d_ms = (f.timestamp() - prev).max(0);
                     prev = f.timestamp();
                     out.push(Frame::new(img, ((d_ms + 5) / 10).clamp(1, 65535) as u16));
+                    let i = out.len() - 1;
+                    pk.add(&mut out, i);
                 }
+                pk.finish(&mut out);
                 out
             } else {
                 vec![Frame::new(image::load_from_memory(bytes)?.to_rgba8(), 10)]
@@ -442,7 +455,7 @@ pub fn save_gif(anim: &Animation, opt: &GifOptions, path: &Path, progress: Optio
 }
 
 pub fn encode_apng(anim: &Animation, noai: bool) -> Result<Vec<u8>> {
-    let frames = anim.enabled_frames();
+    let frames = anim.enabled_frames_merged();
     anyhow::ensure!(!frames.is_empty(), "No enabled frames");
     let (w, h) = frames[0].image.dimensions();
     let mut buf = Vec::new();
@@ -455,7 +468,7 @@ pub fn encode_apng(anim: &Animation, noai: bool) -> Result<Vec<u8>> {
         let mut wr = enc.write_header()?;
         for f in &frames {
             wr.set_frame_delay(f.delay_cs, 100)?;
-            wr.write_image_data(f.image.as_raw())?;
+            wr.write_image_data(f.image.get().as_raw())?;
         }
         wr.finish()?;
     }
@@ -571,7 +584,7 @@ pub enum SplitFormat {
 /// One frame encoded as it would be written by the frames export.
 pub fn encode_frame_file(f: &Frame, fmt: SplitFormat, png: &PngOptions, gif: &GifOptions) -> Result<Vec<u8>> {
     match fmt {
-        SplitFormat::Png => encode_png(&f.image, png),
+        SplitFormat::Png => encode_png(&f.image.get(), png),
         SplitFormat::Gif => {
             let single = Animation { frames: vec![Frame { enabled: true, ..f.clone() }], loop_count: None };
             encode_gif(&single, &GifOptions { frame_diff: false, merge_duplicates: false, ..gif.clone() }, None)
@@ -611,7 +624,7 @@ pub fn export_frames_zip_opts(anim: &Animation, path: &Path, prefix: &str, png: 
     let digits = frames.len().to_string().len().max(3);
     for (i, f) in frames.iter().enumerate() {
         zip.start_file(format!("{prefix}_{:0width$}.png", i + 1, width = digits), opts)?;
-        zip.write_all(&encode_png(&f.image, png)?)?;
+        zip.write_all(&encode_png(&f.image.get(), png)?)?;
     }
     zip.finish()?;
     Ok(frames.len())
@@ -676,7 +689,7 @@ pub fn render_spritesheet(anim: &Animation, opt: &SheetOptions) -> Result<(RgbaI
     for (i, f) in frames.iter().enumerate() {
         let x = (i as u32 % cols) * (fw + p);
         let y = (i as u32 / cols) * (fh + p);
-        image::imageops::replace(&mut sheet, &*f.image, x as i64, y as i64);
+        image::imageops::replace(&mut sheet, &*f.image.get(), x as i64, y as i64);
         rects.push((x, y));
     }
     Ok((sheet, rects, cols, rows))
@@ -805,7 +818,7 @@ pub fn encode_webp(anim: &Animation, o: &WebpOptions) -> Result<Vec<u8>> {
 /// `encode_webp` that gives way to the user and can be stopped between frames.
 pub fn encode_webp_stoppable(anim: &Animation, o: &WebpOptions, stop: Option<&std::sync::atomic::AtomicUsize>) -> Result<Vec<u8>> {
     use webp_animation::{AnimParams, Encoder, EncoderOptions, EncodingConfig, EncodingType};
-    let frames = anim.enabled_frames();
+    let frames = anim.enabled_frames_merged();
     anyhow::ensure!(!frames.is_empty(), "No enabled frames");
     let (w, h) = frames[0].image.dimensions();
     let cfg = EncodingConfig {
@@ -828,7 +841,7 @@ pub fn encode_webp_stoppable(anim: &Animation, o: &WebpOptions, stop: Option<&st
     for f in &frames {
         crate::stack::yield_to_foreground(stop);
         anyhow::ensure!(!crate::stack::stopped(stop), "Stopped");
-        enc.add_frame(f.image.as_raw(), t).map_err(|e| anyhow::anyhow!("WebP frame: {e:?}"))?;
+        enc.add_frame(f.image.get().as_raw(), t).map_err(|e| anyhow::anyhow!("WebP frame: {e:?}"))?;
         t += crate::anim::effective_delay(f.delay_cs) as i32 * 10;
     }
     let data = enc.finalize(t).map_err(|e| anyhow::anyhow!("WebP: {e:?}"))?;
@@ -877,7 +890,7 @@ pub fn encode_preview(anim: &Animation, f: &PreviewFormat, stop: Option<&std::sy
             let decoded: Vec<Frame> = files
                 .par_iter()
                 .zip(frames.par_iter())
-                .map(|(b, f)| Ok(Frame { image: Arc::new(image::load_from_memory(b)?.to_rgba8()), delay_cs: f.delay_cs, enabled: true, cut: false, blank: false }))
+                .map(|(b, f)| Ok(Frame { image: crate::pixels::Pixels::new(image::load_from_memory(b)?.to_rgba8()), delay_cs: f.delay_cs, enabled: true, cut: false, blank: false }))
                 .collect::<Result<_>>()?;
             // the size shown is the total of all files
             let total: Vec<u8> = files.concat();
@@ -894,16 +907,17 @@ pub fn encode_preview(anim: &Animation, f: &PreviewFormat, stop: Option<&std::sy
             let mut dec = decode_video_bytes(&b, "avif", (w, h))?;
             // ffmpeg can't decode AVIF's alpha layer; it's stored near-losslessly,
             // so show the source's transparency
-            if anim.frames.iter().any(|f| f.image.pixels().any(|p| p[3] < 255)) {
+            if anim.frames.iter().any(|f| f.image.get().pixels().any(|p| p[3] < 255)) {
                 let mut src = anim.clone();
                 src.frames.retain(|f| f.enabled);
                 let mut t = 0.0f32;
                 for f in &mut dec.frames {
-                    let s = &src.frames[crate::stack::frame_at_time(&src, t + 0.001)].image;
-                    let img = Arc::make_mut(&mut f.image);
+                    let s = src.frames[crate::stack::frame_at_time(&src, t + 0.001)].image.get();
+                    let mut img = (*f.image.get()).clone();
                     for (p, q) in img.pixels_mut().zip(s.pixels()) {
                         p[3] = q[3];
                     }
+                    f.image = crate::pixels::Pixels::new(img);
                     t += crate::anim::effective_delay(f.delay_cs) as f32 / 100.0;
                 }
             }
@@ -953,7 +967,7 @@ pub fn export_video_q(anim: &Animation, path: &Path, fmt: VideoFormat, bg: [u8; 
     let frames = anim.enabled_frames();
     anyhow::ensure!(!frames.is_empty(), "No enabled frames");
     let tmp = std::env::temp_dir().join(format!("gifkit_{}_{}", std::process::id(), RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
-    let has_alpha = frames.iter().any(|f| f.image.pixels().any(|p| p[3] < 255));
+    let has_alpha = frames.iter().any(|f| f.image.get().pixels().any(|p| p[3] < 255));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
     let mut list = String::new();
@@ -962,10 +976,10 @@ pub fn export_video_q(anim: &Animation, path: &Path, fmt: VideoFormat, bg: [u8; 
         let img = if fmt == VideoFormat::Mp4 {
             // flatten onto background, MP4 has no alpha
             let mut flat = RgbaImage::from_pixel(f.image.width(), f.image.height(), image::Rgba([bg[0], bg[1], bg[2], 255]));
-            image::imageops::overlay(&mut flat, &*f.image, 0, 0);
+            image::imageops::overlay(&mut flat, &*f.image.get(), 0, 0);
             flat
         } else {
-            (*f.image).clone()
+            (*f.image.get()).clone()
         };
         img.save(tmp.join(&name))?;
         list.push_str(&format!("file '{}'\nduration {:.3}\n", name, crate::anim::effective_delay(f.delay_cs) as f64 / 100.0));

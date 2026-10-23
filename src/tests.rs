@@ -29,7 +29,7 @@ fn synth(transparent: bool) -> Animation {
 fn max_diff(a: &Animation, b: &Animation) -> u32 {
     let mut m = 0;
     for (fa, fb) in a.frames.iter().zip(&b.frames) {
-        for (pa, pb) in fa.image.pixels().zip(fb.image.pixels()) {
+        for (pa, pb) in fa.image.get().pixels().zip(fb.image.get().pixels()) {
             if pa[3] < 128 && pb[3] < 128 {
                 continue;
             }
@@ -185,18 +185,18 @@ fn text_and_censor_and_overlay() {
     let s = text::render_sprite(&fonts, &ann);
     assert!(s.width() > 20 && s.height() > 40);
     assert!(s.pixels().any(|p| p[3] == 255 && p[0] == 255));
-    let mut img = (*a.frames[0].image).clone();
+    let mut img = (*a.frames[0].image.get()).clone();
     text::draw_sprite(&mut img, &s, &ann);
-    assert_ne!(img.as_raw(), a.frames[0].image.as_raw());
+    assert_ne!(img.as_raw(), a.frames[0].image.get().as_raw());
 
     let c = effects::CensorSettings { x: 0, y: 0, w: 40, h: 40, ..Default::default() };
-    let out = effects::censor_frame(&a.frames[0].image, 0, &c);
-    assert_ne!(out.as_raw(), a.frames[0].image.as_raw());
+    let out = effects::censor_frame(&a.frames[0].image.get(), 0, &c);
+    assert_ne!(out.as_raw(), a.frames[0].image.get().as_raw());
 
     let src = overlay::OverlaySource { name: "x".into(), path: None, frames: vec![RgbaImage::from_pixel(10, 10, Rgba([0, 255, 0, 255]))], delays: vec![10] };
     let pl = vec![overlay::Placement { enabled: true, x: 5, y: 5, w: 20, h: 20, angle: 0.0 }; a.len()];
     let o = overlay::apply(&a, &src, &pl, 1.0);
-    assert_eq!(*o.frames[0].image.get_pixel(10, 10), Rgba([0, 255, 0, 255]));
+    assert_eq!(*o.frames[0].image.get().get_pixel(10, 10), Rgba([0, 255, 0, 255]));
 }
 
 #[test]
@@ -287,16 +287,16 @@ fn live_stack_matches_baked_and_plans() {
     let times = crate::stack::plan_times(&plan);
     let prep = s.prepare(&a, &fonts);
     let f5 = s.render_frame(&a, &plan, &times, 5, &fonts, &prep);
-    assert_eq!(f5.as_raw(), flat.frames[5].image.as_raw());
+    assert_eq!(f5.as_raw(), flat.frames[5].image.get().as_raw());
 
     // layer order matters: text above grayscale keeps colour, below it doesn't
     let red = |img: &image::RgbaImage| img.pixels().any(|p| p[0] > 200 && p[1] < 60);
     let mut s2 = Stack::default();
     s2.push(LayerKind::Effects(Box::new(EffectSettings { grayscale: true, ..Default::default() })));
     s2.push(LayerKind::Text(text::Annotation { text: "XX".into(), color: [255, 0, 0, 255], border: text::Border::None, x: 0, y: 0, ..Default::default() }));
-    assert!(red(&s2.flatten(&a, &fonts, None).frames[0].image));
+    assert!(red(&s2.flatten(&a, &fonts, None).frames[0].image.get()));
     s2.layers.swap(0, 1);
-    assert!(!red(&s2.flatten(&a, &fonts, None).frames[0].image));
+    assert!(!red(&s2.flatten(&a, &fonts, None).frames[0].image.get()));
 
     // transform: cut + speed + crop + resize + rotate
     let mut s3 = Stack::default();
@@ -339,10 +339,10 @@ fn layers_follow_frame_edits() {
     s.transform.rot = 90; // → x' = 64 - y, y' = x
     let out = s.flatten(&a, &fonts, None);
     assert_eq!((out.width(), out.height()), (64, 96));
-    assert!(red(out.frames[0].image.get_pixel(64 - 45, 50)), "censor did not follow 90° rotation");
+    assert!(red(out.frames[0].image.get().get_pixel(64 - 45, 50)), "censor did not follow 90° rotation");
     // rotated region is 10 wide, 20 tall now
-    assert!(red(out.frames[0].image.get_pixel(64 - 45, 50 + 8)));
-    assert!(!red(out.frames[0].image.get_pixel(64 - 45 + 8, 50)));
+    assert!(red(out.frames[0].image.get().get_pixel(64 - 45, 50 + 8)));
+    assert!(!red(out.frames[0].image.get().get_pixel(64 - 45 + 8, 50)));
 
     // crop + resize + free rotation
     s.transform.rot = 0;
@@ -355,21 +355,21 @@ fn layers_follow_frame_edits() {
     let g = s.transform.geo_map(96, 64);
     let (cx, cy) = g.m.apply(50.0, 45.0);
     let out = s.flatten(&a, &fonts, None);
-    assert!(red(out.frames[0].image.get_pixel(cx.round() as u32, cy.round() as u32)), "censor did not follow crop/resize/rotate");
+    assert!(red(out.frames[0].image.get().get_pixel(cx.round() as u32, cy.round() as u32)), "censor did not follow crop/resize/rotate");
 
     // an effects layer that rotates (below the censor) is followed too
     let mut s2 = Stack::default();
     s2.push(LayerKind::Effects(Box::new(EffectSettings { rot90: true, ..Default::default() })));
     s2.push(LayerKind::Censor(effects::CensorSettings { x: 40, y: 40, w: 20, h: 10, method: effects::CensorMethod::Solid, color: [255, 0, 0], ..Default::default() }));
     let out = s2.flatten(&a, &fonts, None);
-    assert!(red(out.frames[0].image.get_pixel(64 - 45, 50)), "censor did not follow an effects-layer rotation");
+    assert!(red(out.frames[0].image.get().get_pixel(64 - 45, 50)), "censor did not follow an effects-layer rotation");
 
     // rotated layer itself: 90° censor is taller than wide
     let mut s3 = Stack::default();
     s3.push(LayerKind::Censor(effects::CensorSettings { x: 40, y: 40, w: 20, h: 6, angle: 90.0, method: effects::CensorMethod::Solid, color: [255, 0, 0], ..Default::default() }));
     let out = s3.flatten(&a, &fonts, None);
-    assert!(red(out.frames[0].image.get_pixel(50, 52)));
-    assert!(!red(out.frames[0].image.get_pixel(58, 43)));
+    assert!(red(out.frames[0].image.get().get_pixel(50, 52)));
+    assert!(!red(out.frames[0].image.get().get_pixel(58, 43)));
 }
 
 #[test]
@@ -384,7 +384,7 @@ fn pixelate_censor_on_real_gif() {
     let times = crate::stack::plan_times(&plan);
     let prep = s.prepare(&a, &fonts);
     let img = s.render_frame(&a, &plan, &times, 37, &fonts, &prep);
-    let diff = img.pixels().zip(a.frames[37].image.pixels()).filter(|(x, y)| x != y).count();
+    let diff = img.pixels().zip(a.frames[37].image.get().pixels()).filter(|(x, y)| x != y).count();
     assert!(diff > 100, "pixelate changed only {diff} pixels");
 }
 
@@ -431,17 +431,17 @@ fn watermark_single_and_tiled() {
         }
         _ => panic!("expected single"),
     }
-    let mut img = (*a.frames[0].image).clone();
+    let mut img = (*a.frames[0].image.get()).clone();
     effects::draw_watermark(&mut img, &sp, wm.opacity);
-    assert_ne!(img.as_raw(), a.frames[0].image.as_raw());
+    assert_ne!(img.as_raw(), a.frames[0].image.get().as_raw());
     // top-left corner untouched by a bottom-right watermark
-    assert_eq!(img.get_pixel(1, 1), a.frames[0].image.get_pixel(1, 1));
+    assert_eq!(img.get_pixel(1, 1), a.frames[0].image.get().get_pixel(1, 1));
 
     wm.tiled = true;
     let sp = wm.sprite(&fonts, w, h).unwrap();
-    let mut img = (*a.frames[0].image).clone();
+    let mut img = (*a.frames[0].image.get()).clone();
     effects::draw_watermark(&mut img, &sp, 100.0);
-    let changed = img.pixels().zip(a.frames[0].image.pixels()).filter(|(p, q)| p != q).count();
+    let changed = img.pixels().zip(a.frames[0].image.get().pixels()).filter(|(p, q)| p != q).count();
     assert!(changed > (w * h) as usize / 20, "tiled watermark should cover the frame, changed {changed}");
 
     // empty text = inactive
@@ -453,7 +453,7 @@ fn watermark_single_and_tiled() {
 fn shield_is_subtle_and_deterministic() {
     let a = synth(false);
     let s = effects::ShieldSettings { strength: 6.0, ..Default::default() };
-    let src = &a.frames[0].image;
+    let src = &a.frames[0].image.get();
     let o1 = effects::shield(src, &s, 0);
     let o2 = effects::shield(src, &s, 5);
     assert_eq!(o1.as_raw(), o2.as_raw(), "same seed, static pattern");
@@ -485,7 +485,7 @@ fn watermark_and_shield_layers_render_in_stack() {
     assert!(st.needs_render());
     let out = st.flatten(&a, &fonts, None);
     assert_eq!(out.len(), a.len());
-    assert_ne!(out.frames[0].image.as_raw(), a.frames[0].image.as_raw());
+    assert_ne!(out.frames[0].image.get().as_raw(), a.frames[0].image.get().as_raw());
 }
 
 #[test]
@@ -601,9 +601,9 @@ fn webp_roundtrip_and_smaller() {
     let back = io::load_animation_bytes(&lossless).unwrap();
     assert_eq!(back.len(), a.len());
     for (fa, fb) in a.frames.iter().zip(&back.frames) {
-        for (x, y, pa) in fa.image.enumerate_pixels() {
-            let pb = fb.image.get_pixel(x, y);
-            if pa != pb {
+        for (x, y, pa) in fa.image.get().enumerate_pixels() {
+            let pb = *fb.image.get().get_pixel(x, y);
+            if *pa != pb {
                 panic!("lossless WebP differs at {x},{y}: {pa:?} vs {pb:?}");
             }
         }
@@ -614,7 +614,7 @@ fn webp_roundtrip_and_smaller() {
     let t = synth(true);
     let b = io::encode_webp(&t, &io::WebpOptions { lossless: true, ..Default::default() }).unwrap();
     let back = io::load_animation_bytes(&b).unwrap();
-    assert_eq!(back.frames[0].image.get_pixel(0, 0)[3], 0);
+    assert_eq!(back.frames[0].image.get().get_pixel(0, 0)[3], 0);
 }
 
 #[test]
@@ -655,7 +655,7 @@ fn dump_webp() {
     let d = std::env::var("DUMP").unwrap();
     std::fs::write(format!("{d}/l.webp"), &b).unwrap();
     for (i, f) in a.frames.iter().enumerate() {
-        f.image.save(format!("{d}/f{i}.png")).unwrap();
+        f.image.get().save(format!("{d}/f{i}.png")).unwrap();
     }
 }
 
@@ -768,7 +768,7 @@ fn preview_alpha_probe() {
     let a = synth(true);
     for f in [P::Avif(60), P::Video(io::VideoFormat::WebmAlpha, [0, 0, 0]), P::Webp(io::WebpOptions::default())] {
         let (dec, _) = io::encode_preview(&a, &f, None).unwrap();
-        eprintln!("{f:?}: corner alpha {} square {:?}", dec.frames[0].image.get_pixel(90, 2)[3], dec.frames[0].image.get_pixel(5, 30));
+        eprintln!("{f:?}: corner alpha {} square {:?}", dec.frames[0].image.get().get_pixel(90, 2)[3], dec.frames[0].image.get().get_pixel(5, 30));
     }
 }
 
@@ -836,7 +836,7 @@ fn noai_markers_in_png_apng_webp() {
     let a = synth(true);
     // still PNG, full colour and palette
     for colors in [0u16, 64] {
-        let img = (*a.frames[0].image).clone();
+        let img = (*a.frames[0].image.get()).clone();
         let plain = io::encode_png(&img, &io::PngOptions { colors, noai: false }).unwrap();
         let tagged = io::encode_png(&img, &io::PngOptions { colors, noai: true }).unwrap();
         assert!(!has(&plain, b"noai") && has(&tagged, b"noai") && has(&tagged, b"DMI-PROHIBITED"));
@@ -882,7 +882,7 @@ fn noai_avif_still_decodes() {
         assert_eq!(x.len(), y.len());
         assert_eq!((x.width(), x.height()), (y.width(), y.height()));
         for (f, g) in x.frames.iter().zip(&y.frames) {
-            assert_eq!(f.image.as_raw(), g.image.as_raw(), "alpha={alpha}: pixels changed");
+            assert_eq!(f.image.get().as_raw(), g.image.get().as_raw(), "alpha={alpha}: pixels changed");
         }
         if let Ok(keep) = std::env::var("GIFKIT_KEEP_AVIF") {
             std::fs::copy(&tp, std::path::Path::new(&keep).join(format!("tagged_{alpha}.avif"))).unwrap();
@@ -919,7 +919,7 @@ fn shape_and_markup_layers_in_stack() {
     use crate::shapes::{MarkupSettings, PenStroke, ShapeKind, ShapeSettings};
     use crate::stack::{LayerKind, Stack};
     let a = synth(false);
-    let base = (*a.frames[0].image).clone();
+    let base = (*a.frames[0].image.get()).clone();
     let mut st = Stack::default();
     st.push(LayerKind::Shape(Box::new(ShapeSettings { kind: ShapeKind::Rect, x: 10, y: 10, w: 30, h: 20, fill: [255, 0, 255], stroke_on: false, ..Default::default() })));
     // one stroke on every frame, one on frame 3 only
@@ -928,18 +928,18 @@ fn shape_and_markup_layers_in_stack() {
         PenStroke { points: vec![[60.0, 10.0], [90.0, 10.0]], color: [0, 0, 255], width: 6.0, from: 3, to: 3, ..Default::default() },
     ] }));
     let out = st.flatten(&a, &[], None);
-    let f0 = &out.frames[0].image;
+    let f0 = &out.frames[0].image.get();
     assert_eq!(f0.get_pixel(25, 20).0, [255, 0, 255, 255], "shape fill");
     assert_ne!(base.get_pixel(25, 20).0, [255, 0, 255, 255]);
     assert_eq!(f0.get_pixel(75, 50).0, [0, 255, 0, 255], "pen stroke");
     assert_ne!(f0.get_pixel(75, 10).0, [0, 0, 255, 255], "frame-3 stroke must not show on frame 1");
-    assert_eq!(out.frames[2].image.get_pixel(75, 10).0, [0, 0, 255, 255], "frame-3 stroke shows on frame 3");
+    assert_eq!(out.frames[2].image.get().get_pixel(75, 10).0, [0, 0, 255, 255], "frame-3 stroke shows on frame 3");
     // a flipped frame carries the shape along
     st.transform.rot_on = true;
     st.transform.flip_h = true;
     let out = st.flatten(&a, &[], None);
     let w = out.width();
-    assert_eq!(out.frames[0].image.get_pixel(w - 1 - 25, 20).0, [255, 0, 255, 255]);
+    assert_eq!(out.frames[0].image.get().get_pixel(w - 1 - 25, 20).0, [255, 0, 255, 255]);
 }
 
 #[test]
@@ -979,8 +979,8 @@ fn emoji_layer_renders() {
     let mut st = Stack::default();
     st.push(LayerKind::Emoji(Box::new(EmojiSettings { emoji: "1f525".into(), x: 20, y: 10, w: 40, h: 40, ..Default::default() })));
     let out = st.flatten(&a, &[], None);
-    let before = &a.frames[0].image;
-    let after = &out.frames[0].image;
+    let before = &a.frames[0].image.get();
+    let after = &out.frames[0].image.get();
     let changed = (20..60).flat_map(|x| (10..50).map(move |y| (x, y))).filter(|&(x, y)| before.get_pixel(x, y) != after.get_pixel(x, y)).count();
     assert!(changed > 600, "emoji changed only {changed} pixels");
     assert_eq!(before.get_pixel(90, 60), after.get_pixel(90, 60), "outside the box stays as it was");
@@ -1011,7 +1011,7 @@ fn booth_contact_sheet() {
 fn booth_effects_change_pixels() {
     use crate::booth::{apply, BoothFx};
     let a = synth(false);
-    let src = &a.frames[3].image;
+    let src = &a.frames[3].image.get();
     for fx in BoothFx::LOOKS.iter().chain(BoothFx::DISTORT.iter()) {
         let out = apply(src, *fx, 60.0, 50.0, 50.0);
         assert_eq!(out.dimensions(), src.dimensions(), "{fx:?}");
@@ -1069,7 +1069,7 @@ fn project_round_trip() {
     assert_eq!(pr.base.len(), base.len());
     assert_eq!(pr.base.loop_count, base.loop_count);
     for (a, b) in pr.base.frames.iter().zip(&base.frames) {
-        assert_eq!(a.image.as_raw(), b.image.as_raw(), "frames are lossless");
+        assert_eq!(a.image.get().as_raw(), b.image.get().as_raw(), "frames are lossless");
         assert_eq!((a.delay_cs, a.enabled), (b.delay_cs, b.enabled));
     }
     assert_eq!(pr.original.as_ref().map(|o| o.len()), Some(5));
@@ -1100,7 +1100,7 @@ fn project_round_trip() {
 fn booth_zero_strength_is_identity() {
     use crate::booth::{apply, BoothFx};
     let a = synth(false);
-    let src = &a.frames[3].image;
+    let src = &a.frames[3].image.get();
     for fx in [BoothFx::Glow, BoothFx::Bulge, BoothFx::Dent, BoothFx::Twirl, BoothFx::Squeeze, BoothFx::Stretch, BoothFx::Tunnel, BoothFx::FishEye] {
         let out = apply(src, fx, 0.0, 50.0, 50.0);
         let worst = out.pixels().zip(src.pixels()).map(|(p, q)| (0..4).map(|c| (p[c] as i32 - q[c] as i32).abs()).max().unwrap_or(0)).max().unwrap_or(0);
@@ -1163,7 +1163,7 @@ fn long_gif_encodes_in_runs() {
     let one = synth(false);
     let mut a = Animation { frames: Vec::new(), loop_count: None };
     for k in 0..25 {
-        a.frames.extend(one.frames.iter().map(|f| Frame::new((*f.image).clone(), f.delay_cs + (k % 2) as u16)));
+        a.frames.extend(one.frames.iter().map(|f| Frame::new((*f.image.get()).clone(), f.delay_cs + (k % 2) as u16)));
     }
     assert!(a.len() > 200);
     let bytes = encode_gif(&a, &GifOptions::default(), None).unwrap();
@@ -1207,7 +1207,7 @@ fn layer_clips_and_keyframes_render() {
     // moves 30 px right from frame 2 to frame 7, steady speed
     s.layers[li].timing.keys = vec![Key { frame: 2, ease: crate::timeline::Ease::Linear, ..Default::default() }, Key { frame: 7, x: 30.0, ease: crate::timeline::Ease::Linear, ..Default::default() }];
     let out = s.flatten(&a, &[], None);
-    let red = |f: usize, x: u32, y: u32| out.frames[f].image.get_pixel(x, y)[0] > 200;
+    let red = |f: usize, x: u32, y: u32| out.frames[f].image.get().get_pixel(x, y)[0] > 200;
     assert!(!red(0, 10, 10) && !red(1, 10, 10), "hidden before its clip");
     assert!(red(2, 10, 10), "shows where placed at the first key");
     assert!(red(7, 40, 10) && !red(7, 10, 10), "moved 30 px by the last key");
@@ -1215,7 +1215,7 @@ fn layer_clips_and_keyframes_render() {
     // a keyed fade mixes with what's under it
     s.layers[li].timing.keys = vec![Key { frame: 0, opacity: 50.0, ..Default::default() }];
     let out = s.flatten(&a, &[], None);
-    let p = out.frames[3].image.get_pixel(10, 10);
+    let p = *out.frames[3].image.get().get_pixel(10, 10);
     assert!((110..=145).contains(&p[0]), "half faded: {p:?}");
 }
 
@@ -1230,7 +1230,7 @@ fn effect_intro_starts_with_its_clip() {
     let li = s.index_of(id).unwrap();
     s.layers[li].timing.clips = Some(vec![Clip { start: 4, end: Some(8) }]);
     let out = s.flatten(&a, &[], None);
-    let v = |f: usize| out.frames[f].image.get_pixel(4, 4)[0];
+    let v = |f: usize| out.frames[f].image.get().get_pixel(4, 4)[0];
     assert_eq!(v(2), 200, "outside the clip nothing happens");
     assert!(v(4) < 80, "the fade starts at the clip: {}", v(4));
     assert_eq!(v(7), 200, "and is done three frames in");
@@ -1246,7 +1246,7 @@ fn canvas_space_pads_and_layers_follow() {
     s.transform.pad = [6, 0, 14, 2]; // top, right, bottom, left
     s.push(LayerKind::Shape(Box::new(ShapeSettings { kind: ShapeKind::Rect, x: 0, y: 0, w: 4, h: 4, fill: [255, 0, 0], ..Default::default() })));
     let out = s.flatten(&a, &[], None);
-    let f = &out.frames[0].image;
+    let f = &out.frames[0].image.get();
     assert_eq!(f.dimensions(), (22, 30));
     assert_eq!(f.get_pixel(0, 0).0, [255, 255, 255, 255], "new space is white by default");
     assert_eq!(f.get_pixel(10, 25).0, [255, 255, 255, 255]);
@@ -1254,7 +1254,7 @@ fn canvas_space_pads_and_layers_follow() {
     assert_eq!(f.get_pixel(3, 7)[0], 255, "a layer at the source corner moves with the picture");
     s.transform.pad_transparent = true;
     let out = s.flatten(&a, &[], None);
-    assert_eq!(out.frames[0].image.get_pixel(0, 0)[3], 0);
+    assert_eq!(out.frames[0].image.get().get_pixel(0, 0)[3], 0);
 }
 
 #[test]
@@ -1268,7 +1268,7 @@ fn caption_bar_fits_its_text() {
     let id = s.push(LayerKind::Text(Annotation { text: long.into(), size: 16.0, caption: Caption::Bottom, ..Default::default() }));
     while s.layout_text(200, 100, &fonts) {}
     let out = s.flatten(&a, &fonts, None);
-    let f = &out.frames[0].image;
+    let f = &out.frames[0].image.get();
     assert_eq!(f.width(), 200, "a caption bar only adds height");
     assert!(f.height() > 100 + 40, "two or more lines make the bar taller: {}", f.height());
     assert_eq!(f.get_pixel(100, 50).0, [0, 0, 255, 255], "the picture is untouched");
@@ -1307,15 +1307,15 @@ fn preview_proxy_matches_a_shrunk_full_render() {
     let full = s.flatten(&a, &[], None);
     let k = 0.5;
     let (pw, ph) = proxy_size(400, 300, k);
-    let small = Animation { frames: a.frames.iter().map(|f| Frame::new(image::imageops::resize(&*f.image, pw, ph, image::imageops::FilterType::Triangle), 5)).collect(), loop_count: None };
+    let small = Animation { frames: a.frames.iter().map(|f| Frame::new(image::imageops::resize(&*f.image.get(), pw, ph, image::imageops::FilterType::Triangle), 5)).collect(), loop_count: None };
     let prev = s.proxy(k).flatten(&small, &[], None);
     let (fw, fh) = full.frames[0].image.dimensions();
     let (qw, qh) = prev.frames[0].image.dimensions();
     assert!((qw as f32 - fw as f32 * k).abs() <= 2.0 && (qh as f32 - fh as f32 * k).abs() <= 2.0, "{fw}x{fh} vs {qw}x{qh}");
     // the red box lands in the same place, at half the size
     let red = |img: &RgbaImage, x: u32, y: u32| img.get_pixel(x.min(img.width() - 1), y.min(img.height() - 1))[0] > 200 && img.get_pixel(x.min(img.width() - 1), y.min(img.height() - 1))[1] < 60;
-    let f = &full.frames[0].image;
-    let q = &prev.frames[0].image;
+    let f = &full.frames[0].image.get();
+    let q = &prev.frames[0].image.get();
     let mut same = 0;
     let mut total = 0;
     for y in (0..fh).step_by(4) {
@@ -1390,7 +1390,7 @@ fn fades_line_up_with_timeline_changes() {
         st.push(LayerKind::Effects(Box::new(fx)));
         tweak(&mut st, &mut b);
         let flat = st.flatten(&b, &[], None);
-        let shown: Vec<i32> = flat.frames.iter().filter(|f| f.enabled).map(|f| lum(&f.image)).collect();
+        let shown: Vec<i32> = flat.frames.iter().filter(|f| f.enabled).map(|f| lum(&f.image.get())).collect();
         let (first, last) = (shown[0], *shown.last().unwrap());
         let min = *shown.iter().min().unwrap();
         assert!(first == min && last == min, "{name}: first {first} last {last} min {min} {shown:?}");
@@ -1431,4 +1431,24 @@ fn keys_scale_each_way_and_read_old_files() {
     // on a sprite already turned 90°, its own width runs up and down
     let (o, _, _) = transform_sprite(&img, 0, 0, (5.0, 5.0), (0.0, 0.0), motion_matrix(2.0, 1.0, 90.0, 0.0)).unwrap();
     assert!(o.width() <= 11 && o.height() == 20, "{}x{}", o.width(), o.height());
+}
+
+/// A held picture opens as several frames and saves as one again.
+#[test]
+fn split_holds_save_back_as_one() {
+    let img = |k: u8| image::RgbaImage::from_pixel(40, 30, image::Rgba([k * 20, 90, 200, 255]));
+    let a = Animation { frames: vec![Frame::new(img(1), 4), Frame::new(img(2), 4), Frame::new(img(3), 120), Frame::new(img(4), 4)], loop_count: None };
+    let bytes = crate::encode::encode_gif(&a, &GifOptions::default(), None).unwrap();
+    let mut b = io::load_animation_bytes(&bytes).unwrap();
+    assert_eq!(b.len(), 4);
+    assert!(b.split_holds() > 0);
+    for (name, out) in [
+        ("gif", crate::encode::encode_gif(&b, &GifOptions::default(), None).unwrap()),
+        ("webp", io::encode_webp(&b, &io::WebpOptions { lossless: true, ..Default::default() }).unwrap()),
+        ("apng", io::encode_apng(&b, false).unwrap()),
+    ] {
+        let back = io::load_animation_bytes(&out).unwrap();
+        assert_eq!(back.len(), 4, "{name}");
+        assert!((back.duration_secs() - a.duration_secs()).abs() < 0.02, "{name}");
+    }
 }

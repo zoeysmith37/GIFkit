@@ -367,7 +367,7 @@ impl From<TextureHandle> for Tex {
 }
 
 /// Graphics memory the views' rendered frames may hold.
-const GPU_FRAMES_BUDGET: usize = 512 << 20;
+const GPU_FRAMES_BUDGET: usize = 160 << 20;
 
 /// Frames the graphics card rendered for the views, registered with egui.
 struct GpuFrames {
@@ -397,7 +397,7 @@ struct Thumbs {
 
 /// Longest side of a thumbnail, and how many are kept on the graphics card.
 const THUMB_SIDE: u32 = 192;
-const THUMB_KEEP: usize = 2500;
+const THUMB_KEEP: usize = 800;
 
 impl Thumbs {
     fn get(&mut self, key: u64, i: usize) -> Option<TextureHandle> {
@@ -467,36 +467,58 @@ impl Thumbs {
     }
 }
 
-/// Texture cache invalidated by a key.
+/// Texture cache invalidated by a key. The least recently shown go first
+/// once it's over its budget.
 #[derive(Default)]
 struct TexCache {
     key: u64,
-    map: HashMap<usize, TextureHandle>,
+    map: HashMap<usize, (TextureHandle, u64)>,
     /// bytes of texture held, to stay inside a budget
     bytes: usize,
+    tick: u64,
+    /// the on-screen size it was filled for
+    side: u32,
 }
 
-/// Graphics memory a texture cache may hold before it starts over.
-const TEX_BUDGET: usize = 1 << 30;
+/// Graphics memory one texture cache may hold. On built-in graphics this is
+/// ordinary memory, so it's kept to what smooth playback needs.
+const TEX_BUDGET: usize = 64 << 20;
 
 /// Pictures wider or taller than this are shrunk before they go to the
 /// graphics card: the screen can't show more, and uploads stay quick.
 const TEX_MAX_SIDE: u32 = 2048;
 
+/// How big (longest side, in screen pixels) pictures are shown at the
+/// moment, rounded up to a power of two. Pictures shown at under half their
+/// size go to the card at this size instead.
+static TEX_SIDE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(TEX_MAX_SIDE);
+/// The biggest any view showed a picture this frame (screen pixels).
+static TEX_NEED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 impl TexCache {
     fn get(&mut self, key: u64, i: usize) -> Option<TextureHandle> {
-        if self.key != key {
+        let side = TEX_SIDE.load(Ordering::Relaxed);
+        if self.key != key || self.side != side {
             self.map.clear();
             self.bytes = 0;
             self.key = key;
+            self.side = side;
         }
-        self.map.get(&i).cloned()
+        self.tick += 1;
+        let t = self.tick;
+        self.map.get_mut(&i).map(|e| {
+            e.1 = t;
+            e.0.clone()
+        })
     }
     fn put(&mut self, ctx: &egui::Context, i: usize, img: &RgbaImage, opts: TextureOptions, name: &str) -> TextureHandle {
         let side = img.width().max(img.height());
+        // no bigger than the screen shows it (when that saves most of it)
+        let screen = TEX_SIDE.load(Ordering::Relaxed);
+        let limit = if screen * 2 <= side { screen } else { TEX_MAX_SIDE };
         let small;
-        let img = if side > TEX_MAX_SIDE {
-            let k = TEX_MAX_SIDE as f32 / side as f32;
+        let img = if side > limit {
+            let k = limit as f32 / side as f32;
             let (w, h) = stack::proxy_size(img.width(), img.height(), k);
             small = image::imageops::resize(img, w, h, image::imageops::FilterType::Triangle);
             &small
@@ -504,14 +526,28 @@ impl TexCache {
             img
         };
         let size = img.width() as usize * img.height() as usize * 4;
-        if self.map.len() > 600 || self.bytes + size > TEX_BUDGET {
-            self.map.clear();
-            self.bytes = 0;
+        // the least recently shown go, down to seven eighths
+        if self.bytes + size > TEX_BUDGET {
+            let mut v: Vec<(u64, usize)> = self.map.iter().map(|(k, e)| (e.1, *k)).collect();
+            v.sort_unstable();
+            for (_, k) in v {
+                if self.bytes + size <= TEX_BUDGET / 8 * 7 {
+                    break;
+                }
+                if let Some((t, _)) = self.map.remove(&k) {
+                    self.bytes -= t.size()[0] * t.size()[1] * 4;
+                }
+            }
         }
         let t = ctx.load_texture(format!("{name}{i}"), to_color_image(img), opts);
-        self.map.insert(i, t.clone());
+        self.tick += 1;
+        self.map.insert(i, (t.clone(), self.tick));
         self.bytes += size;
         t
+    }
+    /// How many pictures `w` by `h` fit in the budget.
+    fn room_for(w: u32, h: u32) -> usize {
+        TEX_BUDGET / (w as usize * h as usize * 4).max(1)
     }
 }
 
@@ -771,6 +807,11 @@ pub struct GifKitApp {
     view_single: ViewSource,
     cmp: Option<CmpResult>,
     cmp_job: Option<CmpJob>,
+    /// frames being packed in the background: (old id, packed)
+    pack_job: Option<Receiver<Vec<(u64, crate::pixels::Pixels)>>>,
+    /// frames that didn't pack smaller (not tried again)
+    pack_tried: std::collections::HashSet<u64>,
+    pack_last: f64,
     cmp_key_seen: u64,
     cmp_key_since: f64,
     cmp_gen: u64,
@@ -2665,6 +2706,9 @@ impl GifKitApp {
             view_right: ViewSource::Compressed,
             cmp: None,
             cmp_job: None,
+            pack_job: None,
+            pack_tried: std::collections::HashSet::new(),
+            pack_last: 0.0,
             cmp_key_seen: 0,
             cmp_key_since: 0.0,
             cmp_gen: 0,
@@ -2991,7 +3035,11 @@ impl GifKitApp {
                 self.set_base_with_undo(a, Some(s), &label);
                 self.info(format!("✔ {label}"));
             }
-            JobOutput::Loaded(Ok((a, path, size))) => {
+            JobOutput::Loaded(Ok((mut a, path, size))) => {
+                // held pictures (and a video's merged still parts) become
+                // several frames sharing one picture, so moving layers keep
+                // moving over them
+                a.split_holds();
                 self.undo.clear();
                 self.redo.clear();
                 self.committed = None;
@@ -3049,7 +3097,7 @@ impl GifKitApp {
                 // scripting hook: GIFKIT_OVERLAY=path adds an image layer on open
                 if let Ok(ov) = std::env::var("GIFKIT_OVERLAY") {
                     if let Ok(a) = io::load_animation(std::path::Path::new(&ov)) {
-                        self.add_overlay(OverlaySource { name: ov.rsplit('/').next().unwrap_or("overlay").into(), path: Some(PathBuf::from(&ov)), delays: a.frames.iter().map(|f| f.delay_cs).collect(), frames: a.frames.iter().map(|f| (*f.image).clone()).collect() });
+                        self.add_overlay(OverlaySource { name: ov.rsplit('/').next().unwrap_or("overlay").into(), path: Some(PathBuf::from(&ov)), delays: a.frames.iter().map(|f| f.delay_cs).collect(), frames: a.frames.iter().map(|f| (*f.image.get()).clone()).collect() });
                     }
                 }
             }
@@ -3519,6 +3567,123 @@ impl GifKitApp {
         }
     }
 
+    /// Every animation kept around (the opened one, the edit, undo steps,
+    /// the screen-sized copies and the compressed preview).
+    fn kept_anims_mut(&mut self) -> Vec<&mut Animation> {
+        let mut v: Vec<&mut Animation> = Vec::new();
+        v.extend(self.original.as_mut());
+        v.extend(self.base.as_mut());
+        for s in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            v.push(&mut s.anim);
+        }
+        if let Some(p) = self.proxy.as_mut() {
+            v.push(&mut p.2);
+            v.extend(p.3.as_mut());
+        }
+        if let Some(c) = self.cmp.as_mut() {
+            v.push(&mut c.anim);
+        }
+        v
+    }
+
+    /// Pack kept frames that aren't yet, in the background, then put the
+    /// packed ones in everywhere the same frame is kept.
+    fn manage_packing(&mut self, ctx: &egui::Context, now: f64) {
+        if let Some(rx) = &self.pack_job {
+            match rx.try_recv() {
+                Ok(done) => {
+                    self.pack_job = None;
+                    let mut swap: HashMap<u64, crate::pixels::Pixels> = HashMap::new();
+                    for (old, p) in done {
+                        if p.is_packed() {
+                            swap.insert(old, p);
+                        } else {
+                            self.pack_tried.insert(old);
+                        }
+                    }
+                    for a in self.kept_anims_mut() {
+                        for f in &mut a.frames {
+                            if let Some(p) = swap.get(&f.image.id()) {
+                                f.image = p.clone();
+                            }
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                    return;
+                }
+                Err(_) => self.pack_job = None,
+            }
+        }
+        if now - self.pack_last < 1.0 {
+            return;
+        }
+        self.pack_last = now;
+        let tried = std::mem::take(&mut self.pack_tried);
+        let mut seen = std::collections::HashSet::new();
+        let mut todo: Vec<crate::pixels::Pixels> = Vec::new();
+        for a in self.kept_anims_mut() {
+            for f in &a.frames {
+                let p = &f.image;
+                if !p.is_packed() && p.width() * p.height() >= 64 * 64 && !tried.contains(&p.id()) && seen.insert(p.id()) {
+                    todo.push(p.clone());
+                }
+            }
+        }
+        self.pack_tried = tried;
+        if todo.is_empty() {
+            return;
+        }
+        let (tx, rx) = channel();
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            stack::lower_thread_priority();
+            let out: Vec<(u64, crate::pixels::Pixels)> = stack::bg_pool().install(|| {
+                use rayon::prelude::*;
+                todo.par_iter()
+                    .map(|p| {
+                        stack::yield_to_foreground(None);
+                        (p.id(), p.packed())
+                    })
+                    .collect()
+            });
+            let _ = tx.send(out);
+            ctx2.request_repaint();
+        });
+        self.pack_job = Some(rx);
+    }
+
+    /// GIFKIT_MEM: every few seconds, what each copy and cache holds (MB).
+    fn mem_report(&mut self, ctx: &egui::Context) {
+        if std::env::var_os("GIFKIT_MEM").is_none() {
+            return;
+        }
+        let now = ctx.input(|i| i.time);
+        let last = ctx.data(|d| d.get_temp::<f64>(egui::Id::unique("mem-last"))).unwrap_or(-10.0);
+        if now - last < 3.0 {
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            return;
+        }
+        ctx.data_mut(|d| d.insert_temp(egui::Id::unique("mem-last"), now));
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        let mb = |b: usize| b as f64 / 1_048_576.0;
+        let mut seen = std::collections::HashSet::new();
+        let mut uniq = |a: &Animation| -> usize { a.frames.iter().filter(|f| seen.insert(f.image.id() as usize)).map(|f| f.image.stored_bytes()).sum() };
+        let orig = self.original.as_ref().map(&mut uniq).unwrap_or(0);
+        let base = self.base.as_ref().map(&mut uniq).unwrap_or(0);
+        let proxy = self.proxy.as_ref().map(|p| uniq(&p.2) + p.3.as_ref().map(&mut uniq).unwrap_or(0)).unwrap_or(0);
+        let undo: usize = self.undo.iter().chain(self.redo.iter()).map(|s| uniq(&s.anim)).sum();
+        let cmp = self.cmp.as_ref().map(|c| uniq(&c.anim) + c.bytes.len()).unwrap_or(0);
+        let tex = |t: &TexCache| t.bytes;
+        let rss = std::fs::read_to_string("/proc/self/status").ok().and_then(|s| s.lines().find(|l| l.starts_with("VmRSS")).map(|l| l.split_whitespace().nth(1).unwrap_or("0").parse::<usize>().unwrap_or(0) * 1024)).unwrap_or(0);
+        eprintln!(
+            "mem: rss {:.0} | raw frames alive {:.0} | gpu frames {:.0} | unpacked cache {:.0} | original {:.0} base {:.0} proxy {:.0} undo/redo {:.0} ({} steps) compressed {:.0} | textures base {:.0} comp {:.0} orig {:.0} cmp {:.0} crop {:.0} thumbs {}",
+            mb(rss), mb(crate::pixels::RAW_BYTES.load(Ordering::Relaxed)), mb(self.gpu_frames.bytes), mb(crate::pixels::cache_bytes()), mb(orig), mb(base), mb(proxy), mb(undo), self.undo.len() + self.redo.len(), mb(cmp),
+            mb(tex(&self.base_tex)), mb(tex(&self.comp_tex)), mb(tex(&self.orig_tex)), mb(tex(&self.cmp_tex)), mb(tex(&self.crop_tex)), self.thumbs.map.len()
+        );
+    }
+
     /// Setting ffmpeg up: point at it, or (on Windows) download a copy.
     fn ffmpeg_window(&mut self, ctx: &egui::Context) {
         // a download finishing
@@ -3906,8 +4071,9 @@ impl GifKitApp {
             form_row(ui, "Size:", |ui| combo(ui, "vid-size", &mut opt.max_side, &items));
             let levels: Vec<(usize, &str)> = io::MERGE_LEVELS.iter().enumerate().map(|(i, l)| (i, l.0)).collect();
             form_row(ui, "Still parts:", |ui| combo(ui, "vid-merge", &mut opt.merge, &levels)).on_hover_text(
-                "Frames that barely change from the one before are merged into it, and it shows for longer. \
-                 Screen recordings are still most of the time, so this saves a lot of frames.\n\n\
+                "Frames that barely change from the one before reuse its picture, so they take less memory \
+                 and the saved file is smaller. Effects and animations still move over them. \
+                 Screen recordings are still most of the time, so this saves a lot.\n\n\
                  Repeated: only frames that look the same.\nSmall changes: also a moving cursor or a few typed letters.\nMost changes: anything but big movement.",
             );
             ui.add_space(8.0);
@@ -3984,7 +4150,7 @@ impl GifKitApp {
                         (Err(e), None) => Err(e),
                     };
                     if has_base {
-                        JobOutput::Overlay(a.map(|a| OverlaySource { name: "Pasted image".into(), path: None, delays: a.frames.iter().map(|f| f.delay_cs).collect(), frames: a.frames.iter().map(|f| (*f.image).clone()).collect() }))
+                        JobOutput::Overlay(a.map(|a| OverlaySource { name: "Pasted image".into(), path: None, delays: a.frames.iter().map(|f| f.delay_cs).collect(), frames: a.frames.iter().map(|f| (*f.image.get()).clone()).collect() }))
                     } else {
                         JobOutput::Loaded(a.map(|a| (a, None, None)))
                     }
@@ -4057,7 +4223,7 @@ impl GifKitApp {
                 name: p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
                 path: Some(p.clone()),
                 delays: a.frames.iter().map(|f| f.delay_cs).collect(),
-                frames: a.frames.iter().map(|f| (*f.image).clone()).collect(),
+                frames: a.frames.iter().map(|f| (*f.image.get()).clone()).collect(),
             }))
         });
     }
@@ -4382,8 +4548,8 @@ impl GifKitApp {
             return Some(t);
         }
         let img = match self.ready_proxy() {
-            Some((_, a)) => a.frames.get(src)?.image.clone(),
-            None => self.base.as_ref()?.frames.get(src)?.image.clone(),
+            Some((_, a)) => a.frames.get(src)?.image.get(),
+            None => self.base.as_ref()?.frames.get(src)?.image.get(),
         };
         let o = self.tex_opts();
         Some(self.base_tex.put(ctx, src, &img, o, "base"))
@@ -4396,8 +4562,8 @@ impl GifKitApp {
             return Some(t);
         }
         let img = match self.ready_proxy() {
-            Some((_, a)) => a.frames.get(idx)?.image.clone(),
-            None => self.base.as_ref()?.frames.get(idx)?.image.clone(),
+            Some((_, a)) => a.frames.get(idx)?.image.get(),
+            None => self.base.as_ref()?.frames.get(idx)?.image.get(),
         };
         self.thumbs.want(idx, img);
         None
@@ -4479,25 +4645,25 @@ impl GifKitApp {
             let out = stack::bg_pool().install(|| {
                 let shrink = |a: &Animation| {
                     let (w, h) = stack::proxy_size(a.width(), a.height(), s);
-                    let imgs: Vec<&RgbaImage> = a.frames.iter().map(|f| &*f.image).collect();
-                    let small = stack::shrink_images(&imgs, w, h);
-                    let frames = a.frames.iter().zip(small).map(|(f, i)| crate::anim::Frame { image: Arc::new(i), ..f.clone() }).collect();
+                    let px: Vec<&crate::pixels::Pixels> = a.frames.iter().map(|f| &f.image).collect();
+                    let small = stack::shrink_pixels(&px, w, h);
+                    let frames = a.frames.iter().zip(small).map(|(f, i)| crate::anim::Frame { image: i, ..f.clone() }).collect();
                     Animation { frames, loop_count: a.loop_count }
                 };
                 let small = shrink(&base);
                 // the original mostly shares the source's frames: reuse those
                 let orig = original.map(|o| {
                     let (w, h) = stack::proxy_size(o.width(), o.height(), s);
-                    let shared: Vec<Option<usize>> = o.frames.iter().map(|f| base.frames.iter().position(|b| Arc::ptr_eq(&b.image, &f.image))).collect();
-                    let own: Vec<&RgbaImage> = o.frames.iter().zip(&shared).filter(|(_, k)| k.is_none()).map(|(f, _)| &*f.image).collect();
-                    let mut made = stack::shrink_images(&own, w, h).into_iter();
+                    let shared: Vec<Option<usize>> = o.frames.iter().map(|f| base.frames.iter().position(|b| crate::pixels::Pixels::ptr_eq(&b.image, &f.image))).collect();
+                    let own: Vec<&crate::pixels::Pixels> = o.frames.iter().zip(&shared).filter(|(_, k)| k.is_none()).map(|(f, _)| &f.image).collect();
+                    let mut made = stack::shrink_pixels(&own, w, h).into_iter();
                     let frames = o
                         .frames
                         .iter()
                         .zip(&shared)
                         .map(|(f, k)| match k {
                             Some(k) => crate::anim::Frame { image: small.frames[*k].image.clone(), ..f.clone() },
-                            None => crate::anim::Frame { image: Arc::new(made.next().unwrap_or_else(|| image::imageops::resize(&*f.image, w, h, image::imageops::FilterType::Triangle))), ..f.clone() },
+                            None => crate::anim::Frame { image: made.next().unwrap_or_else(|| crate::pixels::Pixels::new(image::imageops::resize(&*f.image.get(), w, h, image::imageops::FilterType::Triangle))), ..f.clone() },
                         })
                         .collect();
                     Animation { frames, loop_count: o.loop_count }
@@ -4605,7 +4771,8 @@ impl GifKitApp {
         }
         let key = self.comp_key;
         // the card is still busy with the last one: keep it up a moment longer
-        if self.gpu_frames.key != key || !self.gpu_frames.map.contains_key(&i) {
+        // (while a slider is dragged; playing, the picture keeps moving)
+        if !self.playing && (self.gpu_frames.key != key || !self.gpu_frames.map.contains_key(&i)) {
             if let (Some((gpu, _)), Some((_, t))) = (&self.gpu, &self.last_comp) {
                 if gpu.busy() && self.gpu_frames.since_busy < 30 {
                     self.gpu_frames.since_busy += 1;
@@ -4630,7 +4797,7 @@ impl GifKitApp {
         let (st, base) = self.render_inputs()?;
         let src = self.plan.get(i)?.src;
         let job = st.gpu_frame(&base, &self.plan, &self.plan_times, i, &self.fonts, &prep)?;
-        let frame = &base.frames.get(src)?.image;
+        let frame = &*base.frames.get(src)?.image.get();
         let frame_key = hash_parts(&[self.version, src as u64, base.width() as u64, base.height() as u64]);
         let filter = if self.pixelated { eframe::wgpu::FilterMode::Nearest } else { eframe::wgpu::FilterMode::Linear };
         let (gpu, renderer) = self.gpu.as_mut()?;
@@ -4661,6 +4828,43 @@ impl GifKitApp {
         self.gpu_frames.bytes += bytes;
         self.gpu_frames.map.insert(i, (tex, id, tick));
         Some(Tex { id, size, _keep: None })
+    }
+
+    /// Playing: unpack the source frames coming up in the background, and
+    /// have the card draw the next frame before it's due, so frames that
+    /// aren't kept (long animations) never hold the picture up.
+    fn read_ahead(&mut self, ctx: &egui::Context) {
+        if !self.playing || self.plan.is_empty() {
+            return;
+        }
+        let src_anim = match self.ready_proxy() {
+            Some((_, a)) => Some(a),
+            None => self.base.as_ref(),
+        };
+        if let Some(a) = src_anim {
+            let mut j = self.cur;
+            for _ in 0..8 {
+                j = self.next_enabled(j);
+                if let Some(f) = self.plan.get(j).and_then(|p| a.frames.get(p.src)) {
+                    f.image.prefetch();
+                }
+            }
+        }
+        // the next frame on the card, one a screen refresh
+        if self.needs_render() && self.gpu.is_some() && self.gpu_frames.key == self.comp_key {
+            let mut j = self.cur;
+            for _ in 0..2 {
+                j = self.next_enabled(j);
+                if !self.gpu_frames.map.contains_key(&j) {
+                    let ready = self.render_inputs().and_then(|(_, b)| self.plan.get(j).and_then(|p| b.frames.get(p.src)).map(|f| f.image.is_ready())).unwrap_or(false);
+                    // not while its picture is still being unpacked
+                    if ready {
+                        let _ = self.gpu_composite(ctx, j);
+                    }
+                    break;
+                }
+            }
+        }
     }
 
     fn free_gpu_frames(&mut self) {
@@ -4809,9 +5013,18 @@ impl GifKitApp {
             self.prerender = None;
             self.comp_key_since = f64::INFINITY;
         }
+        // playing past what the cache holds: render the next stretch
+        if self.playing && self.prerender.is_none() && self.comp_key_since.is_infinite() && self.needs_render() && !self.plan.is_empty() {
+            let next = self.next_enabled(self.cur);
+            if !(self.comp_tex.key == key && self.comp_tex.map.contains_key(&next)) {
+                self.comp_key_since = now - 1.0;
+            }
+        }
         let stable = now - self.comp_key_since > 0.5;
         if self.prerender.is_none() && stable && self.needs_render() && !self.plan.is_empty() {
-            let cached = self.comp_tex.key == key && self.comp_tex.map.len() >= self.plan.len();
+            // as many as the texture budget holds
+            let room = TexCache::room_for(self.true_out_size().x as u32, self.true_out_size().y as u32);
+            let cached = self.comp_tex.key == key && self.comp_tex.map.len() >= self.plan.len().min(room);
             if cached {
                 return;
             }
@@ -4822,7 +5035,7 @@ impl GifKitApp {
             // render in playback order, starting just after the frame on screen
             let n = plan.len();
             let start = self.cur + 1;
-            let missing: Vec<usize> = (0..n).map(|k| (start + k) % n).filter(|i| !(self.comp_tex.key == key && self.comp_tex.map.contains_key(i))).collect();
+            let missing: Vec<usize> = (0..n).map(|k| (start + k) % n).take(room).filter(|i| !(self.comp_tex.key == key && self.comp_tex.map.contains_key(i))).collect();
             let cancel = self.prerender_cancel.clone();
             let (tx, rx) = channel();
             let ctx2 = ctx.clone();
@@ -4970,7 +5183,7 @@ impl GifKitApp {
         }
         let path = self.path.as_ref().filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("gif")))?;
         let (base, orig) = (self.base.as_ref()?, self.original.as_ref()?);
-        let same = base.len() == orig.len() && base.frames.iter().zip(&orig.frames).all(|(a, b)| a.enabled && !a.blank && Arc::ptr_eq(&a.image, &b.image) && a.delay_cs == b.delay_cs);
+        let same = base.len() == orig.len() && base.frames.iter().zip(&orig.frames).all(|(a, b)| a.enabled && !a.blank && crate::pixels::Pixels::ptr_eq(&a.image, &b.image) && a.delay_cs == b.delay_cs);
         let plain = self.stack.layers.iter().all(|l| !l.visible) && self.stack.transform.is_identity() && self.stack.loop_count(base) == orig.loop_count;
         (same && plain).then(|| path.clone())
     }
@@ -5072,9 +5285,9 @@ impl GifKitApp {
                     let anim = if side > TEX_MAX_SIDE {
                         let (w, h) = stack::proxy_size(full.0, full.1, TEX_MAX_SIDE as f32 / side as f32);
                         {
-                            let imgs: Vec<&RgbaImage> = orig.frames.iter().map(|f| &*f.image).collect();
-                            let small = stack::shrink_images(&imgs, w, h);
-                            Animation { frames: orig.frames.iter().zip(small).map(|(f, i)| crate::anim::Frame { image: Arc::new(i), ..f.clone() }).collect(), loop_count: orig.loop_count }
+                            let px: Vec<&crate::pixels::Pixels> = orig.frames.iter().map(|f| &f.image).collect();
+                            let small = stack::shrink_pixels(&px, w, h);
+                            Animation { frames: orig.frames.iter().zip(small).map(|(f, i)| crate::anim::Frame { image: i, ..f.clone() }).collect(), loop_count: orig.loop_count }
                         }
                     } else {
                         orig
@@ -5142,9 +5355,9 @@ impl GifKitApp {
                 let anim = if side > TEX_MAX_SIDE {
                     let (w, h) = stack::proxy_size(full.0, full.1, TEX_MAX_SIDE as f32 / side as f32);
                     {
-                            let imgs: Vec<&RgbaImage> = anim.frames.iter().map(|f| &*f.image).collect();
-                            let small = stack::shrink_images(&imgs, w, h);
-                            Animation { frames: anim.frames.iter().zip(small).map(|(f, i)| crate::anim::Frame { image: Arc::new(i), ..f.clone() }).collect(), loop_count: anim.loop_count }
+                            let px: Vec<&crate::pixels::Pixels> = anim.frames.iter().map(|f| &f.image).collect();
+                            let small = stack::shrink_pixels(&px, w, h);
+                            Animation { frames: anim.frames.iter().zip(small).map(|(f, i)| crate::anim::Frame { image: i, ..f.clone() }).collect(), loop_count: anim.loop_count }
                         }
                 } else {
                     anim
@@ -5180,8 +5393,8 @@ impl GifKitApp {
             return Some(t);
         }
         let img = match self.orig_small() {
-            Some(o) => o.frames.get(i)?.image.clone(),
-            None => self.original.as_ref()?.frames.get(i)?.image.clone(),
+            Some(o) => o.frames.get(i)?.image.get(),
+            None => self.original.as_ref()?.frames.get(i)?.image.get(),
         };
         let o = self.tex_opts();
         Some(self.orig_tex.put(ctx, i, &img, o, "orig"))
@@ -5193,7 +5406,7 @@ impl GifKitApp {
         if let Some(t) = self.cmp_tex.get(key, i) {
             return Some(t);
         }
-        let img = c.anim.frames.get(i)?.image.clone();
+        let img = c.anim.frames.get(i)?.image.get();
         let o = self.tex_opts();
         Some(self.cmp_tex.put(ctx, i, &img, o, "cmp"))
     }
@@ -5271,7 +5484,19 @@ impl eframe::App for GifKitApp {
             }
         }
         let perf_t0 = std::time::Instant::now();
+        self.mem_report(&ctx);
         stack::mark_ui_thread();
+        // textures follow the size pictures were shown at last frame
+        let need = TEX_NEED.swap(0, Ordering::Relaxed);
+        if need > 0 {
+            let side = need.next_power_of_two().clamp(512, TEX_MAX_SIDE);
+            // only grow at once; shrink when it's well under, so a zoom
+            // back and forth doesn't redo every texture
+            let cur = TEX_SIDE.load(Ordering::Relaxed);
+            if side > cur || side * 2 < cur {
+                TEX_SIDE.store(side, Ordering::Relaxed);
+            }
+        }
         // background work gives way while the user is clicking, dragging,
         // scrolling or typing (and for a moment after)
         if ctx.input(|i| i.pointer.any_down() || i.events.iter().any(|e| matches!(e, egui::Event::Key { .. } | egui::Event::MouseWheel { .. } | egui::Event::Text(_)))) {
@@ -5321,9 +5546,12 @@ impl eframe::App for GifKitApp {
         self.manage_proxy(&ctx);
         mark("proxy");
         self.manage_prerender(&ctx, now);
+        self.read_ahead(&ctx);
         mark("prerender");
         self.manage_compare(&ctx, now);
         mark("compare");
+        self.manage_packing(&ctx, now);
+        mark("packing");
         self.load_preview_fonts(&ctx);
         mark("fonts");
         let pal = *p();
@@ -7808,7 +8036,7 @@ impl GifKitApp {
                             placement.y = sc(placement.y, fy);
                             placement.w = (placement.w as f32 * fs).max(1.0) as u32;
                             placement.h = (placement.h as f32 * fs).max(1.0) as u32;
-                            let src = OverlaySource { name: path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(), path: Some(path.clone()), delays: a.frames.iter().map(|f| f.delay_cs).collect(), frames: a.frames.iter().map(|f| (*f.image).clone()).collect() };
+                            let src = OverlaySource { name: path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(), path: Some(path.clone()), delays: a.frames.iter().map(|f| f.delay_cs).collect(), frames: a.frames.iter().map(|f| (*f.image.get()).clone()).collect() };
                             (self.stack.push(LayerKind::Overlay(OverlayLayer { src: Arc::new(src), placements: vec![placement; n], opacity })), visible)
                         }
                         Err(_) => {
@@ -7940,6 +8168,9 @@ impl GifKitApp {
         let scale = self.views[vi].zoom.unwrap_or(fit);
         let center = rect.center() + self.views[vi].pan;
         let img_rect = Rect::from_center_size(center, img_size * scale);
+        // how big it's shown, for the size textures are made at
+        let shown = (img_size.x.max(img_size.y) * scale * ctx.pixels_per_point()).ceil() as u32;
+        TEX_NEED.fetch_max(shown, Ordering::Relaxed);
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, pal.canvas);
         let vis = img_rect.intersect(rect);
