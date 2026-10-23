@@ -1306,3 +1306,24 @@ fn outro_at_the_layers_end() {
     assert_eq!(px(9), [200, 200, 200, 255], "the first clip's end isn't faded");
     assert_ne!(px(19), [200, 200, 200, 255], "the layer's end is");
 }
+
+/// A looping motion keeps moving over a stretch of identical frames (a
+/// held picture), whether they're separate copies or one shared picture.
+#[test]
+fn motion_continues_over_held_frames() {
+    use crate::anim::{Animation, Frame};
+    let img = image::RgbaImage::from_fn(64, 48, |x, y| image::Rgba([(x * 4) as u8, (y * 5) as u8, 90, 255]));
+    let one = Frame::new(img.clone(), 10);
+    for shared in [false, true] {
+        let frames: Vec<Frame> = (0..8).map(|_| if shared { one.clone() } else { Frame::new(img.clone(), 10) }).collect();
+        let mut base = Animation { frames, loop_count: None };
+        for f in &mut base.frames {
+            f.image = f.image.packed();
+        }
+        let mut st = crate::stack::Stack::default();
+        st.push(crate::stack::LayerKind::Effects(Box::new(crate::effects::EffectSettings { loop_hop: true, loop_amount: 100.0, loop_cycles: 2, ..Default::default() })));
+        let out = st.flatten(&base, &[], None);
+        let same = out.frames.windows(2).filter(|w| w[0].image.get().as_raw() == w[1].image.get().as_raw()).count();
+        assert!(same <= 1, "shared {shared}: {same} of 7 steps didn't move");
+    }
+}

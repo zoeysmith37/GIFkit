@@ -29,6 +29,8 @@ struct Inner {
     /// the unpacked picture while something still holds it (the cache, or
     /// whoever asked for it last)
     open: Mutex<Weak<RgbaImage>>,
+    /// being unpacked ahead of time
+    fetching: std::sync::atomic::AtomicBool,
 }
 
 /// Bytes of unpacked (raw) frames alive, for the memory report.
@@ -59,7 +61,7 @@ impl Pixels {
     pub fn from_arc(img: Arc<RgbaImage>) -> Self {
         let (w, h) = img.dimensions();
         RAW_BYTES.fetch_add(img.as_raw().len(), Ordering::Relaxed);
-        Pixels(Arc::new(Inner { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), w, h, store: Store::Raw(img), open: Mutex::new(Weak::new()) }))
+        Pixels(Arc::new(Inner { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), w, h, store: Store::Raw(img), open: Mutex::new(Weak::new()), fetching: std::sync::atomic::AtomicBool::new(false) }))
     }
 
     pub fn width(&self) -> u32 {
@@ -133,6 +135,24 @@ impl Pixels {
         }
     }
 
+    /// Unpacked already (or never packed)?
+    pub fn is_ready(&self) -> bool {
+        matches!(self.0.store, Store::Raw(_)) || self.0.open.lock().ok().and_then(|w| w.upgrade()).is_some()
+    }
+
+    /// Unpack in the background now, so it's ready when it's needed (the
+    /// frames just ahead in playback).
+    pub fn prefetch(&self) {
+        if self.is_ready() || self.0.fetching.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let p = self.clone();
+        crate::stack::bg_pool().spawn(move || {
+            let _ = p.get();
+            p.0.fetching.store(false, Ordering::Relaxed);
+        });
+    }
+
     /// The pixels, unpacked (from the cache when they're there).
     pub fn get(&self) -> Arc<RgbaImage> {
         if let Store::Raw(i) = &self.0.store {
@@ -186,7 +206,7 @@ impl Pixels {
                 _ => return self.clone(),
             },
         };
-        let p = Pixels(Arc::new(Inner { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), w, h, store, open: Mutex::new(Weak::new()) }));
+        let p = Pixels(Arc::new(Inner { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), w, h, store, open: Mutex::new(Weak::new()), fetching: std::sync::atomic::AtomicBool::new(false) }));
         // it was just in use: keep the unpacked picture to hand
         if let Ok(mut o) = p.0.open.lock() {
             *o = Arc::downgrade(img);

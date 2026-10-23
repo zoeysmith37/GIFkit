@@ -3035,7 +3035,12 @@ impl GifKitApp {
                 self.set_base_with_undo(a, Some(s), &label);
                 self.info(format!("✔ {label}"));
             }
-            JobOutput::Loaded(Ok((a, path, size))) => {
+            JobOutput::Loaded(Ok((mut a, path, size))) => {
+                // held pictures become several frames, so moving layers keep
+                // moving over them (not for videos: merging there is a choice)
+                if !path.as_deref().is_some_and(io::is_video) {
+                    a.split_holds();
+                }
                 self.undo.clear();
                 self.redo.clear();
                 self.committed = None;
@@ -4766,7 +4771,8 @@ impl GifKitApp {
         }
         let key = self.comp_key;
         // the card is still busy with the last one: keep it up a moment longer
-        if self.gpu_frames.key != key || !self.gpu_frames.map.contains_key(&i) {
+        // (while a slider is dragged; playing, the picture keeps moving)
+        if !self.playing && (self.gpu_frames.key != key || !self.gpu_frames.map.contains_key(&i)) {
             if let (Some((gpu, _)), Some((_, t))) = (&self.gpu, &self.last_comp) {
                 if gpu.busy() && self.gpu_frames.since_busy < 30 {
                     self.gpu_frames.since_busy += 1;
@@ -4822,6 +4828,43 @@ impl GifKitApp {
         self.gpu_frames.bytes += bytes;
         self.gpu_frames.map.insert(i, (tex, id, tick));
         Some(Tex { id, size, _keep: None })
+    }
+
+    /// Playing: unpack the source frames coming up in the background, and
+    /// have the card draw the next frame before it's due, so frames that
+    /// aren't kept (long animations) never hold the picture up.
+    fn read_ahead(&mut self, ctx: &egui::Context) {
+        if !self.playing || self.plan.is_empty() {
+            return;
+        }
+        let src_anim = match self.ready_proxy() {
+            Some((_, a)) => Some(a),
+            None => self.base.as_ref(),
+        };
+        if let Some(a) = src_anim {
+            let mut j = self.cur;
+            for _ in 0..8 {
+                j = self.next_enabled(j);
+                if let Some(f) = self.plan.get(j).and_then(|p| a.frames.get(p.src)) {
+                    f.image.prefetch();
+                }
+            }
+        }
+        // the next frame on the card, one a screen refresh
+        if self.needs_render() && self.gpu.is_some() && self.gpu_frames.key == self.comp_key {
+            let mut j = self.cur;
+            for _ in 0..2 {
+                j = self.next_enabled(j);
+                if !self.gpu_frames.map.contains_key(&j) {
+                    let ready = self.render_inputs().and_then(|(_, b)| self.plan.get(j).and_then(|p| b.frames.get(p.src)).map(|f| f.image.is_ready())).unwrap_or(false);
+                    // not while its picture is still being unpacked
+                    if ready {
+                        let _ = self.gpu_composite(ctx, j);
+                    }
+                    break;
+                }
+            }
+        }
     }
 
     fn free_gpu_frames(&mut self) {
@@ -4969,6 +5012,13 @@ impl GifKitApp {
         if done {
             self.prerender = None;
             self.comp_key_since = f64::INFINITY;
+        }
+        // playing past what the cache holds: render the next stretch
+        if self.playing && self.prerender.is_none() && self.comp_key_since.is_infinite() && self.needs_render() && !self.plan.is_empty() {
+            let next = self.next_enabled(self.cur);
+            if !(self.comp_tex.key == key && self.comp_tex.map.contains_key(&next)) {
+                self.comp_key_since = now - 1.0;
+            }
         }
         let stable = now - self.comp_key_since > 0.5;
         if self.prerender.is_none() && stable && self.needs_render() && !self.plan.is_empty() {
@@ -5496,6 +5546,7 @@ impl eframe::App for GifKitApp {
         self.manage_proxy(&ctx);
         mark("proxy");
         self.manage_prerender(&ctx, now);
+        self.read_ahead(&ctx);
         mark("prerender");
         self.manage_compare(&ctx, now);
         mark("compare");

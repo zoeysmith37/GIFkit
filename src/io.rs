@@ -455,7 +455,7 @@ pub fn save_gif(anim: &Animation, opt: &GifOptions, path: &Path, progress: Optio
 }
 
 pub fn encode_apng(anim: &Animation, noai: bool) -> Result<Vec<u8>> {
-    let frames = anim.enabled_frames();
+    let frames = anim.enabled_frames_merged();
     anyhow::ensure!(!frames.is_empty(), "No enabled frames");
     let (w, h) = frames[0].image.dimensions();
     let mut buf = Vec::new();
@@ -818,7 +818,7 @@ pub fn encode_webp(anim: &Animation, o: &WebpOptions) -> Result<Vec<u8>> {
 /// `encode_webp` that gives way to the user and can be stopped between frames.
 pub fn encode_webp_stoppable(anim: &Animation, o: &WebpOptions, stop: Option<&std::sync::atomic::AtomicUsize>) -> Result<Vec<u8>> {
     use webp_animation::{AnimParams, Encoder, EncoderOptions, EncodingConfig, EncodingType};
-    let frames = anim.enabled_frames();
+    let frames = anim.enabled_frames_merged();
     anyhow::ensure!(!frames.is_empty(), "No enabled frames");
     let (w, h) = frames[0].image.dimensions();
     let cfg = EncodingConfig {

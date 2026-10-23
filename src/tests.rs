@@ -1432,3 +1432,23 @@ fn keys_scale_each_way_and_read_old_files() {
     let (o, _, _) = transform_sprite(&img, 0, 0, (5.0, 5.0), (0.0, 0.0), motion_matrix(2.0, 1.0, 90.0, 0.0)).unwrap();
     assert!(o.width() <= 11 && o.height() == 20, "{}x{}", o.width(), o.height());
 }
+
+/// A held picture opens as several frames and saves as one again.
+#[test]
+fn split_holds_save_back_as_one() {
+    let img = |k: u8| image::RgbaImage::from_pixel(40, 30, image::Rgba([k * 20, 90, 200, 255]));
+    let a = Animation { frames: vec![Frame::new(img(1), 4), Frame::new(img(2), 4), Frame::new(img(3), 120), Frame::new(img(4), 4)], loop_count: None };
+    let bytes = crate::encode::encode_gif(&a, &GifOptions::default(), None).unwrap();
+    let mut b = io::load_animation_bytes(&bytes).unwrap();
+    assert_eq!(b.len(), 4);
+    assert!(b.split_holds() > 0);
+    for (name, out) in [
+        ("gif", crate::encode::encode_gif(&b, &GifOptions::default(), None).unwrap()),
+        ("webp", io::encode_webp(&b, &io::WebpOptions { lossless: true, ..Default::default() }).unwrap()),
+        ("apng", io::encode_apng(&b, false).unwrap()),
+    ] {
+        let back = io::load_animation_bytes(&out).unwrap();
+        assert_eq!(back.len(), 4, "{name}");
+        assert!((back.duration_secs() - a.duration_secs()).abs() < 0.02, "{name}");
+    }
+}
