@@ -3036,11 +3036,10 @@ impl GifKitApp {
                 self.info(format!("✔ {label}"));
             }
             JobOutput::Loaded(Ok((mut a, path, size))) => {
-                // held pictures become several frames, so moving layers keep
-                // moving over them (not for videos: merging there is a choice)
-                if !path.as_deref().is_some_and(io::is_video) {
-                    a.split_holds();
-                }
+                // held pictures (and a video's merged still parts) become
+                // several frames sharing one picture, so moving layers keep
+                // moving over them
+                a.split_holds();
                 self.undo.clear();
                 self.redo.clear();
                 self.committed = None;
@@ -4072,8 +4071,9 @@ impl GifKitApp {
             form_row(ui, "Size:", |ui| combo(ui, "vid-size", &mut opt.max_side, &items));
             let levels: Vec<(usize, &str)> = io::MERGE_LEVELS.iter().enumerate().map(|(i, l)| (i, l.0)).collect();
             form_row(ui, "Still parts:", |ui| combo(ui, "vid-merge", &mut opt.merge, &levels)).on_hover_text(
-                "Frames that barely change from the one before are merged into it, and it shows for longer. \
-                 Screen recordings are still most of the time, so this saves a lot of frames.\n\n\
+                "Frames that barely change from the one before reuse its picture, so they take less memory \
+                 and the saved file is smaller. Effects and animations still move over them. \
+                 Screen recordings are still most of the time, so this saves a lot.\n\n\
                  Repeated: only frames that look the same.\nSmall changes: also a moving cursor or a few typed letters.\nMost changes: anything but big movement.",
             );
             ui.add_space(8.0);

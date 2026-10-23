@@ -78,7 +78,7 @@ impl Animation {
         };
         let total: usize = self.frames.iter().map(parts).sum();
         // very long holds in a long animation: leave it be
-        if total == self.frames.len() || total > 5000.max(self.frames.len()) {
+        if total == self.frames.len() || total > 20000.max(self.frames.len()) {
             return 0;
         }
         let mut out = Vec::with_capacity(total);
