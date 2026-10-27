@@ -242,7 +242,7 @@ fn timing(r: &mut Rng, n: usize) -> crate::timeline::Timing {
     }
     if r.chance(0.4) {
         for _ in 0..r.below(4) {
-            t.keys.push(Key { frame: r.below(n + 4), x: r.pick(&[0.0, 30.0, -500.0]), y: r.pick(&[0.0, 12.0]), scale_x: r.pick(&[0.0, 50.0, 100.0, 400.0, -20.0]), scale_y: r.pick(&[0.0, 100.0, 250.0]), angle: r.pick(&[0.0, 90.0, 720.0]), opacity: r.pick(&[0.0, 50.0, 100.0, 300.0]), ease: crate::timeline::Ease::ALL[r.below(5)] });
+            t.keys.push(Key { frame: r.below(n + 4), x: r.pick(&[0.0, 30.0, -500.0]), y: r.pick(&[0.0, 12.0]), scale_x: r.pick(&[0.0, 50.0, 100.0, 400.0, -20.0]), scale_y: r.pick(&[0.0, 100.0, 250.0]), angle: r.pick(&[0.0, 90.0, 720.0]), opacity: r.pick(&[0.0, 50.0, 100.0, 300.0]), ease: crate::timeline::Ease::ALL[r.below(6)], curve: [0.2, r.pick(&[-0.5, 0.0, 1.5]), 0.7, 1.0] });
         }
         t.sort_keys();
     }
@@ -803,7 +803,7 @@ fn gpu_matches_cpu() {
     cases.push(("layers", Transform::default(), layers(), vec![]));
     cases.push(("layers + turn", t(&|t| (t.rot_on, t.rot_any, t.rot_deg) = (true, true, -15.0)), layers(), vec![]));
     cases.push(("layers + resize", t(&|t| (t.resize_on, t.rs_pct) = (true, 60.0)), layers(), vec![]));
-    let mk = crate::timeline::Key { frame: 0, x: 15.0, y: -5.0, scale_x: 150.0, scale_y: 80.0, angle: 30.0, opacity: 60.0, ease: crate::timeline::Ease::Linear };
+    let mk = crate::timeline::Key { frame: 0, x: 15.0, y: -5.0, scale_x: 150.0, scale_y: 80.0, angle: 30.0, opacity: 60.0, ease: crate::timeline::Ease::Linear, curve: crate::timeline::CURVE_SMOOTH };
     cases.push(("motion", Transform::default(), layers(), vec![mk]));
     let one = |k: usize| vec![layers().remove(k)];
     for (k, nm) in ["text", "shape", "emoji", "overlay"].iter().enumerate() {

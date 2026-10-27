@@ -59,7 +59,15 @@ Moves a layer over time with ready-made motions like slide, hop and spin. Keyfra
 ## Playing
 - Space plays and the arrow keys step a frame
 - I and O set in and out points. Export can save just that part
-- Trim to Last Clip cuts the empty end off",
+- Trim to Last Clip cuts the empty end off
+- Shift+O shows onion skin: frames before in red, the next in green
+
+## Moving layers
+- K adds a keyframe. Auto key adds one when you change a value
+- Ease Custom opens a curve to shape the timing. Back overshoots
+- Draw Path: drag on the preview and the layer follows the line
+- Track: click something in the picture and the layer follows it
+- The selected layer's path shows as dots, one a frame",
     ),
     (
         "Frame Edits",
@@ -72,7 +80,12 @@ Moves a layer over time with ready-made motions like slide, hop and spin. Keyfra
 
 ## Speed and frames
 - Speed changes the delay of every frame
-- Frames skips frames you don't want and adds images as new frames",
+- Frames skips frames you don't want and adds images as new frames
+
+## In-betweens
+Frames > In-Betweens adds new frames between each pair for smoother motion.
+- Follow motion slides things along instead of fading them
+- The length stays the same unless frames would get under 2 cs",
     ),
     (
         "Export and Size",
@@ -83,6 +96,7 @@ Moves a layer over time with ready-made motions like slide, hop and spin. Keyfra
 - Quality drops first. The frames shrink only if they must
 - Keep frame size stops it from shrinking them
 - Platforms sets the limit for Discord, Slack, Twitch and others. Emoji sizes shrink the frames too
+- Near matches merges frames that barely change. Good for screen recordings
 
 ## Cutting the end
 Cut empty end frames drops blank frames at the end when exporting.",

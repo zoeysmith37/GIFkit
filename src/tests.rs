@@ -1538,3 +1538,54 @@ fn text_types_in() {
         assert_eq!(counts[15], ink(&full.flatten(&a, &fonts, None).frames[15].image.get()));
     }
 }
+
+/// Near matches merge noisy frames but keep a small thing that moves.
+#[test]
+fn near_identical_frames_merge() {
+    use image::{Rgba, RgbaImage};
+    let mut seed = 1u32;
+    let mut noise = |base: u8| {
+        RgbaImage::from_fn(64, 48, |_, _| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let v = base.saturating_add((seed >> 29) as u8);
+            Rgba([v, v, v, 255])
+        })
+    };
+    let frames: Vec<Frame> = (0..8).map(|_| Frame::new(noise(100), 5)).collect();
+    let a = Animation { frames, loop_count: None };
+    let back = |o: &GifOptions| crate::io::load_animation_bytes(&encode_gif(&a, o, None).unwrap()).unwrap();
+    let exact = back(&GifOptions::default());
+    assert_eq!(exact.len(), 8, "noise isn't identical");
+    let near = back(&GifOptions { merge_tolerance: 30, ..Default::default() });
+    assert_eq!(near.len(), 1);
+    assert_eq!(near.frames[0].delay_cs, 40, "time kept");
+    // a 6 px square moving over a still background stays
+    let sq = |x: u32| RgbaImage::from_fn(64, 48, |px, py| if px >= x && px < x + 6 && (20..26).contains(&py) { Rgba([255, 255, 255, 255]) } else { Rgba([0, 0, 0, 255]) });
+    let moving = Animation { frames: (0..5).map(|i| Frame::new(sq(5 + i * 8), 5)).collect(), loop_count: None };
+    let out = crate::io::load_animation_bytes(&encode_gif(&moving, &GifOptions { merge_tolerance: 100, ..Default::default() }, None).unwrap()).unwrap();
+    assert_eq!(out.len(), 5, "motion kept");
+}
+
+/// In-betweens that follow motion slide a square along; plain blends
+/// fade one into the other. Either way the length stays the same.
+#[test]
+fn inbetweens_follow_motion() {
+    use image::{Rgba, RgbaImage};
+    let sq = |x0: u32| RgbaImage::from_fn(96, 64, |x, y| {
+        let inside = x >= x0 && x < x0 + 16 && (24..40).contains(&y);
+        // a little texture so it can be found
+        if inside { Rgba([255, if (x - x0) % 4 < 2 { 255 } else { 180 }, 255, 255]) } else { Rgba([0, 0, 0, 255]) }
+    });
+    let a = Animation { frames: vec![Frame::new(sq(20), 10), Frame::new(sq(28), 10)], loop_count: None };
+    let slide = ops::inbetween(&a, 1, false, true, None);
+    let fade = ops::inbetween(&a, 1, false, false, None);
+    assert_eq!(slide.len(), 3);
+    let len = |a: &Animation| a.frames.iter().map(|f| f.delay_cs as u32).sum::<u32>();
+    assert_eq!(len(&slide), 20, "same length");
+    let mid = slide.frames[1].image.get();
+    // the square's left edge is half way, at 24: solid there, nothing at 20
+    assert!(mid.get_pixel(26, 32)[0] > 230, "{:?}", mid.get_pixel(26, 32));
+    assert!(mid.get_pixel(21, 32)[0] < 40, "left behind: {:?}", mid.get_pixel(21, 32));
+    let mid = fade.frames[1].image.get();
+    assert!((100..160).contains(&mid.get_pixel(21, 32)[0]), "a plain blend is half there");
+}

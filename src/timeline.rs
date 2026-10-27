@@ -42,6 +42,31 @@ pub struct Key {
     pub opacity: f32,
     /// how the motion arrives at and leaves this key
     pub ease: Ease,
+    /// with `Ease::Custom`: the timing on the way to the next key, as a
+    /// CSS cubic-bezier (x1, y1, x2, y2); y can go past 0..1 to overshoot
+    pub curve: [f32; 4],
+}
+
+/// The default custom curve: slow out and in, like Smooth.
+pub const CURVE_SMOOTH: [f32; 4] = [0.42, 0.0, 0.58, 1.0];
+
+/// Where a CSS cubic-bezier timing curve is at `t` (0..=1).
+pub fn bezier(c: [f32; 4], t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    let [x1, y1, x2, y2] = c;
+    let (x1, x2) = (x1.clamp(0.0, 1.0), x2.clamp(0.0, 1.0));
+    let at = |a: f32, b: f32, s: f32| 3.0 * a * s * (1.0 - s) * (1.0 - s) + 3.0 * b * s * s * (1.0 - s) + s * s * s;
+    // the curve's x only grows, so halving finds where it reaches t
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    for _ in 0..30 {
+        let mid = (lo + hi) / 2.0;
+        if at(x1, x2, mid) < t {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    at(y1, y2, (lo + hi) / 2.0)
 }
 
 /// How motion moves through a keyframe.
@@ -58,10 +83,12 @@ pub enum Ease {
     Out,
     /// stays put until the next key, then jumps
     Hold,
+    /// a curve of your own, on the way to the next key
+    Custom,
 }
 
 impl Ease {
-    pub const ALL: [Ease; 5] = [Ease::Smooth, Ease::Linear, Ease::In, Ease::Out, Ease::Hold];
+    pub const ALL: [Ease; 6] = [Ease::Smooth, Ease::Linear, Ease::In, Ease::Out, Ease::Hold, Ease::Custom];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -70,6 +97,7 @@ impl Ease {
             Ease::In => "Ease in",
             Ease::Out => "Ease out",
             Ease::Hold => "Hold",
+            Ease::Custom => "Custom",
         }
     }
 
@@ -84,7 +112,7 @@ impl Ease {
 
 impl Default for Key {
     fn default() -> Self {
-        Key { frame: 0, x: 0.0, y: 0.0, scale_x: 100.0, scale_y: 100.0, angle: 0.0, opacity: 100.0, ease: Ease::Smooth }
+        Key { frame: 0, x: 0.0, y: 0.0, scale_x: 100.0, scale_y: 100.0, angle: 0.0, opacity: 100.0, ease: Ease::Smooth, curve: CURVE_SMOOTH }
     }
 }
 
@@ -103,12 +131,13 @@ struct KeyFile {
     /// older projects: smooth or linear
     smooth: Option<bool>,
     ease: Option<Ease>,
+    curve: Option<[f32; 4]>,
 }
 
 impl Default for KeyFile {
     fn default() -> Self {
         let k = Key::default();
-        KeyFile { frame: 0, x: 0.0, y: 0.0, scale: None, scale_x: None, scale_y: None, angle: k.angle, opacity: k.opacity, smooth: None, ease: None }
+        KeyFile { frame: 0, x: 0.0, y: 0.0, scale: None, scale_x: None, scale_y: None, angle: k.angle, opacity: k.opacity, smooth: None, ease: None, curve: None }
     }
 }
 
@@ -116,7 +145,7 @@ impl From<KeyFile> for Key {
     fn from(f: KeyFile) -> Key {
         let s = f.scale.unwrap_or(100.0);
         let ease = f.ease.unwrap_or(if f.smooth.unwrap_or(true) { Ease::Smooth } else { Ease::Linear });
-        Key { frame: f.frame, x: f.x, y: f.y, scale_x: f.scale_x.unwrap_or(s), scale_y: f.scale_y.unwrap_or(s), angle: f.angle, opacity: f.opacity, ease }
+        Key { frame: f.frame, x: f.x, y: f.y, scale_x: f.scale_x.unwrap_or(s), scale_y: f.scale_y.unwrap_or(s), angle: f.angle, opacity: f.opacity, ease, curve: f.curve.unwrap_or(CURVE_SMOOTH) }
     }
 }
 
@@ -210,15 +239,96 @@ impl Timing {
         let mut t = (i - a.frame) as f32 / (b.frame - a.frame).max(1) as f32;
         // eased keys slow down as the layer leaves or arrives
         let (ea, eb) = (a.ease.slow_leaving(), b.ease.slow_arriving());
-        t = match (ea, eb) {
+        t = if a.ease == Ease::Custom {
+            // its own curve decides the whole way to the next key
+            bezier(a.curve, t)
+        } else {
+            match (ea, eb) {
             (true, true) => t * t * (3.0 - 2.0 * t),
             (true, false) => 1.0 - (1.0 - t) * (1.0 - t),
             (false, true) => t * t,
             (false, false) => t,
+            }
         };
         let (ma, mb) = (m(&a), m(&b));
         let l = |x: f32, y: f32| x + (y - x) * t;
         Motion { dx: l(ma.dx, mb.dx), dy: l(ma.dy, mb.dy), sx: l(ma.sx, mb.sx), sy: l(ma.sy, mb.sy), angle: l(ma.angle, mb.angle), opacity: l(ma.opacity, mb.opacity) }
+    }
+
+    /// Move along `path` (centres, in source pixels) over the layer's
+    /// clips, at an even speed: keyframes where the path bends, linear in
+    /// between. Size, turn and fade stay as they were. `centre` is where the
+    /// layer was placed. Returns how many keys it made.
+    pub fn follow_path(&mut self, path: &[(f32, f32)], centre: (f32, f32), n: usize) -> usize {
+        if path.len() < 2 || n == 0 {
+            return 0;
+        }
+        let (a, z) = self.extent(n);
+        let frames = z - a + 1;
+        // where it is each frame: the same distance along the path each time
+        let mut len = vec![0.0f32];
+        for w in path.windows(2) {
+            let d = ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt();
+            len.push(len.last().unwrap() + d);
+        }
+        let total = *len.last().unwrap();
+        let at = |s: f32| -> (f32, f32) {
+            let j = len.iter().position(|&l| l >= s).unwrap_or(len.len() - 1).max(1);
+            let (l0, l1) = (len[j - 1], len[j]);
+            let t = if l1 > l0 { (s - l0) / (l1 - l0) } else { 0.0 };
+            (path[j - 1].0 + (path[j].0 - path[j - 1].0) * t, path[j - 1].1 + (path[j].1 - path[j - 1].1) * t)
+        };
+        let pos: Vec<(f32, f32)> = (0..frames).map(|i| at(if frames > 1 { total * i as f32 / (frames - 1) as f32 } else { 0.0 })).collect();
+        self.set_positions(a, &pos, centre)
+    }
+
+    /// Put the layer's centre at `pos[i]` on frame `a + i` (source pixels):
+    /// keyframes where the line bends, linear in between. Size, turn and
+    /// fade stay as they were. Returns how many keys it made.
+    pub fn set_positions(&mut self, a: usize, pos: &[(f32, f32)], centre: (f32, f32)) -> usize {
+        let frames = pos.len();
+        if frames == 0 {
+            return 0;
+        }
+        let z = a + frames - 1;
+        // keep the frames where the line bends (the rest are in between)
+        let mut keep = vec![false; frames];
+        keep[0] = true;
+        keep[frames - 1] = true;
+        fn simplify(pos: &[(f32, f32)], keep: &mut [bool], i: usize, j: usize) {
+            if j <= i + 1 {
+                return;
+            }
+            let (p, q) = (pos[i], pos[j]);
+            let (mut worst, mut wi) = (0.0f32, i);
+            for k in i + 1..j {
+                // where a straight line between the two would put it
+                let t = (k - i) as f32 / (j - i) as f32;
+                let e = (p.0 + (q.0 - p.0) * t, p.1 + (q.1 - p.1) * t);
+                let d = ((pos[k].0 - e.0).powi(2) + (pos[k].1 - e.1).powi(2)).sqrt();
+                if d > worst {
+                    worst = d;
+                    wi = k;
+                }
+            }
+            if worst > 1.0 {
+                keep[wi] = true;
+                simplify(pos, keep, i, wi);
+                simplify(pos, keep, wi, j);
+            }
+        }
+        simplify(pos, &mut keep, 0, frames - 1);
+        let old = self.clone();
+        self.keys.retain(|k| k.frame < a || k.frame > z);
+        let mut made = 0;
+        for (i, p) in pos.iter().enumerate().filter(|(i, _)| keep[*i]) {
+            let f = a + i;
+            let m = old.motion(f);
+            self.keys.push(Key { frame: f, x: p.0 - centre.0, y: p.1 - centre.1, scale_x: m.sx * 100.0, scale_y: m.sy * 100.0, angle: m.angle, opacity: m.opacity * 100.0, ease: Ease::Linear, curve: CURVE_SMOOTH });
+            made += 1;
+        }
+        self.sort_keys();
+        made
     }
 
     pub fn key_at(&self, frame: usize) -> Option<usize> {
@@ -231,7 +341,7 @@ impl Timing {
             return i;
         }
         let m = self.motion(frame);
-        let k = Key { frame, x: m.dx, y: m.dy, scale_x: m.sx * 100.0, scale_y: m.sy * 100.0, angle: m.angle, opacity: m.opacity * 100.0, ease: Ease::Smooth };
+        let k = Key { frame, x: m.dx, y: m.dy, scale_x: m.sx * 100.0, scale_y: m.sy * 100.0, angle: m.angle, opacity: m.opacity * 100.0, ease: Ease::Smooth, curve: CURVE_SMOOTH };
         self.keys.push(k);
         self.sort_keys();
         self.key_at(frame).unwrap_or(0)
@@ -372,6 +482,36 @@ pub fn blend(after: &mut RgbaImage, before: &RgbaImage, amount: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn follows_a_drawn_path() {
+        let mut t = Timing::default();
+        // an L: right 100, then down 100
+        let path = vec![(0.0, 0.0), (50.0, 0.0), (100.0, 0.0), (100.0, 50.0), (100.0, 100.0)];
+        let k = t.follow_path(&path, (0.0, 0.0), 21);
+        assert!(k >= 3 && k <= 5, "{k} keys: the ends and the corner");
+        let m = |i| t.motion(i);
+        assert!((m(0).dx).abs() < 0.5 && (m(20).dy - 100.0).abs() < 0.5);
+        // half way along is the corner, at an even speed
+        assert!((m(10).dx - 100.0).abs() < 1.0 && m(10).dy.abs() < 1.0, "{:?}", m(10));
+        assert!((m(5).dx - 50.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn custom_curve() {
+        // ends fixed, linear stays linear, overshoot goes past
+        for c in [CURVE_SMOOTH, [0.0, 0.0, 1.0, 1.0], [0.3, 1.6, 0.6, 1.0]] {
+            assert!(bezier(c, 0.0).abs() < 1e-3 && (bezier(c, 1.0) - 1.0).abs() < 1e-3);
+        }
+        assert!((bezier([0.0, 0.0, 1.0, 1.0], 0.3) - 0.3).abs() < 0.01);
+        assert!(bezier([0.3, 1.6, 0.6, 1.0], 0.6) > 1.0, "overshoot");
+        let mut t = Timing::default();
+        t.keys = vec![Key { frame: 0, x: 0.0, ease: Ease::Custom, curve: [0.3, 1.6, 0.6, 1.0], ..Default::default() }, Key { frame: 10, x: 100.0, ..Default::default() }];
+        assert!((1..10).any(|i| t.motion(i).dx > 100.0), "goes past and comes back");
+        // and it saves
+        let back: Key = serde_json::from_str(&serde_json::to_string(&t.keys[0]).unwrap()).unwrap();
+        assert_eq!(back, t.keys[0]);
+    }
 
     #[test]
     fn keys_tween_and_hold() {

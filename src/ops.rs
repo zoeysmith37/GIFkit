@@ -362,30 +362,238 @@ pub fn lerp_image(a: &RgbaImage, b: &RgbaImage, t: f32) -> RgbaImage {
 /// Insert `steps` blended frames between each pair of frames. The total
 /// duration of each original frame is split between it and its in-betweens.
 pub fn crossfade(anim: &Animation, steps: usize, wrap: bool) -> Animation {
+    inbetween(anim, steps, wrap, false, None)
+}
+
+/// `steps` new frames between each pair. With `follow`, the picture is
+/// moved along with what moves in it (block motion) before the two are
+/// mixed, so things slide instead of fading through each other. Each
+/// frame's time is shared with its in-betweens, so the length stays the
+/// same. Skipped frames and gaps are left as they are.
+pub fn inbetween(anim: &Animation, steps: usize, wrap: bool, follow: bool, progress: Option<&std::sync::atomic::AtomicUsize>) -> Animation {
+    inbetween_counted(anim, steps, wrap, follow, progress).0
+}
+
+/// [`inbetween`], also saying how many frames each frame became.
+pub fn inbetween_counted(anim: &Animation, steps: usize, wrap: bool, follow: bool, progress: Option<&std::sync::atomic::AtomicUsize>) -> (Animation, Vec<usize>) {
+    use rayon::prelude::*;
     if steps == 0 || anim.len() < 2 {
-        return anim.clone();
+        return (anim.clone(), vec![1; anim.len()]);
     }
     let n = anim.len();
-    let mut out = Vec::new();
-    for i in 0..n {
+    // each frame and the next shown one it leads into
+    let next_of = |i: usize| -> Option<usize> {
         let f = &anim.frames[i];
-        let has_next = i + 1 < n || wrap;
-        if !has_next {
-            out.push(f.clone());
-            continue;
+        if !f.enabled || f.blank {
+            return None;
         }
-        let next = &anim.frames[(i + 1) % n];
-        let parts = steps as u16 + 1;
-        let d = (f.delay_cs / parts).max(2);
-        let mut base = f.clone();
-        base.delay_cs = d;
-        out.push(base);
-        for s in 1..=steps {
-            let t = s as f32 / (steps + 1) as f32;
-            out.push(Frame { image: crate::pixels::Pixels::new(lerp_image(&f.image.get(), &next.image.get(), t)), delay_cs: d, enabled: f.enabled, cut: false, blank: false, trim: 0 });
+        let mut j = i + 1;
+        loop {
+            if j >= n {
+                if !wrap {
+                    return None;
+                }
+                j = 0;
+            }
+            if j == i {
+                return None;
+            }
+            let g = &anim.frames[j];
+            if g.enabled && !g.blank {
+                return (j > i || wrap).then_some(j);
+            }
+            if g.enabled && g.blank {
+                // a gap comes next: nothing to blend into
+                return None;
+            }
+            j += 1;
         }
+    };
+    let made: Vec<Vec<Frame>> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let f = &anim.frames[i];
+            let Some(j) = next_of(i) else {
+                // stays as it is (its time and place kept)
+                return vec![f.clone()];
+            };
+            let parts = steps + 1;
+            // split the delay evenly, all of it
+            let d = f.delay_cs as usize;
+            // (2 cs at least: shorter plays slow in browsers, so it runs a little long instead)
+            let share = |k: usize| ((d * (k + 1) + parts / 2) / parts - (d * k + parts / 2) / parts).max(2) as u16;
+            let (a, b) = (f.image.get(), anim.frames[j].image.get());
+            let flow = (follow && a.dimensions() == b.dimensions()).then(|| Flow::between(&a, &b));
+            let mut v = vec![Frame { delay_cs: share(0), ..f.clone() }];
+            for s in 1..=steps {
+                let t = s as f32 / parts as f32;
+                let img = match &flow {
+                    Some(fl) => fl.inbetween(&a, &b, t),
+                    None => lerp_image(&a, &b, t),
+                };
+                v.push(Frame { image: crate::pixels::Pixels::new(img), delay_cs: share(s), enabled: true, cut: false, blank: false, trim: 0 });
+            }
+            if let Some(p) = progress {
+                p.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            v
+        })
+        .collect();
+    let counts = made.iter().map(|v| v.len()).collect();
+    (Animation { frames: made.into_iter().flatten().collect(), loop_count: anim.loop_count }, counts)
+}
+
+/// How the picture moves from one frame to the next: a vector per block,
+/// found by looking for each block of the first frame in the second.
+struct Flow {
+    /// block size in full-size pixels
+    bs: f32,
+    cols: usize,
+    rows: usize,
+    v: Vec<(f32, f32)>,
+}
+
+impl Flow {
+    fn between(a: &RgbaImage, b: &RgbaImage) -> Flow {
+        // big frames are matched smaller, then scaled back
+        let (w, h) = a.dimensions();
+        let s = ((w.max(h) as f32 / 480.0).ceil() as u32).max(1);
+        let luma = |img: &RgbaImage| -> (Vec<u8>, i32, i32) {
+            let (sw, sh) = ((w / s).max(1), (h / s).max(1));
+            let mut v = vec![0u8; (sw * sh) as usize];
+            for y in 0..sh {
+                for x in 0..sw {
+                    let mut sum = 0u32;
+                    for dy in 0..s {
+                        for dx in 0..s {
+                            let p = img.get_pixel((x * s + dx).min(w - 1), (y * s + dy).min(h - 1));
+                            sum += ((p[0] as u32 * 77 + p[1] as u32 * 150 + p[2] as u32 * 29) >> 8) * p[3] as u32 / 255;
+                        }
+                    }
+                    v[(y * sw + x) as usize] = (sum / (s * s)) as u8;
+                }
+            }
+            (v, sw as i32, sh as i32)
+        };
+        let (la, sw, sh) = luma(a);
+        let (lb, _, _) = luma(b);
+        const BS: i32 = 8;
+        const R: i32 = 8;
+        let at = |l: &[u8], x: i32, y: i32| l[(y.clamp(0, sh - 1) * sw + x.clamp(0, sw - 1)) as usize] as i32;
+        let (cols, rows) = (((sw + BS - 1) / BS) as usize, ((sh + BS - 1) / BS) as usize);
+        // None: a flat block, which can't say where it went
+        let mut v: Vec<Option<(f32, f32)>> = vec![None; cols * rows];
+        for by in 0..rows {
+            for bx in 0..cols {
+                let (x0, y0) = (bx as i32 * BS, by as i32 * BS);
+                // a flat block can't say where it went
+                let mut lo = 255;
+                let mut hi = 0;
+                for y in 0..BS {
+                    for x in 0..BS {
+                        let c = at(&la, x0 + x, y0 + y);
+                        lo = lo.min(c);
+                        hi = hi.max(c);
+                    }
+                }
+                if hi - lo < 12 {
+                    continue;
+                }
+                let mut best = (i32::MAX, 0, 0);
+                for dy in -R..=R {
+                    for dx in -R..=R {
+                        let mut sum = (dx * dx + dy * dy) * 2;
+                        'b: for y in 0..BS {
+                            for x in 0..BS {
+                                sum += (at(&la, x0 + x, y0 + y) - at(&lb, x0 + x + dx, y0 + y + dy)).abs();
+                            }
+                            if sum >= best.0 {
+                                break 'b;
+                            }
+                        }
+                        if sum < best.0 {
+                            best = (sum, dx, dy);
+                        }
+                    }
+                }
+                v[by * cols + bx] = Some(((best.1 * s as i32) as f32, (best.2 * s as i32) as f32));
+            }
+        }
+        // smooth it out a little so blocks don't tear apart: the middle
+        // value of the blocks around that found something (flat ones take
+        // their neighbours' motion, and don't outvote a small thing moving)
+        let raw = v;
+        let mut v = vec![(0.0f32, 0.0f32); cols * rows];
+        for by in 0..rows {
+            for bx in 0..cols {
+                let mut xs = Vec::with_capacity(9);
+                let mut ys = Vec::with_capacity(9);
+                for oy in -1i32..=1 {
+                    for ox in -1i32..=1 {
+                        let (x, y) = (bx as i32 + ox, by as i32 + oy);
+                        if x >= 0 && y >= 0 && (x as usize) < cols && (y as usize) < rows {
+                            if let Some(q) = raw[y as usize * cols + x as usize] {
+                                xs.push(q.0);
+                                ys.push(q.1);
+                            }
+                        }
+                    }
+                }
+                if xs.is_empty() {
+                    continue;
+                }
+                // the middle value: one wrong block doesn't drag the rest
+                xs.sort_by(|a, b| a.total_cmp(b));
+                ys.sort_by(|a, b| a.total_cmp(b));
+                v[by * cols + bx] = (xs[xs.len() / 2], ys[ys.len() / 2]);
+            }
+        }
+        Flow { bs: (BS as u32 * s) as f32, cols, rows, v }
     }
-    Animation { frames: out, loop_count: anim.loop_count }
+
+    /// The vector at a pixel, blended between the blocks around it.
+    fn at(&self, x: f32, y: f32) -> (f32, f32) {
+        let gx = (x / self.bs - 0.5).clamp(0.0, (self.cols - 1) as f32);
+        let gy = (y / self.bs - 0.5).clamp(0.0, (self.rows - 1) as f32);
+        let (x0, y0) = (gx.floor() as usize, gy.floor() as usize);
+        let (x1, y1) = ((x0 + 1).min(self.cols - 1), (y0 + 1).min(self.rows - 1));
+        let (fx, fy) = (gx - x0 as f32, gy - y0 as f32);
+        let g = |x: usize, y: usize| self.v[y * self.cols + x];
+        let mix = |a: (f32, f32), b: (f32, f32), t: f32| (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+        mix(mix(g(x0, y0), g(x1, y0), fx), mix(g(x0, y1), g(x1, y1), fx), fy)
+    }
+
+    /// The frame a share `t` of the way from `a` to `b`.
+    fn inbetween(&self, a: &RgbaImage, b: &RgbaImage, t: f32) -> RgbaImage {
+        let (w, h) = a.dimensions();
+        let sample = |img: &RgbaImage, x: f32, y: f32| -> [f32; 4] {
+            let x = x.clamp(0.0, (w - 1) as f32);
+            let y = y.clamp(0.0, (h - 1) as f32);
+            let (x0, y0) = (x.floor() as u32, y.floor() as u32);
+            let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+            let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+            let p = |x: u32, y: u32| img.get_pixel(x, y).0;
+            let mut o = [0.0f32; 4];
+            for k in 0..4 {
+                let top = p(x0, y0)[k] as f32 * (1.0 - fx) + p(x1, y0)[k] as f32 * fx;
+                let bot = p(x0, y1)[k] as f32 * (1.0 - fx) + p(x1, y1)[k] as f32 * fx;
+                o[k] = top * (1.0 - fy) + bot * fy;
+            }
+            o
+        };
+        RgbaImage::from_fn(w, h, |x, y| {
+            let (px, py) = (x as f32, y as f32);
+            let (vx, vy) = self.at(px, py);
+            // what was a bit back along the way in the first, and a bit on in the second
+            let ca = sample(a, px - vx * t, py - vy * t);
+            let cb = sample(b, px + vx * (1.0 - t), py + vy * (1.0 - t));
+            let mut o = [0u8; 4];
+            for k in 0..4 {
+                o[k] = (ca[k] * (1.0 - t) + cb[k] * t).round().clamp(0.0, 255.0) as u8;
+            }
+            Rgba(o)
+        })
+    }
 }
 
 /// Make the loop seamless: the last `n` frames fade into the first `n`, and

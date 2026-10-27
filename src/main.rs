@@ -30,6 +30,7 @@ mod emoji;
 mod sysfonts;
 mod text;
 mod timeline;
+mod track;
 mod theme;
 #[cfg(test)]
 mod tests;

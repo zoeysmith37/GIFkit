@@ -35,6 +35,9 @@ pub struct GifOptions {
     pub ordered_dither: bool,
     /// Merge consecutive identical frames into one (delays summed).
     pub merge_duplicates: bool,
+    /// Also merge frames that differ by no more than this (0 = only exact
+    /// matches, up to 100): noise and flicker go, real motion stays.
+    pub merge_tolerance: u8,
     /// Alpha below this is treated as fully transparent.
     pub alpha_threshold: u8,
     /// Always use the built-in LZW encoder (testing aid).
@@ -54,6 +57,7 @@ impl Default for GifOptions {
             dither: false,
             ordered_dither: false,
             merge_duplicates: true,
+            merge_tolerance: 0,
             alpha_threshold: 128,
             force_custom_lzw: false,
             // on by default: files are marked as not for AI training
@@ -338,6 +342,40 @@ fn same_image(a: &RgbaImage, b: &RgbaImage) -> bool {
     a.as_raw() == b.as_raw()
 }
 
+/// Whether `b` looks like `a` to within `tol` (1..=100): every 16×16 tile's
+/// average difference stays small, so a change in one spot (something
+/// moving) still counts while noise spread over the frame doesn't.
+pub(crate) fn near_image(a: &RgbaImage, b: &RgbaImage, tol: u8) -> bool {
+    if a.dimensions() != b.dimensions() {
+        return false;
+    }
+    let (w, h) = a.dimensions();
+    // per channel, out of 255
+    let limit = 0.5 + tol.min(100) as f32 * 0.25;
+    const T: u32 = 16;
+    let (ra, rb) = (a.as_raw(), b.as_raw());
+    for ty in (0..h).step_by(T as usize) {
+        for tx in (0..w).step_by(T as usize) {
+            let (x1, y1) = ((tx + T).min(w), (ty + T).min(h));
+            let mut sum = 0u32;
+            for y in ty..y1 {
+                let row = (y * w) as usize * 4;
+                for x in tx..x1 {
+                    let i = row + x as usize * 4;
+                    // a pixel's difference is its biggest channel change
+                    let d = (0..4).map(|c| ra[i + c].abs_diff(rb[i + c])).max().unwrap_or(0);
+                    sum += d as u32;
+                }
+            }
+            let n = ((x1 - tx) * (y1 - ty)) as f32;
+            if sum as f32 / n > limit {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Every distinct opaque colour in the animation with its pixel count, most
 /// frequent first. `None` when there are more than `cap` distinct colours.
 fn colour_census(frames: &[Prepared], thr: u8, cap: usize) -> Option<Vec<([u8; 3], u64)>> {
@@ -424,7 +462,7 @@ pub fn encode_gif(anim: &Animation, opt: &GifOptions, progress: Option<&AtomicUs
     for f in &frames {
         if opt.merge_duplicates {
             if let Some(last) = prepared.last_mut() {
-                if crate::pixels::Pixels::ptr_eq(&last.rgba, &f.image) || same_image(&last.rgba.get(), &f.image.get()) {
+                if crate::pixels::Pixels::ptr_eq(&last.rgba, &f.image) || same_image(&last.rgba.get(), &f.image.get()) || (opt.merge_tolerance > 0 && near_image(&last.rgba.get(), &f.image.get(), opt.merge_tolerance)) {
                     last.delay = last.delay.saturating_add(f.delay_cs);
                     continue;
                 }

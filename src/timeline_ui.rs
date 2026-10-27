@@ -190,6 +190,60 @@ fn flip(d: &mut [crate::anim::Frame]) {
     }
 }
 
+/// The custom ease: a timing graph with two handles to drag, and a few
+/// shapes to start from.
+fn curve_editor(ui: &mut egui::Ui, c: &mut [f32; 4]) {
+    let pal = *p();
+    ui.label(RichText::new("Timing to the next keyframe").color(pal.fg_muted).size(12.0));
+    // y room above and below the square for overshoot
+    let size = vec2(200.0, 264.0);
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let box_ = Rect::from_min_size(rect.min + vec2(18.0, 57.0), vec2(164.0, 150.0));
+    let to = |x: f32, y: f32| pos2(box_.min.x + x * box_.width(), box_.max.y - y * box_.height());
+    let from = |p: Pos2| ((p.x - box_.min.x) / box_.width(), (box_.max.y - p.y) / box_.height());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, pal.view);
+    painter.rect_stroke(box_, 0.0, Stroke::new(1.0, mix(pal.view, pal.fg, 0.2)), egui::StrokeKind::Inside);
+    for k in 1..4 {
+        let f = k as f32 / 4.0;
+        painter.vline(to(f, 0.0).x, box_.y_range(), Stroke::new(1.0, mix(pal.view, pal.fg, 0.07)));
+        painter.hline(box_.x_range(), to(0.0, f).y, Stroke::new(1.0, mix(pal.view, pal.fg, 0.07)));
+    }
+    // the curve: time across, how far along up
+    let pts: Vec<Pos2> = (0..=60).map(|i| {
+        let t = i as f32 / 60.0;
+        to(t, crate::timeline::bezier(*c, t))
+    }).collect();
+    let (p0, p3) = (to(0.0, 0.0), to(1.0, 1.0));
+    let handles = [(0usize, p0), (2usize, p3)];
+    for (i, end) in handles {
+        let h = to(c[i], c[i + 1]);
+        painter.line_segment([end, h], Stroke::new(1.0, pal.fg_muted));
+    }
+    painter.add(egui::Shape::line(pts, Stroke::new(2.0, pal.highlight)));
+    for (i, _) in handles {
+        let h = to(c[i], c[i + 1]);
+        let id = egui::Id::unique(("curve-handle", i));
+        let r = ui.interact(Rect::from_center_size(h, vec2(16.0, 16.0)), id, Sense::drag());
+        if r.dragged() {
+            if let Some(pp) = r.interact_pointer_pos() {
+                let (x, y) = from(pp);
+                c[i] = x.clamp(0.0, 1.0);
+                c[i + 1] = y.clamp(-0.35, 1.35);
+            }
+        }
+        let hot = r.hovered() || r.dragged();
+        painter.circle(h, if hot { 6.0 } else { 5.0 }, if hot { pal.highlight } else { pal.window }, Stroke::new(1.5, pal.highlight));
+    }
+    ui.horizontal_wrapped(|ui| {
+        for (name, v) in [("Smooth", crate::timeline::CURVE_SMOOTH), ("Linear", [0.0, 0.0, 1.0, 1.0]), ("Ease in", [0.6, 0.0, 1.0, 1.0]), ("Ease out", [0.0, 0.0, 0.4, 1.0]), ("Back", [0.34, 1.3, 0.64, 1.0]), ("Snap", [0.8, 0.0, 0.2, 1.0])] {
+            if ui.add(sel_btn(egui::Button::new(name).small(), *c == v)).clicked() {
+                *c = v;
+            }
+        }
+    });
+}
+
 /// How one GIF clip goes into the next.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Trans {
@@ -681,7 +735,7 @@ impl GifKitApp {
             (Some((li, k)), _) => self.stack.layers[li].timing.keys[k],
             (None, Some(li)) => {
                 let m = self.stack.layers[li].timing.motion(self.cur);
-                Key { frame: self.cur, x: m.dx, y: m.dy, scale_x: m.sx * 100.0, scale_y: m.sy * 100.0, angle: m.angle, opacity: m.opacity * 100.0, ease: Ease::Smooth }
+                Key { frame: self.cur, x: m.dx, y: m.dy, scale_x: m.sx * 100.0, scale_y: m.sy * 100.0, angle: m.angle, opacity: m.opacity * 100.0, ease: Ease::Smooth, curve: crate::timeline::CURVE_SMOOTH }
             }
             _ => Key::default(),
         };
@@ -709,7 +763,7 @@ impl GifKitApp {
         let gap = 6.0;
         // (group, width): 0 auto key, 1 position, 2 scale, 3 angle, 4 opacity, 5 ease
         let widths = [
-            CHIP_H + gap + 16.0,
+            CHIP_H * 3.0 + gap * 3.0 + 16.0,
             text_w("Position:") + gap * 2.0 + 108.0 * 2.0,
             text_w("Scale:") + gap * 2.0 + 88.0 * 2.0,
             text_w("Angle:") + gap + 70.0,
@@ -752,6 +806,36 @@ impl GifKitApp {
                             } else {
                                 diamond(ui.painter(), r.center(), 5.5, Color32::TRANSPARENT, Stroke::new(1.3, pal.fg_muted));
                             }
+                            // draw the path the layer follows on the preview
+                            let can = sel_li.is_some_and(|li| !self.stack.layers[li].locked) && placed.is_some();
+                            let on = self.path_draw && can;
+                            let pb = ui
+                                .add_enabled(can, sel_btn(egui::Button::new("").frame_when_inactive(on).min_size(vec2(CHIP_H, CHIP_H)), on))
+                                .on_hover_text("Draw Path: drag on the preview and the layer follows that line across its clip")
+                                .on_disabled_hover_text("Select a layer that sits somewhere on the frame to draw its path");
+                            crate::icons::paint(ui.painter(), "draw-freehand", pb.rect.center(), 16.0, if on { pal.fg } else { pal.fg_muted });
+                            if pb.clicked() {
+                                self.path_draw = !self.path_draw;
+                                self.path_track = false;
+                                self.path_pts.clear();
+                                if self.path_draw {
+                                    self.info("Drag on the preview to draw the path. Its start is where the clip starts.");
+                                }
+                            }
+                            // stick the layer to something in the picture
+                            let on = self.path_track && can;
+                            let tb = ui
+                                .add_enabled(can, sel_btn(egui::Button::new("").frame_when_inactive(on).min_size(vec2(CHIP_H, CHIP_H)), on))
+                                .on_hover_text("Track: click something in the picture and the layer follows it")
+                                .on_disabled_hover_text("Select a layer that sits somewhere on the frame to track with it");
+                            crate::icons::paint(ui.painter(), "edit-select", tb.rect.center(), 16.0, if on { pal.fg } else { pal.fg_muted });
+                            if tb.clicked() {
+                                self.path_track = !self.path_track;
+                                self.path_draw = false;
+                                if self.path_track {
+                                    self.info("Click the spot to follow, on this frame. The layer keeps its distance from it.");
+                                }
+                            }
                         }
                         // effects, watermarks and the AI shield cover the whole frame: they only fade
                         1 => {
@@ -791,7 +875,13 @@ impl GifKitApp {
                                         }
                                     })
                                     .response
-                                    .on_hover_text("How the motion arrives at and leaves this keyframe. Hold keeps it still until the next one.");
+                                    .on_hover_text("How the motion arrives at and leaves this keyframe. Hold keeps it still until the next one. Custom lets you draw it.");
+                                if key.ease == Ease::Custom {
+                                    let r = ui.add(egui::Button::new("Curve…").min_size(vec2(0.0, CHIP_H))).on_hover_text("Shape the timing to the next keyframe");
+                                    egui::Popup::menu(&r).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                                        curve_editor(ui, &mut key.curve);
+                                    });
+                                }
                             });
                         }
                     }
@@ -2635,11 +2725,17 @@ impl GifKitApp {
             return;
         }
         self.snapshot(&format!("tl-add{now}"), now);
-        let mut put = 0;
+        let mut made: Vec<(u64, usize)> = Vec::new();
         for (t, a, b) in sel {
-            put += self.tl_place_clips(t, b + 1, &[(0, b - a + 1)]).len();
+            made.extend(self.tl_place_clips(t, b + 1, &[(0, b - a + 1)]).into_iter().map(|s| (t, s)));
         }
+        let put = made.len();
         self.modified |= put > 0;
+        // the copies become the selection, as after a paste
+        if let Some(&(t, first)) = made.first() {
+            self.tl_select_placed(t, &[first]);
+            self.tl_sel = made[1..].to_vec();
+        }
         if put == 0 {
             self.info("No room after the clip to put a copy");
         }

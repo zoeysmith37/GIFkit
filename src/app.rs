@@ -266,6 +266,9 @@ enum JobOutput {
     ProjectSaved(anyhow::Result<PathBuf>),
     /// the best loop: first output frame, the one matching it, how different
     LoopPoint(Option<(usize, usize, f32)>),
+    /// a layer (id) to put on frames `first..`: its centres there, and
+    /// where it was placed
+    Track(u64, usize, Vec<(f32, f32)>, (f32, f32)),
 }
 
 /// Something that would throw away unsaved changes, waiting for an answer.
@@ -791,6 +794,10 @@ pub struct GifKitApp {
     backdrop: Backdrop,
     backdrop_col: [u8; 3],
     pixelated: bool,
+    /// ghosts of the frames around the playhead on the preview
+    onion: bool,
+    /// those ghosts for the viewport being drawn: picture and tint
+    onion_paint: Vec<(Tex, Color32)>,
 
     base_tex: TexCache,
     thumbs: Thumbs,
@@ -850,6 +857,8 @@ pub struct GifKitApp {
     fr_delay: u16,
     fr_crossfade: usize,
     fr_crossfade_wrap: bool,
+    /// in-betweens move with the picture, not only fade
+    fr_follow: bool,
     /// Make Seamless: how many frames the end fades into the start over
     loop_blend: usize,
     fr_thumb: f32,
@@ -1046,6 +1055,12 @@ pub struct GifKitApp {
     quitting: bool,
     /// changing a motion value at a frame without a keyframe adds one
     tl_autokey: bool,
+    /// Draw Path: a drag on the preview becomes the selected layer's motion
+    path_draw: bool,
+    /// the path being drawn, in source pixels
+    path_pts: Vec<(f32, f32)>,
+    /// Track: a click on the preview picks a spot for the layer to follow
+    path_track: bool,
     /// while trimming the GIF's outer ends: the output frames that stay
     tl_trim: Option<(usize, usize)>,
     keymap: crate::keys::Keymap,
@@ -2759,6 +2774,8 @@ impl GifKitApp {
             },
             backdrop_col: theme::get_setting("backdrop_col").and_then(|v| parse_hex(&v)).unwrap_or([255, 255, 255]),
             pixelated: theme::get_setting("pixelated").as_deref() == Some("1"),
+            onion: theme::get_setting("onion").as_deref() == Some("1") || std::env::var_os("GIFKIT_ONION").is_some(),
+            onion_paint: Vec::new(),
             base_tex: TexCache::default(),
             thumbs: Thumbs::default(),
             comp_tex: TexCache::default(),
@@ -2809,6 +2826,7 @@ impl GifKitApp {
             fr_delay: 10,
             fr_crossfade: 2,
             fr_crossfade_wrap: true,
+            fr_follow: true,
             loop_blend: 8,
             fr_thumb: 96.0,
             video_bg: [255, 255, 255],
@@ -2933,6 +2951,9 @@ impl GifKitApp {
             after_save: None,
             quitting: false,
             tl_autokey: theme::get_setting("auto_key").map(|v| v != "0").unwrap_or(true),
+            path_draw: false,
+            path_pts: Vec::new(),
+            path_track: false,
             tl_trim: None,
             keymap: crate::keys::Keymap::load(),
             key_capture: None,
@@ -3257,6 +3278,15 @@ impl GifKitApp {
             JobOutput::Anim(Err(e)) | JobOutput::Baked(Err(e)) | JobOutput::Loaded(Err(e)) | JobOutput::Overlay(Err(e)) | JobOutput::Fit(Err(e)) | JobOutput::ProjectLoaded(Err(e)) | JobOutput::ProjectSaved(Err(e)) => self.error(format!("{label} failed: {e:#}")),
             JobOutput::ProjectLoaded(Ok((pr, path))) => self.apply_project(pr, path),
             JobOutput::LoopPoint(None) => self.info("Too few frames to look for a loop"),
+            JobOutput::Track(id, a, pos, centre) => {
+                if let Some(li) = self.stack.index_of(id) {
+                    let now = ctx.input(|i| i.time);
+                    self.snapshot(&format!("track{now}"), now);
+                    let k = self.stack.layers[li].timing.set_positions(a, &pos, centre);
+                    self.modified = true;
+                    self.info(format!("Tracked over {} frames: {k} keyframes", pos.len()));
+                }
+            }
             JobOutput::LoopPoint(Some((a, b, d))) => {
                 // in and out around it, looping, to see it and save it
                 self.tl_set_in(Some(a));
@@ -4432,6 +4462,9 @@ impl GifKitApp {
             let on = ctx.input(|i| i.viewport().fullscreen).unwrap_or(false);
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!on));
         }
+        if hit(A::OnionSkin) && !typing {
+            self.toggle_onion();
+        }
         if hit(A::Handbook) {
             self.handbook_open = true;
         }
@@ -5042,6 +5075,35 @@ impl GifKitApp {
             }
         }
         self.gpu_frames.bytes = 0;
+    }
+
+    fn toggle_onion(&mut self) {
+        self.onion = !self.onion;
+        theme::set_setting("onion", if self.onion { "1" } else { "0" });
+        self.info(if self.onion { "Onion skin on: frames before show red, the next one green" } else { "Onion skin off" });
+    }
+
+    /// Onion skin: two frames back in red and one ahead in green, fainter
+    /// further off. Not while playing (it would only smear).
+    fn onion_frames(&mut self, ctx: &egui::Context) -> Vec<(Tex, Color32)> {
+        if !self.onion || self.playing || self.plan.len() < 2 {
+            return Vec::new();
+        }
+        let n = self.plan.len();
+        let keep = self.last_comp.clone();
+        let mut v = Vec::new();
+        for (d, tint) in [(-2i64, Color32::from_rgba_unmultiplied(255, 90, 90, 28)), (-1, Color32::from_rgba_unmultiplied(255, 90, 90, 58)), (1, Color32::from_rgba_unmultiplied(90, 230, 140, 58))] {
+            let i = self.cur as i64 + d;
+            if i < 0 || i >= n as i64 {
+                continue;
+            }
+            if let Some(t) = self.composite_texture(ctx, i as usize) {
+                v.push((t, tint));
+            }
+        }
+        // what the main view shows stays the frame at the playhead
+        self.last_comp = keep;
+        v
     }
 
     fn composite_texture(&mut self, ctx: &egui::Context, i: usize) -> Option<Tex> {
@@ -6107,6 +6169,9 @@ impl GifKitApp {
                 }
                 if menu_item(ui, "zoom-original", "&Actual Size", &self.keymap.text(crate::keys::Action::ActualSize), has) {
                     self.zoom_to(1.0);
+                }
+                if menu_check(ui, self.onion, "&Onion Skin", &self.keymap.text(crate::keys::Action::OnionSkin)) {
+                    self.toggle_onion();
                 }
                 ui.separator();
                 if menu_check(ui, self.show_timeline, "Show &Timeline", "") {
@@ -8493,8 +8558,15 @@ impl GifKitApp {
                 let same_shape = ((ts.x / ts.y) - (img_size.x / img_size.y)).abs() < 0.02 * (img_size.x / img_size.y) && ts.x < img_size.x - 0.5;
                 let tr = if same_shape { img_rect } else { Rect::from_min_size(img_rect.min, ts * scale) };
                 painter.image(t.id(), tr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                // onion skin: the frames around it, faint and tinted
+                for (o, tint) in std::mem::take(&mut self.onion_paint) {
+                    let os = o.size_vec2();
+                    let or = if same_shape { img_rect } else { Rect::from_min_size(img_rect.min, os * scale) };
+                    painter.image(o.id(), or, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), tint);
+                }
             }
         }
+        self.onion_paint.clear();
         let resp = ui.interact(rect, egui::Id::unique(("gifkit-viewport", vi)), Sense::click_and_drag());
         if resp.hovered() || resp.dragged() {
             self.active_view = vi;
@@ -8736,6 +8808,7 @@ impl GifKitApp {
                     let tex = self.composite_texture(ctx, self.cur);
                     let size = self.true_out_size();
                     self.out_size = (size.x, size.y);
+                    self.onion_paint = self.onion_frames(ctx);
                     (tex, size)
                 };
                 let label = crop_mode.then(|| (if self.crop_live { "Full frame · with edits".to_string() } else { "Full frame · original".to_string() }, Color32::WHITE));
@@ -8932,6 +9005,84 @@ impl GifKitApp {
         let rot_handle = |o: &Obb| to_screen(o.from_local(0.0, -o.h / 2.0 - 30.0 / m.scale));
         let ptr_img = resp.interact_pointer_pos().map(|p| m.to_img(p));
         let shift = ui.input(|i| i.modifiers.shift);
+
+        // ---- Track: a click picks the spot the layer follows
+        if self.path_track && space == Space::Output {
+            if let Some((li, id, b, _)) = sel {
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                }
+                if resp.clicked() {
+                    if let (Some(pi), Some(base)) = (ptr_img, self.base.clone()) {
+                        let (px, py) = map_of(li).inverse().apply(pi.x, pi.y);
+                        let n = self.plan.len();
+                        let l = &self.stack.layers[li];
+                        let (a, z) = l.timing.extent(n);
+                        let mo = l.timing.motion(self.cur);
+                        // the layer keeps where it sits from the spot
+                        let off = (b.cx + mo.dx - px, b.cy + mo.dy - py);
+                        let srcs: Vec<usize> = self.plan[a..=z].iter().map(|f| f.src).collect();
+                        let start = self.cur.clamp(a, z) - a;
+                        let centre = (b.cx, b.cy);
+                        self.path_track = false;
+                        let ctx = ui.ctx().clone();
+                        self.spawn(&ctx, "Tracking", srcs.len(), move |p| {
+                            use rayon::prelude::*;
+                            let grays: Vec<crate::track::Gray> = srcs.par_iter().map(|&s| crate::track::Gray::new(&base.frames[s].image.get())).collect();
+                            let refs: Vec<&crate::track::Gray> = grays.iter().collect();
+                            let pts = crate::track::track(&refs, start, (px, py), p);
+                            if std::env::var_os("GIFKIT_TRACK_DEBUG").is_some() {
+                                eprintln!("track from {:?} on frame {start}: {:?}", (px, py), pts.iter().step_by(5).map(|q| (q.0 as i32, q.1 as i32)).collect::<Vec<_>>());
+                            }
+                            let pos = pts.into_iter().map(|q| (q.0 + off.0, q.1 + off.1)).collect();
+                            JobOutput::Track(id, a, pos, centre)
+                        });
+                    }
+                }
+                return;
+            }
+        }
+
+        // ---- Draw Path: the drag is the path, not a move
+        if self.path_draw && space == Space::Output {
+            if let Some((li, _, b, _)) = sel {
+                let inv = map_of(li).inverse();
+                let to_src = |p: Pos2| inv.apply(p.x, p.y);
+                if started {
+                    let origin = ui.input(|i| i.pointer.press_origin()).map(|p| m.to_img(p));
+                    self.path_pts = origin.map(to_src).into_iter().collect();
+                }
+                if dragged {
+                    if let Some(pi) = ptr_img {
+                        let q = to_src(pi);
+                        let far = self.path_pts.last().is_none_or(|l| ((l.0 - q.0).powi(2) + (l.1 - q.1).powi(2)).sqrt() * m.scale > 2.0);
+                        if far {
+                            self.path_pts.push(q);
+                        }
+                    }
+                }
+                if show && self.path_pts.len() > 1 {
+                    let mp = map_of(li);
+                    let pts: Vec<Pos2> = self.path_pts.iter().map(|&(x, y)| to_screen(mp.apply(x, y))).collect();
+                    painter.add(egui::Shape::line(pts, Stroke::new(2.0, pal.highlight)));
+                }
+                if stopped && self.path_pts.len() > 1 {
+                    let pts = std::mem::take(&mut self.path_pts);
+                    let now = ui.input(|i| i.time);
+                    self.snapshot(&format!("path{now}"), now);
+                    let n = self.plan.len();
+                    let k = self.stack.layers[li].timing.follow_path(&pts, (b.cx, b.cy), n);
+                    self.modified = true;
+                    // done: back to moving things, with the path shown
+                    self.path_draw = false;
+                    self.info(format!("The layer follows the path: {k} keyframes"));
+                }
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                }
+                return;
+            }
+        }
 
         // ---- start of a drag: decide what is being edited
         if started {
@@ -9165,6 +9316,20 @@ impl GifKitApp {
             // keyframed motion: a dashed outline where it is on this frame,
             // the handles stay on where it was placed
             let mo = l.timing.motion(self.cur);
+            // the selected layer's path over its clip: a dot a frame
+            if Some(l.id) == sel_id && l.timing.keys.len() > 1 {
+                let n = self.plan.len();
+                let (a, z) = l.timing.extent(n);
+                let pts: Vec<Pos2> = (a..=z).map(|i| {
+                    let mi = l.timing.motion(i);
+                    to_screen(mp.apply(b.cx + mi.dx, b.cy + mi.dy))
+                }).collect();
+                painter.add(egui::Shape::line(pts.clone(), Stroke::new(1.0, pal.highlight.gamma_multiply(0.6))));
+                for (k, p) in pts.iter().enumerate() {
+                    let here = a + k == self.cur;
+                    painter.circle_filled(*p, if here { 4.0 } else { 1.8 }, if here { pal.highlight } else { Color32::WHITE.gamma_multiply(0.8) });
+                }
+            }
             if mo.moves() {
                 let o2 = map_box(&mp, mo.apply(b), l.readable());
                 let mut pts2: Vec<Pos2> = o2.corners().iter().map(|c| to_screen(*c)).collect();
@@ -10109,16 +10274,20 @@ impl GifKitApp {
                 _ => crate::target::TargetFormat::Gif(self.gif_opts.clone()),
             };
             let allow_scale = !self.fit_keep_size;
+            // the preview already made the file the current settings give
+            let have = self.cmp.as_ref().filter(|c| c.key == self.cmp_key() && c.sample.is_none() && !c.sheet).map(|c| (*c.bytes).clone());
+            let (range, cut_empty) = self.export_trim();
             if let Some(base) = self.base.clone() {
                 let stack = self.stack.clone();
                 let fonts = self.fonts.clone();
                 let total = self.plan.len();
                 self.spawn(ctx, &format!("Finding settings under {}", fmt_size(max)), total, move |p| {
-                    // render each scale through the real Resize step so sizes match the preview
-                    JobOutput::Fit(crate::target::fit_with(&tf, max, allow_scale, p, |sc| {
+                    // render each scale through the real Resize step, trimmed
+                    // as Export trims, so sizes match the preview and the file
+                    JobOutput::Fit(crate::target::fit_from(&tf, max, allow_scale, p, have, |sc| {
                         let mut st = stack.clone();
                         apply_fit_scale(&mut st.transform, sc);
-                        st.flatten(&base, &fonts, None)
+                        st.flatten_for_export(&base, &fonts, None, range, cut_empty).0
                     }))
                 });
             }
@@ -10202,6 +10371,9 @@ impl GifKitApp {
             form_row(ui, "", |ui| {
                 check(ui, &mut o.frame_diff, "Store only changed pixels");
                 check(ui, &mut o.merge_duplicates, "Merge identical frames");
+            });
+            ui.add_enabled_ui(o.merge_duplicates, |ui| {
+                slider_row(ui, "Near matches", egui::Slider::new(&mut o.merge_tolerance, 0..=100).custom_formatter(|v, _| if v == 0.0 { "Off".into() } else { format!("{v:.0}") })).on_hover_text("Also merges frames that barely change. Good for screen recordings and noisy video.");
             });
             form_row(ui, "Drop frames", |ui| {
                 even_grid(ui, 2, 0.0, |ui, i, size| {
@@ -11490,23 +11662,68 @@ impl GifKitApp {
                 self.base.as_mut().unwrap().loop_count = if forever { None } else { Some(count.max(1)) };
             }
         });
-        group(ui, "Blend", |ui| {
+        group(ui, "In-Betweens", |ui| {
             let mut go = false;
-            form_row(ui, "Crossfade", |ui| {
+            form_row(ui, "Add", |ui| {
                 even_grid(ui, 2, 0.0, |ui, i, size| {
                     if i == 0 {
-                        spin(ui, size, &mut self.fr_crossfade, 1.0, |d| d.range(1..=30).suffix(" steps")).on_hover_text("Number of in-between frames");
+                        spin(ui, size, &mut self.fr_crossfade, 1.0, |d| d.range(1..=30).suffix(" each")).on_hover_text("New frames between each pair");
                     } else {
                         cell(ui, size, |ui| check(ui, &mut self.fr_crossfade_wrap, "Loop")).on_hover_text("Also blend the last frame into the first");
                     }
                 })
             });
             form_row(ui, "", |ui| {
-                go = wide_button(ui, egui::Button::new("Apply Crossfade")).clicked();
+                check(ui, &mut self.fr_follow, "Follow motion").on_hover_text("Moves the picture along with what moves in it, so things slide instead of fading through each other");
+            });
+            // too short a delay and browsers slow it down
+            let shortest = self.base.as_ref().and_then(|a| a.frames.iter().filter(|f| f.enabled).map(|f| f.delay_cs).min()).unwrap_or(10);
+            let each = shortest as f32 / (self.fr_crossfade + 1) as f32;
+            if each < 2.0 {
+                form_row(ui, "", |ui| {
+                    ui.label(RichText::new("⚠ Not enough time to share: it gets longer").color(p().neutral).size(12.0)).on_hover_text("Each frame's time is shared with its new ones, but no frame goes under 2 cs (browsers slow those down). Use fewer to keep the length.");
+                });
+            }
+            form_row(ui, "", |ui| {
+                go = wide_button(ui, egui::Button::new("Make In-Betweens")).on_hover_text("Smoother motion. The length stays the same.").clicked();
             });
             if go {
-                let (s, w) = (self.fr_crossfade, self.fr_crossfade_wrap);
-                self.run_anim(ctx, "Crossfade", move |a, _| Ok(ops::crossfade(a, s, w)));
+                let (steps, wrap, follow) = (self.fr_crossfade, self.fr_crossfade_wrap, self.fr_follow);
+                if let Some(base) = self.base.clone() {
+                    let mut stack = self.stack.clone();
+                    let plan_src: Vec<usize> = self.plan.iter().map(|f| f.src).collect();
+                    self.spawn(ctx, "In-betweens", base.len(), move |p| {
+                        let (out, counts) = ops::inbetween_counted(&base, steps, wrap, follow, Some(p));
+                        // layers stretch with the frames: where each old frame
+                        // now starts, counting shown frames as the timeline does,
+                        // and how many it became
+                        let mut pos = Vec::with_capacity(base.len());
+                        let mut at = 0usize;
+                        for (f, &cnt) in base.frames.iter().zip(&counts) {
+                            pos.push((at, cnt));
+                            if f.enabled {
+                                at += cnt;
+                            }
+                        }
+                        let map = |k: usize| plan_src.get(k).and_then(|&s| pos.get(s)).copied();
+                        for l in &mut stack.layers {
+                            if let Some(cl) = &mut l.timing.clips {
+                                for c in cl.iter_mut() {
+                                    if let Some((a, _)) = map(c.start) {
+                                        let end = c.end.and_then(|e| map(e)).map(|(b, n)| b + n - 1);
+                                        *c = crate::timeline::Clip { start: a, end: c.end.and(end) };
+                                    }
+                                }
+                            }
+                            for key in &mut l.timing.keys {
+                                if let Some((a, _)) = map(key.frame) {
+                                    key.frame = a;
+                                }
+                            }
+                        }
+                        JobOutput::Baked(Ok((out, stack)))
+                    });
+                }
             }
             let mut bg = false;
             form_row(ui, "Background", |ui| {

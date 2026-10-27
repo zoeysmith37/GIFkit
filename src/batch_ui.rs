@@ -168,13 +168,18 @@ pub(super) struct BatchJob {
     pub avif: u8,
     pub keep_size: bool,
     pub fonts: Vec<FontEntry>,
+    /// frames in the file being worked on
+    pub frames: Arc<AtomicUsize>,
 }
 
 impl BatchJob {
     /// Load `src`, edit it, fit it and save it: where it went, its size and
     /// whether it got under the limit.
-    pub fn one(&self, src: &Path) -> anyhow::Result<(PathBuf, u64, bool)> {
+    /// `work` counts frames rendered and encoded, for the progress bar
+    /// (and carries Stop).
+    pub fn one(&self, src: &Path, work: &AtomicUsize) -> anyhow::Result<(PathBuf, u64, bool)> {
         let a = io::load_animation(src)?;
+        self.frames.store(a.len(), std::sync::atomic::Ordering::Relaxed);
         let dims = (a.width(), a.height());
         let mut stack = Stack::default();
         if let Some(rp) = &self.rp {
@@ -212,20 +217,23 @@ impl BatchJob {
                 let fit = crate::target::fit_with(&tf, max, !self.keep_size, &trials, |sc| {
                     let mut st = stack.clone();
                     apply_fit_scale(&mut st.transform, sc);
-                    st.flatten(&a, &self.fonts, None)
+                    st.flatten(&a, &self.fonts, Some(work))
                 })?;
                 (fit.bytes, fit.reached)
             }
             None => {
-                let flat = stack.flatten(&a, &self.fonts, None);
+                let flat = stack.flatten(&a, &self.fonts, Some(work));
                 let b = match self.fmt {
                     ExportFormat::Webp => io::encode_webp(&flat, &self.webp)?,
                     ExportFormat::Avif => io::encode_avif(&flat, self.avif)?,
-                    _ => crate::encode::encode_gif(&flat, &gif, None)?,
+                    _ => crate::encode::encode_gif(&flat, &gif, Some(work))?,
                 };
                 (b, true)
             }
         };
+        if crate::stack::stopped(Some(work)) {
+            anyhow::bail!("stopped");
+        }
         let data = match self.fmt {
             ExportFormat::Webp if self.noai => crate::noai::tag_webp(data),
             ExportFormat::Avif if self.noai => crate::noai::tag_avif(data),
@@ -421,6 +429,7 @@ impl GifKitApp {
             avif: self.avif_quality,
             keep_size: self.fit_keep_size,
             fonts: self.fonts.clone(),
+            frames: Default::default(),
         };
         let job = BatchJob { gif: job.rp.as_ref().and_then(|r| r.pr.gif.clone()).unwrap_or_else(|| self.gif_opts.clone()), ..job };
         let files = self.batch.files.clone();
@@ -432,16 +441,45 @@ impl GifKitApp {
             }
         }
         self.batch.open = false;
-        self.spawn(ctx, &format!("Batch: {total} file{}", if total == 1 { "" } else { "s" }), total, move |p| {
+        // the bar moves through each file, a thousand steps a file
+        self.spawn(ctx, &format!("Batch: {total} file{}", if total == 1 { "" } else { "s" }), total * 1000, move |p| {
+            use std::sync::atomic::Ordering::Relaxed;
+            let set = |v: usize| {
+                let _ = p.fetch_update(Relaxed, Relaxed, |old| Some((old & crate::stack::STOP_BIT) | v));
+            };
             let mut done = 0;
             let mut bytes = 0u64;
             let mut fails: Vec<String> = Vec::new();
             let mut missed = 0;
             let mut last_dir = None;
             for (i, src) in files.iter().enumerate() {
-                p.store(i, std::sync::atomic::Ordering::Relaxed);
+                if p.load(Relaxed) & crate::stack::STOP_BIT != 0 {
+                    break;
+                }
+                set(i * 1000);
                 let name = src.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                let r = job.one(src);
+                let work = AtomicUsize::new(0);
+                let finished = std::sync::atomic::AtomicBool::new(false);
+                let fitting = job.platform.is_some();
+                let r = std::thread::scope(|sc| {
+                    // a watcher: this file's share of the bar, and Stop passed on
+                    sc.spawn(|| {
+                        while !finished.load(Relaxed) {
+                            if p.load(Relaxed) & crate::stack::STOP_BIT != 0 {
+                                work.fetch_or(crate::stack::STOP_BIT, Relaxed);
+                            }
+                            let w = (work.load(Relaxed) & !crate::stack::STOP_BIT) as f32;
+                            let n = job.frames.load(Relaxed).max(1) as f32;
+                            // render then encode; a size search runs several, so it eases in
+                            let f = if fitting { 1.0 - (-w / (3.0 * n)).exp() } else { w / (2.0 * n) };
+                            set(i * 1000 + (f.clamp(0.0, 0.99) * 1000.0) as usize);
+                            std::thread::sleep(std::time::Duration::from_millis(60));
+                        }
+                    });
+                    let r = job.one(src, &work);
+                    finished.store(true, Relaxed);
+                    r
+                });
                 match r {
                     Ok((path, n, reached)) => {
                         done += 1;
@@ -454,7 +492,7 @@ impl GifKitApp {
                     Err(e) => fails.push(format!("{name}: {e:#}")),
                 }
             }
-            p.store(total, std::sync::atomic::Ordering::Relaxed);
+            set(total * 1000);
             let mut msg = format!("Batch saved {done} of {total} file{} ({})", if total == 1 { "" } else { "s" }, fmt_size(bytes));
             if let Some(d) = last_dir.filter(|_| out.is_some()) {
                 msg += &format!(" to {d}");
@@ -505,14 +543,16 @@ mod tests {
             _ => panic!("not text"),
         }
         let slack = PLATFORMS.iter().position(|p| p.name == "Slack Emoji").unwrap();
-        let job = BatchJob { rp: Some(rp), out: Some(d.clone()), fmt: ExportFormat::Gif, platform: Some(slack), gif: GifOptions::default(), noai: true, webp: Default::default(), avif: 60, keep_size: false, fonts: crate::text::builtin_fonts() };
-        let (path, n, reached) = job.one(&src).unwrap();
+        let job = BatchJob { rp: Some(rp), out: Some(d.clone()), fmt: ExportFormat::Gif, platform: Some(slack), gif: GifOptions::default(), noai: true, webp: Default::default(), avif: 60, keep_size: false, fonts: crate::text::builtin_fonts(), frames: Default::default() };
+        let w = AtomicUsize::new(0);
+        let (path, n, reached) = job.one(&src, &w).unwrap();
+        assert!(w.load(std::sync::atomic::Ordering::Relaxed) > 0, "no progress counted");
         assert!(reached, "{n} bytes");
         assert!(n <= 125 * 1024);
         let out = io::load_animation(&path).unwrap();
         assert!(out.width().max(out.height()) <= 128, "{}x{}", out.width(), out.height());
         // a second run doesn't overwrite the first
-        let (p2, _, _) = BatchJob { platform: None, rp: None, ..job }.one(&src).unwrap();
+        let (p2, _, _) = BatchJob { platform: None, rp: None, ..job }.one(&src, &w).unwrap();
         assert_ne!(p2, path);
         std::fs::remove_dir_all(&d).ok();
     }
