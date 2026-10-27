@@ -342,7 +342,11 @@ pub fn set_mem_pct(pct: usize) {
 
 /// `bytes` scaled by the memory setting.
 pub fn scaled(bytes: usize) -> usize {
-    (bytes as u128 * MEM_PCT.load(Ordering::Relaxed) as u128 / 100) as usize
+    scale_by(bytes, MEM_PCT.load(Ordering::Relaxed))
+}
+
+fn scale_by(bytes: usize, pct: usize) -> usize {
+    (bytes as u128 * pct as u128 / 100) as usize
 }
 
 /// Memory the whole process uses now (bytes), where the system says.
@@ -464,12 +468,10 @@ mod tests {
 
     #[test]
     fn memory_level_scales_budgets() {
-        set_mem_pct(50);
-        assert_eq!(scaled(64 << 20), 32 << 20);
-        set_mem_pct(250);
-        assert_eq!(scaled(64 << 20), 160 << 20);
-        set_mem_pct(100);
-        assert_eq!(scaled(64 << 20), 64 << 20);
+        // pure: other tests share the live setting
+        assert_eq!(scale_by(64 << 20, 50), 32 << 20);
+        assert_eq!(scale_by(64 << 20, 250), 160 << 20);
+        assert_eq!(scale_by(64 << 20, 100), 64 << 20);
     }
 
     #[test]
