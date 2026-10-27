@@ -15,7 +15,9 @@ const EDGE: f32 = 5.0;
 /// room before frame 1, so a clip's start edge is easy to grab
 const PAD: f32 = 14.0;
 /// most pixels per frame when zoomed in
-const ZOOM_MAX: f32 = 120.0;
+const ZOOM_MAX: f32 = 400.0;
+/// How far out past fitting everything the timeline zooms (a share of the fit).
+const ZOOM_OUT: f32 = 0.25;
 /// the scroll bar along the bottom
 const BAR_H: f32 = 9.0;
 
@@ -60,6 +62,7 @@ enum TbAct {
     Marker,
     Snap,
     Loop,
+    TrimEnd,
 }
 
 /// What Copy put aside: clips as (offset from the first, length), or a keyframe.
@@ -452,7 +455,7 @@ impl GifKitApp {
                 (TbAct::Split, "split", "Split at Playhead", format!("Split the selected track at the playhead{}", k(A::TlSplit)), idle && self.tl_track.is_some() && !locked_sel, None),
                 (TbAct::Join, "merge", "Join with Next Clip", "Join the selected clip with the one right after it".into(), idle && self.tl_can_join() && !locked_sel, None),
                 (TbAct::AddClip, "list-add", "Add Clip at Playhead", "Add a clip at the playhead (on an empty part of the selected track)".into(), idle && gap_here && !locked_sel, None),
-                (TbAct::Delete, "edit-delete", "Delete", format!("Delete the selected clips or keyframe{}. On the GIF track it leaves a gap.", k(A::TlDelete)), idle && (self.tl_clip.is_some() || self.tl_key.is_some()) && !locked_sel, None),
+                (TbAct::Delete, "edit-delete", "Delete", format!("Delete the selected clips or keyframe{}. On the GIF track it leaves a gap.", k(A::TlDelete)), idle && (self.tl_clip.is_some() || self.tl_key.is_some() || !self.tl_keys.is_empty() || !self.tl_sel.is_empty()) && !locked_sel, None),
             ],
             vec![
                 (TbAct::Copy, "edit-copy", "Copy", "Copy the selected clips or keyframe (Ctrl+C). GIF clips copy their frames.".into(), any_clips || self.tl_key.is_some(), None),
@@ -469,6 +472,7 @@ impl GifKitApp {
                 (TbAct::In, "zone-in", "Set In Point", format!("Set the in point at the playhead{}", k(A::TlIn)), true, None),
                 (TbAct::Out, "zone-out", "Set Out Point", format!("Set the out point at the playhead{}", k(A::TlOut)), true, None),
                 (TbAct::Marker, "bookmark-new", "Add Marker", format!("Add a marker at the playhead{}", k(A::TlMarker)), true, None),
+                (TbAct::TrimEnd, "transform-crop", "Trim to Last Clip", "Shorten the animation to where its last clip ends".into(), idle && self.tl_last_clip_end().is_some_and(|e| e + 1 < self.gif_edit_len()), None),
             ],
             vec![(TbAct::Snap, "snap", "Snap", "Snap: clip edges and keyframes jump to the playhead, other clips, keyframes and markers nearby (hold Shift while dragging to place freely)".into(), true, Some(self.tl_snap))],
         ];
@@ -554,6 +558,8 @@ impl GifKitApp {
                 }
                 let (fit, cur_z) = (self.tl_fit.max(1e-3), self.tl_zoom_now.max(1e-3));
                 let top = ZOOM_MAX.max(fit * 1.01);
+                // the slider runs from all the way out to all the way in
+                let fit = fit * ZOOM_OUT;
                 if tb_tool(ui, "zoom-in", "", "Zoom in (Ctrl+wheel)", cur_z < top * 0.999).clicked() {
                     self.tl_zoom_to = Some(cur_z * 1.5);
                 }
@@ -603,6 +609,7 @@ impl GifKitApp {
                 theme::set_setting("tl_snap", if self.tl_snap { "1" } else { "0" });
             }
             Some(TbAct::Loop) => self.tl_zone_loop = !self.tl_zone_loop,
+            Some(TbAct::TrimEnd) => self.tl_trim_to_last(now),
             None => {}
         }
         // the selected layer's motion at the playhead. Changing a value makes
@@ -611,7 +618,11 @@ impl GifKitApp {
         let sel_li = sel_layer.and_then(|t| self.stack.index_of(t));
         let key_here = sel_li.and_then(|li| self.stack.layers[li].timing.key_at(self.cur).map(|k| (li, k)));
         if self.tl_drag.is_none() {
-            self.tl_key = key_here.map(|(_, k)| k);
+            // one Alt+clicked out stays out until the playhead moves off it
+            if self.tl_key_dropped.is_some_and(|(t, f)| Some(t) != sel_layer || f != self.cur) {
+                self.tl_key_dropped = None;
+            }
+            self.tl_key = key_here.map(|(_, k)| k).filter(|_| self.tl_key_dropped.is_none());
         }
         let mut key = match (key_here, sel_li) {
             (Some((li, k)), _) => self.stack.layers[li].timing.keys[k],
@@ -775,15 +786,15 @@ impl GifKitApp {
         self.tl_fit = fit;
         // the toolbar's zoom, about the playhead (kept where it is on screen)
         if let Some(z) = self.tl_zoom_to.take() {
-            let old = if self.tl_zoom <= 0.0 { fit } else { self.tl_zoom.max(fit) };
-            let nz = z.clamp(fit, ZOOM_MAX.max(fit));
+            let old = if self.tl_zoom <= 0.0 { fit } else { self.tl_zoom.max(fit * ZOOM_OUT) };
+            let nz = z.clamp(fit * ZOOM_OUT, ZOOM_MAX.max(fit));
             let anchor = self.cur as f32 + 0.5;
             let rel = (anchor - self.tl_x0) / (lane_w / old);
             let rel = if (0.0..=1.0).contains(&rel) { rel } else { 0.5 };
-            self.tl_zoom = if nz <= fit * 1.0001 { 0.0 } else { nz };
+            self.tl_zoom = if (nz - fit).abs() <= fit * 0.0001 { 0.0 } else { nz };
             self.tl_x0 = anchor - rel * lane_w / nz;
         }
-        let zoom = if self.tl_zoom <= 0.0 { fit } else { self.tl_zoom.max(fit) };
+        let zoom = if self.tl_zoom <= 0.0 { fit } else { self.tl_zoom.max(fit * ZOOM_OUT) };
         self.tl_zoom_now = zoom;
         let visible = lane_w / zoom;
         // follow the playhead while playing
@@ -806,8 +817,8 @@ impl GifKitApp {
             let factor = if zd != 1.0 { zd.powf(3.0) } else if ctrl && scroll.y != 0.0 { 1.0 + scroll.y * 0.004 } else { 1.0 };
             if factor != 1.0 {
                 let at = ui.input(|i| i.pointer.hover_pos()).map(|p| x0 + (p.x - lanes.min.x - PAD) / zoom).unwrap_or(x0);
-                let nz = (zoom * factor).clamp(fit, ZOOM_MAX.max(fit));
-                self.tl_zoom = if nz <= fit * 1.0001 { 0.0 } else { nz };
+                let nz = (zoom * factor).clamp(fit * ZOOM_OUT, ZOOM_MAX.max(fit));
+                self.tl_zoom = if (nz - fit).abs() <= fit * 0.0001 { 0.0 } else { nz };
                 self.tl_x0 = at - (at - x0) * zoom / nz;
             } else if shift || scroll.x != 0.0 || (scroll.y != 0.0 && rows_h <= tracks_h) {
                 self.tl_x0 -= (scroll.x + if shift || rows_h <= tracks_h { scroll.y } else { 0.0 }) / zoom;
@@ -1035,7 +1046,7 @@ impl GifKitApp {
             if let Some(li) = (id != GIF).then(|| self.stack.index_of(id)).flatten() {
                 for (k, key) in self.stack.layers[li].timing.keys.iter().enumerate() {
                     let c = pos2(fx(key.frame as f32), top + h / 2.0);
-                    let on = selected && self.tl_key == Some(k);
+                    let on = (selected && self.tl_key == Some(k)) || self.tl_keys.contains(&(id, key.frame));
                     let (r, fill, stroke) = (if on { 6.5 } else { 5.0 }, if on { pal.highlight } else { Color32::WHITE }, Stroke::new(1.0, Color32::from_black_alpha(160)));
                     // a hold key is square: nothing moves until the next one
                     if key.ease == Ease::Hold {
@@ -1245,6 +1256,8 @@ impl GifKitApp {
                     let id = tracks[t];
                     let spans = self.track_spans(id);
                     let multi = ui.input(|i| i.modifiers.shift || i.modifiers.command);
+                    // Alt+click takes things out of the selection
+                    let remove = ui.input(|i| i.modifiers.alt);
                     let locked = self.tl_locked(id);
                     let cy = row_top(t) + row_h(t) / 2.0;
                     // keyframes first, they sit on top
@@ -1256,39 +1269,72 @@ impl GifKitApp {
                     let before = self.tl_selected();
                     let prim = self.tl_track.zip(self.tl_clip).and_then(|(t, c)| self.track_spans(t).get(c).map(|s| (t, s.0)));
                     let was_sel = hit.is_some_and(|ci| self.tl_is_selected(id, ci, spans[ci].0));
-                    if let (true, Some(ci)) = (multi && resp.clicked() && key.is_none(), hit) {
-                        // Shift or Ctrl+click adds the clip to the selection, or takes it out
-                        let a = spans[ci].0;
-                        if prim == Some((id, a)) {
-                        } else if self.tl_sel.contains(&(id, a)) {
-                            self.tl_sel.retain(|s| *s != (id, a));
-                        } else {
-                            self.tl_sel.extend(prim);
-                            self.tl_select_track(id);
-                            self.tl_clip = Some(ci);
-                            self.tl_key = None;
+                    let key_frame = key.and_then(|k| self.stack.index_of(id).and_then(|li| self.stack.layers[li].timing.keys.get(k)).map(|k| k.frame));
+                    let key_was_sel = key.zip(key_frame).is_some_and(|(k, f)| self.tl_key_is_selected(id, k, f));
+                    if (multi || remove) && resp.clicked() && (key.is_some() || hit.is_some()) {
+                        if let (Some(k), Some(f)) = (key, key_frame) {
+                            if remove {
+                                // Alt+click: out of the selection
+                                if self.tl_track == Some(id) && self.tl_key == Some(k) {
+                                    self.tl_key = None;
+                                    self.tl_key_dropped = Some((id, f));
+                                }
+                                self.tl_keys.retain(|x| *x != (id, f));
+                            } else if !key_was_sel {
+                                // Ctrl or Shift+click: into it
+                                self.tl_keys.push((id, f));
+                            }
+                        } else if let Some(ci) = hit {
+                            let a = spans[ci].0;
+                            if remove {
+                                if prim == Some((id, a)) {
+                                    self.tl_clip = None;
+                                }
+                                self.tl_sel.retain(|s| *s != (id, a));
+                            } else if prim != Some((id, a)) && !self.tl_sel.contains(&(id, a)) {
+                                // the new one becomes the main clip; the old one stays selected
+                                self.tl_demote_key();
+                                self.tl_sel.extend(prim);
+                                self.tl_select_track(id);
+                                self.tl_clip = Some(ci);
+                                self.tl_sel.retain(|s| *s != (id, a));
+                            }
                         }
-                        self.tl_sel.retain(|s| *s != (id, a));
                         ctx.request_repaint();
                         return;
                     }
                     self.tl_select_track(id);
                     if resp.clicked() {
                         self.tl_sel.clear();
-                    } else if was_sel {
-                        // dragging one of several selected clips moves them all
+                        self.tl_keys.clear();
+                    } else if was_sel || key_was_sel {
+                        // dragging one of several selected things moves them all
                         let a = hit.map(|ci| spans[ci].0).unwrap_or(0);
-                        self.tl_sel = before.iter().filter(|c| (c.0, c.1) != (id, a)).map(|c| (c.0, c.1)).collect();
+                        if was_sel && key.is_none() {
+                            self.tl_sel = before.iter().filter(|c| (c.0, c.1) != (id, a)).map(|c| (c.0, c.1)).collect();
+                        }
                     } else {
                         self.tl_sel.clear();
+                        self.tl_keys.clear();
                     }
                     if let Some(k) = key {
                         let kf = self.stack.layers[self.stack.index_of(id).unwrap()].timing.keys[k].frame;
+                        // a selected keyframe dragged takes the other selected ones along
+                        let others: Vec<(u64, usize)> = if key_was_sel && resp.drag_started() { self.tl_selected_keys().into_iter().filter(|x| *x != (id, kf) && !self.tl_locked(x.0)).collect() } else { Vec::new() };
                         self.tl_key = Some(k);
                         self.tl_clip = None;
+                        self.tl_keys.retain(|x| *x != (id, kf));
                         self.cur = kf.min(n - 1);
                         self.playing = false;
                         if !locked {
+                            if resp.drag_started() {
+                                self.snapshot(&format!("tl-drag{now}"), now);
+                            }
+                            self.tl_key_group = others.clone();
+                            if !others.is_empty() {
+                                self.tl_key_group.push((id, kf));
+                            }
+                            self.tl_key_moved = 0;
                             self.tl_drag = Some(TlDrag { track: id, clip: 0, grab: TlGrab::Key(k), at: f, orig: (kf, kf) });
                         }
                     } else if let Some(ci) = hit {
@@ -1348,17 +1394,29 @@ impl GifKitApp {
                     } else if resp.drag_started() && !self.tl_razor {
                         // dragging on an empty part draws a selection box
                         self.tl_box = Some(p);
-                        if !multi {
+                        if !multi && !remove {
                             self.tl_clip = None;
+                            self.tl_key = None;
                             self.tl_sel.clear();
+                            self.tl_keys.clear();
                         }
                     } else {
                         // empty lane: move the playhead there
                         self.tl_clip = None;
                         self.tl_key = None;
                         self.tl_sel.clear();
+                        self.tl_keys.clear();
                         self.cur = fi;
                         self.playing = false;
+                    }
+                } else if p.y > tracks_top && resp.drag_started() && !self.tl_razor {
+                    // below the rows: a selection box too (rows full of clips have no room)
+                    self.tl_box = Some(p);
+                    if !ui.input(|i| i.modifiers.shift || i.modifiers.command || i.modifiers.alt) {
+                        self.tl_clip = None;
+                        self.tl_key = None;
+                        self.tl_sel.clear();
+                        self.tl_keys.clear();
                     }
                 }
             }
@@ -1410,6 +1468,20 @@ impl GifKitApp {
                 TlGrab::Playhead => {
                     self.cur = clamp(f.round() as i64, 0, n - 1);
                     self.playing = false;
+                }
+                TlGrab::Key(_) if !self.tl_key_group.is_empty() => {
+                    // several keyframes: the same distance each, none past the ends
+                    let group = self.tl_key_group.clone();
+                    let lo = -(group.iter().map(|g| g.1).min().unwrap_or(0) as i64);
+                    let hi = n as i64 - 1 - group.iter().map(|g| g.1).max().unwrap_or(0) as i64;
+                    let dl = delta.clamp(lo, hi);
+                    if dl != self.tl_key_moved {
+                        let at: Vec<(u64, usize)> = group.iter().map(|&(t, f)| (t, (f as i64 + self.tl_key_moved) as usize)).collect();
+                        if self.tl_move_keys(&at, dl - self.tl_key_moved) {
+                            self.tl_key_moved = dl;
+                        }
+                    }
+                    self.cur = (d.orig.0 as i64 + self.tl_key_moved).clamp(0, n as i64 - 1) as usize;
                 }
                 TlGrab::Key(k) => {
                     let nf = clamp(d.orig.0 as i64 + delta, 0, n - 1);
@@ -1542,6 +1614,7 @@ impl GifKitApp {
             if !ui.input(|i| i.pointer.primary_down()) {
                 self.tl_drag = None;
                 self.tl_snap_line = None;
+                self.tl_key_group.clear();
                 // the selection follows the clips that moved
                 if !self.tl_group.is_empty() {
                     let group = std::mem::take(&mut self.tl_group);
@@ -1595,16 +1668,54 @@ impl GifKitApp {
                 self.tl_box = None;
                 if let Some(p) = hovered_pos.or(ui.input(|i| i.pointer.interact_pos())) {
                     let r = Rect::from_two_pos(o, p);
+                    let remove = ui.input(|i| i.modifiers.alt);
                     let mut found: Vec<(u64, usize, usize)> = Vec::new();
+                    let mut keys: Vec<(u64, usize)> = Vec::new();
                     for (t, &id) in tracks.iter().enumerate() {
                         let (top, h) = (row_top(t), row_h(t));
                         if top + h < r.min.y || top > r.max.y {
                             continue;
                         }
+                        // keyframes whose diamond the box takes in
+                        if let Some(li) = (id != GIF).then(|| self.stack.index_of(id)).flatten() {
+                            let cy = top + h / 2.0;
+                            if cy >= r.min.y - 6.0 && cy <= r.max.y + 6.0 {
+                                for k in &self.stack.layers[li].timing.keys {
+                                    let x = fx(k.frame as f32);
+                                    if x >= r.min.x - 6.0 && x <= r.max.x + 6.0 {
+                                        keys.push((id, k.frame));
+                                    }
+                                }
+                            }
+                        }
+                        // clips only when the box is more than a key's width
+                        // over them, so boxing keys doesn't take their clips
+                        let keys_only = !keys.is_empty() && keys.iter().any(|k| k.0 == id);
                         for (ci, &(a, b)) in self.track_spans(id).iter().enumerate() {
-                            if fx(a as f32) <= r.max.x && fx(b as f32 + 1.0) >= r.min.x {
+                            if fx(a as f32) <= r.max.x && fx(b as f32 + 1.0) >= r.min.x && !keys_only {
                                 found.push((id, ci, a));
                             }
+                        }
+                    }
+                    if remove {
+                        // Alt: the box takes things out of the selection
+                        for (id, ci, a) in &found {
+                            if self.tl_track == Some(*id) && self.tl_clip == Some(*ci) {
+                                self.tl_clip = None;
+                            }
+                            self.tl_sel.retain(|s| *s != (*id, *a));
+                        }
+                        let main = self.tl_selected_keys().first().copied().filter(|_| self.tl_key.is_some());
+                        if main.is_some_and(|m| keys.contains(&m)) {
+                            self.tl_key = None;
+                        }
+                        self.tl_keys.retain(|k| !keys.contains(k));
+                        found.clear();
+                        keys.clear();
+                    }
+                    for k in keys {
+                        if !self.tl_keys.contains(&k) {
+                            self.tl_keys.push(k);
                         }
                     }
                     if let Some(&(id, ci, _)) = found.first() {
@@ -1785,7 +1896,7 @@ impl GifKitApp {
             if menu_item(ui, "list-add", "&Add Clip at Playhead", "", gap_here) {
                 self.tl_add_clip(now);
             }
-            if menu_item(ui, "edit-delete", if n_sel > 1 { "&Delete Clips" } else { "&Delete Clip" }, &km.text(A::TlDelete), (self.tl_clip.is_some() || self.tl_key.is_some()) && !locked) {
+            if menu_item(ui, "edit-delete", if n_sel > 1 { "&Delete Clips" } else { "&Delete Clip" }, &km.text(A::TlDelete), (self.tl_clip.is_some() || self.tl_key.is_some() || !self.tl_keys.is_empty() || !self.tl_sel.is_empty()) && !locked) {
                 self.tl_delete_selected(now);
             }
             ui.separator();
@@ -1973,6 +2084,82 @@ impl GifKitApp {
         v
     }
 
+    /// Every selected keyframe as (track, frame): the main one and the rest.
+    fn tl_selected_keys(&self) -> Vec<(u64, usize)> {
+        let mut v: Vec<(u64, usize)> = Vec::new();
+        if let (Some(k), Some(t)) = (self.tl_key, self.tl_track) {
+            if let Some(f) = self.stack.index_of(t).and_then(|li| self.stack.layers[li].timing.keys.get(k)).map(|k| k.frame) {
+                v.push((t, f));
+            }
+        }
+        for &(t, f) in &self.tl_keys {
+            let there = self.stack.index_of(t).is_some_and(|li| self.stack.layers[li].timing.key_at(f).is_some());
+            if there && !v.contains(&(t, f)) {
+                v.push((t, f));
+            }
+        }
+        v
+    }
+
+    fn tl_key_is_selected(&self, track: u64, k: usize, frame: usize) -> bool {
+        (self.tl_track == Some(track) && self.tl_key == Some(k)) || self.tl_keys.contains(&(track, frame))
+    }
+
+    /// The main keyframe joins the others (so selecting something else
+    /// keeps it selected).
+    fn tl_demote_key(&mut self) {
+        if let (Some(k), Some(t)) = (self.tl_key, self.tl_track) {
+            if let Some(f) = self.stack.index_of(t).and_then(|li| self.stack.layers[li].timing.keys.get(k)).map(|k| k.frame) {
+                if !self.tl_keys.contains(&(t, f)) {
+                    self.tl_keys.push((t, f));
+                }
+            }
+        }
+        self.tl_key = None;
+    }
+
+    /// Move the keyframes at `keys` (track, frame) `d` frames, all or none:
+    /// none past the ends or onto a keyframe that isn't moving. The
+    /// selection follows them.
+    fn tl_move_keys(&mut self, keys: &[(u64, usize)], d: i64) -> bool {
+        let n = self.plan.len() as i64;
+        if d == 0 || keys.is_empty() {
+            return d == 0;
+        }
+        if keys.iter().any(|&(_, f)| f as i64 + d < 0 || f as i64 + d >= n) {
+            return false;
+        }
+        let mut tracks: Vec<u64> = keys.iter().map(|k| k.0).collect();
+        tracks.dedup();
+        for &t in &tracks {
+            let Some(li) = self.stack.index_of(t) else { return false };
+            let moving: Vec<usize> = keys.iter().filter(|k| k.0 == t).map(|k| k.1).collect();
+            let tm = &self.stack.layers[li].timing;
+            if moving.iter().any(|&f| tm.keys.iter().any(|k| k.frame as i64 == f as i64 + d && !moving.contains(&k.frame))) {
+                return false;
+            }
+        }
+        let main = self.tl_key.zip(self.tl_track).and_then(|(k, t)| self.stack.index_of(t).and_then(|li| self.stack.layers[li].timing.keys.get(k)).map(|k| (t, k.frame)));
+        for &t in &tracks {
+            let Some(li) = self.stack.index_of(t) else { continue };
+            let moving: Vec<usize> = keys.iter().filter(|k| k.0 == t).map(|k| k.1).collect();
+            let tm = &mut self.stack.layers[li].timing;
+            // which ones first, then move them, so they never land on each other
+            let idx: Vec<usize> = tm.keys.iter().enumerate().filter(|(_, k)| moving.contains(&k.frame)).map(|(i, _)| i).collect();
+            for i in idx {
+                tm.keys[i].frame = (tm.keys[i].frame as i64 + d) as usize;
+            }
+            tm.sort_keys();
+        }
+        let mv = |(t, f): (u64, usize)| if keys.contains(&(t, f)) { (t, (f as i64 + d) as usize) } else { (t, f) };
+        self.tl_keys = self.tl_keys.iter().map(|&k| mv(k)).collect();
+        if let Some((t, f)) = main.map(mv) {
+            self.tl_key = self.stack.index_of(t).and_then(|li| self.stack.layers[li].timing.key_at(f));
+        }
+        self.modified = true;
+        true
+    }
+
     fn tl_is_selected(&self, track: u64, ci: usize, a: usize) -> bool {
         (self.tl_track == Some(track) && self.tl_clip == Some(ci)) || self.tl_sel.contains(&(track, a))
     }
@@ -1985,6 +2172,22 @@ impl GifKitApp {
     /// Delete every selected clip (the GIF's skip their frames).
     pub(super) fn tl_delete_selected(&mut self, now: f64) {
         let sel = self.tl_selected();
+        let keys: Vec<(u64, usize)> = self.tl_selected_keys().into_iter().filter(|k| !self.tl_locked(k.0)).collect();
+        if !keys.is_empty() && (keys.len() > 1 || !sel.is_empty() || self.tl_key.is_none()) {
+            // keyframes (and any clips) together
+            self.snapshot(&format!("tl-del{now}"), now);
+            for (t, f) in keys {
+                if let Some(li) = self.stack.index_of(t) {
+                    self.stack.layers[li].timing.keys.retain(|k| k.frame != f);
+                }
+            }
+            self.tl_key = None;
+            self.tl_keys.clear();
+            self.modified = true;
+            if sel.is_empty() {
+                return;
+            }
+        }
         if sel.len() < 2 {
             self.tl_delete(now);
             return;
@@ -2138,6 +2341,15 @@ impl GifKitApp {
     /// Alt+arrows: the selected clips (or keyframe) a frame earlier or later.
     fn tl_nudge(&mut self, d: i64, now: f64) {
         let n = self.plan.len();
+        // several keyframes: all of them, or none
+        let keys: Vec<(u64, usize)> = self.tl_selected_keys().into_iter().filter(|k| !self.tl_locked(k.0)).collect();
+        if keys.len() > 1 {
+            self.snapshot(&format!("tl-drag{now}"), now);
+            if self.tl_move_keys(&keys, d) {
+                self.cur = (self.cur as i64 + d).clamp(0, n as i64 - 1) as usize;
+            }
+            return;
+        }
         if let (Some(k), Some(t)) = (self.tl_key, self.tl_track.filter(|t| !self.tl_locked(*t))) {
             if let Some(li) = self.stack.index_of(t) {
                 let tm = &mut self.stack.layers[li].timing;
@@ -2277,6 +2489,37 @@ impl GifKitApp {
         pts.into_iter().filter(|p| !skip.contains(p)).map(|p| (p, (p as f32 - pos).abs())).filter(|(_, d)| *d <= thr).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(p, _)| p)
     }
 
+
+    /// The last frame any clip covers: the GIF's clips, and layer clips with
+    /// an end of their own (ones that run to the end follow the length).
+    pub(super) fn tl_last_clip_end(&self) -> Option<usize> {
+        let mut last = self.gif_runs().iter().map(|r| r.1).max();
+        let n = self.plan.len();
+        for l in &self.stack.layers {
+            if let Some(cl) = &l.timing.clips {
+                for c in cl {
+                    let e = match c.end {
+                        Some(e) => e,
+                        // a clip that starts later than everything still counts from its start
+                        None => c.start,
+                    };
+                    last = Some(last.map_or(e, |x: usize| x.max(e)));
+                }
+            }
+        }
+        last.map(|l| l.min(n.saturating_sub(1)))
+    }
+
+    /// Shorten the animation to where its last clip ends.
+    pub(super) fn tl_trim_to_last(&mut self, now: f64) {
+        let Some(e) = self.tl_last_clip_end() else { return };
+        if e + 1 >= self.gif_edit_len() {
+            self.info("Nothing after the last clip to trim");
+            return;
+        }
+        self.snapshot(&format!("tl-trimend{now}"), now);
+        self.tl_cut(0, e);
+    }
 
     /// Keep only output frames `a..=b`: the Cut edit takes the rest off, and
     /// layers move with the frames so they stay where they were.

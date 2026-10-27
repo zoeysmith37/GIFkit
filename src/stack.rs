@@ -1323,6 +1323,30 @@ impl Stack {
     }
 
     /// Bake the stack into a new animation.
+/// What to export of the timeline: only output frames `range` (the in and
+    /// out points), and whether see-through frames at the end are left off.
+    /// Also gives back when (seconds) the exported part starts and ends.
+    pub fn flatten_for_export(&self, base: &Animation, fonts: &[FontEntry], progress: Option<&AtomicUsize>, range: Option<(usize, usize)>, cut_empty: bool) -> (Animation, (f32, f32)) {
+        let plan = self.plan(base);
+        let times = plan_times(&plan);
+        let n = plan.len();
+        let (a, b) = range.map(|(a, b)| (a.min(n.saturating_sub(1)), b.min(n.saturating_sub(1)))).unwrap_or((0, n.saturating_sub(1)));
+        let prep = self.prepare(base, fonts);
+        let idx: Vec<usize> = (a..=b.max(a)).collect();
+        let frames = self.render_frames(base, &plan, &times, &idx, fonts, &prep, progress);
+        let mut out = Animation { frames, loop_count: self.loop_count(base) };
+        effects::normalize_sizes(&mut out);
+        if cut_empty {
+            // nothing to see at the end (a clip shortened, a gap left): it goes
+            while out.frames.len() > 1 && out.frames.last().is_some_and(|f| !f.enabled || f.image.is_fully_transparent()) {
+                out.frames.pop();
+            }
+        }
+        let start = times.get(a).copied().unwrap_or(0.0);
+        let d = out.duration_secs();
+        (out, (start, start + d))
+    }
+
     pub fn flatten(&self, base: &Animation, fonts: &[FontEntry], progress: Option<&AtomicUsize>) -> Animation {
         let plan = self.plan(base);
         let times = plan_times(&plan);

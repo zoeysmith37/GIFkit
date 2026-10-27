@@ -106,6 +106,14 @@ impl Pixels {
         }
     }
 
+    /// Is every pixel fully see-through? Packed frames answer from their palette.
+    pub fn is_fully_transparent(&self) -> bool {
+        match &self.0.store {
+            Store::Indexed { palette, .. } => palette.iter().all(|c| c[3] == 0),
+            _ => self.get().pixels().all(|p| p[3] == 0),
+        }
+    }
+
     /// Each colour (RGBA) and how many pixels have it. Packed frames count
     /// their palette indices instead of unpacking.
     pub fn colour_counts(&self, mut f: impl FnMut([u8; 4], u64)) {

@@ -120,7 +120,7 @@ impl VideoImport {
     pub fn defaults(info: &VideoInfo) -> Self {
         // the fastest exact GIF rate that isn't above the source
         let delay_cs = VIDEO_DELAYS.into_iter().find(|d| 100.0 / *d as f64 <= info.fps + 0.01).unwrap_or(10);
-        Self { start: 0.0, end: info.duration, delay_cs, max_side: VIDEO_MAX_SIDE, merge: 1 }
+        Self { start: 0.0, end: info.duration, delay_cs, max_side: VIDEO_MAX_SIDE, merge: 0 }
     }
 
     /// Output frame size (even numbers, as video scalers need).

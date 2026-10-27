@@ -289,6 +289,9 @@ struct CmpResult {
     size: u64,
     /// the frames' real size (big results are shrunk for the screen)
     full: (u32, u32),
+    /// when (seconds) the exported part starts and ends: the in and out
+    /// points, less see-through frames cut off the end
+    span: (f32, f32),
 }
 
 impl CmpResult {
@@ -303,8 +306,13 @@ impl CmpResult {
                 let at: u32 = s[..j].iter().filter_map(|&i| plan.get(i)).map(|f| effective_delay(f.delay) as u32).sum();
                 stack::frame_at_time(&self.anim, at as f32 / 100.0 + 0.001)
             }
-            None => stack::frame_at_time(&self.anim, t),
+            None => stack::frame_at_time(&self.anim, (t - self.span.0).max(0.0)),
         }
+    }
+
+    /// Is time `t` (seconds) in what's exported?
+    fn covers(&self, t: f32) -> bool {
+        self.sample.is_some() || (t + 1e-4 >= self.span.0 && t < self.span.1 - 1e-4)
     }
 
     fn size_text(&self) -> String {
@@ -322,7 +330,7 @@ struct CmpJob {
     sheet: bool,
     /// set to stop it (an edit made it out of date)
     stop: Arc<AtomicUsize>,
-    rx: Receiver<anyhow::Result<(Animation, Vec<u8>, Option<Vec<usize>>, u64, (u32, u32))>>,
+    rx: Receiver<anyhow::Result<(Animation, Vec<u8>, Option<Vec<usize>>, u64, (u32, u32), (f32, f32))>>,
 }
 
 struct Prerender {
@@ -932,6 +940,19 @@ pub struct GifKitApp {
     tl_menu_head: Option<u64>,
     /// more selected clips besides the main one, as (track, first frame)
     tl_sel: Vec<(u64, usize)>,
+    /// export: leave see-through frames at the end off, and only the part
+    /// between the in and out points
+    export_cut_empty: bool,
+    export_zone_only: bool,
+    /// keyframes selected besides the main one: (track, frame)
+    tl_keys: Vec<(u64, usize)>,
+    /// a keyframe Alt+clicked out of the selection while the playhead is on
+    /// it: (track, frame), until the playhead moves
+    tl_key_dropped: Option<(u64, usize)>,
+    /// keyframes moving together: (track, frame when the drag began), and
+    /// how far they've moved
+    tl_key_group: Vec<(u64, usize)>,
+    tl_key_moved: i64,
     /// clips moving together: (track, clip index, first, last) when the drag began
     tl_group: Vec<(u64, usize, usize, usize)>,
     /// a rubber band selection started here
@@ -2794,6 +2815,12 @@ impl GifKitApp {
             tl_drop: None,
             tl_menu_head: None,
             tl_sel: Vec::new(),
+            export_cut_empty: theme::get_setting("export_cut_empty").as_deref() != Some("0"),
+            export_zone_only: false,
+            tl_keys: Vec::new(),
+            tl_key_dropped: None,
+            tl_key_group: Vec::new(),
+            tl_key_moved: 0,
             tl_group: Vec::new(),
             tl_box: None,
             tl_board: None,
@@ -2978,9 +3005,10 @@ impl GifKitApp {
         let Some(base) = self.base.clone() else { return };
         let stack = self.stack.clone();
         let fonts = self.fonts.clone();
-        let total = self.plan.len() * 2;
+        let (range, cut_empty) = self.export_trim();
+        let total = range.map(|(a, b)| b + 1 - a).unwrap_or(self.plan.len()) * 2;
         self.spawn(ctx, label, total, move |p| {
-            let out = stack.flatten(&base, &fonts, Some(p));
+            let (out, _) = stack.flatten_for_export(&base, &fonts, Some(p), range, cut_empty);
             JobOutput::Info(f(&out, p))
         });
     }
@@ -3374,6 +3402,24 @@ impl GifKitApp {
     fn save_options_ui(&mut self, ui: &mut egui::Ui) {
         let noai_tip = "Marks the file as not for AI training. Adds a “noai” note and the standard XMP “data mining prohibited” field where the format allows it. Some sites and scrapers respect it.";
         egui::Grid::new("saveopts").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+            ui.label("Frames:");
+            ui.vertical(|ui| {
+                if check(ui, &mut self.export_cut_empty, "Cut empty end frames").on_hover_text("Frames at the end with nothing to see (fully see-through) are left out, so a shortened clip doesn't save a long empty stretch").changed() {
+                    theme::set_setting("export_cut_empty", if self.export_cut_empty { "1" } else { "0" });
+                }
+                match self.tl_zone() {
+                    Some((a, b)) => {
+                        check(ui, &mut self.export_zone_only, &format!("Only In to Out (frames {}–{})", a + 1, b + 1)).on_hover_text("Save only the part between the timeline's in and out points");
+                    }
+                    None => {
+                        ui.add_enabled_ui(false, |ui| {
+                            let mut off = false;
+                            check(ui, &mut off, "Only In to Out").on_disabled_hover_text("Set in and out points on the timeline first (I and O)");
+                        });
+                    }
+                }
+            });
+            ui.end_row();
             if self.export_fmt.can_tag() {
                 ui.label("Tag:");
                 check(ui, &mut self.gif_opts.noai_tag, "Add “noai” tag").on_hover_text(noai_tip);
@@ -5185,11 +5231,22 @@ impl GifKitApp {
         let (base, orig) = (self.base.as_ref()?, self.original.as_ref()?);
         let same = base.len() == orig.len() && base.frames.iter().zip(&orig.frames).all(|(a, b)| a.enabled && !a.blank && crate::pixels::Pixels::ptr_eq(&a.image, &b.image) && a.delay_cs == b.delay_cs);
         let plain = self.stack.layers.iter().all(|l| !l.visible) && self.stack.transform.is_identity() && self.stack.loop_count(base) == orig.loop_count;
+        // the in and out points, or see-through frames at the end, change it
+        let (range, cut) = self.export_trim();
+        let trimmed = range.is_some() || (cut && base.frames.iter().rev().find(|f| f.enabled).is_some_and(|f| f.image.is_fully_transparent()));
+        let plain = plain && !trimmed;
         (same && plain).then(|| path.clone())
     }
 
+    /// What export leaves out: everything outside the in and out points
+    /// (when asked), and see-through frames at the end (when asked).
+    fn export_trim(&self) -> (Option<(usize, usize)>, bool) {
+        (self.tl_zone().filter(|_| self.export_zone_only), self.export_cut_empty)
+    }
+
     fn cmp_key(&self) -> u64 {
-        hash_parts(&[self.stack.signature(), self.version, self.timing_rev, hash_str(&format!("{:?}", self.preview_format())), self.stack.plan_signature()])
+        let (range, cut) = self.export_trim();
+        hash_parts(&[self.stack.signature(), self.version, self.timing_rev, hash_str(&format!("{:?}{range:?}{cut}", self.preview_format())), self.stack.plan_signature()])
     }
 
     /// The output format the compressed preview shows (shared with Export).
@@ -5235,9 +5292,9 @@ impl GifKitApp {
                     let (key, sheet, j_stop) = (j.key, j.sheet, j.stop.clone());
                     self.cmp_job = None;
                     match res {
-                        Ok((anim, bytes, sample, size, full)) => {
+                        Ok((anim, bytes, sample, size, full, span)) => {
                             self.cmp_gen += 1;
-                            self.cmp = Some(CmpResult { key, sheet, anim, bytes: Arc::new(bytes), gen: self.cmp_gen, sample, size, full });
+                            self.cmp = Some(CmpResult { key, sheet, anim, bytes: Arc::new(bytes), gen: self.cmp_gen, sample, size, full, span });
                         }
                         Err(e) if stack::stopped(Some(&j_stop)) => {
                             let _ = e;
@@ -5293,7 +5350,8 @@ impl GifKitApp {
                         orig
                     };
                     let n = b.len() as u64;
-                    (anim, b, None, n, full)
+                    let d = anim.duration_secs();
+                    (anim, b, None, n, full, (0.0, d))
                 });
                 let _ = tx.send(res);
                 ctx2.request_repaint();
@@ -5313,7 +5371,9 @@ impl GifKitApp {
         let pixels = n as u64 * os.x as u64 * os.y as u64;
         // only frames that are shown: skipped ones are left out of the file, so
         // sampling them would leave the preview with gaps
-        let shown: Vec<usize> = (0..n).filter(|&i| self.plan[i].enabled).collect();
+        let (range, cut_empty) = self.export_trim();
+        let (ra, rb) = range.unwrap_or((0, n.saturating_sub(1)));
+        let shown: Vec<usize> = (ra..=rb.min(n.saturating_sub(1))).filter(|&i| self.plan[i].enabled).collect();
         let sample: Option<Vec<usize>> = (self.sample_preview && !is_sheet && self.cmp_full_key != key && pixels > SAMPLE_PIXELS && shown.len() > 60).then(|| {
             const RUNS: usize = 6;
             const LEN: usize = 8;
@@ -5334,8 +5394,13 @@ impl GifKitApp {
             let stop = Some(&*stop2);
             let res = stack::bg_pool().install(|| {
                 let t0 = std::time::Instant::now();
+                let mut span = (0.0f32, 0.0f32);
                 let out = match &sample {
-                    None => stack.flatten(&base, &fonts, stop),
+                    None => {
+                        let (a, s) = stack.flatten_for_export(&base, &fonts, stop, range, cut_empty);
+                        span = s;
+                        a
+                    }
                     Some(idx) => {
                         let plan = stack.plan(&base);
                         let times = stack::plan_times(&plan);
@@ -5371,12 +5436,12 @@ impl GifKitApp {
                     None => bytes.len() as u64,
                     Some(_) => {
                         let plan = stack.plan(&base);
-                        let total: u64 = plan.iter().filter(|f| f.enabled).map(|f| f.delay.max(1) as u64).sum();
+                        let total: u64 = plan.iter().enumerate().filter(|(i, f)| f.enabled && range.is_none_or(|(a, b)| *i >= a && *i <= b)).map(|(_, f)| f.delay.max(1) as u64).sum();
                         let part: u64 = out.frames.iter().filter(|f| f.enabled).map(|f| f.delay_cs.max(1) as u64).sum();
                         (bytes.len() as f64 * total as f64 / part.max(1) as f64) as u64
                     }
                 };
-                Ok((anim, bytes, sample, size, full))
+                Ok((anim, bytes, sample, size, full, span))
             });
             let _ = tx.send(res);
             ctx2.request_repaint();
@@ -7444,8 +7509,11 @@ impl GifKitApp {
                             }
                         }
                         let (w, h) = (self.out_size.0 as u32, self.out_size.1 as u32);
-                        let n = self.plan.iter().filter(|f| f.enabled).count();
-                        let dur: f32 = self.plan.iter().filter(|f| f.enabled).map(|f| effective_delay(f.delay) as f32 / 100.0).sum();
+                        // what's saved: the in to out part when that's asked for
+                        let (ra, rb) = self.export_trim().0.unwrap_or((0, self.plan.len().saturating_sub(1)));
+                        let part = || self.plan.iter().enumerate().filter(move |(i, f)| f.enabled && *i >= ra && *i <= rb).map(|(_, f)| f);
+                        let n = part().count();
+                        let dur: f32 = part().map(|f| effective_delay(f.delay) as f32 / 100.0).sum();
                         let dims = match self.export_fmt {
                             ExportFormat::Sheet => format!("{n} frames of {w}×{h} on one sheet"),
                             ExportFormat::Frames => format!("{n} files of {w}×{h}"),
@@ -8456,10 +8524,13 @@ impl GifKitApp {
                 // a sampled estimate only has a few stretches of frames: elsewhere
                 // the edit shows, rather than the nearest sampled frame jumping about
                 let outside = fresh && self.cmp.as_ref().and_then(|c| c.sample.as_ref()).is_some_and(|s| !s.contains(&self.cur));
-                if outside {
+                let t_now = self.play_time();
+                let not_saved = fresh && self.cmp.as_ref().is_some_and(|c| !c.covers(t_now));
+                if outside || not_saved {
                     let tex = self.composite_texture(ctx, self.cur);
                     let size = self.true_out_size();
-                    let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, Some(("Not in the size sample · showing the edit".into(), Color32::from_gray(225))), None, false);
+                    let note = if not_saved { "Not exported · showing the edit" } else { "Not in the size sample · showing the edit" };
+                    let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, Some((note.into(), Color32::from_gray(225))), None, false);
                     if !crop_mode {
                         self.canvas_interaction(ui, &resp, m, (size.x, size.y), Space::Output, vi);
                     }

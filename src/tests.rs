@@ -1452,3 +1452,26 @@ fn split_holds_save_back_as_one() {
         assert!((back.duration_secs() - a.duration_secs()).abs() < 0.02, "{name}");
     }
 }
+
+/// Export can leave off see-through frames at the end, and save only the
+/// in to out part.
+#[test]
+fn export_trims_empty_end_and_range() {
+    let solid = image::RgbaImage::from_pixel(20, 10, image::Rgba([200, 30, 30, 255]));
+    let clear = image::RgbaImage::new(20, 10);
+    let mut frames: Vec<Frame> = (0..6).map(|_| Frame::new(solid.clone(), 5)).collect();
+    frames.extend((0..4).map(|_| Frame::new(clear.clone(), 5)));
+    let a = Animation { frames, loop_count: None };
+    let st = crate::stack::Stack::default();
+    let (all, _) = st.flatten_for_export(&a, &[], None, None, false);
+    assert_eq!(all.len(), 10);
+    let (cut, span) = st.flatten_for_export(&a, &[], None, None, true);
+    assert_eq!(cut.len(), 6);
+    assert!((span.1 - 0.30).abs() < 1e-4);
+    let (part, span) = st.flatten_for_export(&a, &[], None, Some((2, 4)), true);
+    assert_eq!(part.len(), 3);
+    assert!((span.0 - 0.10).abs() < 1e-4 && (span.1 - 0.25).abs() < 1e-4);
+    // all see-through: one frame stays
+    let (one, _) = st.flatten_for_export(&a, &[], None, Some((7, 9)), true);
+    assert_eq!(one.len(), 1);
+}
