@@ -1413,7 +1413,7 @@ impl Stack {
                 if let Some(p) = progress {
                     p.fetch_add(1, Ordering::Relaxed);
                 }
-                Frame { image, delay_cs: plan[i].delay, enabled: plan[i].enabled, cut: false, blank: false }
+                Frame { image, delay_cs: plan[i].delay, enabled: plan[i].enabled, cut: false, blank: false, trim: 0 }
             })
             .collect()
     }
@@ -1465,7 +1465,7 @@ impl Stack {
                 if let Some(p) = progress {
                     p.fetch_add(1, Ordering::Relaxed);
                 }
-                out.push(Frame { image, delay_cs: plan[i].delay, enabled: plan[i].enabled, cut: false, blank: false });
+                out.push(Frame { image, delay_cs: plan[i].delay, enabled: plan[i].enabled, cut: false, blank: false, trim: 0 });
             }
         }
         Some(out)

@@ -1113,7 +1113,7 @@ fn timeline_bits_round_trip() {
     use crate::timeline::{Ease, Key, Marker};
     let mut f = ProjectFile::default();
     f.markers = vec![Marker { frame: 4, label: "Intro".into() }];
-    f.frames = vec![FrameMeta { delay: 5, enabled: true, cut: false, blank: false }, FrameMeta { delay: 5, enabled: true, cut: true, blank: true }];
+    f.frames = vec![FrameMeta { delay: 5, enabled: true, cut: false, blank: false, trim: 0 }, FrameMeta { delay: 5, enabled: true, cut: true, blank: true, trim: 0 }];
     let json = serde_json::to_string(&f).unwrap();
     let back: ProjectFile = serde_json::from_str(&json).unwrap();
     assert_eq!(back.markers, f.markers);

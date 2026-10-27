@@ -382,7 +382,7 @@ pub fn crossfade(anim: &Animation, steps: usize, wrap: bool) -> Animation {
         out.push(base);
         for s in 1..=steps {
             let t = s as f32 / (steps + 1) as f32;
-            out.push(Frame { image: crate::pixels::Pixels::new(lerp_image(&f.image.get(), &next.image.get(), t)), delay_cs: d, enabled: f.enabled, cut: false, blank: false });
+            out.push(Frame { image: crate::pixels::Pixels::new(lerp_image(&f.image.get(), &next.image.get(), t)), delay_cs: d, enabled: f.enabled, cut: false, blank: false, trim: 0 });
         }
     }
     Animation { frames: out, loop_count: anim.loop_count }
@@ -403,7 +403,7 @@ pub fn loop_crossfade(anim: &Animation, n: usize) -> Animation {
             // from the end's frame towards the start's
             let end = &anim.frames[l - n + i];
             let t = (i as f32 + 0.5) / n as f32;
-            out.push(Frame { image: crate::pixels::Pixels::new(lerp_image(&end.image.get(), &f.image.get(), t)), delay_cs: f.delay_cs, enabled: f.enabled, cut: f.cut, blank: false });
+            out.push(Frame { image: crate::pixels::Pixels::new(lerp_image(&end.image.get(), &f.image.get(), t)), delay_cs: f.delay_cs, enabled: f.enabled, cut: f.cut, blank: false, trim: 0 });
         } else {
             out.push(f.clone());
         }

@@ -36,6 +36,13 @@ pub struct FrameMeta {
     /// a gap on the GIF track (shows nothing)
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub blank: bool,
+    /// a trimmed GIF frame kept behind a clip edge
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub trim: u8,
+}
+
+fn is_zero(v: &u8) -> bool {
+    *v == 0
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -133,7 +140,7 @@ fn png(img: &RgbaImage) -> Result<Vec<u8>> {
 }
 
 fn meta(a: &Animation) -> Vec<FrameMeta> {
-    a.frames.iter().map(|f| FrameMeta { delay: f.delay_cs, enabled: f.enabled, cut: f.cut, blank: f.blank }).collect()
+    a.frames.iter().map(|f| FrameMeta { delay: f.delay_cs, enabled: f.enabled, cut: f.cut, blank: f.blank, trim: f.trim }).collect()
 }
 
 /// Write a project. `images` are the frames of image layers and watermark
@@ -228,7 +235,7 @@ pub fn load(path: &Path) -> Result<Project> {
             .enumerate()
             .map(|(i, m)| {
                 let img = decoded.remove(&format!("{dir}/{i:05}.png")).with_context(|| format!("{dir}/{i:05}.png is missing"))?;
-                Ok(Frame { image: crate::pixels::Pixels::new(img), delay_cs: m.delay, enabled: m.enabled, cut: m.cut, blank: m.blank })
+                Ok(Frame { image: crate::pixels::Pixels::new(img), delay_cs: m.delay, enabled: m.enabled, cut: m.cut, blank: m.blank, trim: m.trim })
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Animation { frames, loop_count })

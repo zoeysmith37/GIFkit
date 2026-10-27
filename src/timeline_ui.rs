@@ -127,32 +127,47 @@ fn free_slot(spans: &[(usize, usize)], len: usize, want: usize, n: usize, after:
 }
 
 /// The GIF's frames (as shown) with clip `a..=b` of `d0` given new edges
-/// `na..=nb`: what it gives up becomes a gap, and the gap it's pulled into
-/// fills by holding its end, playing it again or stretching it.
+/// `na..=nb`. What it gives up becomes a gap that keeps its frames, so
+/// pulling the edge back out brings them back. Past those, the gap it's
+/// pulled into fills by holding its end, playing it again or stretching it.
 fn gif_edge_fill(d0: &[crate::anim::Frame], (a, b): (usize, usize), (na, nb): (usize, usize), how: Extend) -> Vec<crate::anim::Frame> {
     let mut d = d0.to_vec();
-    if b >= d.len() || nb >= d.len() || na > nb {
+    if b >= d.len() || nb >= d.len() || na > nb || a > b {
         return d;
     }
-    for i in a..=b {
+    // the clip with the frames trimmed off its ends
+    let mut lo = a;
+    while lo > 0 && d0[lo - 1].blank && d0[lo - 1].trim == 2 {
+        lo -= 1;
+    }
+    let mut hi = b;
+    while hi + 1 < d0.len() && d0[hi + 1].blank && d0[hi + 1].trim == 1 {
+        hi += 1;
+    }
+    let full: Vec<crate::anim::Frame> = d0[lo..=hi].iter().map(|f| crate::anim::Frame { cut: false, blank: false, enabled: true, trim: 0, ..f.clone() }).collect();
+    for i in lo..=hi {
         if i < na || i > nb {
             d[i].blank = true;
+            d[i].trim = if i < na { 2 } else { 1 };
         }
     }
-    let clip = &d0[a..=b];
-    let len = clip.len();
-    if na < a || nb > b {
+    let len = full.len();
+    if na < lo || nb > hi {
         let total = nb + 1 - na;
-        // the part of the clip that stays, for stretching
-        let (k0, k1) = (na.max(a) - a, nb.min(b) - a);
+        // the part that stays, for stretching
+        let (k0, k1) = (na.max(lo) - lo, nb.min(hi) - lo);
         for j in 0..total {
-            let pos = na as i64 + j as i64 - a as i64;
+            let pos = na as i64 + j as i64 - lo as i64;
             let src = match how {
-                Extend::Hold => &clip[pos.clamp(0, len as i64 - 1) as usize],
-                Extend::Loop => &clip[pos.rem_euclid(len as i64) as usize],
-                Extend::Stretch => &clip[k0 + j * (k1 + 1 - k0) / total],
+                Extend::Hold => &full[pos.clamp(0, len as i64 - 1) as usize],
+                Extend::Loop => &full[pos.rem_euclid(len as i64) as usize],
+                Extend::Stretch => &full[k0 + j * (k1 + 1 - k0) / total],
             };
-            d[na + j] = crate::anim::Frame { cut: false, blank: false, enabled: true, ..src.clone() };
+            d[na + j] = src.clone();
+        }
+    } else {
+        for i in na..=nb {
+            d[i] = crate::anim::Frame { cut: false, ..full[i - lo].clone() };
         }
     }
     d[na].cut = true;
@@ -160,6 +175,19 @@ fn gif_edge_fill(d0: &[crate::anim::Frame], (a, b): (usize, usize), (na, nb): (u
         f.cut = true;
     }
     d
+}
+
+/// GIF frames into the other order: trimmed frames swap which side of a
+/// clip they belong to.
+fn flip(d: &mut [crate::anim::Frame]) {
+    d.reverse();
+    for f in d {
+        f.trim = match f.trim {
+            1 => 2,
+            2 => 1,
+            t => t,
+        };
+    }
 }
 
 /// How one GIF clip goes into the next.
@@ -244,8 +272,25 @@ impl GifKitApp {
         for i in a..=b.min(self.plan.len().saturating_sub(1)) {
             let f = &mut base.frames[self.plan[i].src];
             f.blank = !on;
+            f.trim = 0;
             if on {
                 f.enabled = true;
+            }
+        }
+        if !on {
+            // a clip taken out takes the frames trimmed off it too
+            let t = &self.stack.transform;
+            let (tail, head) = if t.play_on && t.reverse { (2, 1) } else { (1, 2) };
+            let n = self.plan.len();
+            let mut i = b + 1;
+            while i < n && base.frames[self.plan[i].src].blank && base.frames[self.plan[i].src].trim == tail {
+                base.frames[self.plan[i].src].trim = 0;
+                i += 1;
+            }
+            let mut i = a;
+            while i > 0 && base.frames[self.plan[i - 1].src].blank && base.frames[self.plan[i - 1].src].trim == head {
+                base.frames[self.plan[i - 1].src].trim = 0;
+                i -= 1;
             }
         }
         self.timing_rev += 1;
@@ -985,6 +1030,28 @@ impl GifKitApp {
             let col = picked.map(|c| Color32::from_rgb(c[0], c[1], c[2])).unwrap_or_else(|| kind.map(kind_colour).unwrap_or(pal.highlight));
             let spans = self.track_spans(id);
             let lp = tp.with_clip_rect(track_clip.intersect(lane));
+            if id == GIF {
+                // frames trimmed off a clip, faint: pulling its edge brings them back
+                if let Some(base) = &self.base {
+                    let kept = |i: usize| self.plan.get(i).and_then(|p| base.frames.get(p.src)).is_some_and(|f| f.blank && f.trim != 0);
+                    let edit = self.gif_edit_len();
+                    let mut i = 0;
+                    while i < edit {
+                        if kept(i) {
+                            let s = i;
+                            while i + 1 < edit && kept(i + 1) {
+                                i += 1;
+                            }
+                            let r = Rect::from_min_max(pos2(fx(s as f32), top + 6.0), pos2(fx(i as f32 + 1.0), top + h - 6.0));
+                            if r.max.x >= lane.min.x && r.min.x <= lane.max.x {
+                                lp.rect_filled(r, 2.0, mix(pal.view, col, 0.2));
+                                lp.rect_stroke(r, 2.0, Stroke::new(1.0, mix(pal.view, col, 0.45)), egui::StrokeKind::Inside);
+                            }
+                        }
+                        i += 1;
+                    }
+                }
+            }
             for (ci, &(a, b)) in spans.iter().enumerate() {
                 let r = Rect::from_min_max(pos2(fx(a as f32), top + 3.0), pos2(fx(b as f32 + 1.0), top + h - 3.0));
                 if r.max.x < lane.min.x || r.min.x > lane.max.x {
@@ -2687,9 +2754,17 @@ impl GifKitApp {
         let len = block.len();
         for f in &mut d[a..=b] {
             f.blank = true;
+            f.trim = 0;
+        }
+        // frames trimmed off it stay behind as a plain gap
+        for f in d[b + 1..].iter_mut().take_while(|f| f.blank && f.trim == 1) {
+            f.trim = 0;
+        }
+        for f in d[..a].iter_mut().rev().take_while(|f| f.blank && f.trim == 2) {
+            f.trim = 0;
         }
         for (j, f) in block.into_iter().enumerate() {
-            d[w + j] = crate::anim::Frame { blank: false, enabled: true, cut: j == 0, ..f };
+            d[w + j] = crate::anim::Frame { blank: false, enabled: true, cut: j == 0, trim: 0, ..f };
         }
         if let Some(f) = d.get_mut(w + len) {
             f.cut = true;
@@ -2785,6 +2860,7 @@ impl GifKitApp {
         for f in &mut frames {
             f.blank = false;
             f.enabled = true;
+            f.trim = 0;
         }
         // into a gap: they fill it, and only what doesn't fit pushes on
         let gap = |f: &crate::anim::Frame| f.blank || !f.enabled;
@@ -2942,7 +3018,7 @@ impl GifKitApp {
         let mut d: Vec<crate::anim::Frame> = base.frames[s..=e].to_vec();
         let t = &self.stack.transform;
         if t.play_on && t.reverse {
-            d.reverse();
+            flip(&mut d);
         }
         Some((s, e, d))
     }
@@ -2954,7 +3030,7 @@ impl GifKitApp {
         let old_n = self.plan.len();
         let t = &self.stack.transform;
         if t.play_on && t.reverse {
-            d.reverse();
+            flip(&mut d);
         }
         let len = d.len();
         let Some(base) = self.base.as_mut() else { return };
@@ -3078,6 +3154,27 @@ mod tests {
         let d = fr("g g g 4 5");
         assert_eq!(show(&gif_edge_fill(&d, (3, 4), (1, 4), Extend::Hold)), "g |4 4 4 5");
         assert_eq!(show(&gif_edge_fill(&d, (3, 4), (0, 4), Extend::Loop)), "|5 4 5 4 5");
+    }
+
+    #[test]
+    fn trimmed_frames_come_back() {
+        let d = fr("1 2 3 g g 8");
+        // the end trimmed, then pulled out again in a later drag
+        let t = gif_edge_fill(&d, (0, 2), (0, 0), Extend::Hold);
+        assert_eq!(show(&t), "|1 g g g g 8");
+        assert_eq!(show(&gif_edge_fill(&t, (0, 0), (0, 1), Extend::Hold)), "|1 2 g g g 8");
+        assert_eq!(show(&gif_edge_fill(&t, (0, 0), (0, 3), Extend::Hold)), "|1 2 3 3 g 8");
+        assert_eq!(show(&gif_edge_fill(&t, (0, 0), (0, 4), Extend::Loop)), "|1 2 3 1 2 |8");
+        // the start trimmed, then pulled back
+        let d = fr("g 1 2 3 4");
+        let t = gif_edge_fill(&d, (1, 4), (3, 4), Extend::Hold);
+        assert_eq!(show(&t), "g g g |3 4");
+        assert_eq!(show(&gif_edge_fill(&t, (3, 4), (1, 4), Extend::Hold)), "g |1 2 3 4");
+        assert_eq!(show(&gif_edge_fill(&t, (3, 4), (0, 4), Extend::Hold)), "|1 1 2 3 4");
+        // the order flipped: the kept frames change sides with it
+        let mut f = t.clone();
+        flip(&mut f);
+        assert_eq!(show(&gif_edge_fill(&f, (0, 1), (0, 3), Extend::Hold)), "|4 3 2 1 g");
     }
 
     #[test]

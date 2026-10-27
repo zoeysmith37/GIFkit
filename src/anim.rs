@@ -18,14 +18,18 @@ pub struct Frame {
     pub cut: bool,
     /// A gap on the GIF track: plays for its delay but shows nothing.
     pub blank: bool,
+    /// A gap frame trimmed off a GIF clip, kept so pulling the edge back
+    /// brings it back: 1 = off the end of the clip before, 2 = off the start
+    /// of the clip after (in the order the timeline shows).
+    pub trim: u8,
 }
 
 impl Frame {
     pub fn new(image: RgbaImage, delay_cs: u16) -> Self {
-        Self { image: Pixels::new(image), delay_cs, enabled: true, cut: false, blank: false }
+        Self { image: Pixels::new(image), delay_cs, enabled: true, cut: false, blank: false, trim: 0 }
     }
     pub fn with_image(&self, image: RgbaImage) -> Self {
-        Self { image: Pixels::new(image), delay_cs: self.delay_cs, enabled: self.enabled, cut: self.cut, blank: self.blank }
+        Self { image: Pixels::new(image), delay_cs: self.delay_cs, enabled: self.enabled, cut: self.cut, blank: self.blank, trim: self.trim }
     }
 }
 

@@ -890,7 +890,7 @@ pub fn encode_preview(anim: &Animation, f: &PreviewFormat, stop: Option<&std::sy
             let decoded: Vec<Frame> = files
                 .par_iter()
                 .zip(frames.par_iter())
-                .map(|(b, f)| Ok(Frame { image: crate::pixels::Pixels::new(image::load_from_memory(b)?.to_rgba8()), delay_cs: f.delay_cs, enabled: true, cut: false, blank: false }))
+                .map(|(b, f)| Ok(Frame { image: crate::pixels::Pixels::new(image::load_from_memory(b)?.to_rgba8()), delay_cs: f.delay_cs, enabled: true, cut: false, blank: false, trim: 0 }))
                 .collect::<Result<_>>()?;
             // the size shown is the total of all files
             let total: Vec<u8> = files.concat();
