@@ -5086,23 +5086,29 @@ impl GifKitApp {
     /// Onion skin: two frames back in red and one ahead in green, fainter
     /// further off. Not while playing (it would only smear).
     fn onion_frames(&mut self, ctx: &egui::Context) -> Vec<(Tex, Color32)> {
-        if !self.onion || self.playing || self.plan.len() < 2 {
-            return Vec::new();
-        }
         let n = self.plan.len();
         let keep = self.last_comp.clone();
+        let v = self.onion_of(self.cur, n, |me, i| me.composite_texture(ctx, i));
+        // what the main view shows stays the frame at the playhead
+        self.last_comp = keep;
+        v
+    }
+
+    /// The onion skin around frame `i` of `n`, with `get` making a frame's picture.
+    fn onion_of(&mut self, i: usize, n: usize, mut get: impl FnMut(&mut Self, usize) -> Option<Tex>) -> Vec<(Tex, Color32)> {
+        if !self.onion || self.playing || n < 2 {
+            return Vec::new();
+        }
         let mut v = Vec::new();
         for (d, tint) in [(-2i64, Color32::from_rgba_unmultiplied(255, 90, 90, 28)), (-1, Color32::from_rgba_unmultiplied(255, 90, 90, 58)), (1, Color32::from_rgba_unmultiplied(90, 230, 140, 58))] {
-            let i = self.cur as i64 + d;
-            if i < 0 || i >= n as i64 {
+            let j = i as i64 + d;
+            if j < 0 || j >= n as i64 {
                 continue;
             }
-            if let Some(t) = self.composite_texture(ctx, i as usize) {
+            if let Some(t) = get(self, j as usize) {
                 v.push((t, tint));
             }
         }
-        // what the main view shows stays the frame at the playhead
-        self.last_comp = keep;
         v
     }
 
@@ -8824,6 +8830,8 @@ impl GifKitApp {
                     (vec2(o.width() as f32, o.height() as f32), (o.width(), o.height()) == self.dims())
                 };
                 let tex = self.orig_texture(ctx, i).map(Tex::from);
+                let on = self.original.as_ref().map(|o| o.len()).unwrap_or(0);
+                self.onion_paint = self.onion_of(i, on, |me, j| me.orig_texture(ctx, j).map(Tex::from));
                 let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, None, None, false);
                 // the original doesn't show what layers do, so only the crop is edited here
                 if same && self.tool == Tool::Crop {
@@ -8842,6 +8850,7 @@ impl GifKitApp {
                     let tex = self.composite_texture(ctx, self.cur);
                     let size = self.true_out_size();
                     let note = if not_saved { "Not exported · showing the edit" } else { "Not in the size sample · showing the edit" };
+                    self.onion_paint = self.onion_frames(ctx);
                     let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, Some((note.into(), Color32::from_gray(225))), None, false);
                     if !crop_mode {
                         self.canvas_interaction(ui, &resp, m, (size.x, size.y), Space::Output, vi);
@@ -8854,6 +8863,9 @@ impl GifKitApp {
                     let _ = n;
                     let sheet = self.cmp.as_ref().map(|c| c.sheet).unwrap_or(false);
                     let tex = self.cmp_texture(ctx, i).map(Tex::from);
+                    // its own frames around it (identical ones are merged in the file)
+                    let cn = self.cmp.as_ref().map(|c| if c.sheet { 0 } else { c.anim.len() }).unwrap_or(0);
+                    self.onion_paint = self.onion_of(i, cn, |me, j| me.cmp_texture(ctx, j).map(Tex::from));
                     let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, None, None, false);
                     // a sprite sheet doesn't share the frame's coordinates: no editing handles
                     if !crop_mode && !sheet {
@@ -8870,6 +8882,7 @@ impl GifKitApp {
                     } else {
                         "⚠ Not compressed yet"
                     };
+                    self.onion_paint = self.onion_frames(ctx);
                     let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, None, Some(badge.into()), encoding);
                     if !crop_mode {
                         self.canvas_interaction(ui, &resp, m, (size.x, size.y), Space::Output, vi);
