@@ -1030,6 +1030,8 @@ pub struct GifKitApp {
     /// the menu bar, where clicks don't change what Copy and Paste work on
     menubar_rect: Rect,
     tl_extend: usize,
+    /// what a drag can snap to, fixed when it starts
+    tl_snap_pts: Option<Vec<usize>>,
     /// a clip dragged into free room on its row: where it starts there
     tl_free_drop: Option<usize>,
     /// the GIF's frames (as shown) when an edge drag began
@@ -2922,6 +2924,7 @@ impl GifKitApp {
             tl_head_drag: false,
             tl_reorder: None,
             tl_extend: 0,
+            tl_snap_pts: None,
             tl_free_drop: None,
             tl_gif_d0: None,
             menubar_rect: Rect::NOTHING,

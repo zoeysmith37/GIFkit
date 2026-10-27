@@ -1530,6 +1530,9 @@ impl GifKitApp {
                 }
             }
         }
+        if self.tl_drag.is_none() {
+            self.tl_snap_pts = None;
+        }
         if let (Some(d), Some(p)) = (self.tl_drag, ui.input(|i| i.pointer.interact_pos())) {
             let f = frame_at(p.x);
             let raw = f - d.at;
@@ -1543,28 +1546,33 @@ impl GifKitApp {
                     TlGrab::End => vec![d.orig.1 + 1],
                     _ => vec![d.orig.0, d.orig.1 + 1],
                 };
-                // not to itself, where it was or where it is now
-                let mut skip = vec![d.orig.0, d.orig.1 + 1];
-                match d.grab {
-                    TlGrab::Key(k) => skip.extend(self.stack.index_of(d.track).and_then(|li| self.stack.layers[li].timing.keys.get(k).map(|k| k.frame))),
-                    _ => {
-                        if let Some(&(a, b)) = self.track_spans(d.track).get(d.clip) {
-                            skip.extend([a, b + 1]);
-                        }
-                        for &(t, j, a, b) in &self.tl_group {
-                            skip.extend([a, b + 1]);
-                            if let Some(&(x, y)) = self.track_spans(t).get(j) {
-                                skip.extend([x, y + 1]);
-                            }
-                        }
+                // what it can snap to, fixed when the drag starts: everything
+                // but the things moving (where they started). Worked out
+                // again each frame, a clip sitting on its snap point would
+                // hide that point and jump back and forth.
+                if self.tl_snap_pts.is_none() {
+                    let mut skip = vec![d.orig.0, d.orig.1 + 1];
+                    for &(_, _, a, b) in &self.tl_group {
+                        skip.extend([a, b + 1]);
                     }
+                    skip.extend(self.tl_key_group.iter().map(|k| k.1));
+                    let mut pts = self.tl_edit_points();
+                    // a key drag carries the playhead along, so not that
+                    if !matches!(d.grab, TlGrab::Key(_)) {
+                        pts.push(self.cur);
+                    }
+                    pts.retain(|p| !skip.contains(p));
+                    pts.sort();
+                    pts.dedup();
+                    self.tl_snap_pts = Some(pts);
                 }
                 let thr = (8.0 / zoom).max(0.5);
                 let best = edges
                     .iter()
                     .filter_map(|&e| {
                         let pos = e as f32 + raw;
-                        self.tl_snap_to(pos, thr, &skip).map(|t| ((t as f32 - pos).abs(), t as i64 - e as i64, t))
+                        let pts = self.tl_snap_pts.as_deref().unwrap_or(&[]);
+                        pts.iter().map(|&p| (p, (p as f32 - pos).abs())).filter(|(_, dd)| *dd <= thr).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(t, _)| ((t as f32 - pos).abs(), t as i64 - e as i64, t))
                     })
                     .min_by(|a, b| a.0.total_cmp(&b.0));
                 if let Some((_, dl, t)) = best {
@@ -1695,6 +1703,7 @@ impl GifKitApp {
             if !ui.input(|i| i.pointer.primary_down()) {
                 self.tl_drag = None;
                 self.tl_snap_line = None;
+                self.tl_snap_pts = None;
                 self.tl_key_group.clear();
                 // the selection follows the clips that moved
                 if !self.tl_group.is_empty() {
@@ -2426,9 +2435,9 @@ impl GifKitApp {
 
     /// Put copied clips on `track` starting at `at`, where there's room.
     /// Returns how many went in.
-    fn tl_place_clips(&mut self, track: u64, at: usize, clips: &[(usize, usize)]) -> usize {
+    fn tl_place_clips(&mut self, track: u64, at: usize, clips: &[(usize, usize)]) -> Vec<usize> {
         let n = self.plan.len();
-        let mut put = 0;
+        let mut put = Vec::new();
         for &(off, len) in clips {
             let want = at + off;
             if want >= n || len == 0 {
@@ -2442,10 +2451,24 @@ impl GifKitApp {
                 let cl = l.timing.clips.get_or_insert_with(Vec::new);
                 cl.push(Clip { start: a, end: if b + 1 >= n { None } else { Some(b) } });
                 cl.sort_by_key(|c| c.start);
-                put += 1;
+                put.push(a);
             }
         }
         put
+    }
+
+    /// Select clips just put on `track` (by where they start), with the
+    /// playhead at the first.
+    fn tl_select_placed(&mut self, track: u64, starts: &[usize]) {
+        let Some(&first) = starts.iter().min() else { return };
+        self.tl_select_track(track);
+        let spans = self.track_spans(track);
+        self.tl_clip = spans.iter().position(|s| s.0 == first);
+        self.tl_key = None;
+        self.tl_keys.clear();
+        self.tl_sel = starts.iter().filter(|&&a| a != first).map(|&a| (track, a)).collect();
+        self.cur = first.min(self.plan.len().saturating_sub(1));
+        self.playing = false;
     }
 
     /// Whether `clips` all find room on `track` from `at` on, in an
@@ -2514,12 +2537,14 @@ impl GifKitApp {
                 }
             }
             let put = self.tl_place_clips(track, at, &clips);
+            self.tl_select_placed(track, &put);
             self.modified = true;
-            self.info(format!("Added {need} frames and pasted {put} clip{}", if put == 1 { "" } else { "s" }));
+            let k = put.len();
+            self.info(format!("Added {need} frames and pasted {k} clip{}", if k == 1 { "" } else { "s" }));
         } else if shorter {
             self.tl_paste_ask = None;
             self.snapshot(&format!("tl-add{now}"), now);
-            let mut put = 0;
+            let mut put = Vec::new();
             for &(off, len) in &clips {
                 let want = at + off;
                 if want >= n || len == 0 {
@@ -2535,10 +2560,12 @@ impl GifKitApp {
                     continue;
                 }
                 let room = spans.iter().filter(|s| s.0 > a).map(|s| s.0).min().unwrap_or(n) - a;
-                put += self.tl_place_clips(track, a, &[(0, len.min(room))]);
+                put.extend(self.tl_place_clips(track, a, &[(0, len.min(room))]));
             }
-            self.modified |= put > 0;
-            self.info(if put == 0 { "No room after the playhead".to_string() } else { format!("Pasted {put} clip{} cut to fit", if put == 1 { "" } else { "s" }) });
+            self.tl_select_placed(track, &put);
+            let k = put.len();
+            self.modified |= k > 0;
+            self.info(if k == 0 { "No room after the playhead".to_string() } else { format!("Pasted {k} clip{} cut to fit", if k == 1 { "" } else { "s" }) });
         } else if cancel || !open {
             self.tl_paste_ask = None;
         }
@@ -2578,7 +2605,9 @@ impl GifKitApp {
                     return;
                 }
                 self.snapshot(&format!("tl-add{now}"), now);
-                let put = self.tl_place_clips(track, self.cur, &c);
+                let starts = self.tl_place_clips(track, self.cur, &c);
+                let put = starts.len();
+                self.tl_select_placed(track, &starts);
                 self.modified |= put > 0;
                 self.info(if put == c.len() { format!("Pasted {put} clip{}", if put == 1 { "" } else { "s" }) } else { format!("Pasted {put} of {} clips (no room left after the playhead)", c.len()) });
             }
@@ -2608,7 +2637,7 @@ impl GifKitApp {
         self.snapshot(&format!("tl-add{now}"), now);
         let mut put = 0;
         for (t, a, b) in sel {
-            put += self.tl_place_clips(t, b + 1, &[(0, b - a + 1)]);
+            put += self.tl_place_clips(t, b + 1, &[(0, b - a + 1)]).len();
         }
         self.modified |= put > 0;
         if put == 0 {
@@ -2761,11 +2790,6 @@ impl GifKitApp {
     }
 
     /// The nearest snap target to `pos` (a frame boundary), within `thr` frames.
-    fn tl_snap_to(&self, pos: f32, thr: f32, skip: &[usize]) -> Option<usize> {
-        let mut pts = self.tl_edit_points();
-        pts.push(self.cur);
-        pts.into_iter().filter(|p| !skip.contains(p)).map(|p| (p, (p as f32 - pos).abs())).filter(|(_, d)| *d <= thr).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(p, _)| p)
-    }
 
 
     /// The last frame any clip covers: the GIF's clips, and layer clips with
