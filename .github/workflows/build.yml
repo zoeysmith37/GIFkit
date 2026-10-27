@@ -34,7 +34,7 @@ jobs:
 
       - name: Linux build deps
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev xvfb mesa-vulkan-drivers libgl1-mesa-dri
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev xvfb mesa-vulkan-drivers libgl1-mesa-dri libxkbcommon-x11-0
 
       - name: Test
         shell: bash
