@@ -942,6 +942,12 @@ pub struct GifKitApp {
     tl_menu_head: Option<u64>,
     /// more selected clips besides the main one, as (track, first frame)
     tl_sel: Vec<(u64, usize)>,
+    /// autosave: when it last looked, what it last wrote, a write under way
+    autosave_at: f64,
+    autosave_sig: u64,
+    autosave_job: Option<Receiver<bool>>,
+    /// work kept from a session that didn't end normally: (file, when, project path)
+    restore_offer: Option<(PathBuf, String, Option<PathBuf>)>,
     /// export: leave see-through frames at the end off, and only the part
     /// between the in and out points
     export_cut_empty: bool,
@@ -2597,6 +2603,12 @@ fn load_recent() -> Vec<PathBuf> {
     }
 }
 
+/// "3 minutes", "2 hours", "5 days".
+fn fmt_ago(s: u64) -> String {
+    let (n, unit) = if s < 90 { (s, "second") } else if s < 5400 { (s / 60, "minute") } else if s < 129_600 { (s / 3600, "hour") } else { (s / 86_400, "day") };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
 /// Shorten to `max` characters with an ellipsis.
 fn elide(s: &str, max: usize) -> String {
     let s = s.lines().next().unwrap_or("");
@@ -2818,6 +2830,10 @@ impl GifKitApp {
             tl_drop: None,
             tl_menu_head: None,
             tl_sel: Vec::new(),
+            autosave_at: 0.0,
+            autosave_sig: 0,
+            autosave_job: None,
+            restore_offer: None,
             export_cut_empty: theme::get_setting("export_cut_empty").as_deref() != Some("0"),
             export_zone_only: false,
             tl_keys: Vec::new(),
@@ -2938,6 +2954,20 @@ impl GifKitApp {
         }
         if std::env::var("GIFKIT_ABOUT").is_ok() {
             app.about_open = true;
+        }
+        // work kept from a session that didn't close normally
+        if let Some((kept, note)) = Self::autosave_paths().filter(|(k, _)| k.is_file()) {
+            let info: serde_json::Value = std::fs::read_to_string(&note).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+            let project = info["project"].as_str().map(PathBuf::from);
+            let name = project.as_ref().or(info["source"].as_str().map(PathBuf::from).as_ref()).and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
+            let ago = info["saved"].as_u64().and_then(|t| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|n| n.as_secs().saturating_sub(t)));
+            let when = match (name, ago) {
+                (Some(n), Some(s)) => format!("{n} · saved {} ago", fmt_ago(s)),
+                (Some(n), None) => n,
+                (None, Some(s)) => format!("Saved {} ago", fmt_ago(s)),
+                _ => String::new(),
+            };
+            app.restore_offer = Some((kept, when, project));
         }
         // Windows doesn't come with ffmpeg: offer to set it up (once, unless asked to again)
         if (cfg!(windows) || std::env::var_os("GIFKIT_FFMPEG_ASK").is_some()) && !app.ffmpeg && theme::get_setting("ffmpeg_ask").as_deref() != Some("no") {
@@ -3162,6 +3192,7 @@ impl GifKitApp {
             JobOutput::ProjectLoaded(Ok((pr, path))) => self.apply_project(pr, path),
             JobOutput::ProjectSaved(Ok(path)) => {
                 self.modified = false;
+                self.clear_autosave();
                 self.info(format!("Saved project {}", path.display()));
                 self.project_path = Some(path);
             }
@@ -5513,6 +5544,11 @@ impl GifKitApp {
 // ================================================================ UI
 
 impl eframe::App for GifKitApp {
+    /// A normal exit: nothing to restore next time.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.clear_autosave();
+    }
+
     /// Ctrl+C / X / V arrive as keys (clipboard shortcuts are off in the
     /// window options): copy and cut become egui's events, and paste reads
     /// the clipboard here, so files and browser pictures come in whole.
@@ -5575,7 +5611,7 @@ impl eframe::App for GifKitApp {
         self.thumbs.pump(&ctx);
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true) || std::env::var_os("GIFKIT_ASSUME_FOCUS").is_some();
         // a dialog of ours having focus still counts as the app being active
-        let dialog_open = self.export_open || self.history_open || self.about_open || self.ff_open || self.shortcuts_open || self.video_import.is_some();
+        let dialog_open = self.export_open || self.history_open || self.about_open || self.ff_open || self.restore_offer.is_some() || self.shortcuts_open || self.video_import.is_some();
         theme::set_focused(&ctx, focused || dialog_open, self.theme);
         self.views_last = self.drop_views.drain(..).map(|v| v.0).collect();
         // text that follows the canvas (wrapping, centring, caption bars)
@@ -5619,6 +5655,7 @@ impl eframe::App for GifKitApp {
         self.manage_compare(&ctx, now);
         mark("compare");
         self.manage_packing(&ctx, now);
+        self.manage_autosave(now);
         mark("packing");
         self.load_preview_fonts(&ctx);
         mark("fonts");
@@ -5806,6 +5843,7 @@ impl eframe::App for GifKitApp {
         self.history_window(&ctx);
         self.confirm_window(&ctx);
         self.about_window(&ctx);
+        self.restore_window(&ctx);
         self.ffmpeg_window(&ctx);
         mark("canvas");
         self.emoji_drag_drop(&ctx);
@@ -6259,6 +6297,7 @@ impl GifKitApp {
 
     /// Forget the open animation and everything done to it.
     fn close_document(&mut self) {
+        self.clear_autosave();
         self.base = None;
         self.original = None;
         self.orig_gen += 1;
@@ -7766,7 +7805,7 @@ impl GifKitApp {
 
     /// Save to the project's file, or ask where (always with `save_as`).
     fn save_project(&mut self, ctx: &egui::Context, save_as: bool) {
-        use crate::project::{ProjLayer, ProjLayerEntry, ProjectFile, EXT};
+        use crate::project::EXT;
         let Some(base) = self.base.clone() else { return };
         if self.busy() {
             return;
@@ -7785,6 +7824,16 @@ impl GifKitApp {
                 p
             }
         };
+        let (file, overlays, watermarks) = self.project_parts();
+        let original = self.original.clone();
+        self.spawn_in(ctx, "Save project", 1, false, move |_| JobOutput::ProjectSaved(crate::project::save(&path, file, &base, original.as_ref(), &overlays, &watermarks).map(|_| path.clone())));
+    }
+
+    /// The project as it would be saved: its description, and the pictures
+    /// image and watermark layers use.
+    #[allow(clippy::type_complexity)]
+    fn project_parts(&self) -> (crate::project::ProjectFile, HashMap<usize, Vec<RgbaImage>>, HashMap<usize, Arc<RgbaImage>>) {
+        use crate::project::{ProjLayer, ProjLayerEntry, ProjectFile};
         let mut overlays = HashMap::new();
         let mut watermarks = HashMap::new();
         let layers = self
@@ -7828,8 +7877,103 @@ impl GifKitApp {
             settings: serde_json::to_value(self.proj_settings()).unwrap_or_default(),
             ..Default::default()
         };
-        let original = self.original.clone();
-        self.spawn_in(ctx, "Save project", 1, false, move |_| JobOutput::ProjectSaved(crate::project::save(&path, file, &base, original.as_ref(), &overlays, &watermarks).map(|_| path.clone())));
+        (file, overlays, watermarks)
+    }
+
+    /// Where unsaved work is kept, and a note of what it was.
+    fn autosave_paths() -> Option<(PathBuf, PathBuf)> {
+        let dir = theme::config_path()?.parent()?.to_path_buf();
+        Some((dir.join("autosave.gifkit"), dir.join("autosave.json")))
+    }
+
+    /// Every minute or so, unsaved work is written aside in the background,
+    /// so a crash or a power cut loses little. A normal exit removes it.
+    fn manage_autosave(&mut self, now: f64) {
+        if let Some(rx) = &self.autosave_job {
+            if rx.try_recv().is_ok() {
+                self.autosave_job = None;
+            }
+            return;
+        }
+        // GIFKIT_AUTOSAVE_SECS: a shorter wait, for testing
+        let every = std::env::var("GIFKIT_AUTOSAVE_SECS").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(60.0);
+        if !self.modified || self.base.is_none() || self.busy() || self.restore_offer.is_some() || now - self.autosave_at < every {
+            return;
+        }
+        let sig = hash_parts(&[self.version, self.stack.signature(), self.timing_rev, self.stack.plan_signature(), self.stack.layers.len() as u64]);
+        self.autosave_at = now;
+        if sig == self.autosave_sig {
+            return;
+        }
+        self.autosave_sig = sig;
+        let Some((path, note)) = Self::autosave_paths() else { return };
+        let (file, overlays, watermarks) = self.project_parts();
+        let (base, original) = (self.base.clone().unwrap(), self.original.clone());
+        let info = serde_json::json!({ "project": self.project_path, "source": self.path, "saved": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) });
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            stack::lower_thread_priority();
+            let tmp = path.with_extension("gifkit.part");
+            let ok = stack::bg_pool().install(|| crate::project::save(&tmp, file, &base, original.as_ref(), &overlays, &watermarks)).is_ok() && std::fs::rename(&tmp, &path).is_ok();
+            if ok {
+                let _ = std::fs::write(&note, info.to_string());
+            }
+            let _ = tx.send(ok);
+        });
+        self.autosave_job = Some(rx);
+    }
+
+    /// The work is saved, closed or discarded: nothing to restore.
+    fn clear_autosave(&mut self) {
+        if let Some((a, b)) = Self::autosave_paths() {
+            let _ = std::fs::remove_file(a);
+            let _ = std::fs::remove_file(b);
+        }
+        self.autosave_sig = 0;
+    }
+
+    /// GIFkit didn't close normally last time: offer the work it kept.
+    fn restore_window(&mut self, ctx: &egui::Context) {
+        let Some((path, when, project)) = self.restore_offer.clone() else { return };
+        if ctx.cumulative_frame_nr() < 3 {
+            ctx.request_repaint();
+            return;
+        }
+        let pal = *p();
+        let mut open = true;
+        let (mut restore, mut discard) = (false, false);
+        dialog_ex(ctx, "restore", "Restore Work", vec2(440.0, 200.0), false, true, &mut open, |ui| {
+            ui.set_width(410.0);
+            ui.label(RichText::new("Restore unsaved work?").font(theme::medium(16.0)).color(pal.fg));
+            ui.add_space(6.0);
+            ui.label("GIFkit didn't close normally last time. Your work was kept.");
+            if !when.is_empty() {
+                hint(ui, &when);
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    discard = ui.button("Discard").clicked();
+                    restore = ui.add(egui::Button::new("Restore").stroke(Stroke::new(1.0, pal.highlight)).min_size(vec2(90.0, 0.0))).clicked();
+                });
+            });
+        });
+        if restore {
+            self.restore_offer = None;
+            match crate::project::load(&path) {
+                Ok(pr) => {
+                    self.apply_project(pr, path);
+                    // saving goes where the work came from, not over the kept copy
+                    self.project_path = project;
+                    self.modified = true;
+                    self.info("Restored your unsaved work");
+                }
+                Err(e) => self.error(format!("Couldn't restore: {e:#}")),
+            }
+        } else if discard || !open {
+            self.restore_offer = None;
+            self.clear_autosave();
+        }
     }
 
     fn apply_project(&mut self, pr: crate::project::Project, path: PathBuf) {
