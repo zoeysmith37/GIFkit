@@ -1405,6 +1405,17 @@ impl GifKitApp {
                         let kf = self.stack.layers[self.stack.index_of(id).unwrap()].timing.keys[k].frame;
                         // a selected keyframe dragged takes the other selected ones along
                         let others: Vec<(u64, usize)> = if key_was_sel && resp.drag_started() { self.tl_selected_keys().into_iter().filter(|x| *x != (id, kf) && !self.tl_locked(x.0)).collect() } else { Vec::new() };
+                        // selected clips go along with selected keys
+                        let clips: Vec<(u64, usize, usize)> = if key_was_sel && resp.drag_started() { self.tl_selected().into_iter().filter(|c| c.0 != GIF && !self.tl_locked(c.0)).collect() } else { Vec::new() };
+                        if key_was_sel && !resp.clicked() {
+                            // what was the main key and clip stay selected
+                            self.tl_demote_key();
+                            if let Some(pc) = prim {
+                                if !self.tl_sel.contains(&pc) {
+                                    self.tl_sel.push(pc);
+                                }
+                            }
+                        }
                         self.tl_key = Some(k);
                         self.tl_clip = None;
                         self.tl_keys.retain(|x| *x != (id, kf));
@@ -1415,10 +1426,19 @@ impl GifKitApp {
                                 self.snapshot(&format!("tl-drag{now}"), now);
                             }
                             self.tl_key_group = others.clone();
-                            if !others.is_empty() {
+                            if !others.is_empty() || !clips.is_empty() {
                                 self.tl_key_group.push((id, kf));
                             }
                             self.tl_key_moved = 0;
+                            self.tl_group.clear();
+                            for (t, ga, gb) in clips {
+                                if let Some(li) = self.stack.index_of(t) {
+                                    self.stack.ensure_clips(li, &self.plan);
+                                }
+                                if let Some(j) = self.track_spans(t).iter().position(|s| s.0 == ga) {
+                                    self.tl_group.push((t, j, ga, gb));
+                                }
+                            }
                             self.tl_drag = Some(TlDrag { track: id, clip: 0, grab: TlGrab::Key(k), at: f, orig: (kf, kf) });
                         }
                     } else if let Some(ci) = hit {
@@ -1452,9 +1472,14 @@ impl GifKitApp {
                                         self.stack.ensure_clips(li, &self.plan);
                                     }
                                 }
-                                // the others selected move along (layer clips, not locked ones)
+                                // the others selected move along (layer clips, not locked ones,
+                                // and selected keyframes)
                                 self.tl_group.clear();
-                                if grab == TlGrab::Body && id != GIF && !self.tl_sel.is_empty() {
+                                self.tl_key_group.clear();
+                                self.tl_key_moved = 0;
+                                let keys: Vec<(u64, usize)> = if was_sel { self.tl_keys.iter().copied().filter(|k| !self.tl_locked(k.0)).collect() } else { Vec::new() };
+                                if grab == TlGrab::Body && id != GIF && (!self.tl_sel.is_empty() || !keys.is_empty()) {
+                                    self.tl_key_group = keys;
                                     for (t, ga, gb) in self.tl_selected() {
                                         if t == GIF || self.tl_locked(t) {
                                             continue;
@@ -1555,16 +1580,12 @@ impl GifKitApp {
                 }
                 TlGrab::Key(_) if !self.tl_key_group.is_empty() => {
                     // several keyframes: the same distance each, none past the ends
-                    let group = self.tl_key_group.clone();
-                    let lo = -(group.iter().map(|g| g.1).min().unwrap_or(0) as i64);
-                    let hi = n as i64 - 1 - group.iter().map(|g| g.1).max().unwrap_or(0) as i64;
-                    let dl = delta.clamp(lo, hi);
-                    if dl != self.tl_key_moved {
-                        let at: Vec<(u64, usize)> = group.iter().map(|&(t, f)| (t, (f as i64 + self.tl_key_moved) as usize)).collect();
-                        if self.tl_move_keys(&at, dl - self.tl_key_moved) {
-                            self.tl_key_moved = dl;
-                        }
-                    }
+                    // (and any selected clips with them)
+                    let group = self.tl_group.clone();
+                    let (lo, hi) = self.tl_group_range(&group);
+                    let dl = if lo <= hi { delta.clamp(lo, hi) } else { 0 };
+                    let dl = self.tl_keys_follow(dl);
+                    self.tl_group_set(&group, dl);
                     self.cur = (d.orig.0 as i64 + self.tl_key_moved).clamp(0, n as i64 - 1) as usize;
                 }
                 TlGrab::Key(k) => {
@@ -1583,37 +1604,13 @@ impl GifKitApp {
                     }
                 }
                 TlGrab::Body if !self.tl_group.is_empty() => {
-                    // several clips: the same distance each, none past its neighbours
+                    // several clips (and any selected keyframes): the same
+                    // distance each, none past its neighbours
                     let group = self.tl_group.clone();
-                    let (mut lo, mut hi) = (i64::MIN, i64::MAX);
-                    for &(t, _, a, b) in &group {
-                        lo = lo.max(-(a as i64));
-                        hi = hi.min(n as i64 - 1 - b as i64);
-                        for (j, &(x, y)) in self.track_spans(t).iter().enumerate() {
-                            if group.iter().any(|g| g.0 == t && g.1 == j) {
-                                continue;
-                            }
-                            if y < a {
-                                lo = lo.max(y as i64 + 1 - a as i64);
-                            }
-                            if x > b {
-                                hi = hi.min(x as i64 - 1 - b as i64);
-                            }
-                        }
-                    }
+                    let (lo, hi) = self.tl_group_range(&group);
                     let dl = if lo <= hi { delta.clamp(lo, hi) } else { 0 };
-                    for &(t, j, a, b) in &group {
-                        if let Some(li) = self.stack.index_of(t) {
-                            if let Some(cl) = &mut self.stack.layers[li].timing.clips {
-                                cl.sort_by_key(|c| c.start);
-                                if let Some(c) = cl.get_mut(j) {
-                                    let (na, nb) = ((a as i64 + dl) as usize, (b as i64 + dl) as usize);
-                                    *c = Clip { start: na, end: if nb + 1 >= n { None } else { Some(nb) } };
-                                }
-                            }
-                        }
-                    }
-                    self.modified = true;
+                    let dl = self.tl_keys_follow(dl);
+                    self.tl_group_set(&group, dl);
                 }
                 TlGrab::Body => {
                     // into free room on the row it goes straight there; over
@@ -1702,7 +1699,13 @@ impl GifKitApp {
                 // the selection follows the clips that moved
                 if !self.tl_group.is_empty() {
                     let group = std::mem::take(&mut self.tl_group);
-                    self.tl_sel = group.iter().filter(|g| !(g.0 == d.track && g.1 == d.clip)).filter_map(|&(t, j, _, _)| self.track_spans(t).get(j).map(|s| (t, s.0))).collect();
+                    let main = (d.grab == TlGrab::Body).then_some((d.track, d.clip));
+                    self.tl_sel = group.iter().filter(|g| Some((g.0, g.1)) != main).filter_map(|&(t, j, _, _)| self.track_spans(t).get(j).map(|s| (t, s.0))).collect();
+                }
+                // the drag is one undo step: what it changed after the step
+                // was taken isn't counted again as a live edit
+                if d.grab != TlGrab::Playhead && !(d.track == GIF && d.grab == TlGrab::Body) {
+                    self.committed = None;
                 }
                 self.tl_gif_d0 = None;
                 if let Some(t) = self.tl_drop.take() {
@@ -1772,11 +1775,9 @@ impl GifKitApp {
                                 }
                             }
                         }
-                        // clips only when the box is more than a key's width
-                        // over them, so boxing keys doesn't take their clips
-                        let keys_only = !keys.is_empty() && keys.iter().any(|k| k.0 == id);
+                        // clips it touches, along with any keys on them
                         for (ci, &(a, b)) in self.track_spans(id).iter().enumerate() {
-                            if fx(a as f32) <= r.max.x && fx(b as f32 + 1.0) >= r.min.x && !keys_only {
+                            if fx(a as f32) <= r.max.x && fx(b as f32 + 1.0) >= r.min.x {
                                 found.push((id, ci, a));
                             }
                         }
@@ -2276,6 +2277,66 @@ impl GifKitApp {
         true
     }
 
+    /// How far a group of layer clips (track, index, first, last as they
+    /// started) and the keys moving with them can go: none past the ends or
+    /// into a clip that isn't moving.
+    fn tl_group_range(&self, group: &[(u64, usize, usize, usize)]) -> (i64, i64) {
+        let n = self.plan.len() as i64;
+        let (mut lo, mut hi) = (i64::MIN, i64::MAX);
+        for &(t, _, a, b) in group {
+            lo = lo.max(-(a as i64));
+            hi = hi.min(n - 1 - b as i64);
+            for (j, &(x, y)) in self.track_spans(t).iter().enumerate() {
+                if group.iter().any(|g| g.0 == t && g.1 == j) {
+                    continue;
+                }
+                if y < a {
+                    lo = lo.max(y as i64 + 1 - a as i64);
+                }
+                if x > b {
+                    hi = hi.min(x as i64 - 1 - b as i64);
+                }
+            }
+        }
+        for &(_, f) in &self.tl_key_group {
+            lo = lo.max(-(f as i64));
+            hi = hi.min(n - 1 - f as i64);
+        }
+        (lo, hi)
+    }
+
+    /// The group's clips `dl` frames from where they started.
+    fn tl_group_set(&mut self, group: &[(u64, usize, usize, usize)], dl: i64) {
+        let n = self.plan.len();
+        for &(t, j, a, b) in group {
+            if let Some(li) = self.stack.index_of(t) {
+                if let Some(cl) = &mut self.stack.layers[li].timing.clips {
+                    cl.sort_by_key(|c| c.start);
+                    if let Some(c) = cl.get_mut(j) {
+                        let (na, nb) = ((a as i64 + dl) as usize, (b as i64 + dl) as usize);
+                        *c = Clip { start: na, end: if nb + 1 >= n { None } else { Some(nb) } };
+                    }
+                }
+            }
+        }
+        if !group.is_empty() {
+            self.modified = true;
+        }
+    }
+
+    /// The keys moving with a drag go `dl` from where they started. Where
+    /// they can't (onto a key that stays), everything stays where it got to.
+    fn tl_keys_follow(&mut self, dl: i64) -> i64 {
+        if self.tl_key_group.is_empty() || dl == self.tl_key_moved {
+            return if self.tl_key_group.is_empty() { dl } else { self.tl_key_moved };
+        }
+        let at: Vec<(u64, usize)> = self.tl_key_group.iter().map(|&(t, f)| (t, (f as i64 + self.tl_key_moved) as usize)).collect();
+        if self.tl_move_keys(&at, dl - self.tl_key_moved) {
+            self.tl_key_moved = dl;
+        }
+        self.tl_key_moved
+    }
+
     fn tl_is_selected(&self, track: u64, ci: usize, a: usize) -> bool {
         (self.tl_track == Some(track) && self.tl_clip == Some(ci)) || self.tl_sel.contains(&(track, a))
     }
@@ -2387,6 +2448,102 @@ impl GifKitApp {
         put
     }
 
+    /// Whether `clips` all find room on `track` from `at` on, in an
+    /// animation `n` frames long.
+    fn tl_clips_fit(&self, track: u64, at: usize, clips: &[(usize, usize)], n: usize) -> bool {
+        // (a clip reaching the end is pinned where it is when it grows)
+        let mut spans = self.track_spans(track);
+        for &(off, len) in clips {
+            let want = at + off;
+            if len == 0 {
+                continue;
+            }
+            match free_slot(&spans, len, want.min(n.saturating_sub(1)), n, true) {
+                Some(a) => {
+                    spans.push((a, a + len - 1));
+                    spans.sort();
+                }
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// Paste that didn't fit: make the animation longer, paste the clips
+    /// cut short to the room there is, or don't.
+    pub(super) fn tl_paste_window(&mut self, ctx: &egui::Context) {
+        let Some((track, at, clips)) = self.tl_paste_ask.clone() else { return };
+        let n = self.plan.len();
+        // frames to add so every clip fits
+        let total: usize = clips.iter().map(|c| c.1).sum();
+        let need = (1..=total + n).find(|&k| self.tl_clips_fit(track, at, &clips, n + k)).unwrap_or(total);
+        let pal = *p();
+        let mut open = true;
+        let (mut longer, mut shorter, mut cancel) = (false, false, false);
+        let many = clips.len() > 1;
+        dialog_ex(ctx, "paste-fit", "Paste", vec2(440.0, 190.0), false, true, &mut open, |ui| {
+            ui.set_width(410.0);
+            ui.label(RichText::new(if many { "The clips don't fit" } else { "The clip doesn't fit" }).font(theme::medium(16.0)).color(pal.fg));
+            ui.add_space(6.0);
+            ui.label("There isn't room for it after the playhead.");
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    cancel = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
+                    shorter = ui.button("Cut to Fit").on_hover_text("Paste it shorter, into the room there is").clicked();
+                    longer = ui.add(egui::Button::new(format!("Add {need} Frames")).stroke(Stroke::new(1.0, pal.highlight))).on_hover_text("Make the animation longer, holding its last frame").clicked();
+                });
+            });
+        });
+        let now = ctx.input(|i| i.time);
+        if longer {
+            self.tl_paste_ask = None;
+            if self.busy() {
+                self.info("Wait for the current job, then paste again");
+                return;
+            }
+            // one undo step for the frames and the clips
+            let key = format!("tl-lengthen{now}");
+            self.snapshot(&key, now);
+            // clips on this row reaching the end stay the length they are
+            let open: Vec<usize> = self.tl_layer_mut(track).and_then(|l| l.timing.clips.as_ref().map(|cl| cl.iter().filter(|c| c.end.is_none()).map(|c| c.start).collect())).unwrap_or_default();
+            self.tl_lengthen(need, now);
+            if let Some(cl) = self.tl_layer_mut(track).and_then(|l| l.timing.clips.as_mut()) {
+                for c in cl.iter_mut().filter(|c| open.contains(&c.start)) {
+                    c.end = Some(n - 1);
+                }
+            }
+            let put = self.tl_place_clips(track, at, &clips);
+            self.modified = true;
+            self.info(format!("Added {need} frames and pasted {put} clip{}", if put == 1 { "" } else { "s" }));
+        } else if shorter {
+            self.tl_paste_ask = None;
+            self.snapshot(&format!("tl-add{now}"), now);
+            let mut put = 0;
+            for &(off, len) in &clips {
+                let want = at + off;
+                if want >= n || len == 0 {
+                    continue;
+                }
+                let spans = self.track_spans(track);
+                // the first free frame from there, and the room after it
+                let mut a = want;
+                while let Some(&(_, y)) = spans.iter().find(|&&(x, y)| a >= x && a <= y) {
+                    a = y + 1;
+                }
+                if a >= n {
+                    continue;
+                }
+                let room = spans.iter().filter(|s| s.0 > a).map(|s| s.0).min().unwrap_or(n) - a;
+                put += self.tl_place_clips(track, a, &[(0, len.min(room))]);
+            }
+            self.modified |= put > 0;
+            self.info(if put == 0 { "No room after the playhead".to_string() } else { format!("Pasted {put} clip{} cut to fit", if put == 1 { "" } else { "s" }) });
+        } else if cancel || !open {
+            self.tl_paste_ask = None;
+        }
+    }
+
     /// Ctrl+V: copied clips on the selected layer at the playhead, or the
     /// copied keyframe's values at the playhead.
     pub(super) fn tl_paste(&mut self, now: f64) {
@@ -2415,6 +2572,11 @@ impl GifKitApp {
                 }
             }
             Some(TlBoard::Clips(c)) => {
+                if !self.tl_clips_fit(track, self.cur, &c, self.plan.len()) {
+                    // no room: ask what to do
+                    self.tl_paste_ask = Some((track, self.cur, c));
+                    return;
+                }
                 self.snapshot(&format!("tl-add{now}"), now);
                 let put = self.tl_place_clips(track, self.cur, &c);
                 self.modified |= put > 0;

@@ -985,6 +985,8 @@ pub struct GifKitApp {
     tl_box: Option<Pos2>,
     /// copied clips or a keyframe
     tl_board: Option<timeline_ui::TlBoard>,
+    /// copied clips that didn't fit: (track, frame, clips as offset and length)
+    tl_paste_ask: Option<(u64, usize, Vec<(usize, usize)>)>,
     /// snap edges and keys to things nearby while dragging; the frame snapped to
     tl_snap: bool,
     tl_snap_line: Option<usize>,
@@ -2892,6 +2894,7 @@ impl GifKitApp {
             tl_group: Vec::new(),
             tl_box: None,
             tl_board: None,
+            tl_paste_ask: None,
             tl_snap: theme::get_setting("tl_snap").map(|v| v != "0").unwrap_or(true),
             tl_snap_line: None,
             tl_in: None,
@@ -5685,7 +5688,7 @@ impl eframe::App for GifKitApp {
         self.thumbs.pump(&ctx);
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true) || std::env::var_os("GIFKIT_ASSUME_FOCUS").is_some();
         // a dialog of ours having focus still counts as the app being active
-        let dialog_open = self.handbook_open || self.batch.open || self.export_open || self.history_open || self.about_open || self.ff_open || self.restore_offer.is_some() || self.shortcuts_open || self.video_import.is_some();
+        let dialog_open = self.tl_paste_ask.is_some() || self.handbook_open || self.batch.open || self.export_open || self.history_open || self.about_open || self.ff_open || self.restore_offer.is_some() || self.shortcuts_open || self.video_import.is_some();
         theme::set_focused(&ctx, focused || dialog_open, self.theme);
         self.views_last = self.drop_views.drain(..).map(|v| v.0).collect();
         // text that follows the canvas (wrapping, centring, caption bars)
@@ -5923,6 +5926,7 @@ impl eframe::App for GifKitApp {
         self.restore_window(&ctx);
         self.batch_window(&ctx);
         self.handbook_window(&ctx);
+        self.tl_paste_window(&ctx);
         self.ffmpeg_window(&ctx);
         mark("canvas");
         self.emoji_drag_drop(&ctx);
