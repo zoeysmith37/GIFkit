@@ -1462,13 +1462,13 @@ fn group_ex<R>(ui: &mut egui::Ui, title: &str, default_open: bool, badge: Option
     if find_on() {
         let probing = FIND.with(|f| f.borrow().probing);
         if probing {
-            let all = find_matches(title);
+            let all = find_matches(&group_search_text(title));
             if all {
                 find_note(title);
             }
             return Some(find_scoped(Some(""), all, false, || add(ui)));
         }
-        all = find_matches(title);
+        all = find_matches(&group_search_text(title));
         if !all {
             let (_, hit) = find_scoped(Some(""), false, false, || find_probe(ui, &mut add));
             if !hit {
@@ -1882,6 +1882,15 @@ thread_local! {
 
 fn find_on() -> bool {
     FIND.with(|f| !f.borrow().q.is_empty())
+}
+
+/// A group's title, and words people search for that it covers.
+fn group_search_text(title: &str) -> String {
+    let more = match title {
+        "Transparency" => " background remove green screen chroma key spill cut out",
+        _ => "",
+    };
+    format!("{title}{more}")
 }
 
 fn find_matches(text: &str) -> bool {
@@ -10175,6 +10184,11 @@ impl GifKitApp {
         });
         ui.add_space(8.0);
         let _ = ctx;
+        // the frame on screen's top-left colour, for keying out a background
+        let corner = self.base.as_ref().and_then(|b| self.plan.get(self.cur).and_then(|f| b.frames.get(f.src))).map(|f| {
+            let p = f.image.get().get_pixel(0, 0).0;
+            [p[0], p[1], p[2]]
+        });
         let Stack { transform, layers, .. } = &mut self.stack;
         let fx: &mut EffectSettings = match sel {
             Some(i) => match &mut layers[i].kind {
@@ -10183,7 +10197,7 @@ impl GifKitApp {
             },
             None => &mut self.fx_draft,
         };
-        effects_ui(ui, fx, transform);
+        effects_ui(ui, fx, transform, corner);
         if sel.is_none() && self.fx_draft != EffectSettings::default() {
             let fx = std::mem::take(&mut self.fx_draft);
             self.add_layer(LayerKind::Effects(Box::new(fx)));
@@ -11493,7 +11507,7 @@ fn on(b: &[bool]) -> Option<String> {
     (n > 0).then(|| n.to_string())
 }
 
-fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform) {
+fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform, corner: Option<[u8; 3]>) {
     let d = EffectSettings::default();
     let colour_changed = fx.hue != d.hue || fx.saturation != d.saturation || fx.lightness != d.lightness || fx.brightness != d.brightness || fx.contrast != d.contrast;
     group_ex(ui, "Colour", true, colour_changed.then(|| "●".to_string()), |ui| {
@@ -11621,6 +11635,11 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform) {
             form_row(ui, "Colour", |ui| {
                 ui.horizontal(|ui| {
                     colour_btn(ui, &mut fx.rc_color);
+                    if let Some(c) = corner {
+                        if ui.button("From Corner").on_hover_text("The colour of the frame's top-left corner, usually the background").clicked() {
+                            fx.rc_color = c;
+                        }
+                    }
                     let mut hex = format!("#{:02x}{:02x}{:02x}", fx.rc_color[0], fx.rc_color[1], fx.rc_color[2]);
                     if ui.add(egui::TextEdit::singleline(&mut hex).desired_width(ui.available_width())).changed() {
                         if let Some(c) = parse_hex(&hex) {
@@ -11633,6 +11652,10 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform) {
         let any = fx.rc_white || fx.rc_black || fx.rc_custom;
         ui.add_enabled_ui(any, |ui| {
             slider_row(ui, "Fuzz", soft_slider(&mut fx.rc_fuzz, 0.0..=60.0, "").suffix(" %").max_decimals(0)).on_hover_text("How close a colour must be to count");
+            ui.add_enabled_ui(fx.rc_custom, |ui| {
+                slider_row(ui, "Soft edge", soft_slider(&mut fx.rc_soft, 0.0..=40.0, "").suffix(" %").max_decimals(0)).on_hover_text("Colours a little past the fuzz fade out instead of staying, for smooth edges (green screen)");
+                form_row(ui, "Spill", |ui| check(ui, &mut fx.rc_despill, "Remove colour spill")).on_hover_text("Takes the removed colour's tint out of what's left, such as a green glow from a green screen");
+            });
             opt_row(ui, "Clean edges", &mut fx.rc_clean_edges, |ui| {
                 num_fill(ui, &mut fx.rc_edge_px, 1.0, |d| d.range(1..=50).suffix(" px")).on_hover_text("Removes leftover fringe around cut-out areas");
             });

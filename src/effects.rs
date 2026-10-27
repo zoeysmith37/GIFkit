@@ -45,6 +45,11 @@ pub struct EffectSettings {
     pub rc_fuzz: f32,
     pub rc_clean_edges: bool,
     pub rc_edge_px: u32,
+    /// a soft edge past the fuzz (percent of the colour range): colours just
+    /// outside it go partly see-through, as a chroma key does
+    pub rc_soft: f32,
+    /// take the removed colour's tint out of what's left (green screen spill)
+    pub rc_despill: bool,
 
     // Animation flow
     pub reverse: bool,
@@ -202,6 +207,8 @@ impl Default for EffectSettings {
             rc_fuzz: 2.0,
             rc_clean_edges: true,
             rc_edge_px: 2,
+            rc_soft: 0.0,
+            rc_despill: false,
             reverse: false,
             set_loop: false,
             loop_count: 0,
@@ -462,6 +469,41 @@ fn flatten_on(img: &mut RgbaImage, c: [u8; 3]) {
 
 fn color_dist(p: &[u8], c: [u8; 3]) -> f32 {
     (((p[0] as f32 - c[0] as f32).powi(2) + (p[1] as f32 - c[1] as f32).powi(2) + (p[2] as f32 - c[2] as f32).powi(2)) as f32).sqrt()
+}
+
+/// Which channel a key colour is mostly made of (0 red, 1 green, 2 blue),
+/// if one stands out: the one spill shows in.
+pub fn key_channel(c: [u8; 3]) -> Option<usize> {
+    let (i, &m) = c.iter().enumerate().max_by_key(|(_, v)| **v)?;
+    let others = c.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, v)| *v as i32).max().unwrap_or(0);
+    (m as i32 - others >= 40).then_some(i)
+}
+
+/// A chroma key: pixels within `fuzz` of `target` go, ones within `soft`
+/// more fade out, and (`despill`) the key's tint is taken out of the rest.
+/// Percentages of the colour range. Runs before the hard-edged removal.
+pub fn key_color(img: &mut RgbaImage, target: [u8; 3], fuzz: f32, soft: f32, despill: bool) {
+    let thr = fuzz.max(0.0) / 100.0 * 441.67;
+    let soft = soft.max(0.0) / 100.0 * 441.67;
+    let ch = if despill { key_channel(target) } else { None };
+    img.par_chunks_mut(4).for_each(|p| {
+        let d = color_dist(p, target);
+        if d <= thr {
+            p[3] = 0;
+            return;
+        }
+        if soft > 0.0 && d < thr + soft {
+            p[3] = c8(p[3] as f32 * ((d - thr) / soft));
+        }
+        if let (Some(c), true) = (ch, p[3] > 0) {
+            let (o1, o2) = match c {
+                0 => (p[1], p[2]),
+                1 => (p[0], p[2]),
+                _ => (p[0], p[1]),
+            };
+            p[c] = p[c].min(((o1 as u16 + o2 as u16) / 2) as u8);
+        }
+    });
 }
 
 /// Make pixels close to `target` transparent. `fuzz` in percent.
@@ -880,6 +922,10 @@ pub fn apply_frame(src: &RgbaImage, idx: usize, n: usize, elapsed_s: f32, clip_s
     // replace colour before colour presets so the target colour matches the source
     if s.rc_white || s.rc_black || s.rc_custom {
         let edges = if s.rc_clean_edges { Some(s.rc_edge_px) } else { None };
+        if s.rc_custom && (s.rc_soft > 0.0 || s.rc_despill) {
+            // the soft edge and spill only for a chosen colour (a green screen)
+            key_color(&mut img, s.rc_color, s.rc_fuzz, s.rc_soft, s.rc_despill);
+        }
         if s.rc_white {
             replace_color(&mut img, [255, 255, 255], s.rc_fuzz, edges);
         }

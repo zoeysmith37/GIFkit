@@ -556,6 +556,29 @@ fn fs_fx(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             }
             return q / 255.0;
         }
+        // 56 chroma key: colour a.rgb within a.w goes, b.x more fades out;
+        // b.y = 1 + the channel the key's tint is taken out of (0: none)
+        case 56: {
+            var q = ld(t0, ip);
+            let d = colour_dist(q.rgb, a.rgb);
+            if (d <= a.w) {
+                return vec4<f32>(q.rgb, 0.0) / 255.0;
+            }
+            if (b.x > 0.0 && d < a.w + b.x) {
+                q.a = c8(q.a * ((d - a.w) / b.x));
+            }
+            let ch = i32(b.y) - 1;
+            if (ch >= 0 && q.a > 0.0) {
+                if (ch == 0) {
+                    q.r = min(q.r, floor((q.g + q.b) / 2.0));
+                } else if (ch == 1) {
+                    q.g = min(q.g, floor((q.r + q.b) / 2.0));
+                } else {
+                    q.b = min(q.b, floor((q.r + q.g) / 2.0));
+                }
+            }
+            return q / 255.0;
+        }
         // 14 removed pixels within r across (for the edge clean-up): r
         case 14: {
             let r = i32(a.x);

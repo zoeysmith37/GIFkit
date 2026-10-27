@@ -836,6 +836,8 @@ fn gpu_matches_cpu() {
         ("fx rc white".into(), fx(&|e| (e.rc_white, e.rc_fuzz) = (true, 30.0))),
         ("fx rc custom edges".into(), fx(&|e| (e.rc_custom, e.rc_color, e.rc_fuzz, e.rc_edge_px) = (true, [128, 60, 90], 25.0, 3))),
         ("fx rc black no edge".into(), fx(&|e| (e.rc_black, e.rc_fuzz, e.rc_clean_edges) = (true, 20.0, false))),
+        ("fx key soft spill".into(), fx(&|e| (e.rc_custom, e.rc_color, e.rc_fuzz, e.rc_soft, e.rc_despill, e.rc_clean_edges) = (true, [40, 200, 60], 12.0, 25.0, true, false))),
+        ("fx key soft only".into(), fx(&|e| (e.rc_custom, e.rc_color, e.rc_fuzz, e.rc_soft) = (true, [128, 60, 90], 10.0, 30.0))),
         ("fx grayscale".into(), fx(&|e| e.grayscale = true)),
         ("fx sepia".into(), fx(&|e| e.sepia = true)),
         ("fx monochrome".into(), fx(&|e| e.monochrome = true)),

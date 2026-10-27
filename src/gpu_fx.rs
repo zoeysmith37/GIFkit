@@ -213,6 +213,13 @@ pub fn effects<'a>(p: &mut Plan<'a, '_>, s: &EffectSettings, idx: usize, n: usiz
         p.bright_contrast(s.brightness, s.contrast);
     }
     if s.rc_white || s.rc_black || s.rc_custom {
+        if s.rc_custom && (s.rc_soft > 0.0 || s.rc_despill) {
+            let c = s.rc_color;
+            let thr = s.rc_fuzz.max(0.0) / 100.0 * 441.67;
+            let soft = s.rc_soft.max(0.0) / 100.0 * 441.67;
+            let ch = if s.rc_despill { crate::effects::key_channel(c).map(|c| c as f32 + 1.0).unwrap_or(0.0) } else { 0.0 };
+            p.op(56, &[[c[0] as f32, c[1] as f32, c[2] as f32, thr], [soft, ch, 0.0, 0.0]]);
+        }
         let edges = if s.rc_clean_edges { Some(s.rc_edge_px) } else { None };
         for (on, c) in [(s.rc_white, [255, 255, 255]), (s.rc_black, [0, 0, 0]), (s.rc_custom, s.rc_color)] {
             if !on {

@@ -1475,3 +1475,21 @@ fn export_trims_empty_end_and_range() {
     let (one, _) = st.flatten_for_export(&a, &[], None, Some((7, 9)), true);
     assert_eq!(one.len(), 1);
 }
+
+/// The chroma key: the key colour goes, near colours fade, spill is taken out.
+#[test]
+fn chroma_key_soft_edge_and_spill() {
+    let green = image::Rgba([40u8, 200, 60, 255]);
+    let near = image::Rgba([70u8, 190, 80, 255]);
+    let tinted = image::Rgba([150u8, 210, 140, 255]);
+    let far = image::Rgba([220u8, 40, 40, 255]);
+    let mut img = image::RgbaImage::from_fn(4, 1, |x, _| [green, near, tinted, far][x as usize]);
+    crate::effects::key_color(&mut img, [40, 200, 60], 5.0, 20.0, true);
+    assert_eq!(img.get_pixel(0, 0)[3], 0, "the key colour goes");
+    let a = img.get_pixel(1, 0)[3];
+    assert!(a > 0 && a < 255, "a near colour fades: {a}");
+    assert!(img.get_pixel(2, 0)[1] <= 145, "green spill comes out: {:?}", img.get_pixel(2, 0));
+    assert_eq!(*img.get_pixel(3, 0), far, "other colours stay");
+    assert_eq!(crate::effects::key_channel([128, 128, 128]), None);
+    assert_eq!(crate::effects::key_channel([20, 30, 220]), Some(2));
+}
