@@ -942,6 +942,10 @@ pub struct GifKitApp {
     tl_menu_head: Option<u64>,
     /// more selected clips besides the main one, as (track, first frame)
     tl_sel: Vec<(u64, usize)>,
+    /// Copy Result: the file export writes to instead of asking, and the file
+    /// to put on the clipboard once it's written
+    copy_to: Option<PathBuf>,
+    copy_pending: Option<PathBuf>,
     /// autosave: when it last looked, what it last wrote, a write under way
     autosave_at: f64,
     autosave_sig: u64,
@@ -2603,6 +2607,19 @@ fn load_recent() -> Vec<PathBuf> {
     }
 }
 
+/// Put a file on the system clipboard (as a file, the way a file manager
+/// copies one), so it pastes into chats, posts and folders. The clipboard
+/// is kept for the life of the app: on Linux it goes when its owner does.
+fn copy_file_to_clipboard(p: &std::path::Path) -> anyhow::Result<()> {
+    static CB: std::sync::Mutex<Option<arboard::Clipboard>> = std::sync::Mutex::new(None);
+    let mut g = CB.lock().map_err(|_| anyhow::anyhow!("clipboard busy"))?;
+    if g.is_none() {
+        *g = Some(arboard::Clipboard::new()?);
+    }
+    g.as_mut().unwrap().set().file_list(&[p])?;
+    Ok(())
+}
+
 /// "3 minutes", "2 hours", "5 days".
 fn fmt_ago(s: u64) -> String {
     let (n, unit) = if s < 90 { (s, "second") } else if s < 5400 { (s / 60, "minute") } else if s < 129_600 { (s / 3600, "hour") } else { (s / 86_400, "day") };
@@ -2830,6 +2847,8 @@ impl GifKitApp {
             tl_drop: None,
             tl_menu_head: None,
             tl_sel: Vec::new(),
+            copy_to: None,
+            copy_pending: None,
             autosave_at: 0.0,
             autosave_sig: 0,
             autosave_job: None,
@@ -5560,7 +5579,8 @@ impl eframe::App for GifKitApp {
         let mut out = Vec::with_capacity(raw.events.len());
         for e in std::mem::take(&mut raw.events) {
             match e {
-                egui::Event::Key { key: egui::Key::C, pressed: true, modifiers, .. } if modifiers.command && !modifiers.alt => out.push(egui::Event::Copy),
+                // Ctrl+Shift+C is Copy Result, not Copy
+                egui::Event::Key { key: egui::Key::C, pressed: true, modifiers, .. } if modifiers.command && !modifiers.alt && !modifiers.shift => out.push(egui::Event::Copy),
                 egui::Event::Key { key: egui::Key::X, pressed: true, modifiers, .. } if modifiers.command && !modifiers.alt => out.push(egui::Event::Cut),
                 egui::Event::Key { key: egui::Key::V, pressed: true, modifiers, .. } if modifiers.command && !modifiers.alt => {
                     let (events, extra) = crate::paste::read(typing);
@@ -5570,7 +5590,7 @@ impl eframe::App for GifKitApp {
                     }
                 }
                 // their releases go too, as with egui's own handling
-                egui::Event::Key { key: egui::Key::C | egui::Key::X | egui::Key::V, modifiers, .. } if modifiers.command && !modifiers.alt => {}
+                egui::Event::Key { key: k @ (egui::Key::C | egui::Key::X | egui::Key::V), modifiers, .. } if modifiers.command && !modifiers.alt && !(k == egui::Key::C && modifiers.shift) => {}
                 e => out.push(e),
             }
         }
@@ -5643,6 +5663,9 @@ impl eframe::App for GifKitApp {
         self.poll_job(&ctx);
         mark("jobs");
         self.handle_dropped(&ctx);
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::C)) {
+            self.copy_result(&ctx);
+        }
         self.shortcuts(&ctx);
         self.refresh_plan();
         mark("plan");
@@ -5929,6 +5952,9 @@ impl GifKitApp {
                     self.save_project(ctx, true);
                 }
                 ui.separator();
+                if menu_item_tip(ui, "edit-copy", "Copy &Result", "Ctrl+Shift+C", idle && has, "Save the result as Export would and copy the file, to paste into a chat, a post or a folder") {
+                    self.copy_result(ctx);
+                }
                 if menu_item(ui, "document-export", "&Export…", &self.keymap.text(crate::keys::Action::Export), idle && has) {
                     self.export_open = true;
                 }
@@ -7644,6 +7670,12 @@ impl GifKitApp {
 
     /// Save dialog starting in the last used folder.
     fn save_path(&mut self, filter: &str, exts: &[&str]) -> Option<PathBuf> {
+        // Copy Result: to a file of its own, no dialog
+        if self.copy_to.is_some() {
+            let p = self.copy_to.take()?.with_extension(exts[0]);
+            self.copy_pending = Some(p.clone());
+            return Some(p);
+        }
         let mut d = rfd::FileDialog::new().add_filter(filter, exts).set_file_name(format!("{}.{}", self.export_stem(), exts[0]));
         if let Some(dir) = &self.last_dir {
             d = d.set_directory(dir);
@@ -7672,6 +7704,17 @@ impl GifKitApp {
 
     /// Report a finished save and open its folder when asked to.
     fn saved(&mut self, r: anyhow::Result<String>) {
+        if let Some(p) = self.copy_pending.take() {
+            // made for the clipboard: put it there
+            match r {
+                Ok(_) => match copy_file_to_clipboard(&p) {
+                    Ok(()) => self.info(format!("Copied {} ({}): paste it into a chat, a post or a folder", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), fmt_size(std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0)))),
+                    Err(e) => self.error(format!("Couldn't copy: {e:#}")),
+                },
+                Err(e) => self.error(format!("{e:#}")),
+            }
+            return;
+        }
         match r {
             Ok(s) => {
                 self.info(s);
@@ -7684,6 +7727,27 @@ impl GifKitApp {
                 self.error(format!("{e:#}"));
             }
         }
+    }
+
+    /// Copy Result: save the output (as Export would) to a file of its own
+    /// and put that file on the clipboard.
+    pub(super) fn copy_result(&mut self, ctx: &egui::Context) {
+        if self.base.is_none() || self.busy() {
+            return;
+        }
+        if self.export_fmt == ExportFormat::Frames {
+            self.info("Frames save as a folder: pick another format to copy");
+            return;
+        }
+        let dir = std::env::temp_dir().join("gifkit-copied");
+        let _ = std::fs::create_dir_all(&dir);
+        // last time's copies go (anything already pasted keeps its own)
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let _ = std::fs::remove_file(e.path());
+        }
+        self.copy_to = Some(dir.join(self.export_stem()));
+        self.do_export(ctx);
+        self.copy_to = None;
     }
 
     fn do_export(&mut self, ctx: &egui::Context) {
