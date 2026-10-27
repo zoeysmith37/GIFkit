@@ -328,6 +328,28 @@ pub fn set_budget(b: usize) {
     BUDGET.store(b.max(16 << 20), Ordering::Relaxed);
 }
 
+static MEM_PCT: AtomicUsize = AtomicUsize::new(100);
+
+/// How much memory GIFkit keeps for speed, as a percent of normal: every
+/// cache budget scales with it.
+pub fn set_mem_pct(pct: usize) {
+    let pct = pct.clamp(25, 400);
+    MEM_PCT.store(pct, Ordering::Relaxed);
+    if std::env::var_os("GIFKIT_PIXCACHE_MB").is_none() {
+        set_budget((128usize << 20) * pct / 100);
+    }
+}
+
+/// `bytes` scaled by the memory setting.
+pub fn scaled(bytes: usize) -> usize {
+    (bytes as u128 * MEM_PCT.load(Ordering::Relaxed) as u128 / 100) as usize
+}
+
+/// Memory the whole process uses now (bytes), where the system says.
+pub fn process_bytes() -> Option<usize> {
+    memory_stats::memory_stats().map(|m| m.physical_mem)
+}
+
 /// Bytes of unpacked pictures held by the cache.
 pub fn cache_bytes() -> usize {
     CACHE.lock().ok().and_then(|c| c.as_ref().map(|c| c.bytes)).unwrap_or(0)
@@ -438,6 +460,16 @@ mod tests {
             assert!(f.image.is_packed());
             assert_eq!(*f.image.get(), checker(128, 96, 3 + k as u32 % 50));
         }
+    }
+
+    #[test]
+    fn memory_level_scales_budgets() {
+        set_mem_pct(50);
+        assert_eq!(scaled(64 << 20), 32 << 20);
+        set_mem_pct(250);
+        assert_eq!(scaled(64 << 20), 160 << 20);
+        set_mem_pct(100);
+        assert_eq!(scaled(64 << 20), 64 << 20);
     }
 
     #[test]

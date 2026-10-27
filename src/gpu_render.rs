@@ -185,7 +185,8 @@ impl TexCache {
             return e.1.clone();
         }
         let size = img.width() as usize * img.height() as usize * 4;
-        while self.bytes + size > self.budget && !self.map.is_empty() {
+        let budget = crate::pixels::scaled(self.budget);
+        while self.bytes + size > budget && !self.map.is_empty() {
             let oldest = *self.map.iter().min_by_key(|(_, e)| e.2).map(|(k, _)| k).unwrap();
             if let Some(e) = self.map.remove(&oldest) {
                 self.bytes -= e.3;

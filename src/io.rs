@@ -948,7 +948,8 @@ fn decode_video_bytes(b: &[u8], ext: &str, size: (u32, u32)) -> Result<Animation
 
 /// Encode an animated AVIF with ffmpeg; `quality` 0..=100.
 pub fn encode_avif(anim: &Animation, quality: u8) -> Result<Vec<u8>> {
-    let tmp = std::env::temp_dir().join(format!("gifkit_avif_{}_{}.avif", std::process::id(), quality));
+    static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let tmp = std::env::temp_dir().join(format!("gifkit_avif_{}_{}.avif", std::process::id(), RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     export_video_q(anim, &tmp, VideoFormat::Avif, [0, 0, 0], Some(quality), false)?;
     let b = std::fs::read(&tmp)?;
     let _ = std::fs::remove_file(&tmp);

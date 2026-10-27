@@ -539,11 +539,11 @@ impl TexCache {
         };
         let size = img.width() as usize * img.height() as usize * 4;
         // the least recently shown go, down to seven eighths
-        if self.bytes + size > TEX_BUDGET {
+        if self.bytes + size > crate::pixels::scaled(TEX_BUDGET) {
             let mut v: Vec<(u64, usize)> = self.map.iter().map(|(k, e)| (e.1, *k)).collect();
             v.sort_unstable();
             for (_, k) in v {
-                if self.bytes + size <= TEX_BUDGET / 8 * 7 {
+                if self.bytes + size <= crate::pixels::scaled(TEX_BUDGET) / 8 * 7 {
                     break;
                 }
                 if let Some((t, _)) = self.map.remove(&k) {
@@ -559,7 +559,7 @@ impl TexCache {
     }
     /// How many pictures `w` by `h` fit in the budget.
     fn room_for(w: u32, h: u32) -> usize {
-        TEX_BUDGET / (w as usize * h as usize * 4).max(1)
+        crate::pixels::scaled(TEX_BUDGET) / (w as usize * h as usize * 4).max(1)
     }
 }
 
@@ -1052,6 +1052,10 @@ pub struct GifKitApp {
     /// previews of big pictures are made from frames shrunk to this long
     /// side (0 = always full size)
     preview_max: u32,
+    /// memory kept for speed, percent of normal (Low 50, High 250)
+    mem_pct: usize,
+    /// the process's memory for the status bar, and when it was read
+    mem_seen: (usize, f64),
     /// the shrunk frames: (key, scale, frames), and the job making them
     proxy: Option<(u64, f32, Animation, Option<Animation>)>,
     proxy_job: Option<(u64, Receiver<(Animation, Option<Animation>)>)>,
@@ -2923,6 +2927,12 @@ impl GifKitApp {
             layer_find_open: false,
             layer_find_fresh: false,
             preview_max: theme::get_setting("preview_max").and_then(|v| v.parse().ok()).unwrap_or(1280),
+            mem_pct: {
+                let pct = theme::get_setting("mem_pct").and_then(|v| v.parse().ok()).unwrap_or(100);
+                crate::pixels::set_mem_pct(pct);
+                pct
+            },
+            mem_seen: (0, -10.0),
             proxy: None,
             proxy_job: None,
             live_job: None,
@@ -3274,7 +3284,9 @@ impl GifKitApp {
 
     fn push_undo(&mut self, s: Snapshot) {
         self.undo.push(s);
-        if self.undo.len() > 100 {
+        // fewer steps back on Low memory, more on High
+        let keep = (crate::pixels::scaled(100 << 10) >> 10).clamp(30, 250);
+        while self.undo.len() > keep {
             self.undo.remove(0);
         }
     }
@@ -4940,7 +4952,7 @@ impl GifKitApp {
         let size = vec2(tex.width() as f32, tex.height() as f32);
         let bytes = tex.width() as usize * tex.height() as usize * 4;
         // keep to a budget, dropping what was looked at longest ago
-        while self.gpu_frames.bytes + bytes > GPU_FRAMES_BUDGET && !self.gpu_frames.map.is_empty() {
+        while self.gpu_frames.bytes + bytes > crate::pixels::scaled(GPU_FRAMES_BUDGET) && !self.gpu_frames.map.is_empty() {
             let oldest = *self.gpu_frames.map.iter().min_by_key(|(_, e)| e.2).map(|(k, _)| k).unwrap();
             if let Some((t, id, _)) = self.gpu_frames.map.remove(&oldest) {
                 self.gpu_frames.bytes -= t.width() as usize * t.height() as usize * 4;
@@ -6156,6 +6168,16 @@ impl GifKitApp {
                     self.free_gpu_frames();
                     self.comp_key = 0;
                 }
+                sub_menu(ui, "", "&Memory Use", |ui| {
+                    ui.set_min_width(250.0);
+                    for (v, l) in [(50usize, "&Low (Saves Memory)"), (100, "&Normal"), (250, "&High (Smoother)")] {
+                        if menu_check(ui, self.mem_pct == v, l, "") {
+                            self.mem_pct = v;
+                            crate::pixels::set_mem_pct(v);
+                            theme::set_setting("mem_pct", &v.to_string());
+                        }
+                    }
+                });
                 if menu_check(ui, self.sample_preview, "&Estimate Size of Long Animations", "") {
                     self.sample_preview = !self.sample_preview;
                     theme::set_setting("sample_preview", if self.sample_preview { "1" } else { "0" });
@@ -6498,6 +6520,21 @@ impl GifKitApp {
                     if job.total > 1 {
                         ui.add(egui::ProgressBar::new(done as f32 / job.total as f32).desired_width(200.0).desired_height(12.0).fill(pal.highlight));
                     }
+                }
+                // memory in use, read every couple of seconds
+                let now = ui.input(|i| i.time);
+                if now - self.mem_seen.1 > 2.0 {
+                    self.mem_seen = (crate::pixels::process_bytes().unwrap_or(0), now);
+                }
+                if self.mem_seen.0 > 0 {
+                    ui.add_space(4.0);
+                    let lvl = match self.mem_pct {
+                        v if v < 100 => "Low",
+                        v if v > 100 => "High",
+                        _ => "Normal",
+                    };
+                    ui.label(RichText::new(format!("{:.0} MiB", self.mem_seen.0 as f64 / 1_048_576.0)).size(12.5).color(pal.fg_muted)).on_hover_text(format!("Memory in use. Memory Use is {lvl} (Settings)."));
+                    ui.ctx().request_repaint_after(std::time::Duration::from_secs(2));
                 }
                 if self.base.is_some() {
                     let name = self.project_path.as_ref().or(self.path.as_ref()).and_then(|p| p.file_name()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Untitled".into());
