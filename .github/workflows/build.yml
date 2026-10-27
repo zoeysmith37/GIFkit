@@ -34,7 +34,7 @@ jobs:
 
       - name: Linux build deps
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev xvfb mesa-vulkan-drivers libgl1-mesa-dri
 
       - name: Test
         run: cargo test --release
@@ -50,6 +50,14 @@ jobs:
           cp assets/linux/install.sh assets/icon/gifkit.svg dist/gifkit-${{ matrix.name }}/
           tar -C dist -czf gifkit-${{ matrix.name }}.tar.gz gifkit-${{ matrix.name }}
 
+      # the real window drives itself through the app and writes a report
+      - name: GUI smoke test (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          xvfb-run -a -s "-screen 0 1600x1000x24" env GIFKIT_SMOKE=smoke.txt timeout 180 target/release/gifkit testdata/test.gif || true
+          cat smoke.txt
+          test "$(head -n1 smoke.txt)" = ok
+
       # ---------------------------------------------------------------- Windows
       - name: Build (Windows)
         if: runner.os == 'Windows'
@@ -61,6 +69,16 @@ jobs:
           Copy-Item target/release/gifkit.exe, README.md $d
           Copy-Item assets/*.txt $d
           Compress-Archive -Path $d -DestinationPath gifkit-${{ matrix.name }}.zip
+
+      - name: GUI smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:GIFKIT_SMOKE = "$PWD\smoke.txt"
+          $p = Start-Process -FilePath target/release/gifkit.exe -ArgumentList "testdata/test.gif" -PassThru
+          if (-not $p.WaitForExit(180000)) { $p.Kill(); Write-Host "hung" }
+          Get-Content smoke.txt
+          if ((Get-Content smoke.txt -TotalCount 1) -ne "ok") { exit 1 }
 
       # ---------------------------------------------------------------- macOS (universal .app)
       - name: Build (macOS)
@@ -101,6 +119,16 @@ jobs:
           codesign --force --deep --sign - $APP
           cp README.md dist/
           cd dist && zip -qry ../gifkit-${{ matrix.name }}.zip GIFkit.app README.md
+
+      - name: GUI smoke test (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          GIFKIT_SMOKE=smoke.txt target/aarch64-apple-darwin/release/gifkit testdata/test.gif &
+          pid=$!
+          for i in $(seq 180); do kill -0 $pid 2>/dev/null || break; sleep 1; done
+          kill $pid 2>/dev/null || true
+          cat smoke.txt
+          test "$(head -n1 smoke.txt)" = ok
 
       - uses: actions/upload-artifact@v4
         with:

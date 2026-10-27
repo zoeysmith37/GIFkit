@@ -224,7 +224,7 @@ fn diamond(painter: &egui::Painter, c: Pos2, r: f32, fill: Color32, stroke: Stro
 
 impl GifKitApp {
     /// Runs of output frames the GIF actually shows (skipped source frames are gaps).
-    fn gif_runs(&self) -> Vec<(usize, usize)> {
+    pub(super) fn gif_runs(&self) -> Vec<(usize, usize)> {
         let Some(base) = &self.base else { return Vec::new() };
         // gaps (blank frames) and skipped frames aren't part of any clip
         let edit = self.gif_edit_len();
@@ -310,7 +310,7 @@ impl GifKitApp {
     }
 
     /// Split `track` so a clip starts at output frame `f`.
-    fn tl_split_at(&mut self, track: u64, f: usize, now: f64) {
+    pub(super) fn tl_split_at(&mut self, track: u64, f: usize, now: f64) {
         let n = self.plan.len();
         if track == GIF {
             // the frame where the new clip starts carries the split

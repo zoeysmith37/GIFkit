@@ -114,7 +114,7 @@ impl Action {
             Action::ActualSize => "Actual size",
             Action::SplitView => "Single or split view",
             Action::FullScreen => "Full screen",
-            Action::Handbook => "Readme",
+            Action::Handbook => "Handbook",
             Action::DeleteObject => "Delete the selected object",
             Action::TlSplit => "Timeline: split at the playhead",
             Action::TlKey => "Timeline: add a keyframe",

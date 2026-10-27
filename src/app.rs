@@ -24,6 +24,10 @@ use std::sync::Arc;
 mod timeline_ui;
 #[path = "batch_ui.rs"]
 mod batch_ui;
+#[path = "smoke.rs"]
+mod smoke;
+#[path = "handbook.rs"]
+mod handbook;
 
 // ================================================================ tools
 
@@ -866,6 +870,9 @@ pub struct GifKitApp {
     frames_zip: bool,
     presets: Vec<crate::presets::Preset>,
     batch: batch_ui::BatchState,
+    smoke: Option<smoke::Smoke>,
+    handbook_open: bool,
+    handbook_topic: usize,
     preset_problems: Vec<String>,
     preset_name: String,
     preset_inc: (bool, bool, bool),
@@ -2813,6 +2820,9 @@ impl GifKitApp {
             frames_zip: false,
             presets: Vec::new(),
             batch: Default::default(),
+            smoke: smoke::Smoke::from_env(),
+            handbook_open: std::env::var_os("GIFKIT_HANDBOOK").is_some(),
+            handbook_topic: std::env::var("GIFKIT_HANDBOOK").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             preset_problems: Vec::new(),
             preset_name: std::env::var("GIFKIT_PRESET_NAME").unwrap_or_default(),
             preset_inc: (true, true, true),
@@ -4417,7 +4427,7 @@ impl GifKitApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!on));
         }
         if hit(A::Handbook) {
-            open_external(&format!("{REPO_URL}#readme"));
+            self.handbook_open = true;
         }
         // letters belong to an open menu, and Alt+letter to the menu bar
         let alt = ctx.input(|i| i.modifiers.alt);
@@ -5652,6 +5662,7 @@ impl eframe::App for GifKitApp {
         }
         let perf_t0 = std::time::Instant::now();
         self.mem_report(&ctx);
+        self.smoke_step(&ctx);
         stack::mark_ui_thread();
         // textures follow the size pictures were shown at last frame
         let need = TEX_NEED.swap(0, Ordering::Relaxed);
@@ -5674,7 +5685,7 @@ impl eframe::App for GifKitApp {
         self.thumbs.pump(&ctx);
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true) || std::env::var_os("GIFKIT_ASSUME_FOCUS").is_some();
         // a dialog of ours having focus still counts as the app being active
-        let dialog_open = self.export_open || self.history_open || self.about_open || self.ff_open || self.restore_offer.is_some() || self.shortcuts_open || self.video_import.is_some();
+        let dialog_open = self.handbook_open || self.batch.open || self.export_open || self.history_open || self.about_open || self.ff_open || self.restore_offer.is_some() || self.shortcuts_open || self.video_import.is_some();
         theme::set_focused(&ctx, focused || dialog_open, self.theme);
         self.views_last = self.drop_views.drain(..).map(|v| v.0).collect();
         // text that follows the canvas (wrapping, centring, caption bars)
@@ -5911,6 +5922,7 @@ impl eframe::App for GifKitApp {
         self.about_window(&ctx);
         self.restore_window(&ctx);
         self.batch_window(&ctx);
+        self.handbook_window(&ctx);
         self.ffmpeg_window(&ctx);
         mark("canvas");
         self.emoji_drag_drop(&ctx);
@@ -6211,7 +6223,10 @@ impl GifKitApp {
             });
             top_menu(ui, "&Help", |ui| {
                 ui.set_min_width(250.0);
-                if menu_item(ui, "help-contents", "GIFkit &Readme", &self.keymap.text(crate::keys::Action::Handbook), true) {
+                if menu_item(ui, "help-contents", "GIFkit &Handbook", &self.keymap.text(crate::keys::Action::Handbook), true) {
+                    self.handbook_open = true;
+                }
+                if menu_item(ui, "", "GIFkit &Readme", "", true) {
                     open_external(&format!("{REPO_URL}#readme"));
                 }
                 ui.separator();
