@@ -61,7 +61,9 @@ jobs:
       - name: GUI smoke test (Linux)
         if: runner.os == 'Linux'
         run: |
-          xvfb-run -a -s "-screen 0 1600x1000x24" env GIFKIT_SMOKE=smoke.txt timeout 180 target/release/gifkit testdata/test.gif 2> smoke.err || echo "exit $?" >> smoke.err
+          Xvfb :99 -screen 0 1600x1000x24 &
+          sleep 2
+          DISPLAY=:99 RUST_BACKTRACE=1 GIFKIT_SMOKE=smoke.txt timeout 180 target/release/gifkit testdata/test.gif > smoke.err 2>&1 || echo "exit $?" >> smoke.err
           touch smoke.txt
           cat smoke.txt smoke.err | tail -n 15 | while read -r l; do echo "::notice::$l"; done
           test "$(head -n1 smoke.txt)" = ok
