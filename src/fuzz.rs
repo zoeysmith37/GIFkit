@@ -818,6 +818,9 @@ fn gpu_matches_cpu() {
     let mut cap = text.clone();
     cap.caption = crate::text::Caption::Bottom;
     cases.push(("caption", Transform::default(), vec![LayerKind::Text(cap)], vec![]));
+    let mut typing = text.clone();
+    (typing.reveal, typing.reveal_secs) = (crate::text::Reveal::Letters, 0.3);
+    cases.push(("typing text", t(&|t| (t.rot_on, t.rot_any, t.rot_deg) = (true, true, -10.0)), vec![LayerKind::Text(typing)], vec![]));
     let mut wm = crate::effects::WatermarkSettings::default();
     wm.tiled = true;
     cases.push(("watermark tiled", Transform::default(), vec![LayerKind::Watermark(Box::new(wm))], vec![]));

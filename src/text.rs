@@ -118,6 +118,65 @@ pub struct Annotation {
     /// the bar in output pixels: top edge and height
     pub bar_y: i32,
     pub bar_h: u32,
+    /// typing: the text shows letter by letter or word by word
+    pub reveal: Reveal,
+    /// over this long (seconds), from where the layer starts
+    pub reveal_secs: f32,
+}
+
+/// How text comes in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum Reveal {
+    #[default]
+    None,
+    Letters,
+    Words,
+}
+
+impl Annotation {
+    /// How many characters (line breaks not counted) show after each step of
+    /// typing, from none to all. Empty when it doesn't type.
+    pub fn reveal_steps(&self, f: &FontEntry) -> Vec<usize> {
+        let shown: String = self.shown_text(f).chars().filter(|c| *c != '\n').collect();
+        let n = shown.chars().count();
+        let mut v = vec![0];
+        match self.reveal {
+            Reveal::None => return Vec::new(),
+            Reveal::Letters => {
+                // a space adds no step of its own
+                for (i, c) in shown.chars().enumerate() {
+                    if !c.is_whitespace() {
+                        v.push(i + 1);
+                    }
+                }
+            }
+            Reveal::Words => {
+                let chars: Vec<char> = shown.chars().collect();
+                for i in 0..n {
+                    if !chars[i].is_whitespace() && (i + 1 == n || chars[i + 1].is_whitespace()) {
+                        v.push(i + 1);
+                    }
+                }
+            }
+        }
+        // very long text: in at most 200 steps
+        if v.len() > 201 {
+            let k = v.len() as f32 / 200.0;
+            v = (0..=200).map(|i| v[((i as f32 * k) as usize).min(v.len() - 1)]).collect();
+            v.dedup();
+        }
+        v
+    }
+
+    /// Which step of typing shows `t` seconds after the layer starts (None:
+    /// all of it).
+    pub fn reveal_step(&self, steps: usize, t: f32) -> Option<usize> {
+        if self.reveal == Reveal::None || steps < 2 {
+            return None;
+        }
+        let k = (t.max(0.0) / self.reveal_secs.max(0.05) * (steps - 1) as f32).floor() as usize;
+        (k < steps - 1).then_some(k)
+    }
 }
 
 impl Default for Annotation {
@@ -148,6 +207,8 @@ impl Default for Annotation {
             wrap_px: 0.0,
             bar_y: 0,
             bar_h: 0,
+            reveal: Reveal::None,
+            reveal_secs: 1.5,
         }
     }
 }
@@ -164,6 +225,8 @@ struct Placed {
     id: GlyphId,
     x: f32,
     y: f32,
+    /// which character of the line it's drawn for (typing reveals by these)
+    ch: usize,
 }
 
 /// Shape a line with HarfBuzz rules (rustybuzz): right-to-left scripts,
@@ -180,6 +243,8 @@ fn shape_line(f: &FontEntry, line: &str, scale: PxScale) -> (Vec<Placed>, f32) {
         let (hs, vs) = (sf.h_scale_factor(), sf.v_scale_factor());
         let mut x = 0.0;
         let mut v = Vec::new();
+        // byte offset to character number
+        let char_at = |b: usize| line[..b.min(line.len())].chars().count();
         let bidi = unicode_bidi::BidiInfo::new(line, None);
         let runs: Vec<(std::ops::Range<usize>, bool)> = match bidi.paragraphs.first() {
             Some(para) => {
@@ -193,12 +258,13 @@ fn shape_line(f: &FontEntry, line: &str, scale: PxScale) -> (Vec<Placed>, f32) {
         };
         for (range, rtl) in runs {
             let mut buf = rustybuzz::UnicodeBuffer::new();
-            buf.push_str(&line[range]);
+            buf.push_str(&line[range.clone()]);
             buf.set_direction(if rtl { rustybuzz::Direction::RightToLeft } else { rustybuzz::Direction::LeftToRight });
             buf.guess_segment_properties();
             let out = rustybuzz::shape(&face, &[], buf);
+            let start = range.start;
             for (info, pos) in out.glyph_infos().iter().zip(out.glyph_positions()) {
-                v.push(Placed { id: GlyphId(info.glyph_id as u16), x: x + pos.x_offset as f32 * hs, y: -(pos.y_offset as f32) * vs });
+                v.push(Placed { id: GlyphId(info.glyph_id as u16), x: x + pos.x_offset as f32 * hs, y: -(pos.y_offset as f32) * vs, ch: char_at(start + info.cluster as usize) });
                 x += pos.x_advance as f32 * hs;
             }
         }
@@ -207,12 +273,12 @@ fn shape_line(f: &FontEntry, line: &str, scale: PxScale) -> (Vec<Placed>, f32) {
     let mut x = 0.0;
     let mut prev = None;
     let mut v = Vec::new();
-    for c in line.chars() {
+    for (ci, c) in line.chars().enumerate() {
         let id = sf.glyph_id(c);
         if let Some(p) = prev {
             x += sf.kern(p, id);
         }
-        v.push(Placed { id, x, y: 0.0 });
+        v.push(Placed { id, x, y: 0.0, ch: ci });
         x += sf.h_advance(id);
         prev = Some(id);
     }
@@ -297,7 +363,9 @@ impl Annotation {
     }
 }
 
-pub fn rasterize(f: &FontEntry, text: &str, size: f32, align: Align) -> (u32, u32, Vec<f32>) {
+/// `rasterize`, drawing only the first `limit` characters (not counting
+/// line breaks) while laying out all of them, so nothing moves as more show.
+pub fn rasterize_upto(f: &FontEntry, text: &str, size: f32, align: Align, limit: Option<usize>) -> (u32, u32, Vec<f32>) {
     let font = &f.font;
     let scale = PxScale::from(size);
     let sf = font.as_scaled(scale);
@@ -306,6 +374,12 @@ pub fn rasterize(f: &FontEntry, text: &str, size: f32, align: Align) -> (u32, u3
     let maxw = lines.iter().map(|l| l.1).fold(0.0, f32::max).ceil() as u32 + 2;
     let total_h = (line_h * lines.len() as f32).ceil() as u32 + 2;
     let mut mask = vec![0f32; (maxw * total_h) as usize];
+    // characters on the lines before (line breaks don't count)
+    let line_start: Vec<usize> = text.split('\n').scan(0usize, |acc, l| {
+        let s = *acc;
+        *acc += l.chars().count();
+        Some(s)
+    }).collect();
     for (li, (glyphs, width)) in lines.iter().enumerate() {
         let off_x = match align {
             Align::Left => 0.0,
@@ -314,6 +388,9 @@ pub fn rasterize(f: &FontEntry, text: &str, size: f32, align: Align) -> (u32, u3
         };
         let base_y = sf.ascent() + li as f32 * line_h;
         for g in glyphs {
+            if limit.is_some_and(|n| line_start[li] + g.ch >= n) {
+                continue;
+            }
             let gl = g.id.with_scale_and_position(scale, ab_glyph::point(off_x + g.x, base_y + g.y));
             if let Some(og) = font.outline_glyph(gl) {
                 let b = og.px_bounds();
@@ -360,9 +437,14 @@ fn stretched(w: u32, s: f32) -> u32 {
 
 /// Pre-rendered RGBA sprite of an annotation (so it is rasterised once per apply).
 pub fn render_sprite(fonts: &[FontEntry], a: &Annotation) -> RgbaImage {
+    render_sprite_upto(fonts, a, None)
+}
+
+/// `render_sprite` with only the first `limit` characters drawn (typing).
+pub fn render_sprite_upto(fonts: &[FontEntry], a: &Annotation, limit: Option<usize>) -> RgbaImage {
     let font = &fonts[a.font_idx.min(fonts.len() - 1)];
     let a = &*a.within_budget(font);
-    let (w, h, mask) = rasterize(font, &a.shown_text(font), a.size, a.align);
+    let (w, h, mask) = rasterize_upto(font, &a.shown_text(font), a.size, a.align, limit);
     let r = a.outline_px();
     let sw = w + 2 * r as u32;
     let sh = h + 2 * r as u32;

@@ -1126,8 +1126,8 @@ fn bundled_fonts_load_and_draw() {
 fn arabic_is_shaped_right_to_left() {
     // joined Arabic is narrower than its isolated letters laid side by side
     let (e, _) = crate::bundled::load("Amiri", "Regular").unwrap();
-    let joined = crate::text::rasterize(&e, "سلام", 48.0, crate::text::Align::Left).0;
-    let apart = crate::text::rasterize(&e, "س ل ا م", 48.0, crate::text::Align::Left).0;
+    let joined = crate::text::rasterize_upto(&e, "سلام", 48.0, crate::text::Align::Left, None).0;
+    let apart = crate::text::rasterize_upto(&e, "س ل ا م", 48.0, crate::text::Align::Left, None).0;
     assert!(joined < apart);
 }
 
@@ -1514,4 +1514,27 @@ fn loop_helpers() {
     let first = s.frames[0].image.get();
     let mix = ops::lerp_image(&anim.frames[15].image.get(), &anim.frames[0].image.get(), 0.1);
     assert_eq!(first.as_raw(), mix.as_raw());
+}
+
+/// Typing text shows more letters (or words) frame by frame, in place.
+#[test]
+fn text_types_in() {
+    let fonts = crate::text::builtin_fonts();
+    let a = Animation { frames: (0..20).map(|_| Frame::new(image::RgbaImage::from_pixel(200, 60, image::Rgba([255, 255, 255, 255])), 10)).collect(), loop_count: None };
+    let ink = |img: &image::RgbaImage| img.pixels().filter(|p| p[0] < 128).count();
+    for reveal in [crate::text::Reveal::Letters, crate::text::Reveal::Words] {
+        let mut st = crate::stack::Stack::default();
+        st.push(crate::stack::LayerKind::Text(crate::text::Annotation { text: "Hello there world".into(), size: 24.0, x: 5, y: 10, reveal, reveal_secs: 1.0, ..Default::default() }));
+        let out = st.flatten(&a, &fonts, None);
+        let counts: Vec<usize> = out.frames.iter().map(|f| ink(&f.image.get())).collect();
+        assert_eq!(counts[0], 0, "{reveal:?}: nothing yet at the start");
+        assert!(counts.windows(2).all(|w| w[1] >= w[0]), "{reveal:?}: only more: {counts:?}");
+        assert!(counts[5] > 0 && counts[5] < counts[15], "{reveal:?}: part way: {counts:?}");
+        // after the second, the whole text
+        let mut full = st.clone();
+        if let crate::stack::LayerKind::Text(t) = &mut full.layers[0].kind {
+            t.reveal = crate::text::Reveal::None;
+        }
+        assert_eq!(counts[15], ink(&full.flatten(&a, &fonts, None).frames[15].image.get()));
+    }
 }

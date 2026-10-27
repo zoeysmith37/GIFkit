@@ -10566,6 +10566,22 @@ impl GifKitApp {
             // a fixed id keeps the focus when the first letter adds the layer
             ui.add(egui::TextEdit::multiline(&mut a.text).id_salt("text_body").desired_rows(2).desired_width(f32::INFINITY));
         });
+        group(ui, "Typing", |ui| {
+            form_row(ui, "Reveal", |ui| {
+                ui.horizontal(|ui| {
+                    for (r, label) in [(text::Reveal::None, "All at once"), (text::Reveal::Letters, "Letters"), (text::Reveal::Words, "Words")] {
+                        if radio(ui, a.reveal == r, label).clicked() {
+                            a.reveal = r;
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Type the text in letter by letter or word by word, from where the layer starts")
+            });
+            ui.add_enabled_ui(a.reveal != text::Reveal::None, |ui| {
+                slider_row(ui, "Over", soft_slider(&mut a.reveal_secs, 0.2..=10.0, "").suffix(" s").max_decimals(1)).on_hover_text("How long typing it all takes");
+            });
+        });
         group(ui, "Layout", |ui| {
             use text::Caption;
             form_row(ui, "Caption bar", |ui| seg_row(ui, &mut a.caption, &[(Caption::None, "None"), (Caption::Top, "Top"), (Caption::Bottom, "Bottom")]))

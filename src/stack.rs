@@ -592,6 +592,8 @@ pub struct PlanFrame {
 pub struct Prepared {
     pub maps: Vec<GeoMap>,
     sprites: Vec<Option<(RgbaImage, i64, i64)>>,
+    /// typing text: the picture after each step (the last step is `sprites`)
+    reveals: Vec<Vec<RgbaImage>>,
     watermarks: Vec<Option<WatermarkSprite>>,
     /// shape and markup sprites per layer, each with its source frame range
     stamps: Vec<Vec<StrokeSprite>>,
@@ -601,7 +603,7 @@ impl Prepared {
     /// Was this made for `st`'s layers? (one entry per layer)
     pub fn fits(&self, st: &Stack) -> bool {
         let n = st.layers.len();
-        self.maps.len() == n && self.sprites.len() == n && self.watermarks.len() == n && self.stamps.len() == n
+        self.maps.len() == n && self.sprites.len() == n && self.watermarks.len() == n && self.stamps.len() == n && self.reveals.len() == n
     }
 }
 
@@ -906,7 +908,37 @@ impl Stack {
                 }
             })
             .collect();
-        Prepared { maps, sprites, watermarks, stamps }
+        // typing text: a picture for each step, laid out as the whole text
+        let reveals = self
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(li, l)| match &l.kind {
+                LayerKind::Text(t) if l.active() && t.reveal != text::Reveal::None && !fonts.is_empty() => {
+                    let Some(b) = l.source_box(0, fonts) else { return Vec::new() };
+                    let o = map_box(&maps[li].m, b, true);
+                    let scale = ((o.w / b.w.max(1e-3)) * (o.h / b.h.max(1e-3))).sqrt();
+                    let mut t2 = t.clone();
+                    t2.size = (t.size * scale).clamp(1.0, 4000.0);
+                    t2.wrap_px = t.wrap_px * scale;
+                    let font = &fonts[t2.font_idx.min(fonts.len() - 1)];
+                    let steps = t2.reveal_steps(font);
+                    use rayon::prelude::*;
+                    steps[..steps.len().saturating_sub(1)]
+                        .par_iter()
+                        .map(|&k| {
+                            let mut sp = text::render_sprite_upto(fonts, &t2, Some(k));
+                            if (o.angle % 360.0).abs() > 0.01 {
+                                sp = crate::ops::rotate_any_image(&sp, o.angle, image::Rgba([0, 0, 0, 0]), true);
+                            }
+                            sp
+                        })
+                        .collect()
+                }
+                _ => Vec::new(),
+            })
+            .collect();
+        Prepared { maps, sprites, watermarks, stamps, reveals }
     }
 
     /// The transformed frame before any layer (geometry only).
@@ -1125,6 +1157,7 @@ impl Stack {
                 }
                 if let Some(Some((s, x, y))) = prep.sprites.get(li) {
                     if t.applies_to(src) {
+                        let s = self.reveal_sprite(prep, li, times, i).unwrap_or(s);
                         draw(&mut img, s, *x, *y, t.opacity as f32 / 100.0);
                     }
                 }
@@ -1436,6 +1469,18 @@ impl Stack {
             }
         }
         Some(out)
+    }
+
+    /// Typing text on layer `li` at output frame `i`: the picture to show
+    /// instead of the whole text (None: all of it).
+    fn reveal_sprite<'a>(&self, prep: &'a Prepared, li: usize, times: &[f32], i: usize) -> Option<&'a RgbaImage> {
+        let shots = prep.reveals.get(li).filter(|v| !v.is_empty())?;
+        let l = &self.layers[li];
+        let LayerKind::Text(t) = &l.kind else { return None };
+        let (s0, _) = l.timing.extent(times.len());
+        let since = times.get(i).copied().unwrap_or(0.0) - times.get(s0).copied().unwrap_or(0.0);
+        let k = t.reveal_step(shots.len() + 1, since)?;
+        shots.get(k)
     }
 
     /// Keep per-frame data in sync with the number of source frames.
@@ -1794,6 +1839,7 @@ impl Stack {
                     }
                     if let Some(Some((s, x, y))) = prep.sprites.get(li) {
                         if tx.applies_to(src) {
+                            let s = self.reveal_sprite(prep, li, times, i).unwrap_or(s);
                             draws.push(mk(s, *x, *y, tx.opacity as f32 / 100.0));
                         }
                     }
