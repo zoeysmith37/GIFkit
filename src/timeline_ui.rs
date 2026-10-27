@@ -797,9 +797,18 @@ impl GifKitApp {
         let zoom = if self.tl_zoom <= 0.0 { fit } else { self.tl_zoom.max(fit * ZOOM_OUT) };
         self.tl_zoom_now = zoom;
         let visible = lane_w / zoom;
-        // follow the playhead while playing
-        if self.playing && self.tl_drag.is_none() && ((self.cur as f32) < self.tl_x0 || self.cur as f32 + 1.0 > self.tl_x0 + visible) {
-            self.tl_x0 = self.cur as f32 - visible * 0.1;
+        // follow the playhead while playing, and when it's stepped (arrow
+        // keys, jumps to edits): once it's out of view, the view moves on.
+        // Left alone while paused, the view stays wherever it was scrolled.
+        let moved = self.cur != self.tl_cur_seen;
+        self.tl_cur_seen = self.cur;
+        if (self.playing || moved) && self.tl_drag.is_none() {
+            if self.cur as f32 + 1.0 > self.tl_x0 + visible {
+                self.tl_x0 = self.cur as f32 - visible * 0.1;
+            } else if (self.cur as f32) < self.tl_x0 {
+                // going back: the frames before it come into view
+                self.tl_x0 = self.cur as f32 + 1.0 - visible * 0.9;
+            }
         }
         self.tl_x0 = self.tl_x0.clamp(0.0, (span - visible).max(0.0));
         let x0 = self.tl_x0;

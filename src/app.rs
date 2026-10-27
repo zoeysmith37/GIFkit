@@ -929,6 +929,8 @@ pub struct GifKitApp {
     /// pixels per frame that fit the whole animation, and the zoom now (last drawn)
     tl_fit: f32,
     tl_zoom_now: f32,
+    /// where the playhead was last frame, to follow it when it moves
+    tl_cur_seen: usize,
     /// a zoom the toolbar asked for, applied about the playhead
     tl_zoom_to: Option<f32>,
     /// middle-button panning, and dragging the scroll bar (grab offset in frames)
@@ -2809,6 +2811,7 @@ impl GifKitApp {
             tl_zoom: 0.0,
             tl_fit: 1.0,
             tl_zoom_now: 1.0,
+            tl_cur_seen: 0,
             tl_zoom_to: None,
             tl_pan: false,
             tl_bar_drag: None,
