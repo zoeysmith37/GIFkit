@@ -66,7 +66,9 @@ Moves a layer over time with ready-made motions like slide, hop and spin. Keyfra
 - K adds a keyframe. Auto key adds one when you change a value
 - Ease Custom opens a curve to shape the timing. Back overshoots
 - Draw Path: drag on the preview and the layer follows the line
-- Track: click something in the picture and the layer follows it
+- Once a layer has keyframes, dragging it on the preview keys it at the playhead
+- Track: click something (or box it) and the layer follows it
+- Pick it on more frames where it changes. Then press Track again or Enter
 - The selected layer's path shows as dots, one a frame",
     ),
     (

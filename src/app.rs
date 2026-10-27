@@ -1061,6 +1061,10 @@ pub struct GifKitApp {
     path_pts: Vec<(f32, f32)>,
     /// Track: a click on the preview picks a spot for the layer to follow
     path_track: bool,
+    /// spots picked for Track: on which frame, where, and the patch size
+    track_anchors: Vec<crate::track::Anchor>,
+    /// where a box for Track started (image coordinates)
+    track_box: Option<Pos2>,
     /// while trimming the GIF's outer ends: the output frames that stay
     tl_trim: Option<(usize, usize)>,
     keymap: crate::keys::Keymap,
@@ -2954,6 +2958,8 @@ impl GifKitApp {
             path_draw: false,
             path_pts: Vec::new(),
             path_track: false,
+            track_anchors: Vec::new(),
+            track_box: None,
             tl_trim: None,
             keymap: crate::keys::Keymap::load(),
             key_capture: None,
@@ -9009,6 +9015,8 @@ impl GifKitApp {
                 continue;
             }
             if let Some(b) = l.source_box(src_idx, &self.fonts) {
+                // a keyframed layer is handled where it is on this frame
+                let b = if l.timing.keys.is_empty() { b } else { l.timing.motion(self.cur).apply(b) };
                 cands.push((li, l.id, b, map_box(&map_of(li), b, l.readable())));
             }
         }
@@ -9019,38 +9027,68 @@ impl GifKitApp {
         let ptr_img = resp.interact_pointer_pos().map(|p| m.to_img(p));
         let shift = ui.input(|i| i.modifiers.shift);
 
-        // ---- Track: a click picks the spot the layer follows
+        // ---- Track: clicks (or boxes) pick spots for the layer to follow,
+        // on as many frames as you like; Track again (or Enter) runs it
         if self.path_track && space == Space::Output {
-            if let Some((li, id, b, _)) = sel {
+            if let Some((li, _, _, _)) = sel {
+                let mp = map_of(li);
+                let inv = mp.inverse();
                 if resp.hovered() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
                 }
-                if resp.clicked() {
-                    if let (Some(pi), Some(base)) = (ptr_img, self.base.clone()) {
-                        let (px, py) = map_of(li).inverse().apply(pi.x, pi.y);
-                        let n = self.plan.len();
-                        let l = &self.stack.layers[li];
-                        let (a, z) = l.timing.extent(n);
-                        let mo = l.timing.motion(self.cur);
-                        // the layer keeps where it sits from the spot
-                        let off = (b.cx + mo.dx - px, b.cy + mo.dy - py);
-                        let srcs: Vec<usize> = self.plan[a..=z].iter().map(|f| f.src).collect();
-                        let start = self.cur.clamp(a, z) - a;
-                        let centre = (b.cx, b.cy);
-                        self.path_track = false;
-                        let ctx = ui.ctx().clone();
-                        self.spawn(&ctx, "Tracking", srcs.len(), move |p| {
-                            use rayon::prelude::*;
-                            let grays: Vec<crate::track::Gray> = srcs.par_iter().map(|&s| crate::track::Gray::new(&base.frames[s].image.get())).collect();
-                            let refs: Vec<&crate::track::Gray> = grays.iter().collect();
-                            let pts = crate::track::track(&refs, start, (px, py), p);
-                            if std::env::var_os("GIFKIT_TRACK_DEBUG").is_some() {
-                                eprintln!("track from {:?} on frame {start}: {:?}", (px, py), pts.iter().step_by(5).map(|q| (q.0 as i32, q.1 as i32)).collect::<Vec<_>>());
-                            }
-                            let pos = pts.into_iter().map(|q| (q.0 + off.0, q.1 + off.1)).collect();
-                            JobOutput::Track(id, a, pos, centre)
-                        });
+                let mut pick: Option<((f32, f32), (i32, i32))> = None;
+                if started {
+                    self.track_box = ui.input(|i| i.pointer.press_origin()).map(|p| m.to_img(p));
+                }
+                if let (Some(o), Some(pi)) = (self.track_box, ptr_img) {
+                    if dragged && show {
+                        painter.rect_stroke(Rect::from_two_pos(m.to_screen(o), m.to_screen(pi)), 0.0, Stroke::new(1.5, pal.highlight), egui::StrokeKind::Middle);
                     }
+                    if stopped {
+                        // a box: its middle, and the patch is the box
+                        let (a, b) = (inv.apply(o.x, o.y), inv.apply(pi.x, pi.y));
+                        let size = (((a.0 - b.0).abs() / 2.0).round() as i32, ((a.1 - b.1).abs() / 2.0).round() as i32);
+                        pick = Some((((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0), (size.0.max(4), size.1.max(4))));
+                        self.track_box = None;
+                    }
+                }
+                if resp.clicked() {
+                    if let Some(pi) = ptr_img {
+                        pick = Some((inv.apply(pi.x, pi.y), (crate::track::CLICK_PATCH, crate::track::CLICK_PATCH)));
+                    }
+                }
+                if let Some((at, size)) = pick {
+                    let frame = self.cur;
+                    self.track_anchors.retain(|a| a.frame != frame);
+                    self.track_anchors.push(crate::track::Anchor { frame, at, size });
+                    self.track_anchors.sort_by_key(|a| a.frame);
+                    let k = self.track_anchors.len();
+                    self.info(format!("{k} spot{} picked. Pick it on other frames too if it gets lost, then press Track again or Enter.", if k == 1 { "" } else { "s" }));
+                }
+                // the spots: this frame's as its box, the rest as small marks
+                if show {
+                    for a in &self.track_anchors {
+                        let c = mp.apply(a.at.0, a.at.1);
+                        let sc = to_screen(c);
+                        if a.frame == self.cur {
+                            let (w, h) = mp.apply_vec(a.size.0 as f32, a.size.1 as f32);
+                            let r = Rect::from_center_size(sc, vec2(w.abs() * 2.0 * m.scale, h.abs() * 2.0 * m.scale));
+                            painter.rect_stroke(r, 0.0, Stroke::new(2.5, Color32::from_black_alpha(150)), egui::StrokeKind::Middle);
+                            painter.rect_stroke(r, 0.0, Stroke::new(1.5, pal.highlight), egui::StrokeKind::Middle);
+                        } else {
+                            painter.line_segment([sc - vec2(5.0, 0.0), sc + vec2(5.0, 0.0)], Stroke::new(1.5, pal.highlight.gamma_multiply(0.6)));
+                            painter.line_segment([sc - vec2(0.0, 5.0), sc + vec2(0.0, 5.0)], Stroke::new(1.5, pal.highlight.gamma_multiply(0.6)));
+                            painter.text(sc + vec2(7.0, -7.0), egui::Align2::LEFT_BOTTOM, format!("{}", a.frame + 1), egui::FontId::proportional(11.0), pal.highlight);
+                        }
+                    }
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) && !self.track_anchors.is_empty() {
+                    self.run_track(ui.ctx());
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.path_track = false;
+                    self.track_anchors.clear();
+                    self.info("Track cancelled");
                 }
                 return;
             }
@@ -9179,7 +9217,7 @@ impl GifKitApp {
                             }
                             let (dx, dy) = mp.inverse().apply_vec(ox, oy);
                             let nb = Obb { cx: src.cx + dx, cy: src.cy + dy, ..src };
-                            self.write_box(li, nb, None, src_idx);
+                            self.write_box_or_key(li, nb, src_idx);
                         }
                         BoxDrag::Resize { fixed, out0, src, size0, stretch0, axis, .. } => {
                             // Shift flips the proportion lock (images and emoji start locked),
@@ -9210,7 +9248,7 @@ impl GifKitApp {
                             let c = out0.from_local(lcx, lcy);
                             let out = Obb { cx: c.0, cy: c.1, w, h, angle: out0.angle };
                             let nb = unmap_box(&mp, out, src.angle);
-                            if size0 > 0.0 {
+                            if size0 > 0.0 && !self.keyed(li) {
                                 // text: height sets the font size, width the stretch
                                 let (ky, kx) = (nb.h / src.h.max(1e-3), nb.w / src.w.max(1e-3));
                                 if let LayerKind::Text(t) = &mut self.stack.layers[li].kind {
@@ -9218,7 +9256,7 @@ impl GifKitApp {
                                     t.stretch = (stretch0 * kx / ky.max(1e-3)).clamp(0.05, 20.0);
                                 }
                             }
-                            self.write_box(li, nb, None, src_idx);
+                            self.write_box_or_key(li, nb, src_idx);
                         }
                         BoxDrag::Rotate { a0, out0, src, .. } => {
                             let a = (pi.y - out0.cy).atan2(pi.x - out0.cx).to_degrees();
@@ -9227,7 +9265,7 @@ impl GifKitApp {
                                 phi = (phi / 15.0).round() * 15.0;
                             }
                             let th = source_angle(&mp, phi, readable);
-                            self.write_box(li, Obb { angle: th, ..src }, None, src_idx);
+                            self.write_box_or_key(li, Obb { angle: th, ..src }, src_idx);
                         }
                         BoxDrag::New { anchor, .. } if matches!(&self.stack.layers[li].kind, LayerKind::Shape(sh) if sh.kind.is_linear()) => {
                             // lines and arrows run from where the drag started to the pointer
@@ -9325,7 +9363,9 @@ impl GifKitApp {
                 continue;
             }
             let mp = maps2.as_ref().map(|m| m[li].m).unwrap_or(Affine::IDENTITY);
-            let o = map_box(&mp, b, l.readable());
+            let keyed = !l.timing.keys.is_empty();
+            // keyframed: the handles are where it is on this frame
+            let o = if keyed { map_box(&mp, l.timing.motion(self.cur).apply(b), l.readable()) } else { map_box(&mp, b, l.readable()) };
             // keyframed motion: a dashed outline where it is on this frame,
             // the handles stay on where it was placed
             let mo = l.timing.motion(self.cur);
@@ -9343,7 +9383,7 @@ impl GifKitApp {
                     painter.circle_filled(*p, if here { 4.0 } else { 1.8 }, if here { pal.highlight } else { Color32::WHITE.gamma_multiply(0.8) });
                 }
             }
-            if mo.moves() {
+            if mo.moves() && !keyed {
                 let o2 = map_box(&mp, mo.apply(b), l.readable());
                 let mut pts2: Vec<Pos2> = o2.corners().iter().map(|c| to_screen(*c)).collect();
                 pts2.push(pts2[0]);
@@ -9509,6 +9549,69 @@ impl GifKitApp {
     }
 
     /// Write an edited source-space box back into layer `li`.
+    /// Track with the spots picked: the selected layer follows them.
+    pub(super) fn run_track(&mut self, ctx: &egui::Context) {
+        self.path_track = false;
+        let anchors = std::mem::take(&mut self.track_anchors);
+        let Some(base) = self.base.clone() else { return };
+        let Some(li) = self.tool.layer_kind().and_then(|k| self.sel_index(k)).or_else(|| self.tl_track.and_then(|t| self.stack.index_of(t))) else { return };
+        let n = self.plan.len();
+        let l = &self.stack.layers[li];
+        let id = l.id;
+        let (a, z) = l.timing.extent(n);
+        let in_clip: Vec<crate::track::Anchor> = anchors.into_iter().filter(|k| k.frame >= a && k.frame <= z).map(|k| crate::track::Anchor { frame: k.frame - a, ..k }).collect();
+        let Some(first) = in_clip.first().copied() else {
+            self.info("The spots are outside the layer's clip");
+            return;
+        };
+        let src = self.plan.get(first.frame + a).map(|f| f.src).unwrap_or(0);
+        let Some(b) = l.source_box(src, &self.fonts) else { return };
+        // the layer keeps its distance from the spot, as it was on the first one's frame
+        let mo = l.timing.motion(first.frame + a);
+        let off = (b.cx + mo.dx - first.at.0, b.cy + mo.dy - first.at.1);
+        let centre = (b.cx, b.cy);
+        let srcs: Vec<usize> = self.plan[a..=z].iter().map(|f| f.src).collect();
+        let k = in_clip.len();
+        self.spawn(ctx, &format!("Tracking with {k} spot{}", if k == 1 { "" } else { "s" }), srcs.len() * k.max(1), move |p| {
+            use rayon::prelude::*;
+            let grays: Vec<crate::track::Gray> = srcs.par_iter().map(|&s| crate::track::Gray::new(&base.frames[s].image.get())).collect();
+            let refs: Vec<&crate::track::Gray> = grays.iter().collect();
+            let pts = crate::track::track_anchors(&refs, &in_clip, p);
+            let pos = pts.into_iter().map(|q| (q.0 + off.0, q.1 + off.1)).collect();
+            JobOutput::Track(id, a, pos, centre)
+        });
+    }
+
+    /// Whether moving the layer on the preview makes keyframes (it has some).
+    fn keyed(&self, li: usize) -> bool {
+        self.stack.layers.get(li).is_some_and(|l| !l.timing.keys.is_empty())
+    }
+
+    /// A box dragged on the preview: a keyframed layer gets a keyframe at
+    /// the playhead (with Auto key, or on a keyframe already there); any
+    /// other is moved where it's placed.
+    fn write_box_or_key(&mut self, li: usize, nb: Obb, src_idx: usize) {
+        if !self.keyed(li) {
+            self.write_box(li, nb, None, src_idx);
+            return;
+        }
+        let Some(b0) = self.stack.layers[li].source_box(src_idx, &self.fonts) else { return };
+        let cur = self.cur;
+        let t = &mut self.stack.layers[li].timing;
+        if !self.tl_autokey && t.key_at(cur).is_none() {
+            self.info("Auto key is off: add a keyframe here (K) to move it on this frame");
+            return;
+        }
+        let k = t.add_key(cur);
+        let key = &mut t.keys[k];
+        key.x = nb.cx - b0.cx;
+        key.y = nb.cy - b0.cy;
+        key.scale_x = nb.w / b0.w.max(1e-3) * 100.0;
+        key.scale_y = nb.h / b0.h.max(1e-3) * 100.0;
+        key.angle = nb.angle - b0.angle;
+        self.modified = true;
+    }
+
     fn write_box(&mut self, li: usize, b: Obb, text_size: Option<f32>, src_idx: usize) {
         let scope = self.place_scope;
         let fonts = &self.fonts;

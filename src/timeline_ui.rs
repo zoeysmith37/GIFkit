@@ -826,14 +826,20 @@ impl GifKitApp {
                             let on = self.path_track && can;
                             let tb = ui
                                 .add_enabled(can, sel_btn(egui::Button::new("").frame_when_inactive(on).min_size(vec2(CHIP_H, CHIP_H)), on))
-                                .on_hover_text("Track: click something in the picture and the layer follows it")
+                                .on_hover_text("Track: click something in the picture (or box it) and the layer follows it. Spots on more frames keep it on target. Press again to run.")
                                 .on_disabled_hover_text("Select a layer that sits somewhere on the frame to track with it");
                             crate::icons::paint(ui.painter(), "edit-select", tb.rect.center(), 16.0, if on { pal.fg } else { pal.fg_muted });
                             if tb.clicked() {
-                                self.path_track = !self.path_track;
                                 self.path_draw = false;
-                                if self.path_track {
-                                    self.info("Click the spot to follow, on this frame. The layer keeps its distance from it.");
+                                if self.path_track && !self.track_anchors.is_empty() {
+                                    // pressed again with spots picked: go
+                                    self.run_track(ctx);
+                                } else {
+                                    self.path_track = !self.path_track;
+                                    self.track_anchors.clear();
+                                    if self.path_track {
+                                        self.info("Click the thing to follow, or drag a box round it. Add spots on other frames where it changes, then press Track again.");
+                                    }
                                 }
                             }
                         }
