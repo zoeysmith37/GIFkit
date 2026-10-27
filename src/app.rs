@@ -258,6 +258,8 @@ enum JobOutput {
     Fit(anyhow::Result<crate::target::Fit>),
     ProjectLoaded(anyhow::Result<(crate::project::Project, PathBuf)>),
     ProjectSaved(anyhow::Result<PathBuf>),
+    /// the best loop: first output frame, the one matching it, how different
+    LoopPoint(Option<(usize, usize, f32)>),
 }
 
 /// Something that would throw away unsaved changes, waiting for an answer.
@@ -842,6 +844,8 @@ pub struct GifKitApp {
     fr_delay: u16,
     fr_crossfade: usize,
     fr_crossfade_wrap: bool,
+    /// Make Seamless: how many frames the end fades into the start over
+    loop_blend: usize,
     fr_thumb: f32,
     video_bg: [u8; 3],
 
@@ -2789,6 +2793,7 @@ impl GifKitApp {
             fr_delay: 10,
             fr_crossfade: 2,
             fr_crossfade_wrap: true,
+            loop_blend: 8,
             fr_thumb: 96.0,
             video_bg: [255, 255, 255],
             view_single: ViewSource::Edit,
@@ -3218,6 +3223,16 @@ impl GifKitApp {
             }
             JobOutput::Anim(Err(e)) | JobOutput::Baked(Err(e)) | JobOutput::Loaded(Err(e)) | JobOutput::Overlay(Err(e)) | JobOutput::Fit(Err(e)) | JobOutput::ProjectLoaded(Err(e)) | JobOutput::ProjectSaved(Err(e)) => self.error(format!("{label} failed: {e:#}")),
             JobOutput::ProjectLoaded(Ok((pr, path))) => self.apply_project(pr, path),
+            JobOutput::LoopPoint(None) => self.info("Too few frames to look for a loop"),
+            JobOutput::LoopPoint(Some((a, b, d))) => {
+                // in and out around it, looping, to see it and save it
+                self.tl_set_in(Some(a));
+                self.tl_set_out(Some(b.saturating_sub(1).max(a)));
+                self.tl_zone_loop = true;
+                self.export_zone_only = true;
+                self.cur = a;
+                self.info(format!("Best loop: frames {}–{} ({:.0}% different at the seam). In and out are set, and export saves just that.", a + 1, b, d * 100.0));
+            }
             JobOutput::ProjectSaved(Ok(path)) => {
                 self.modified = false;
                 self.clear_autosave();
@@ -9849,6 +9864,38 @@ impl GifKitApp {
             if wide_button(ui, egui::Button::new("Collapse Frame Edits")).on_hover_text("Make frame edits permanent. Layers stay editable.").clicked() {
                 self.bake(ctx, true);
             }
+        });
+        group(ui, "Seamless Loop", |ui| {
+            let idle = !self.busy() && self.base.is_some();
+            form_row(ui, "", |ui| {
+                let b = ui.add_enabled_ui(idle, |ui| wide_button(ui, egui::Button::new("Find Loop Point"))).inner.on_hover_text("Finds the two frames that look most alike and sets in and out around them, so it loops with the least jump");
+                if b.clicked() {
+                    self.find_loop_point(ctx);
+                }
+            });
+            form_row(ui, "Blend", |ui| {
+                ui.horizontal(|ui| {
+                    num_fill(ui, &mut self.loop_blend, 1.0, |d| d.range(1..=60).suffix(" frames")).on_hover_text("How many frames the end fades into the start over");
+                });
+            });
+            form_row(ui, "", |ui| {
+                let go = ui.add_enabled_ui(idle, |ui| wide_button(ui, egui::Button::new("Blend the Seam"))).inner.on_hover_text("The end fades into the start, and the animation gets that many frames shorter, so the jump back to frame 1 disappears");
+                if go.clicked() {
+                    let n = self.loop_blend;
+                    self.run_anim(ctx, "Seamless loop", move |a, _| Ok(ops::loop_crossfade(a, n)));
+                }
+            });
+        });
+    }
+
+    /// Look for the best loop in the background (on the frames as edited).
+    fn find_loop_point(&mut self, ctx: &egui::Context) {
+        let Some(base) = self.base.clone() else { return };
+        let plan = self.plan.clone();
+        let n = plan.len();
+        self.spawn(ctx, "Find loop point", n, move |_| {
+            let frames: Vec<Arc<RgbaImage>> = plan.iter().filter_map(|f| base.frames.get(f.src)).map(|f| f.image.get()).collect();
+            JobOutput::LoopPoint(ops::find_loop(&frames, (n / 4).max(4)))
         });
     }
 

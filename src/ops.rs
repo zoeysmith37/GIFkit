@@ -388,6 +388,68 @@ pub fn crossfade(anim: &Animation, steps: usize, wrap: bool) -> Animation {
     Animation { frames: out, loop_count: anim.loop_count }
 }
 
+/// Make the loop seamless: the last `n` frames fade into the first `n`, and
+/// the animation ends where the fade began, so playing it round shows no jump.
+pub fn loop_crossfade(anim: &Animation, n: usize) -> Animation {
+    let l = anim.len();
+    let n = n.min(l / 2);
+    if n == 0 {
+        return anim.clone();
+    }
+    let mut out: Vec<Frame> = Vec::with_capacity(l - n);
+    for i in 0..l - n {
+        let f = &anim.frames[i];
+        if i < n {
+            // from the end's frame towards the start's
+            let end = &anim.frames[l - n + i];
+            let t = (i as f32 + 0.5) / n as f32;
+            out.push(Frame { image: crate::pixels::Pixels::new(lerp_image(&end.image.get(), &f.image.get(), t)), delay_cs: f.delay_cs, enabled: f.enabled, cut: f.cut, blank: false });
+        } else {
+            out.push(f.clone());
+        }
+    }
+    Animation { frames: out, loop_count: anim.loop_count }
+}
+
+/// The best place to loop: two frames at least `min_len` apart that look
+/// most alike, as (first, the one that matches it, how different 0..1).
+/// Playing first..match-1 round then shows the least jump.
+pub fn find_loop(frames: &[std::sync::Arc<RgbaImage>], min_len: usize) -> Option<(usize, usize, f32)> {
+    use rayon::prelude::*;
+    let n = frames.len();
+    if n < 3 {
+        return None;
+    }
+    // small copies to compare
+    const S: u32 = 24;
+    let small: Vec<Vec<f32>> = frames
+        .par_iter()
+        .map(|f| image::imageops::resize(&**f, S, S, image::imageops::FilterType::Triangle).pixels().flat_map(|p| {
+            let a = p[3] as f32 / 255.0;
+            [p[0] as f32 * a, p[1] as f32 * a, p[2] as f32 * a, p[3] as f32]
+        }).collect())
+        .collect();
+    let min_len = min_len.clamp(2, n - 1);
+    // long animations: look at every so many frames
+    let step = (n / 400).max(1);
+    let best = (0..n)
+        .step_by(step)
+        .collect::<Vec<_>>()
+        .par_iter()
+        .filter_map(|&i| {
+            (i + min_len..n)
+                .step_by(step)
+                .map(|j| {
+                    let d: f32 = small[i].iter().zip(&small[j]).map(|(a, b)| (a - b).abs()).sum::<f32>() / (small[i].len() as f32 * 255.0);
+                    // a little in favour of longer loops
+                    (d - (j - i) as f32 * 1e-6, i, j, d)
+                })
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))?;
+    Some((best.1, best.2, best.3))
+}
+
 /// Composite each frame over the first frame (useful for transparent sprite
 /// animations that should keep a static background).
 pub fn first_frame_as_background(anim: &Animation) -> Animation {

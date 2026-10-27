@@ -1493,3 +1493,25 @@ fn chroma_key_soft_edge_and_spill() {
     assert_eq!(crate::effects::key_channel([128, 128, 128]), None);
     assert_eq!(crate::effects::key_channel([20, 30, 220]), Some(2));
 }
+
+/// Seamless loops: the seam blends, and the best loop point is found.
+#[test]
+fn loop_helpers() {
+    // a dot going round: frame k at angle k/40 of a turn, 60 frames
+    let frame = |k: usize| {
+        let a = k as f32 / 40.0 * std::f32::consts::TAU;
+        let (cx, cy) = (32.0 + 20.0 * a.cos(), 32.0 + 20.0 * a.sin());
+        image::RgbaImage::from_fn(64, 64, |x, y| if (x as f32 - cx).hypot(y as f32 - cy) < 6.0 { image::Rgba([255, 255, 255, 255]) } else { image::Rgba([0, 0, 40, 255]) })
+    };
+    let imgs: Vec<std::sync::Arc<image::RgbaImage>> = (0..60).map(|k| std::sync::Arc::new(frame(k))).collect();
+    let (a, b, d) = ops::find_loop(&imgs, 15).unwrap();
+    assert_eq!((b - a) % 40, 0, "a whole turn: {a}..{b}");
+    assert!(d < 0.01, "{d}");
+    let anim = Animation { frames: (0..20).map(|k| Frame::new(frame(k), 4)).collect(), loop_count: None };
+    let s = ops::loop_crossfade(&anim, 5);
+    assert_eq!(s.len(), 15);
+    // the first frame starts from where the old end was
+    let first = s.frames[0].image.get();
+    let mix = ops::lerp_image(&anim.frames[15].image.get(), &anim.frames[0].image.get(), 0.1);
+    assert_eq!(first.as_raw(), mix.as_raw());
+}
