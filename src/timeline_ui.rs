@@ -162,6 +162,14 @@ fn gif_edge_fill(d0: &[crate::anim::Frame], (a, b): (usize, usize), (na, nb): (u
     d
 }
 
+/// How one GIF clip goes into the next.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Trans {
+    Fade,
+    WipeLeft,
+    WipeRight,
+}
+
 /// What the timeline puts on the system clipboard, so Ctrl+V comes back here.
 pub(super) const BOARD_TAG: &str = "GIFkit timeline clips";
 
@@ -1922,6 +1930,38 @@ impl GifKitApp {
             if menu_item(ui, "edit-duplicate", "D&uplicate", &km.text(A::TlDuplicate), any_clips && !locked) {
                 self.tl_duplicate(now);
             }
+            // the GIF's clip: its speed, and how it goes into the next one
+            if let (Some(GIF), Some(ci)) = (self.tl_track, self.tl_clip) {
+                let runs = self.gif_runs();
+                if let Some(&(a, b)) = runs.get(ci) {
+                    ui.separator();
+                    sub_menu(ui, "speedometer", "Clip &Speed", |ui| {
+                        ui.set_min_width(200.0);
+                        for pct in [25u32, 50, 75, 150, 200, 300, 400] {
+                            let label = format!("{pct}%{}", if pct < 100 { " (slower)" } else { " (faster)" });
+                            if menu_item(ui, "", &label, "", idle) {
+                                self.gif_clip_speed(a, b, pct as f32, now);
+                            }
+                        }
+                    });
+                    let next = runs.get(ci + 1).filter(|n| n.0 == b + 1).copied();
+                    ui.add_enabled_ui(next.is_some(), |ui| {
+                        sub_menu(ui, "", "&Transition into Next", |ui| {
+                            ui.set_min_width(220.0);
+                            for (kind, name) in [(Trans::Fade, "Crossfade"), (Trans::WipeLeft, "Wipe from the Left"), (Trans::WipeRight, "Wipe from the Right")] {
+                                for n in [4usize, 8, 16] {
+                                    if menu_item(ui, "", &format!("{name}, {n} frames"), "", idle) {
+                                        self.gif_transition(b, n, kind, now);
+                                    }
+                                }
+                                ui.separator();
+                            }
+                        });
+                    })
+                    .response
+                    .on_disabled_hover_text("Only when the next clip starts right after this one");
+                }
+            }
             ui.separator();
             if menu_item(ui, "keyframe-add", "Add &Keyframe", &km.text(A::TlKey), has) {
                 self.tl_add_key(now);
@@ -2809,6 +2849,69 @@ impl GifKitApp {
             }
         }
         self.gif_write(s, e, d);
+    }
+
+    /// Play the GIF's clip `a..=b` at `pct`% speed: its frames are dropped or
+    /// repeated (sharing their pictures), so it gets shorter or longer on the
+    /// timeline and layers over it keep their pace.
+    fn gif_clip_speed(&mut self, a: usize, b: usize, pct: f32, now: f64) {
+        let Some((s, e, mut d)) = self.gif_display() else { return };
+        if b >= d.len() || a > b || pct <= 0.0 {
+            return;
+        }
+        self.snapshot(&format!("tl-speed{now}"), now);
+        let block: Vec<crate::anim::Frame> = d[a..=b].to_vec();
+        let len = block.len();
+        let new_len = ((len as f32 * 100.0 / pct).round() as usize).max(1);
+        let made: Vec<crate::anim::Frame> = (0..new_len).map(|k| crate::anim::Frame { cut: k == 0, ..block[(k * len / new_len).min(len - 1)].clone() }).collect();
+        d.splice(a..=b, made);
+        if let Some(f) = d.get_mut(a + new_len) {
+            f.cut = true;
+        }
+        self.gif_write(s, e, d);
+        self.tl_clip = self.gif_runs().iter().position(|r| r.0 == a);
+        self.info(format!("Clip at {pct:.0}%: {len} frames to {new_len}"));
+    }
+
+    /// Blend the GIF's clip ending at `b` into the one starting after it,
+    /// over `n` frames around the cut (the length stays the same).
+    fn gif_transition(&mut self, b: usize, n: usize, kind: Trans, now: f64) {
+        let Some((s, e, mut d)) = self.gif_display() else { return };
+        let runs = self.gif_runs();
+        let (Some(x), Some(y)) = (runs.iter().find(|r| r.1 == b).copied(), runs.iter().find(|r| r.0 == b + 1).copied()) else { return };
+        let start = (b + 1).saturating_sub(n / 2).max(x.0);
+        let end = (start + n - 1).min(y.1);
+        if end <= start {
+            return;
+        }
+        self.snapshot(&format!("tl-trans{now}"), now);
+        let span = (end + 1 - start) as f32;
+        let made: Vec<RgbaImage> = (start..=end)
+            .map(|j| {
+                // the outgoing clip holds its last frame past the cut, the
+                // incoming one its first frame before it
+                let from = d[j.min(b)].image.get();
+                let to = d[j.max(b + 1)].image.get();
+                let t = ((j - start) as f32 + 0.5) / span;
+                match kind {
+                    Trans::Fade => crate::ops::lerp_image(&from, &to, t),
+                    Trans::WipeLeft | Trans::WipeRight => {
+                        let w = from.width().min(to.width());
+                        let edge = (t * w as f32).round() as u32;
+                        RgbaImage::from_fn(from.width(), from.height(), |px, py| {
+                            let reveal = if kind == Trans::WipeLeft { px < edge } else { px >= w.saturating_sub(edge) };
+                            if reveal && px < to.width() && py < to.height() { *to.get_pixel(px, py) } else { *from.get_pixel(px, py) }
+                        })
+                    }
+                }
+            })
+            .collect();
+        for (k, img) in made.into_iter().enumerate() {
+            let f = &mut d[start + k];
+            f.image = crate::pixels::Pixels::new(img);
+        }
+        self.gif_write(s, e, d);
+        self.info(format!("{} over {} frames", match kind { Trans::Fade => "Crossfade", _ => "Wipe" }, end + 1 - start));
     }
 
     /// Output frames the GIF row can edit: with Boomerang, the first half
