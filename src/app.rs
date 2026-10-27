@@ -22,6 +22,8 @@ use std::sync::Arc;
 
 #[path = "timeline_ui.rs"]
 mod timeline_ui;
+#[path = "batch_ui.rs"]
+mod batch_ui;
 
 // ================================================================ tools
 
@@ -863,6 +865,7 @@ pub struct GifKitApp {
     export_fmt: ExportFormat,
     frames_zip: bool,
     presets: Vec<crate::presets::Preset>,
+    batch: batch_ui::BatchState,
     preset_problems: Vec<String>,
     preset_name: String,
     preset_inc: (bool, bool, bool),
@@ -1198,8 +1201,6 @@ fn apply_fit_scale(t: &mut Transform, scale: f32) {
     t.resize_on = true;
 }
 
-/// Quick targets, with a little headroom under each service's limit.
-const TARGET_PRESETS: [(&str, f32, bool); 3] = [("Discord 10 MB", 9.5, true), ("X 15 MB", 14.0, true), ("Emote 256 KB", 250.0, false)];
 
 /// Draw a tool's icon. A few are vector drawings because no bundled font has a
 /// clear glyph for them; the rest use the tool's text glyph.
@@ -2807,6 +2808,7 @@ impl GifKitApp {
             export_fmt: ExportFormat::Gif,
             frames_zip: false,
             presets: Vec::new(),
+            batch: Default::default(),
             preset_problems: Vec::new(),
             preset_name: std::env::var("GIFKIT_PRESET_NAME").unwrap_or_default(),
             preset_inc: (true, true, true),
@@ -3008,6 +3010,11 @@ impl GifKitApp {
         }
         if std::env::var("GIFKIT_HISTORY").is_ok() {
             app.history_open = true;
+        }
+        if let Ok(f) = std::env::var("GIFKIT_BATCH") {
+            app.batch.open = true;
+            app.batch.files = std::env::split_paths(&f).collect();
+            app.batch.edits = batch_ui::BatchEdits::Current;
         }
         if std::env::var("GIFKIT_SHORTCUTS").is_ok() {
             app.shortcuts_open = true;
@@ -5891,6 +5898,7 @@ impl eframe::App for GifKitApp {
         self.confirm_window(&ctx);
         self.about_window(&ctx);
         self.restore_window(&ctx);
+        self.batch_window(&ctx);
         self.ffmpeg_window(&ctx);
         mark("canvas");
         self.emoji_drag_drop(&ctx);
@@ -5981,6 +5989,15 @@ impl GifKitApp {
                 }
                 if menu_item(ui, "document-export", "&Export…", &self.keymap.text(crate::keys::Action::Export), idle && has) {
                     self.export_open = true;
+                }
+                if menu_item_tip(ui, "archive-insert", "&Batch…", "", idle, "Put the same edits and output settings on many files") {
+                    self.batch.open = true;
+                    if has {
+                        self.batch.edits = batch_ui::BatchEdits::Current;
+                    }
+                    let (l, pr) = crate::presets::list_with_problems();
+                    self.presets = l;
+                    self.preset_problems = pr;
                 }
                 ui.separator();
                 if menu_item(ui, "application-exit", "&Quit", &self.keymap.text(crate::keys::Action::Quit), true) {
@@ -8297,101 +8314,29 @@ impl GifKitApp {
     }
 
     fn apply_preset(&mut self, pr: &crate::presets::Preset, ctx: &egui::Context) {
-        use crate::presets::PresetLayer;
         let now = ctx.input(|i| i.time);
         self.snapshot(&format!("preset{now}"), now);
-        let (w, h) = self.dims();
-        let (sw, sh) = (pr.src_size.0.max(1) as f32, pr.src_size.1.max(1) as f32);
-        let (fx, fy) = if pr.src_size.0 == 0 { (1.0, 1.0) } else { (w as f32 / sw, h as f32 / sh) };
-        let fs = fx.min(fy);
-        let sc = |v: i32, f: f32| (v as f32 * f).round() as i32;
-        if let Some(t) = &pr.transform {
-            let mut t = t.clone();
-            t.crop = [(t.crop[0] as f32 * fx) as u32, (t.crop[1] as f32 * fy) as u32, (t.crop[2] as f32 * fx) as u32, (t.crop[3] as f32 * fy) as u32];
+        let rp = self.ready_preset(pr);
+        let n = self.base.as_ref().map(|b| b.len()).unwrap_or(1).max(1);
+        let (t, layers) = batch_ui::preset_parts(&rp, self.dims(), n);
+        if let Some(t) = t {
             self.stack.transform = t;
         }
         if let Some(g) = &pr.gif {
             self.gif_opts = g.clone();
         }
-        let mut missing = Vec::new();
-        if let Some(layers) = &pr.layers {
-            let n = self.base.as_ref().map(|b| b.len()).unwrap_or(1).max(1);
-            for l in layers {
-                let id = match l.clone() {
-                    PresetLayer::Effects { visible, fx: e } => (self.stack.push(LayerKind::Effects(Box::new(e))), visible),
-                    PresetLayer::Text { visible, mut text, font } => {
-                        text.x = sc(text.x, fx);
-                        text.y = sc(text.y, fy);
-                        text.size *= fs;
-                        text.font_idx = self.resolve_font(&font);
-                        (self.stack.push(LayerKind::Text(text)), visible)
-                    }
-                    PresetLayer::Censor { visible, mut censor } => {
-                        censor.x = sc(censor.x, fx);
-                        censor.y = sc(censor.y, fy);
-                        censor.w = (censor.w as f32 * fx) as u32;
-                        censor.h = (censor.h as f32 * fy) as u32;
-                        (self.stack.push(LayerKind::Censor(censor)), visible)
-                    }
-                    PresetLayer::Image { visible, path, mut placement, opacity } => match io::load_animation(&path) {
-                        Ok(a) => {
-                            placement.x = sc(placement.x, fx);
-                            placement.y = sc(placement.y, fy);
-                            placement.w = (placement.w as f32 * fs).max(1.0) as u32;
-                            placement.h = (placement.h as f32 * fs).max(1.0) as u32;
-                            let src = OverlaySource { name: path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(), path: Some(path.clone()), delays: a.frames.iter().map(|f| f.delay_cs).collect(), frames: a.frames.iter().map(|f| (*f.image.get()).clone()).collect() };
-                            (self.stack.push(LayerKind::Overlay(OverlayLayer { src: Arc::new(src), placements: vec![placement; n], opacity })), visible)
-                        }
-                        Err(_) => {
-                            missing.push(path.display().to_string());
-                            continue;
-                        }
-                    },
-                    PresetLayer::Watermark { visible, mut watermark } => {
-                        watermark.font_idx = self.resolve_font(&watermark.font_key);
-                        if let Some(p) = &watermark.image_path {
-                            watermark.image = io::load_still(p).ok().map(Arc::new);
-                        }
-                        (self.stack.push(LayerKind::Watermark(Box::new(watermark))), visible)
-                    }
-                    PresetLayer::Shield { visible, shield } => (self.stack.push(LayerKind::Shield(shield)), visible),
-                    PresetLayer::Shape { visible, mut shape } => {
-                        shape.x = sc(shape.x, fx);
-                        shape.y = sc(shape.y, fy);
-                        shape.w = ((shape.w as f32 * fx) as u32).max(1);
-                        shape.h = ((shape.h as f32 * fy) as u32).max(1);
-                        shape.stroke_w *= fs;
-                        (self.stack.push(LayerKind::Shape(Box::new(shape))), visible)
-                    }
-                    PresetLayer::Markup { visible, mut markup } => {
-                        for st in &mut markup.strokes {
-                            for pt in &mut st.points {
-                                pt[0] *= fx;
-                                pt[1] *= fy;
-                            }
-                            st.width *= fs;
-                        }
-                        (self.stack.push(LayerKind::Markup(markup)), visible)
-                    }
-                    PresetLayer::Emoji { visible, mut emoji } => {
-                        emoji.x = sc(emoji.x, fx);
-                        emoji.y = sc(emoji.y, fy);
-                        emoji.w = ((emoji.w as f32 * fs) as u32).max(1);
-                        emoji.h = ((emoji.h as f32 * fs) as u32).max(1);
-                        (self.stack.push(LayerKind::Emoji(Box::new(emoji))), visible)
-                    }
-                };
-                if let Some(i) = self.stack.index_of(id.0) {
-                    self.stack.layers[i].visible = id.1;
-                }
+        for (k, vis) in layers {
+            let id = self.stack.push(k);
+            if let Some(i) = self.stack.index_of(id) {
+                self.stack.layers[i].visible = vis;
             }
         }
         self.modified = true;
         self.refresh_plan();
-        if missing.is_empty() {
+        if rp.missing.is_empty() {
             self.info(format!("Applied preset “{}”", pr.name));
         } else {
-            self.error(format!("Applied “{}”; missing images: {}", pr.name, missing.join(", ")));
+            self.error(format!("Applied “{}”; missing images: {}", pr.name, rp.missing.join(", ")));
         }
     }
 
@@ -10058,16 +10003,19 @@ impl GifKitApp {
                     })
                 });
                 form_row(ui, "", |ui| {
-                    let r = wide_button(ui, drop_button(ui, "Common Limits", p().fg)).on_hover_text("Upload limits of popular sites");
+                    let r = wide_button(ui, drop_button(ui, "Platforms", p().fg)).on_hover_text("Upload limits of popular sites. Emoji sizes shrink the frames too.");
+                    let mut pick = None;
                     egui::Popup::menu(&r).show(|ui| {
-                        ui.set_min_width(170.0);
-                        for (lbl, v, mb) in TARGET_PRESETS {
-                            if ui.button(lbl).clicked() {
-                                self.target_val = v;
-                                self.target_mb = mb;
+                        ui.set_min_width(190.0);
+                        for (i, pf) in batch_ui::PLATFORMS.iter().enumerate() {
+                            if menu_item(ui, "", pf.name, pf.note, true) {
+                                pick = Some(i);
                             }
                         }
                     });
+                    if let Some(i) = pick {
+                        self.use_platform(i);
+                    }
                 });
                 form_row(ui, "", |ui| {
                     if check(ui, &mut self.fit_keep_size, "Keep frame size").on_hover_text("Only change compression and never shrink the frames").changed() {
