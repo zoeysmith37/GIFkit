@@ -61,8 +61,9 @@ jobs:
       - name: GUI smoke test (Linux)
         if: runner.os == 'Linux'
         run: |
-          xvfb-run -a -s "-screen 0 1600x1000x24" env GIFKIT_SMOKE=smoke.txt timeout 180 target/release/gifkit testdata/test.gif || true
-          cat smoke.txt
+          xvfb-run -a -s "-screen 0 1600x1000x24" env GIFKIT_SMOKE=smoke.txt timeout 180 target/release/gifkit testdata/test.gif 2> smoke.err || echo "exit $?" >> smoke.err
+          touch smoke.txt
+          cat smoke.txt smoke.err | tail -n 15 | while read -r l; do echo "::notice::$l"; done
           test "$(head -n1 smoke.txt)" = ok
 
       # ---------------------------------------------------------------- Windows
@@ -82,9 +83,11 @@ jobs:
         shell: pwsh
         run: |
           $env:GIFKIT_SMOKE = "$PWD\smoke.txt"
-          $p = Start-Process -FilePath target/release/gifkit.exe -ArgumentList "testdata/test.gif" -PassThru
-          if (-not $p.WaitForExit(180000)) { $p.Kill(); Write-Host "hung" }
-          Get-Content smoke.txt
+          $p = Start-Process -FilePath target/release/gifkit.exe -ArgumentList "testdata/test.gif" -PassThru -RedirectStandardError smoke.err
+          if (-not $p.WaitForExit(180000)) { $p.Kill(); Add-Content smoke.err "hung" }
+          Add-Content smoke.err "exit $($p.ExitCode)"
+          if (-not (Test-Path smoke.txt)) { New-Item smoke.txt | Out-Null }
+          (Get-Content smoke.txt) + (Get-Content smoke.err | Select-Object -Last 15) | ForEach-Object { Write-Host "::notice::$_" }
           if ((Get-Content smoke.txt -TotalCount 1) -ne "ok") { exit 1 }
 
       # ---------------------------------------------------------------- macOS (universal .app)
@@ -130,11 +133,12 @@ jobs:
       - name: GUI smoke test (macOS)
         if: runner.os == 'macOS'
         run: |
-          GIFKIT_SMOKE=smoke.txt target/aarch64-apple-darwin/release/gifkit testdata/test.gif &
+          GIFKIT_SMOKE=smoke.txt target/aarch64-apple-darwin/release/gifkit testdata/test.gif 2> smoke.err &
           pid=$!
           for i in $(seq 180); do kill -0 $pid 2>/dev/null || break; sleep 1; done
-          kill $pid 2>/dev/null || true
-          cat smoke.txt
+          kill $pid 2>/dev/null && echo hung >> smoke.err || true
+          touch smoke.txt
+          cat smoke.txt smoke.err | tail -n 15 | while read -r l; do echo "::notice::$l"; done
           test "$(head -n1 smoke.txt)" = ok
 
       - uses: actions/upload-artifact@v4
