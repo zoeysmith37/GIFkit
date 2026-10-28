@@ -504,7 +504,7 @@ pub fn match_grid(a: &Gray, b: &Gray, step: i32, r: i32) -> (usize, usize, Vec<M
             // near where most things went first (quick), far and wide only
             // when it isn't there
             let mut got = search(b, &refs, &shapes, pose, (x + typical.0, y + typical.1), step as f32 * 2.0, 1.6, 2.0);
-            if got.1 > (detail * 0.8).max(10.0) {
+            if got.1 > (detail * 0.45).max(6.0) {
                 let far = wide(x, y, &looks);
                 if far.1 < got.1 {
                     got = far;

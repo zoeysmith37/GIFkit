@@ -859,6 +859,8 @@ pub struct GifKitApp {
     fr_crossfade_wrap: bool,
     /// in-betweens move with the picture, not only fade
     fr_follow: bool,
+    /// what in-betweens do where motion can't be followed
+    fr_unsure: crate::interp::Unsure,
     /// Make Seamless: how many frames the end fades into the start over
     loop_blend: usize,
     fr_thumb: f32,
@@ -2831,6 +2833,7 @@ impl GifKitApp {
             fr_crossfade: 2,
             fr_crossfade_wrap: true,
             fr_follow: true,
+            fr_unsure: crate::interp::Unsure::Blur,
             loop_blend: 8,
             fr_thumb: 96.0,
             video_bg: [255, 255, 255],
@@ -11792,6 +11795,13 @@ impl GifKitApp {
             form_row(ui, "", |ui| {
                 check(ui, &mut self.fr_follow, "Follow motion").on_hover_text("Moves the picture along with what moves in it, so things slide instead of fading through each other");
             });
+            if self.fr_follow {
+                form_row(ui, "Unsure", |ui| {
+                    use crate::interp::Unsure;
+                    combo(ui, "ib_unsure", &mut self.fr_unsure, &[(Unsure::Blur, "Motion blur"), (Unsure::Nearer, "Nearer frame"), (Unsure::Fade, "Fade")])
+                        .on_hover_text("Where something changes too much to follow: smear it along its way, show the nearer frame moved into place, or fade the two");
+                });
+            }
             // too short a delay and browsers slow it down
             let shortest = self.base.as_ref().and_then(|a| a.frames.iter().filter(|f| f.enabled).map(|f| f.delay_cs).min()).unwrap_or(10);
             let each = shortest as f32 / (self.fr_crossfade + 1) as f32;
@@ -11804,12 +11814,13 @@ impl GifKitApp {
                 go = wide_button(ui, egui::Button::new("Make In-Betweens")).on_hover_text("Smoother motion. The length stays the same.").clicked();
             });
             if go {
-                let (steps, wrap, follow) = (self.fr_crossfade, self.fr_crossfade_wrap, self.fr_follow);
+                let (steps, wrap, follow, unsure) = (self.fr_crossfade, self.fr_crossfade_wrap, self.fr_follow, self.fr_unsure);
                 if let Some(base) = self.base.clone() {
                     let mut stack = self.stack.clone();
                     let plan_src: Vec<usize> = self.plan.iter().map(|f| f.src).collect();
-                    self.spawn(ctx, "In-betweens", base.len(), move |p| {
-                        let (out, counts) = ops::inbetween_counted(&base, steps, wrap, follow, Some(p));
+                    // following motion, each frame is counted twice (looked at, then made)
+                    self.spawn(ctx, "In-betweens", base.len() * if follow { 2 } else { 1 }, move |p| {
+                        let (out, counts) = ops::inbetween_counted(&base, steps, wrap, follow, unsure, Some(p));
                         // layers stretch with the frames: where each old frame
                         // now starts, counting shown frames as the timeline does,
                         // and how many it became

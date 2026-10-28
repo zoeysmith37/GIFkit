@@ -371,11 +371,103 @@ pub fn crossfade(anim: &Animation, steps: usize, wrap: bool) -> Animation {
 /// frame's time is shared with its in-betweens, so the length stays the
 /// same. Skipped frames and gaps are left as they are.
 pub fn inbetween(anim: &Animation, steps: usize, wrap: bool, follow: bool, progress: Option<&std::sync::atomic::AtomicUsize>) -> Animation {
-    inbetween_counted(anim, steps, wrap, follow, progress).0
+    inbetween_counted(anim, steps, wrap, follow, crate::interp::Unsure::Blur, progress).0
+}
+
+/// Where frame `i` shows something that stays put on screen over the
+/// frames around it (`reach` either way): burned-in text, a logo, a border.
+/// Either its colour stays the same (with detail near, as flat areas can't
+/// be seen to move anyway), or its outline does (see-through text over a
+/// moving picture changes colour but not shape). Full size. None when
+/// there's nothing, or too few frames to tell.
+pub fn still_mask(anim: &Animation, i: usize, reach: usize) -> Option<Vec<bool>> {
+    use rayon::prelude::*;
+    let n = anim.len();
+    let idx: Vec<usize> = (i.saturating_sub(reach)..(i + reach + 1).min(n)).filter(|&k| anim.frames[k].enabled && !anim.frames[k].blank).collect();
+    if idx.len() < 5 {
+        return None;
+    }
+    let imgs: Vec<_> = idx.iter().map(|&k| anim.frames[k].image.get()).collect();
+    let (w, h) = imgs[0].dimensions();
+    if imgs.iter().any(|m| m.dimensions() != (w, h)) {
+        return None;
+    }
+    let (wu, hu) = (w as usize, h as usize);
+    // brightness, and its detail (less the average around it)
+    let lums: Vec<Vec<f32>> = imgs.par_iter().map(|m| m.pixels().map(|p| (p[0] as f32 * 0.3 + p[1] as f32 * 0.59 + p[2] as f32 * 0.11) * p[3] as f32 / 255.0).collect()).collect();
+    let details: Vec<Vec<f32>> = lums
+        .par_iter()
+        .map(|l| {
+            let avg = box_mean(l, wu, hu, 3);
+            l.iter().zip(avg).map(|(a, b)| a - b).collect()
+        })
+        .collect();
+    let keep: Vec<bool> = (0..wu * hu)
+        .into_par_iter()
+        .map(|j| {
+            // the same colour throughout (allowing for a video's noise)
+            let first = imgs[0].as_raw();
+            let same = imgs[1..].iter().all(|m| {
+                let r = m.as_raw();
+                (0..4).all(|c| (r[j * 4 + c] as i32 - first[j * 4 + c] as i32).abs() <= 24)
+            });
+            let edgy = details[0][j].abs() > 12.0;
+            // or the same outline: strong detail, the same way, throughout
+            let d0 = details[0][j];
+            let shape = d0.abs() > 20.0 && details[1..].iter().all(|d| d[j] * d0.signum() > 14.0 && (d[j] - d0).abs() < 35.0);
+            (same && edgy) || shape
+        })
+        .collect();
+    if !keep.iter().any(|&b| b) {
+        return None;
+    }
+    // text and logos are dense: lone specks (a leaf that happened not to
+    // move) go
+    let ones: Vec<f32> = keep.iter().map(|&b| if b { 1.0 } else { 0.0 }).collect();
+    let dense = box_mean(&ones, wu, hu, 4);
+    let keep: Vec<f32> = ones.iter().zip(&dense).map(|(&k, &d)| if k > 0.0 && d > 0.15 { 1.0 } else { 0.0 }).collect();
+    // a little wider, for soft edges
+    let spread = box_mean(&keep, wu, hu, 2);
+    Some(spread.into_iter().map(|v| v > 0.01).collect())
+}
+
+/// Each value the average of those `r` out each way (a box, rows then columns).
+fn box_mean(v: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+    let pass = |v: &[f32], horiz: bool| -> Vec<f32> {
+        let (len, lines) = if horiz { (w, h) } else { (h, w) };
+        let mut out = vec![0.0f32; w * h];
+        for line in 0..lines {
+            let at = |k: usize| if horiz { line * w + k } else { k * w + line };
+            let mut sum = 0.0f32;
+            let mut cnt = 0usize;
+            for k in 0..r.min(len) {
+                sum += v[at(k)];
+                cnt += 1;
+            }
+            for k in 0..len {
+                if k + r < len {
+                    sum += v[at(k + r)];
+                    cnt += 1;
+                }
+                if k > r {
+                    sum -= v[at(k - r - 1)];
+                    cnt -= 1;
+                }
+                out[at(k)] = sum / cnt as f32;
+            }
+        }
+        out
+    };
+    pass(&pass(v, true), false)
 }
 
 /// [`inbetween`], also saying how many frames each frame became.
-pub fn inbetween_counted(anim: &Animation, steps: usize, wrap: bool, follow: bool, progress: Option<&std::sync::atomic::AtomicUsize>) -> (Animation, Vec<usize>) {
+///
+/// Following motion, every pair gets a first look before any is finished,
+/// so each can borrow from the pairs either side (things they saw moving,
+/// the path they took) and from what stays still around it. `progress`
+/// then counts each frame twice: once looked at, once finished.
+pub fn inbetween_counted(anim: &Animation, steps: usize, wrap: bool, follow: bool, unsure: crate::interp::Unsure, progress: Option<&std::sync::atomic::AtomicUsize>) -> (Animation, Vec<usize>) {
     use rayon::prelude::*;
     if steps == 0 || anim.len() < 2 {
         return (anim.clone(), vec![1; anim.len()]);
@@ -409,12 +501,36 @@ pub fn inbetween_counted(anim: &Animation, steps: usize, wrap: bool, follow: boo
             j += 1;
         }
     };
+    let tick = || {
+        if let Some(p) = progress {
+            p.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    };
+    // first looks (None at a cut, or not following)
+    let looks: Vec<Option<crate::interp::Glance>> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let g = if follow { next_of(i).and_then(|j| crate::interp::Glance::new(&anim.frames[i].image.get(), &anim.frames[j].image.get())) } else { None };
+            if follow {
+                tick();
+            }
+            g
+        })
+        .collect();
+    // the pair before each (the one leading into it)
+    let mut before: Vec<Option<usize>> = vec![None; n];
+    for i in 0..n {
+        if let Some(j) = next_of(i) {
+            before[j] = Some(i);
+        }
+    }
     let made: Vec<Vec<Frame>> = (0..n)
         .into_par_iter()
         .map(|i| {
             let f = &anim.frames[i];
             let Some(j) = next_of(i) else {
                 // stays as it is (its time and place kept)
+                tick();
                 return vec![f.clone()];
             };
             let parts = steps + 1;
@@ -425,20 +541,24 @@ pub fn inbetween_counted(anim: &Animation, steps: usize, wrap: bool, follow: boo
             let (a, b) = (f.image.get(), anim.frames[j].image.get());
             // following motion: None at a cut, and then the nearer frame is
             // held, not smeared
-            let pair = follow.then(|| crate::interp::Pair::new(&a, &b));
+            let pair = follow.then(|| {
+                looks[i].as_ref().map(|g| {
+                    let prev = before[i].and_then(|p| looks[p].as_ref());
+                    let next = looks[j].as_ref();
+                    crate::interp::Pair::finish(&a, &b, g, prev, next, still_mask(anim, i, 4))
+                })
+            });
             let mut v = vec![Frame { delay_cs: share(0), ..f.clone() }];
             for s in 1..=steps {
                 let t = s as f32 / parts as f32;
                 let img = match &pair {
-                    Some(Some(p)) => p.at(&a, &b, t),
+                    Some(Some(p)) => p.render(&a, &b, t, 1.0 / parts as f32, unsure),
                     Some(None) => (if t < 0.5 { &a } else { &b }).as_ref().clone(),
                     None => lerp_image(&a, &b, t),
                 };
                 v.push(Frame { image: crate::pixels::Pixels::new(img), delay_cs: share(s), enabled: true, cut: false, blank: false, trim: 0 });
             }
-            if let Some(p) = progress {
-                p.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+            tick();
             v
         })
         .collect();
