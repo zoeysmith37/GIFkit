@@ -31,6 +31,7 @@ mod sysfonts;
 mod text;
 mod timeline;
 mod track;
+mod interp;
 mod theme;
 #[cfg(test)]
 mod tests;

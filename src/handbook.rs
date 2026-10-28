@@ -86,7 +86,8 @@ Moves a layer over time with ready-made motions like slide, hop and spin. Keyfra
 
 ## In-betweens
 Frames > In-Betweens adds new frames between each pair for smoother motion.
-- Follow motion slides things along instead of fading them
+- Follow motion tracks each pixel and moves it part way. No fading
+- A cut or a jump too wild to follow holds the nearer frame instead
 - The length stays the same unless frames would get under 2 cs",
     ),
     (
