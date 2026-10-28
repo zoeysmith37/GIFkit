@@ -763,7 +763,7 @@ impl GifKitApp {
         let gap = 6.0;
         // (group, width): 0 auto key, 1 position, 2 scale, 3 angle, 4 opacity, 5 ease
         let widths = [
-            CHIP_H * 3.0 + gap * 3.0 + 16.0,
+            CHIP_H * 3.0 + gap * 3.0 + 18.0,
             text_w("Position:") + gap * 2.0 + 108.0 * 2.0,
             text_w("Scale:") + gap * 2.0 + 88.0 * 2.0,
             text_w("Angle:") + gap + 70.0,
@@ -799,12 +799,38 @@ impl GifKitApp {
                             if b.clicked() {
                                 auto = !auto;
                             }
-                            let (r, _) = ui.allocate_exact_size(vec2(16.0, CHIP_H), Sense::hover());
-                            // filled on a keyframe, hollow between them
+                            // filled on a keyframe, hollow between them; a click adds
+                            // one at the playhead, or takes it away
+                            let can_key = sel_li.is_some_and(|li| !self.stack.layers[li].locked);
+                            let (r, kr) = ui.allocate_exact_size(vec2(18.0, CHIP_H), if can_key { Sense::click() } else { Sense::hover() });
+                            let hot = can_key && kr.hovered();
+                            if hot {
+                                ui.painter().rect_filled(r, 3.0, mix(pal.window, pal.highlight, 0.25));
+                            }
                             if key_here.is_some() {
                                 diamond(ui.painter(), r.center(), 6.0, pal.highlight, Stroke::NONE);
                             } else {
-                                diamond(ui.painter(), r.center(), 5.5, Color32::TRANSPARENT, Stroke::new(1.3, pal.fg_muted));
+                                diamond(ui.painter(), r.center(), 5.5, Color32::TRANSPARENT, Stroke::new(1.3, if hot { pal.fg } else { pal.fg_muted }));
+                            }
+                            let tip = if !can_key { "Select a layer to key it" } else if key_here.is_some() { "A keyframe is here. Click to remove it." } else { "No keyframe here. Click to add one." };
+                            let keys = self.keymap.text(crate::keys::Action::TlKey);
+                            let keys = if keys.is_empty() { String::new() } else { format!(" ({keys})") };
+                            if kr.on_hover_text(format!("{tip}{keys}")).clicked() {
+                                if let Some(li) = sel_li {
+                                    self.snapshot(&format!("tl-key{now}"), now);
+                                    let t = &mut self.stack.layers[li].timing;
+                                    match t.key_at(self.cur) {
+                                        Some(i) => {
+                                            t.keys.remove(i);
+                                            self.tl_key = None;
+                                        }
+                                        None => {
+                                            let i = t.add_key(self.cur);
+                                            self.tl_key = Some(i);
+                                        }
+                                    }
+                                    self.modified = true;
+                                }
                             }
                             // draw the path the layer follows on the preview
                             let can = sel_li.is_some_and(|li| !self.stack.layers[li].locked) && placed.is_some();
