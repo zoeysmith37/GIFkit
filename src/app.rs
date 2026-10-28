@@ -861,6 +861,8 @@ pub struct GifKitApp {
     fr_follow: bool,
     /// what in-betweens do where motion can't be followed
     fr_unsure: crate::interp::Unsure,
+    /// how in-betweens follow motion
+    fr_method: crate::interp::Method,
     /// Make Seamless: how many frames the end fades into the start over
     loop_blend: usize,
     fr_thumb: f32,
@@ -2834,6 +2836,7 @@ impl GifKitApp {
             fr_crossfade_wrap: true,
             fr_follow: true,
             fr_unsure: crate::interp::Unsure::Blur,
+            fr_method: crate::interp::Method::Ai,
             loop_blend: 8,
             fr_thumb: 96.0,
             video_bg: [255, 255, 255],
@@ -3755,6 +3758,7 @@ impl GifKitApp {
                 hint(ui, "Fonts: Noto Sans (OFL) and DejaVu");
                 hint(ui, "Emoji: Twemoji (CC-BY 4.0) with names from emojibase (MIT)");
                 hint(ui, "Icons: KDE Breeze (LGPL 3)");
+                hint(ui, "AI in-betweens: RIFE v4.6 by hzwer (MIT), ncnn model by nihui (MIT)");
                 hint(ui, "Text fonts: open licence fonts from Google Fonts (OFL, Apache 2.0, UFL)");
                 ui.add_space(4.0);
                 hint(ui, "Licensed under Apache 2.0");
@@ -11796,6 +11800,13 @@ impl GifKitApp {
                 check(ui, &mut self.fr_follow, "Follow motion").on_hover_text("Moves the picture along with what moves in it, so things slide instead of fading through each other");
             });
             if self.fr_follow {
+                form_row(ui, "Method", |ui| {
+                    use crate::interp::Method;
+                    combo(ui, "ib_method", &mut self.fr_method, &[(Method::Ai, "AI (RIFE)"), (Method::Tracker, "Tracker")])
+                        .on_hover_text("AI: a neural network made for in-betweens, sharp even on hard moves. Tracker: GIFkit's own motion tracking, with a choice for where it can't follow");
+                });
+            }
+            if self.fr_follow && self.fr_method == crate::interp::Method::Tracker {
                 form_row(ui, "Unsure", |ui| {
                     use crate::interp::Unsure;
                     combo(ui, "ib_unsure", &mut self.fr_unsure, &[(Unsure::Blur, "Motion blur"), (Unsure::Nearer, "Nearer frame"), (Unsure::Fade, "Fade")])
@@ -11814,13 +11825,13 @@ impl GifKitApp {
                 go = wide_button(ui, egui::Button::new("Make In-Betweens")).on_hover_text("Smoother motion. The length stays the same.").clicked();
             });
             if go {
-                let (steps, wrap, follow, unsure) = (self.fr_crossfade, self.fr_crossfade_wrap, self.fr_follow, self.fr_unsure);
+                let (steps, wrap, follow, unsure, method) = (self.fr_crossfade, self.fr_crossfade_wrap, self.fr_follow, self.fr_unsure, self.fr_method);
                 if let Some(base) = self.base.clone() {
                     let mut stack = self.stack.clone();
                     let plan_src: Vec<usize> = self.plan.iter().map(|f| f.src).collect();
                     // following motion, each frame is counted twice (looked at, then made)
-                    self.spawn(ctx, "In-betweens", base.len() * if follow { 2 } else { 1 }, move |p| {
-                        let (out, counts) = ops::inbetween_counted(&base, steps, wrap, follow, unsure, Some(p));
+                    self.spawn(ctx, "In-betweens", base.len() * if follow && method == crate::interp::Method::Tracker { 2 } else { 1 }, move |p| {
+                        let (out, counts) = ops::inbetween_counted(&base, steps, wrap, follow.then_some(method), unsure, Some(p));
                         // layers stretch with the frames: where each old frame
                         // now starts, counting shown frames as the timeline does,
                         // and how many it became

@@ -32,6 +32,7 @@ mod text;
 mod timeline;
 mod track;
 mod interp;
+mod rife;
 mod theme;
 #[cfg(test)]
 mod tests;

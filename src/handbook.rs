@@ -86,10 +86,10 @@ Moves a layer over time with ready-made motions like slide, hop and spin. Keyfra
 
 ## In-betweens
 Frames > In-Betweens adds new frames between each pair for smoother motion.
-- Follow motion tracks the camera and each moving thing, turns included
-- Each thing bends as one piece. Burned-in text and logos stay put
-- Unsure picks what happens where it can't follow: blur, nearer frame or fade
-- Only a cut holds the nearer frame
+- Follow motion moves things along instead of fading them
+- Method AI uses RIFE, a network made for in-betweens. Sharp even on hard moves
+- Method Tracker uses GIFkit's own tracking. Unsure sets what it does where it can't follow
+- Burned-in text and logos stay put. A cut holds the nearer frame
 - The length stays the same unless frames would get under 2 cs",
     ),
     (

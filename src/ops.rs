@@ -371,7 +371,7 @@ pub fn crossfade(anim: &Animation, steps: usize, wrap: bool) -> Animation {
 /// frame's time is shared with its in-betweens, so the length stays the
 /// same. Skipped frames and gaps are left as they are.
 pub fn inbetween(anim: &Animation, steps: usize, wrap: bool, follow: bool, progress: Option<&std::sync::atomic::AtomicUsize>) -> Animation {
-    inbetween_counted(anim, steps, wrap, follow, crate::interp::Unsure::Blur, progress).0
+    inbetween_counted(anim, steps, wrap, follow.then_some(crate::interp::Method::Ai), crate::interp::Unsure::Blur, progress).0
 }
 
 /// Where frame `i` shows something that stays put on screen over the
@@ -414,7 +414,7 @@ pub fn still_mask(anim: &Animation, i: usize, reach: usize) -> Option<Vec<bool>>
             let edgy = details[0][j].abs() > 12.0;
             // or the same outline: strong detail, the same way, throughout
             let d0 = details[0][j];
-            let shape = d0.abs() > 20.0 && details[1..].iter().all(|d| d[j] * d0.signum() > 14.0 && (d[j] - d0).abs() < 35.0);
+            let shape = d0.abs() > 16.0 && details[1..].iter().all(|d| d[j] * d0.signum() > 10.0 && (d[j] - d0).abs() < 40.0);
             (same && edgy) || shape
         })
         .collect();
@@ -427,7 +427,7 @@ pub fn still_mask(anim: &Animation, i: usize, reach: usize) -> Option<Vec<bool>>
     let dense = box_mean(&ones, wu, hu, 4);
     let keep: Vec<f32> = ones.iter().zip(&dense).map(|(&k, &d)| if k > 0.0 && d > 0.15 { 1.0 } else { 0.0 }).collect();
     // a little wider, for soft edges
-    let spread = box_mean(&keep, wu, hu, 2);
+    let spread = box_mean(&keep, wu, hu, 3);
     Some(spread.into_iter().map(|v| v > 0.01).collect())
 }
 
@@ -467,7 +467,11 @@ fn box_mean(v: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
 /// so each can borrow from the pairs either side (things they saw moving,
 /// the path they took) and from what stays still around it. `progress`
 /// then counts each frame twice: once looked at, once finished.
-pub fn inbetween_counted(anim: &Animation, steps: usize, wrap: bool, follow: bool, unsure: crate::interp::Unsure, progress: Option<&std::sync::atomic::AtomicUsize>) -> (Animation, Vec<usize>) {
+pub fn inbetween_counted(anim: &Animation, steps: usize, wrap: bool, method: Option<crate::interp::Method>, unsure: crate::interp::Unsure, progress: Option<&std::sync::atomic::AtomicUsize>) -> (Animation, Vec<usize>) {
+    if method == Some(crate::interp::Method::Ai) {
+        return inbetween_ai(anim, steps, wrap, progress);
+    }
+    let follow = method.is_some();
     use rayon::prelude::*;
     if steps == 0 || anim.len() < 2 {
         return (anim.clone(), vec![1; anim.len()]);
@@ -562,6 +566,84 @@ pub fn inbetween_counted(anim: &Animation, steps: usize, wrap: bool, follow: boo
             v
         })
         .collect();
+    let counts = made.iter().map(|v| v.len()).collect();
+    (Animation { frames: made.into_iter().flatten().collect(), loop_count: anim.loop_count }, counts)
+}
+
+/// The frame each frame leads into (skipped ones passed over, none into a
+/// gap or past the end unless `wrap`).
+fn next_shown(anim: &Animation, i: usize, wrap: bool) -> Option<usize> {
+    let n = anim.len();
+    let f = &anim.frames[i];
+    if !f.enabled || f.blank {
+        return None;
+    }
+    let mut j = i + 1;
+    loop {
+        if j >= n {
+            if !wrap {
+                return None;
+            }
+            j = 0;
+        }
+        if j == i {
+            return None;
+        }
+        let g = &anim.frames[j];
+        if g.enabled && !g.blank {
+            return (j > i || wrap).then_some(j);
+        }
+        if g.enabled && g.blank {
+            return None;
+        }
+        j += 1;
+    }
+}
+
+/// In-betweens by the RIFE network: each pair checked for a cut (held
+/// then), the rest made by the network, with what stays still on screen
+/// pinned. A few pairs at a time (the network keeps its own threads busy,
+/// and each run takes memory).
+fn inbetween_ai(anim: &Animation, steps: usize, wrap: bool, progress: Option<&std::sync::atomic::AtomicUsize>) -> (Animation, Vec<usize>) {
+    use rayon::prelude::*;
+    let n = anim.len();
+    let at_once = (rayon::current_num_threads() / 4).clamp(1, 4);
+    let mut made: Vec<Vec<Frame>> = Vec::with_capacity(n);
+    for chunk in (0..n).collect::<Vec<_>>().chunks(at_once) {
+        let part: Vec<Vec<Frame>> = chunk
+            .par_iter()
+            .map(|&i| {
+                let f = &anim.frames[i];
+                let out = match next_shown(anim, i, wrap) {
+                    None => vec![f.clone()],
+                    Some(j) => {
+                        let parts = steps + 1;
+                        let d = f.delay_cs as usize;
+                        let share = |k: usize| ((d * (k + 1) + parts / 2) / parts - (d * k + parts / 2) / parts).max(2) as u16;
+                        let (a, b) = (f.image.get(), anim.frames[j].image.get());
+                        let cut = crate::interp::is_cut(&a, &b);
+                        let still = if cut { None } else { still_mask(anim, i, 4) };
+                        let mut v = vec![Frame { delay_cs: share(0), ..f.clone() }];
+                        for s in 1..=steps {
+                            let t = s as f32 / parts as f32;
+                            let img = if cut {
+                                (if t < 0.5 { &a } else { &b }).as_ref().clone()
+                            } else {
+                                crate::rife::between_pinned(&a, &b, t, crate::rife::RUN_SIZE, still.as_deref()).unwrap_or_else(|_| lerp_image(&a, &b, t))
+                            };
+                            v.push(Frame { image: crate::pixels::Pixels::new(img), delay_cs: share(s), enabled: true, cut: false, blank: false, trim: 0 });
+                        }
+                        v
+                    }
+                };
+                if let Some(p) = progress {
+                    p.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                out
+            })
+            .collect();
+        made.extend(part);
+    }
     let counts = made.iter().map(|v| v.len()).collect();
     (Animation { frames: made.into_iter().flatten().collect(), loop_count: anim.loop_count }, counts)
 }

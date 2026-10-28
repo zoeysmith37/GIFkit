@@ -841,6 +841,35 @@ impl Glance {
     }
 }
 
+/// How in-betweens follow motion.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Method {
+    /// the RIFE network (see `rife`)
+    #[default]
+    Ai,
+    /// GIFkit's own: tracked things drawn as meshes
+    Tracker,
+}
+
+/// Whether `b` is a different shot from `a` (hardly any patch of one is in
+/// the other): a quick look on small copies.
+pub fn is_cut(a: &RgbaImage, b: &RgbaImage) -> bool {
+    if a.dimensions() != b.dimensions() {
+        return true;
+    }
+    let k = (160.0 / a.width().max(a.height()) as f32).min(1.0);
+    let (w, h) = (((a.width() as f32 * k).round() as usize).max(8), ((a.height() as f32 * k).round() as usize).max(8));
+    let (ga, gb) = (crate::track::Gray::new(&small(a, w, h)), crate::track::Gray::new(&small(b, w, h)));
+    let step = (w.max(h) as i32 / 8).clamp(8, 48);
+    let r = (step * 7 / 10).max(6);
+    let (fa, fb) = rayon::join(|| crate::track::match_grid(&ga, &gb, step, r), || crate::track::match_grid(&gb, &ga, step, r));
+    let (_, _, detailed, found) = keep_found(fa, fb, step as f32);
+    if std::env::var_os("INTERP_DEBUG").is_some() {
+        eprintln!("cut check: {found} of {detailed}");
+    }
+    detailed >= 4 && (found as f32) < detailed as f32 * 0.2
+}
+
 /// What to do where the motion can't be followed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Unsure {
@@ -1485,7 +1514,7 @@ mod tests {
             let pair = look.as_ref().map(|g| Pair::finish(&fa, &fb, g, prev.as_ref(), next.as_ref(), still));
             let t1 = std::time::Instant::now();
             let (blur, near) = match &pair {
-                Some(p) => (p.render(&fa, &fb, 0.5, 0.5, Unsure::Blur), p.render(&fa, &fb, 0.5, 0.5, Unsure::Nearer)),
+                Some(p) => (p.render(&fa, &fb, 0.5, 0.5, Unsure::Blur), crate::rife::between(&fa, &fb, 0.5, 448).unwrap()),
                 None => ((*fa).clone(), (*fa).clone()),
             };
             eprintln!("{i}-{j}: {} in {:.0} ms (two pictures {:.0} ms)", if pair.is_some() { "made" } else { "held (cut)" }, t0.elapsed().as_secs_f32() * 1000.0, t1.elapsed().as_secs_f32() * 1000.0);
@@ -1511,7 +1540,8 @@ mod tests {
             _ => Unsure::Blur,
         };
         let t0 = std::time::Instant::now();
-        let out = crate::ops::inbetween_counted(&a, steps, false, true, unsure, None).0;
+        let method = if std::env::var("METHOD").as_deref() == Ok("tracker") { Method::Tracker } else { Method::Ai };
+        let out = crate::ops::inbetween_counted(&a, steps, false, Some(method), unsure, None).0;
         eprintln!("{} frames in {:.1} s", out.frames.len(), t0.elapsed().as_secs_f32());
         let dir = std::path::PathBuf::from(std::env::var("OUT").unwrap());
         std::fs::create_dir_all(&dir).unwrap();
