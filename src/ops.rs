@@ -423,8 +423,8 @@ pub fn inbetween_counted(anim: &Animation, steps: usize, wrap: bool, follow: boo
             // (2 cs at least: shorter plays slow in browsers, so it runs a little long instead)
             let share = |k: usize| ((d * (k + 1) + parts / 2) / parts - (d * k + parts / 2) / parts).max(2) as u16;
             let (a, b) = (f.image.get(), anim.frames[j].image.get());
-            // following motion: None when the pair can't be trusted (a cut,
-            // or too wild), and then the nearer frame is held, not smeared
+            // following motion: None at a cut, and then the nearer frame is
+            // held, not smeared
             let pair = follow.then(|| crate::interp::Pair::new(&a, &b));
             let mut v = vec![Frame { delay_cs: share(0), ..f.clone() }];
             for s in 1..=steps {

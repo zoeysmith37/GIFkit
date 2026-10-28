@@ -424,6 +424,99 @@ pub fn track(frames: &[&Gray], start: usize, at: (f32, f32), size: (i32, i32), p
     out
 }
 
+/// Where a patch of one frame went in the next: its middle at (x, y) moved
+/// to (to_x, to_y), turned by `ang` and grown by `sc`. `cost` is how unlike
+/// it looks there, `detail` how much it has to go by (flat patches match
+/// anywhere).
+#[derive(Clone, Copy, Debug)]
+pub struct Moved {
+    pub x: f32,
+    pub y: f32,
+    pub to_x: f32,
+    pub to_y: f32,
+    pub ang: f32,
+    pub sc: f32,
+    pub cost: f32,
+    pub detail: f32,
+}
+
+impl Moved {
+    /// The motion this patch gives the point (px, py): its turn and size
+    /// change taken about its middle.
+    pub fn motion_at(&self, px: f32, py: f32) -> (f32, f32) {
+        let (s, c) = self.ang.sin_cos();
+        let (qx, qy) = ((px - self.x) * self.sc, (py - self.y) * self.sc);
+        (self.to_x + qx * c - qy * s - px, self.to_y + qx * s + qy * c - py)
+    }
+}
+
+/// Patches every `step` pixels (each `r` out each way) of `a`, looked for in
+/// `b` over a wide area, turned and sized: a rough picture of how everything
+/// moved, for in-betweens to start from. Row by row.
+pub fn match_grid(a: &Gray, b: &Gray, step: i32, r: i32) -> (usize, usize, Vec<Moved>) {
+    use rayon::prelude::*;
+    let (w, h) = a.size();
+    let (gw, gh) = (((w + step - 1) / step).max(1) as usize, ((h + step - 1) / step).max(1) as usize);
+    // big patches: every few pixels is plenty to tell where they went
+    let shapes = [Shape::new(r, r, 0, if r > 16 { 3 } else { 1 }), Shape::new(r, r, 1, if r > 16 { 2 } else { 1 }), Shape::new(r, r, 2, 1)];
+    let reach = (w.max(h) as f32 * 0.5).max(32.0);
+    let centre = |i: usize| (((i % gw) as i32 * step + step / 2).min(w - 1) as f32, ((i / gw) as i32 * step + step / 2).min(h - 1) as f32);
+    let prepare = |i: usize| {
+        let (x, y) = centre(i);
+        let looks = looks_at(a, &shapes, Pose { x, y, ang: 0.0, sc: 1.0 });
+        let l0 = &looks[0];
+        let detail = l0.c.iter().map(|q| (0..3).map(|k| (q[k] - l0.mean[k]).abs()).sum::<f32>() / 3.0).sum::<f32>() / l0.c.len().max(1) as f32;
+        (x, y, looks, detail)
+    };
+    // staying put is favoured a little, so flat or repeating patches don't
+    // jump about
+    let wide = |x: f32, y: f32, looks: &[Look]| {
+        let refs: Vec<(&Look, usize)> = looks.iter().enumerate().map(|(k, l)| (l, k)).collect();
+        search(b, &refs, &shapes, Pose { x, y, ang: 0.0, sc: 1.0 }, (x, y), reach, 1.6, 2.0)
+    };
+    // a few patches looked for far and wide show how most things moved
+    let few: Vec<(f32, f32)> = (0..gw * gh)
+        .into_par_iter()
+        .filter(|&i| (i % gw) % 3 == 1 && (i / gw) % 3 == 1)
+        .filter_map(|i| {
+            let (x, y, looks, detail) = prepare(i);
+            (detail >= 3.0).then(|| {
+                let (q, _) = wide(x, y, &looks);
+                (q.x - x, q.y - y)
+            })
+        })
+        .collect();
+    let typical = if few.is_empty() {
+        (0.0, 0.0)
+    } else {
+        let mut xs: Vec<f32> = few.iter().map(|m| m.0).collect();
+        let mut ys: Vec<f32> = few.iter().map(|m| m.1).collect();
+        xs.sort_by(|a, b| a.total_cmp(b));
+        ys.sort_by(|a, b| a.total_cmp(b));
+        (xs[xs.len() / 2], ys[ys.len() / 2])
+    };
+    let v = (0..gw * gh)
+        .into_par_iter()
+        .map(|i| {
+            let (x, y, looks, detail) = prepare(i);
+            let refs: Vec<(&Look, usize)> = looks.iter().enumerate().map(|(k, l)| (l, k)).collect();
+            let pose = Pose { x, y, ang: 0.0, sc: 1.0 };
+            // near where most things went first (quick), far and wide only
+            // when it isn't there
+            let mut got = search(b, &refs, &shapes, pose, (x + typical.0, y + typical.1), step as f32 * 2.0, 1.6, 2.0);
+            if got.1 > (detail * 0.8).max(10.0) {
+                let far = wide(x, y, &looks);
+                if far.1 < got.1 {
+                    got = far;
+                }
+            }
+            let (q, cost) = got;
+            Moved { x, y, to_x: q.x, to_y: q.y, ang: q.ang, sc: q.sc, cost, detail }
+        })
+        .collect();
+    (gw, gh, v)
+}
+
 /// A spot picked by hand: on frame `frame` the thing is at `at`, in a patch
 /// `size` out each way.
 #[derive(Clone, Copy, Debug, PartialEq)]

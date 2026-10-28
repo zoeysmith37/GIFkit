@@ -1,18 +1,23 @@
-//! In-between frames from optical flow.
+//! In-between frames that follow the motion.
 //!
-//! For each pair of frames the motion of every pixel is worked out both
-//! ways (A to B and B to A), from a small copy of the pictures up to a
-//! working size, so large moves are found as well as small ones. Each
-//! frame's pixels are then pushed part of the way along their motion to the
-//! in-between moment and laid down there ("splatting"). Pixels whose two
-//! motions don't agree (they were covered or uncovered) count for much
-//! less, which is what keeps something moving in front of a background
-//! from leaving a ghost. Where neither frame lands anything, the two are
-//! mixed as they are.
+//! The tracker first looks for a grid of patches of one frame in the other,
+//! over a wide area and allowing for turning and growing. Patches that
+//! agree are sorted into whole things moving as one: the camera, then a
+//! character, each a turn, growth and shift. The fine motion of every pixel
+//! is worked out too, coarse to fine, each patch also trying what the
+//! tracker found around it.
 //!
-//! When a pair can't be trusted (a cut, or motion too wild to follow) no
-//! frame is made up: the caller holds the nearer one instead, which looks
-//! better than a smeared guess.
+//! Every pixel then picks the thing it belongs to (judged over a window
+//! around it, so things move as pieces rather than as scattered bits). The
+//! thing's motion is taken out, what's left (small now) is found by the
+//! fine search and smoothed within the thing, and the two together are
+//! that pixel's motion. Part way along, a turning thing has turned part
+//! way, so spins sweep round rather than shrink through the middle.
+//!
+//! Where it still can't be followed (the two frames disagree, or the
+//! motion tears) the frames are faded instead, each moved as the camera
+//! moved: soft there, but never in pieces, and the background still glides.
+//! Only a cut (hardly any patch found anywhere) gets no in-between.
 
 use image::{Rgba, RgbaImage};
 use rayon::prelude::*;
@@ -110,6 +115,27 @@ impl Field {
     }
 }
 
+/// The tracker's rough answer: a grid of patches of one frame and where
+/// each went in the other (None where it couldn't be found), at the working
+/// size.
+struct Hints {
+    gw: usize,
+    gh: usize,
+    step: f32,
+    cells: Vec<Option<crate::track::Moved>>,
+}
+
+impl Hints {
+    /// The patches around (x, y) (working pixels).
+    fn around(&self, x: f32, y: f32) -> impl Iterator<Item = &crate::track::Moved> {
+        let (cx, cy) = ((x / self.step - 0.5).round() as i64, (y / self.step - 0.5).round() as i64);
+        (-1..=1i64).flat_map(move |dy| (-1..=1i64).map(move |dx| (cx + dx, cy + dy))).filter_map(move |(gx, gy)| {
+            (gx >= 0 && gy >= 0 && (gx as usize) < self.gw && (gy as usize) < self.gh).then(|| self.cells[gy as usize * self.gw + gx as usize].as_ref()).flatten()
+        })
+    }
+
+}
+
 /// Patch size and step for the patch search, at every level.
 const P: i32 = 8;
 const S: usize = 4;
@@ -117,7 +143,7 @@ const S: usize = 4;
 /// One level of the patch search: start from `init`, for patches every `S`
 /// pixels try the motion there, the motions found next to it, and a little
 /// around the best; then spread each patch's motion over its pixels.
-fn refine(a: &Lum, b: &Lum, init: &Field, radius: i32) -> Field {
+fn refine(a: &Lum, b: &Lum, init: &Field, radius: i32, hints: &Hints, k: f32) -> Field {
     let (w, h) = (a.w, a.h);
     let gw = w.div_ceil(S);
     let gh = h.div_ceil(S);
@@ -146,6 +172,12 @@ fn refine(a: &Lum, b: &Lum, init: &Field, radius: i32) -> Field {
                 let mut cands = vec![c, (0.0, 0.0), init.at(px + P / 2, py - S as i32 + P / 2)];
                 if let Some(l) = row.last() {
                     cands.push(l.0);
+                }
+                // what the tracker found for the patches around here
+                let (mx, my) = ((px + P / 2) as f32 / k, (py + P / 2) as f32 / k);
+                for c in hints.around(mx, my) {
+                    let m = c.motion_at(mx, my);
+                    cands.push((m.0 * k, m.1 * k));
                 }
                 let mut best = (c, f32::MAX);
                 for f in cands {
@@ -322,11 +354,20 @@ fn settle(a: &Lum, b: &Lum, f: &Field, iters: usize) -> Field {
 }
 
 /// Motion from `a` to `b`, coarse to fine.
-fn flow(a: &Lum, b: &Lum) -> Field {
+fn flow(a: &Lum, b: &Lum, hints: &Hints) -> Field {
+    flow_levels(a, b, hints, 6, 60)
+}
+
+/// The same for motion known to be small: fewer levels, less smoothing.
+fn flow_small(a: &Lum, b: &Lum) -> Field {
+    flow_levels(a, b, &Hints { gw: 0, gh: 0, step: 1.0, cells: Vec::new() }, 3, 24)
+}
+
+fn flow_levels(a: &Lum, b: &Lum, hints: &Hints, most: usize, settle_full: usize) -> Field {
     let mut pa = vec![a.clone()];
     let mut pb = vec![b.clone()];
     // not so small that small things vanish
-    while pa.last().unwrap().w.min(pa.last().unwrap().h) >= 64 && pa.len() < 6 {
+    while pa.last().unwrap().w.min(pa.last().unwrap().h) >= 64 && pa.len() < most {
         let (na, nb) = (pa.last().unwrap().half(), pb.last().unwrap().half());
         pa.push(na);
         pb.push(nb);
@@ -338,8 +379,9 @@ fn flow(a: &Lum, b: &Lum) -> Field {
             f = f.up(pa[l].w, pa[l].h);
         }
         // the smallest level looks furthest (it's cheap there)
-        f = refine(&pa[l], &pb[l], &f, if l == top { 6 } else { 2 });
-        f = settle(&pa[l], &pb[l], &f, if l == 0 { 60 } else { 16 });
+        let k = pa[l].w as f32 / a.w as f32;
+        f = refine(&pa[l], &pb[l], &f, if l == top { 6 } else { 2 }, hints, k);
+        f = settle(&pa[l], &pb[l], &f, if l == 0 { settle_full } else { 16 });
     }
     f
 }
@@ -357,19 +399,385 @@ fn misses(ab: &Field, ba: &Field) -> Vec<f32> {
         .collect()
 }
 
+/// The tracker's patches worth going by: with detail, a fair match, and
+/// agreeing with the patch found going back the other way. Returns hints
+/// each way, how many patches had detail, and how many of those were found.
+fn keep_found(fa: (usize, usize, Vec<crate::track::Moved>), fb: (usize, usize, Vec<crate::track::Moved>), step: f32) -> (Hints, Hints, usize, usize) {
+    let check = |from: &(usize, usize, Vec<crate::track::Moved>), back: &(usize, usize, Vec<crate::track::Moved>)| -> Vec<Option<crate::track::Moved>> {
+        from.2
+            .iter()
+            .map(|c| {
+                if c.detail < 3.0 || c.cost > (c.detail * 0.8).max(10.0) {
+                    return None;
+                }
+                // going back from where it landed should come home
+                let (bx, by) = ((c.to_x / step - 0.5).round() as i64, (c.to_y / step - 0.5).round() as i64);
+                let mut home = false;
+                for gy in by - 1..=by + 1 {
+                    for gx in bx - 1..=bx + 1 {
+                        if gx < 0 || gy < 0 || gx as usize >= back.0 || gy as usize >= back.1 {
+                            continue;
+                        }
+                        let o = &back.2[gy as usize * back.0 + gx as usize];
+                        if (o.x - c.to_x).abs() > step || (o.y - c.to_y).abs() > step {
+                            continue;
+                        }
+                        let m = o.motion_at(c.to_x, c.to_y);
+                        if (c.to_x + m.0 - c.x).hypot(c.to_y + m.1 - c.y) < step * 0.5 {
+                            home = true;
+                        }
+                    }
+                }
+                home.then_some(*c)
+            })
+            .collect()
+    };
+    let (ca, cb) = (check(&fa, &fb), check(&fb, &fa));
+    let detailed = fa.2.iter().filter(|c| c.detail >= 3.0).count();
+    let found = ca.iter().flatten().count();
+    (Hints { gw: fa.0, gh: fa.1, step, cells: ca }, Hints { gw: fb.0, gh: fb.1, step, cells: cb }, detailed, found)
+}
+
+/// A picture as colour (alpha counted in), for choosing motions.
+struct Rgb {
+    w: usize,
+    h: usize,
+    v: Vec<[f32; 3]>,
+}
+
+impl Rgb {
+    fn from(img: &RgbaImage) -> Rgb {
+        let v = img.pixels().map(|p| {
+            let a = p[3] as f32 / 255.0;
+            [p[0] as f32 * a, p[1] as f32 * a, p[2] as f32 * a]
+        }).collect();
+        Rgb { w: img.width() as usize, h: img.height() as usize, v }
+    }
+
+    fn at(&self, x: i32, y: i32) -> [f32; 3] {
+        self.v[y.clamp(0, self.h as i32 - 1) as usize * self.w + x.clamp(0, self.w as i32 - 1) as usize]
+    }
+
+    /// Less the average around each pixel: the detail alone, so a flash or
+    /// a change of light doesn't stop things matching.
+    fn detail(&self) -> Rgb {
+        let ch: Vec<Vec<f32>> = (0..3).map(|c| box_blur(&self.v.iter().map(|p| p[c]).collect::<Vec<_>>(), self.w, self.h, 5)).collect();
+        Rgb { w: self.w, h: self.h, v: self.v.iter().enumerate().map(|(i, p)| [0, 1, 2].map(|c| p[c] - ch[c][i])).collect() }
+    }
+
+    fn sample(&self, x: f32, y: f32) -> [f32; 3] {
+        let (x0, y0) = (x.floor(), y.floor());
+        let (fx, fy) = (x - x0, y - y0);
+        let (x0, y0) = (x0 as i32, y0 as i32);
+        let (p, q, r, s) = (self.at(x0, y0), self.at(x0 + 1, y0), self.at(x0, y0 + 1), self.at(x0 + 1, y0 + 1));
+        [0, 1, 2].map(|c| (p[c] * (1.0 - fx) + q[c] * fx) * (1.0 - fy) + (r[c] * (1.0 - fx) + s[c] * fx) * fy)
+    }
+}
+
+/// A box average `r` out each way (rows then columns).
+fn box_blur(v: &[f32], w: usize, h: usize, r: i32) -> Vec<f32> {
+    let pass = |v: &[f32], horiz: bool| -> Vec<f32> {
+        (0..w * h)
+            .into_par_iter()
+            .map(|i| {
+                let (x, y) = ((i % w) as i32, (i / w) as i32);
+                let (mut s, mut k) = (0.0f32, 0.0f32);
+                for d in -r..=r {
+                    let (nx, ny) = if horiz { (x + d, y) } else { (x, y + d) };
+                    if nx >= 0 && ny >= 0 && nx < w as i32 && ny < h as i32 {
+                        s += v[ny as usize * w + nx as usize];
+                        k += 1.0;
+                    }
+                }
+                s / k
+            })
+            .collect()
+    };
+    pass(&pass(v, true), false)
+}
+
+/// How a piece moves from one frame to the other: its middle (cx, cy) goes
+/// by (tx, ty) while it turns by `ang` and grows by `sc` about it. Part
+/// way there it has turned part way, so spinning things sweep round
+/// instead of shrinking through the middle.
+#[derive(Clone, Copy, Debug)]
+struct Motion {
+    cx: f32,
+    cy: f32,
+    tx: f32,
+    ty: f32,
+    ang: f32,
+    sc: f32,
+    /// what's left after that: this pixel's own small move on top
+    rx: f32,
+    ry: f32,
+}
+
+impl Motion {
+    /// Just a shift, for the point (x, y).
+    fn shift(x: f32, y: f32, m: (f32, f32)) -> Motion {
+        Motion { cx: x, cy: y, tx: 0.0, ty: 0.0, ang: 0.0, sc: 1.0, rx: m.0, ry: m.1 }
+    }
+
+    /// Going back the other way (without a pixel's own move).
+    fn inverse(&self) -> Motion {
+        Motion { cx: self.cx + self.tx, cy: self.cy + self.ty, tx: -self.tx, ty: -self.ty, ang: -self.ang, sc: 1.0 / self.sc, rx: 0.0, ry: 0.0 }
+    }
+
+    /// The same with a pixel's own move on top.
+    fn plus(&self, r: (f32, f32)) -> Motion {
+        Motion { rx: r.0, ry: r.1, ..*self }
+    }
+
+    /// Where (x, y) is a share `t` of the way along.
+    fn at(&self, x: f32, y: f32, t: f32) -> (f32, f32) {
+        let (x, y) = (x + self.rx * t, y + self.ry * t);
+        let (sn, cs) = (self.ang * t).sin_cos();
+        let k = self.sc.powf(t);
+        let (qx, qy) = ((x - self.cx) * k, (y - self.cy) * k);
+        (self.cx + self.tx * t + qx * cs - qy * sn, self.cy + self.ty * t + qx * sn + qy * cs)
+    }
+
+    /// Where the point that is at (x, y) a share `t` of the way along started.
+    fn back(&self, x: f32, y: f32, t: f32) -> (f32, f32) {
+        let (sn, cs) = (-self.ang * t).sin_cos();
+        let k = self.sc.powf(-t);
+        let (qx, qy) = ((x - self.cx - self.tx * t) * k, (y - self.cy - self.ty * t) * k);
+        (self.cx + qx * cs - qy * sn - self.rx * t, self.cy + qx * sn + qy * cs - self.ry * t)
+    }
+
+    /// How far (x, y) goes all the way.
+    fn vec(&self, x: f32, y: f32) -> (f32, f32) {
+        let p = self.at(x, y, 1.0);
+        (p.0 - x, p.1 - y)
+    }
+}
+
+/// The turn, growth and shift that best carries the patches' middles to
+/// where they went, or None when it can't be told (too few, too close, or
+/// growing beyond belief).
+fn fit(cs: &[&crate::track::Moved]) -> Option<Motion> {
+    let n = cs.len() as f32;
+    if cs.len() < 2 {
+        return None;
+    }
+    let (px, py) = (cs.iter().map(|c| c.x).sum::<f32>() / n, cs.iter().map(|c| c.y).sum::<f32>() / n);
+    let (qx, qy) = (cs.iter().map(|c| c.to_x).sum::<f32>() / n, cs.iter().map(|c| c.to_y).sum::<f32>() / n);
+    let (mut a, mut b, mut dd) = (0.0f32, 0.0f32, 0.0f32);
+    for c in cs {
+        let (dx, dy, ex, ey) = (c.x - px, c.y - py, c.to_x - qx, c.to_y - qy);
+        a += dx * ex + dy * ey;
+        b += dx * ey - dy * ex;
+        dd += dx * dx + dy * dy;
+    }
+    if dd < 1.0 {
+        return None;
+    }
+    let sc = a.hypot(b) / dd;
+    (0.6..1.7).contains(&sc).then(|| Motion { cx: px, cy: py, tx: qx - px, ty: qy - py, ang: b.atan2(a), sc, rx: 0.0, ry: 0.0 })
+}
+
+/// Whole things moving as one (the camera, a character), from the patches
+/// found: the turn, growth and shift most of them agree with, then the
+/// same among the ones left over. Up to `most`.
+fn groups(cells: &[&crate::track::Moved], step: f32, most: usize) -> Vec<Motion> {
+    let fits = |m: &Motion, c: &crate::track::Moved| {
+        let p = m.at(c.x, c.y, 1.0);
+        (p.0 - c.to_x).hypot(p.1 - c.to_y) < step * 0.35
+    };
+    let mut left: Vec<&crate::track::Moved> = cells.to_vec();
+    let mut out = Vec::new();
+    while out.len() < most && left.len() >= 3 {
+        let tries: Vec<(usize, Motion)> = (0..left.len())
+            .into_par_iter()
+            .flat_map_iter(|i| {
+                let left = &left;
+                (i + 1..left.len()).filter_map(move |j| fit(&[left[i], left[j]]).map(|m| (left.iter().filter(|c| fits(&m, c)).count(), m)))
+            })
+            .collect();
+        let Some(&(n, m)) = tries.iter().max_by_key(|t| t.0) else { break };
+        if n < 3 {
+            break;
+        }
+        let ins: Vec<&crate::track::Moved> = left.iter().copied().filter(|c| fits(&m, c)).collect();
+        let m = fit(&ins).unwrap_or(m);
+        left.retain(|c| !fits(&m, c));
+        out.push(m);
+    }
+    out
+}
+
+/// Each pixel's motion from those around it: the one that sits in the
+/// middle of the rest (as `ends` places it), so a lone speck of another
+/// motion goes but an edge between two stays sharp.
+fn vmedian<T: Copy + Send + Sync>(labs: &[T], w: usize, h: usize, ends: impl Fn(&T, f32, f32) -> [f32; 4] + Sync) -> Vec<T> {
+    (0..w * h)
+        .into_par_iter()
+        .map(|i| {
+            let (x, y) = ((i % w) as i32, (i / w) as i32);
+            let mut near: Vec<[f32; 4]> = Vec::with_capacity(9);
+            let mut who: Vec<usize> = Vec::with_capacity(9);
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let (nx, ny) = (x + dx, y + dy);
+                    if nx >= 0 && ny >= 0 && nx < w as i32 && ny < h as i32 {
+                        let j = ny as usize * w + nx as usize;
+                        near.push(ends(&labs[j], x as f32, y as f32));
+                        who.push(j);
+                    }
+                }
+            }
+            let mut best = (f32::MAX, i);
+            for (k, e) in near.iter().enumerate() {
+                let d: f32 = near.iter().map(|o| (e[0] - o[0]).abs() + (e[1] - o[1]).abs() + (e[2] - o[2]).abs() + (e[3] - o[3]).abs()).sum();
+                if d < best.0 {
+                    best = (d, who[k]);
+                }
+            }
+            labs[best.1]
+        })
+        .collect()
+}
+
+/// Blur `v` over just the pixels where `inside`, so nothing from outside
+/// leaks in (where nothing is inside nearby, it stays as it was).
+fn blur_within(v: &[(f32, f32)], inside: &[bool], w: usize, h: usize, r: i32) -> Vec<(f32, f32)> {
+    let m: Vec<f32> = inside.iter().map(|&b| if b { 1.0 } else { 0.0 }).collect();
+    let xs: Vec<f32> = v.iter().zip(&m).map(|(p, k)| p.0 * k).collect();
+    let ys: Vec<f32> = v.iter().zip(&m).map(|(p, k)| p.1 * k).collect();
+    let (den, nx, ny) = (box_blur(&m, w, h, r), box_blur(&xs, w, h, r), box_blur(&ys, w, h, r));
+    (0..w * h).map(|i| if den[i] > 1e-3 { (nx[i] / den[i], ny[i] / den[i]) } else { v[i] }).collect()
+}
+
+/// The commonest of the 5×5 around each pixel (of `n` kinds): ragged edges
+/// and lone specks go.
+fn majority(k: &[u8], w: usize, h: usize, n: usize) -> Vec<u8> {
+    (0..w * h)
+        .into_par_iter()
+        .map(|i| {
+            let (x, y) = ((i % w) as i32, (i / w) as i32);
+            let mut count = [0u16; 8];
+            for dy in -2..=2 {
+                for dx in -2..=2 {
+                    let (nx, ny) = (x + dx, y + dy);
+                    if nx >= 0 && ny >= 0 && nx < w as i32 && ny < h as i32 {
+                        count[k[ny as usize * w + nx as usize] as usize] += 1;
+                    }
+                }
+            }
+            let mut best = k[i];
+            for c in 0..n {
+                if count[c] > count[best as usize] {
+                    best = c as u8;
+                }
+            }
+            best
+        })
+        .collect()
+}
+
+/// Each pixel's motion, in layers. The tracker's patches are sorted into
+/// whole things moving as one (the camera, a character): each a turn,
+/// growth and shift. Each thing's motion is taken out of `b` and what's
+/// left (small now) found by the fine search. Every pixel then picks the
+/// thing it belongs to, by which fits best around it; and within each
+/// thing what's left is smoothed, so it moves as one piece that bends
+/// rather than as scattered bits. (With nothing found, the fine motion
+/// alone.)
+fn pick(a: &Rgb, b: &Rgb, la: &Lum, lb: &Lum, things: &[Motion], fine: &Field) -> (Field, Vec<Motion>) {
+    let (w, h) = (a.w, a.h);
+    // the window a fit is judged over, and how far what's left is smoothed
+    let (agg_r, rs) = (8, 8);
+    let diff_at = |x: usize, y: usize, m: (f32, f32)| -> f32 {
+        let (tx, ty) = (x as f32 + m.0, y as f32 + m.1);
+        let p = a.v[y * w + x];
+        let q = b.sample(tx, ty);
+        let off = (-tx).max(tx - (w - 1) as f32).max(-ty).max(ty - (h - 1) as f32).max(0.0);
+        (0..3).map(|c| (p[c] - q[c]).abs()).sum::<f32>() / 3.0 + if off > 2.0 { 25.0 } else { 0.0 }
+    };
+    // the layers: the fine motion on its own (a handicap: it's the
+    // fall-back), then each thing with what's left over
+    let mut layers: Vec<(Motion, Field, f32)> = vec![(Motion::shift(0.0, 0.0, (0.0, 0.0)), fine.clone(), 4.0)];
+    for &g in things {
+        // hardly moving: what's left is the fine motion already found
+        let corner = g.at(0.0, 0.0, 1.0);
+        let far = g.at((w - 1) as f32, (h - 1) as f32, 1.0);
+        if corner.0.hypot(corner.1) < 0.5 && (far.0 - (w - 1) as f32).hypot(far.1 - (h - 1) as f32) < 0.5 {
+            layers.push((g, fine.clone(), 0.0));
+            continue;
+        }
+        let warped = Lum {
+            w,
+            h,
+            v: (0..w * h)
+                .into_par_iter()
+                .map(|i| {
+                    let p = g.at((i % w) as f32, (i / w) as f32, 1.0);
+                    lb.sample(p.0, p.1)
+                })
+                .collect(),
+        };
+        layers.push((g, flow_small(la, &warped), 0.0));
+    }
+    // which layer each pixel is in
+    let costs: Vec<Vec<f32>> = layers
+        .iter()
+        .map(|(g, rest, pen)| {
+            // a thing is judged by its own motion (what's left over could
+            // make anything fit anywhere); a pixel or two of give
+            let d: Vec<f32> = (0..w * h)
+                .into_par_iter()
+                .map(|i| {
+                    let (x, y) = (i % w, i / w);
+                    if *pen > 0.0 {
+                        return diff_at(x, y, rest.v[i]);
+                    }
+                    let r = rest.v[i];
+                    let k = (2.0 / r.0.hypot(r.1).max(1e-3)).min(1.0);
+                    diff_at(x, y, g.plus((r.0 * k, r.1 * k)).vec(x as f32, y as f32))
+                })
+                .collect();
+            box_blur(&d, w, h, agg_r).into_iter().map(|c| c + pen).collect()
+        })
+        .collect();
+    let mut kind: Vec<u8> = (0..w * h).map(|i| (0..layers.len()).min_by(|&p, &q| costs[p][i].total_cmp(&costs[q][i])).unwrap_or(0) as u8).collect();
+    for _ in 0..2 {
+        kind = majority(&kind, w, h, layers.len());
+    }
+    // what's left, smoothed within each layer
+    let mut labs: Vec<Motion> = (0..w * h).map(|i| Motion::shift((i % w) as f32, (i / w) as f32, fine.v[i])).collect();
+    for (k, (g, rest, _)) in layers.iter().enumerate() {
+        let inside: Vec<bool> = kind.iter().map(|&c| c as usize == k).collect();
+        let smooth = if k == 0 { rest.v.clone() } else { blur_within(&rest.v, &inside, w, h, rs) };
+        for i in 0..w * h {
+            if inside[i] {
+                labs[i] = if k == 0 { Motion::shift((i % w) as f32, (i / w) as f32, smooth[i]) } else { g.plus(smooth[i]) };
+            }
+        }
+    }
+    let v = (0..w * h).map(|i| labs[i].vec((i % w) as f32, (i / w) as f32)).collect();
+    (Field { w, h, v }, labs)
+}
+
 /// What can be made between two frames.
 pub struct Pair {
     ab: Field,
     ba: Field,
+    /// each pixel's motion as a piece (turning as well as moving)
+    lab_ab: Vec<Motion>,
+    lab_ba: Vec<Motion>,
     miss_a: Vec<f32>,
     miss_b: Vec<f32>,
+    /// how the camera moved (the biggest thing moving as one), for where
+    /// the rest can't be followed
+    camera: Option<Motion>,
     /// working size to full size
     scale: (f32, f32),
 }
 
 impl Pair {
-    /// The motion between `a` and `b`, or None when it can't be trusted (a
-    /// cut, or too wild to follow).
+    /// The motion between `a` and `b`, or None at a cut (nothing in one
+    /// is in the other).
     pub fn new(a: &RgbaImage, b: &RgbaImage) -> Option<Pair> {
         if a.dimensions() != b.dimensions() {
             return None;
@@ -377,69 +785,70 @@ impl Pair {
         let (fw, fh) = a.dimensions();
         let k = (WORK as f32 / fw.max(fh) as f32).min(1.0);
         let (w, h) = (((fw as f32 * k).round() as usize).max(8), ((fh as f32 * k).round() as usize).max(8));
-        let (la, lb) = (Lum::from(a, w, h), Lum::from(b, w, h));
-        let (ab, ba) = rayon::join(|| flow(&la, &lb), || flow(&lb, &la));
-        let (miss_a, miss_b) = (misses(&ab, &ba), misses(&ba, &ab));
-        // how much of each frame the other can't account for
-        let bad = |m: &[f32], f: &Field, l: &Lum, o: &Lum| -> f32 {
-            let mut n = 0;
-            for (i, &e) in m.iter().enumerate() {
-                let (x, y) = ((i % f.w) as f32, (i / f.w) as f32);
-                let mv = f.v[i];
-                let off = (l.sample(x, y) - o.sample(x + mv.0, y + mv.1)).abs();
-                // disagreeing motions only matter where there's detail to
-                // go by (in flat colour any motion fits)
-                let (xi, yi) = (x as i32, y as i32);
-                let detail = (l.at(xi + 1, yi) - l.at(xi - 1, yi)).abs() + (l.at(xi, yi + 1) - l.at(xi, yi - 1)).abs();
-                if (detail > 12.0 && e > 1.5 + 0.1 * (mv.0.hypot(mv.1))) || off > 40.0 {
-                    n += 1;
-                }
+        let small = |img: &RgbaImage| if (fw as usize, fh as usize) == (w, h) { img.clone() } else { image::imageops::resize(img, w as u32, h as u32, image::imageops::FilterType::Triangle) };
+        let (sa, sb) = (small(a), small(b));
+        let (la, lb) = (Lum::from(&sa, w, h), Lum::from(&sb, w, h));
+        // the tracker's rough answer, both ways
+        let clock = std::time::Instant::now();
+        let lap = |what: &str| {
+            if std::env::var_os("INTERP_DEBUG").is_some() {
+                eprintln!("  {what}: {} ms", clock.elapsed().as_millis());
             }
-            n as f32 / m.len().max(1) as f32
         };
-        let worst = bad(&miss_a, &ab, &la, &lb).max(bad(&miss_b, &ba, &lb, &la));
-        // how broken up the motion is: one thing moving over a background
-        // only jumps along its outline; a muddle jumps all over
-        let rough = |f: &Field| -> f32 {
-            let mut n = 0;
-            for y in 0..f.h as i32 {
-                for x in 0..f.w as i32 {
-                    let m = f.at(x, y);
-                    let lim = 2.0f32.max(0.15 * m.0.hypot(m.1));
-                    let r = f.at(x + 1, y);
-                    let d = f.at(x, y + 1);
-                    if (m.0 - r.0).hypot(m.1 - r.1) > lim || (m.0 - d.0).hypot(m.1 - d.1) > lim {
-                        n += 1;
-                    }
-                }
-            }
-            n as f32 / (f.w * f.h).max(1) as f32
-        };
-        let muddle = rough(&ab).max(rough(&ba));
+        let (ga, gb) = (crate::track::Gray::new(&sa), crate::track::Gray::new(&sb));
+        let step = (w.max(h) as i32 / 10).clamp(10, 48);
+        let r = (step * 7 / 10).max(8);
+        let (fa, fb) = rayon::join(|| crate::track::match_grid(&ga, &gb, step, r), || crate::track::match_grid(&gb, &ga, step, r));
+        lap("patches");
+        let (ha, hb, detailed, found) = keep_found(fa, fb, step as f32);
         if std::env::var_os("INTERP_DEBUG").is_some() {
-            eprintln!("unaccounted: {:.0}%  broken up: {:.0}%", worst * 100.0, muddle * 100.0);
+            eprintln!("patches found: {found} of {detailed} with detail");
         }
-        if (worst > 0.3 || muddle > 0.08) && std::env::var_os("INTERP_FORCE").is_none() {
+        // a cut: hardly anything with detail is in the other frame
+        if detailed >= 4 && (found as f32) < detailed as f32 * 0.2 && std::env::var_os("INTERP_FORCE").is_none() {
             return None;
         }
-        Some(Pair { ab, ba, miss_a, miss_b, scale: (fw as f32 / w as f32, fh as f32 / h as f32) })
+        let (ab, ba) = rayon::join(|| flow(&la, &lb, &ha), || flow(&lb, &la, &hb));
+        lap("fine motion");
+        let (ca, cb) = (Rgb::from(&sa).detail(), Rgb::from(&sb).detail());
+        let camera;
+        let ((ab, lab_ab), (ba, lab_ba)) = {
+            // whole things moving as one, the same both ways
+            let mut cells: Vec<&crate::track::Moved> = ha.cells.iter().flatten().collect();
+            // (and the patches found going back, turned round)
+            let back: Vec<crate::track::Moved> = hb.cells.iter().flatten().map(|c| crate::track::Moved { x: c.to_x, y: c.to_y, to_x: c.x, to_y: c.y, ang: -c.ang, sc: 1.0 / c.sc, ..*c }).collect();
+            cells.extend(back.iter());
+            let things = groups(&cells, step as f32, 3);
+            if std::env::var_os("INTERP_DEBUG").is_some() {
+                for g in &things {
+                    eprintln!("thing at ({:.0},{:.0}) moves ({:.1},{:.1}) turns {:.2} grows {:.2}", g.cx, g.cy, g.tx, g.ty, g.ang, g.sc);
+                }
+            }
+            camera = things.first().copied();
+            let undo: Vec<Motion> = things.iter().map(|g| g.inverse()).collect();
+            rayon::join(|| pick(&ca, &cb, &la, &lb, &things, &ab), || pick(&cb, &ca, &lb, &la, &undo, &ba))
+        };
+        lap("layers");
+        let (miss_a, miss_b) = (misses(&ab, &ba), misses(&ba, &ab));
+        // per pixel these are noisy; in patches they say what's covered
+        let (miss_a, miss_b) = (box_blur(&miss_a, w, h, 2), box_blur(&miss_b, w, h, 2));
+        Some(Pair { ab, ba, lab_ab, lab_ba, miss_a, miss_b, camera, scale: (fw as f32 / w as f32, fh as f32 / h as f32) })
     }
 
     /// The frame a share `t` of the way from `a` to `b`.
     ///
-    /// The motion is carried to the in-between moment first (each pixel's
-    /// motion laid down where it will be then; where two land on one spot
-    /// the one moving unlike the rest of the picture is taken to be in
-    /// front; gaps filled from around them). Then both frames are looked up
-    /// smoothly along it and mixed, each counting for less where it can't
-    /// see that spot. A wrong guess stretches a little rather than breaking
-    /// the picture into pieces.
+    /// Each pixel's motion is carried to the in-between moment first (where
+    /// two land on one spot, the one moving unlike the rest of the picture
+    /// is taken to be in front; gaps take a neighbour's). Then both frames
+    /// are looked up along it and mixed, each counting only where it sees
+    /// that spot (its own motion there is this one). Where that fails, the
+    /// camera-following fade takes over, softly.
     pub fn at(&self, a: &RgbaImage, b: &RgbaImage, t: f32) -> RgbaImage {
         let (fw, fh) = a.dimensions();
         let (w, h) = (self.ab.w, self.ab.h);
-        // the motion at time t, at the working size, from each side: (motion
-        // a to b, how sure, front score)
-        let project = |f: &Field, miss: &[f32], s: f32, sign: f32| -> Vec<Option<((f32, f32), f32)>> {
+        // which piece's motion each spot at time t follows, at the working
+        // size, from each side: (motion, from b's side, how sure)
+        let project = |labs: &[Motion], f: &Field, miss: &[f32], s: f32, from_b: bool| -> Vec<Option<(Motion, bool, f32)>> {
             let typical = {
                 let mut xs: Vec<f32> = f.v.iter().map(|m| m.0).collect();
                 let mut ys: Vec<f32> = f.v.iter().map(|m| m.1).collect();
@@ -447,86 +856,76 @@ impl Pair {
                 ys.sort_by(|a, b| a.total_cmp(b));
                 (xs[xs.len() / 2], ys[ys.len() / 2])
             };
-            let mut best: Vec<Option<((f32, f32), f32, f32)>> = vec![None; w * h];
+            let mut best: Vec<Option<(Motion, bool, f32, f32)>> = vec![None; w * h];
             for y in 0..h {
                 for x in 0..w {
                     let i = y * w + x;
                     let m = f.v[i];
                     let trust = (-(miss[i] * miss[i]) / 2.0).exp();
+                    // what moves unlike the rest is taken to be in front
                     let z = (m.0 - typical.0).hypot(m.1 - typical.1) + trust * 0.5;
-                    let (tx, ty) = ((x as f32 + m.0 * s).round(), (y as f32 + m.1 * s).round());
+                    let (tx, ty) = labs[i].at(x as f32, y as f32, s);
                     // a 2×2 footprint, so a stretch doesn't leave pinholes
                     for (dx, dy) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
-                        let (px, py) = (tx + dx - 0.5, ty + dy - 0.5);
-                        let (px, py) = (px.round() as i64, py.round() as i64);
+                        let (px, py) = ((tx + dx - 0.5).round() as i64, (ty + dy - 0.5).round() as i64);
                         if px < 0 || py < 0 || px >= w as i64 || py >= h as i64 {
                             continue;
                         }
                         let j = py as usize * w + px as usize;
-                        if best[j].is_none_or(|b| z > b.2) {
-                            best[j] = Some(((m.0 * sign, m.1 * sign), trust, z));
+                        if best[j].is_none_or(|b| z > b.3) {
+                            best[j] = Some((labs[i], from_b, trust, z));
                         }
                     }
                 }
             }
-            best.into_iter().map(|b| b.map(|(m, tr, _)| (m, tr))).collect()
+            best.into_iter().map(|b| b.map(|(m, fb, tr, _)| (m, fb, tr))).collect()
         };
-        let (pa, pb) = rayon::join(|| project(&self.ab, &self.miss_a, t, 1.0), || project(&self.ba, &self.miss_b, 1.0 - t, -1.0));
-        // one motion per spot: the surer side, or both when they agree
-        let mut mt: Vec<Option<(f32, f32)>> = pa
+        let (pa, pb) = rayon::join(|| project(&self.lab_ab, &self.ab, &self.miss_a, t, false), || project(&self.lab_ba, &self.ba, &self.miss_b, 1.0 - t, true));
+        // where a spot at time t was in a and will be in b, by a piece's motion
+        let ends = |l: &(Motion, bool), x: f32, y: f32| -> [f32; 4] {
+            if l.1 {
+                let p = l.0.back(x, y, 1.0 - t);
+                let q = l.0.at(p.0, p.1, 1.0);
+                [q.0, q.1, p.0, p.1]
+            } else {
+                let p = l.0.back(x, y, t);
+                let q = l.0.at(p.0, p.1, 1.0);
+                [p.0, p.1, q.0, q.1]
+            }
+        };
+        // one motion per spot: the surer side's
+        let mut mt: Vec<Option<(Motion, bool)>> = pa
             .iter()
             .zip(&pb)
             .map(|(a, b)| match (a, b) {
-                (Some((ma, ta)), Some((mb, tb))) => {
-                    let apart = (ma.0 - mb.0).hypot(ma.1 - mb.1);
-                    if apart < 2.0 {
-                        let k = ta / (ta + tb).max(1e-6);
-                        Some((ma.0 * k + mb.0 * (1.0 - k), ma.1 * k + mb.1 * (1.0 - k)))
-                    } else if ta >= tb {
-                        Some(*ma)
-                    } else {
-                        Some(*mb)
-                    }
-                }
-                (Some((m, _)), None) | (None, Some((m, _))) => Some(*m),
+                (Some((ma, fa, ta)), Some((mb, fb, tb))) => Some(if ta >= tb { (*ma, *fa) } else { (*mb, *fb) }),
+                (Some((m, f, _)), None) | (None, Some((m, f, _))) => Some((*m, *f)),
                 (None, None) => None,
             })
             .collect();
-        // gaps: from around them
-        for _ in 0..32 {
+        // gaps: a neighbour's motion
+        for _ in 0..64 {
             let holes: Vec<usize> = (0..w * h).filter(|&i| mt[i].is_none()).collect();
             if holes.is_empty() {
                 break;
             }
-            let fill: Vec<(usize, (f32, f32))> = holes
+            let fill: Vec<(usize, (Motion, bool))> = holes
                 .iter()
                 .filter_map(|&i| {
                     let (x, y) = ((i % w) as i64, (i / w) as i64);
-                    let (mut sx, mut sy, mut k) = (0.0, 0.0, 0.0);
-                    for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                    [(-1, 0), (1, 0), (0, -1), (0, 1)].iter().find_map(|&(dx, dy)| {
                         let (nx, ny) = (x + dx, y + dy);
-                        if nx >= 0 && ny >= 0 && nx < w as i64 && ny < h as i64 {
-                            if let Some(q) = mt[ny as usize * w + nx as usize] {
-                                sx += q.0;
-                                sy += q.1;
-                                k += 1.0;
-                            }
-                        }
-                    }
-                    (k > 0.0).then(|| (i, (sx / k, sy / k)))
+                        (nx >= 0 && ny >= 0 && nx < w as i64 && ny < h as i64).then(|| mt[ny as usize * w + nx as usize]).flatten().map(|m| (i, m))
+                    })
                 })
                 .collect();
             for (i, v) in fill {
                 mt[i] = Some(v);
             }
         }
-        let field = Field { w, h, v: mt.into_iter().map(|m| m.unwrap_or((0.0, 0.0))).collect() };
-        // how sure each frame is of a spot it's sampled at (seen in both)
-        let sure = |miss: &[f32], x: f32, y: f32| -> f32 {
-            let (xi, yi) = (x.round().clamp(0.0, (w - 1) as f32) as usize, y.round().clamp(0.0, (h - 1) as f32) as usize);
-            let e = miss[yi * w + xi];
-            (-(e * e) / 2.0).exp().max(0.05)
-        };
+        // lone specks of another motion (where two things crossed) go
+        let mt: Vec<(Motion, bool)> = mt.into_iter().enumerate().map(|(i, m)| m.unwrap_or((Motion::shift((i % w) as f32, (i / w) as f32, (0.0, 0.0)), false))).collect();
+        let mt = vmedian(&vmedian(&mt, w, h, ends), w, h, ends);
         let samp = |img: &RgbaImage, x: f32, y: f32| -> [f32; 4] {
             let x = x.clamp(0.0, (fw - 1) as f32);
             let y = y.clamp(0.0, (fh - 1) as f32);
@@ -542,35 +941,82 @@ impl Pair {
             }
             o
         };
+        // where the motion tears (neighbours going to quite different
+        // places): pictures made from it come apart there
+        let tear: Vec<f32> = (0..w * h)
+            .into_par_iter()
+            .map(|i| {
+                let (x, y) = ((i % w) as f32, (i / w) as f32);
+                let e = ends(&mt[i], x, y);
+                let mut worst = 0.0f32;
+                for (dx, dy) in [(1i32, 0i32), (0, 1), (-1, 0), (0, -1)] {
+                    let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                    if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                        continue;
+                    }
+                    let o = ends(&mt[ny as usize * w + nx as usize], nx as f32, ny as f32);
+                    let gap = (o[0] - e[0] - dx as f32).hypot(o[1] - e[1] - dy as f32) + (o[2] - e[2] - dx as f32).hypot(o[3] - e[3] - dy as f32);
+                    worst = worst.max(gap);
+                }
+                if worst > 3.0 { 1.0 } else { 0.0 }
+            })
+            .collect();
+        // an outline tears along a line; something in pieces tears all over
+        let tear: Vec<f32> = box_blur(&tear, w, h, 4).into_iter().map(|d| ((d - 0.35) / 0.25).clamp(0.0, 1.0)).collect();
+        let cam = self.camera;
         let (sx, sy) = self.scale;
         // per pixel: the made colour, and how much the two frames disagree there
-        let rows: Vec<Vec<([f32; 4], f32)>> = (0..fh)
+        let rows: Vec<Vec<([f32; 4], [f32; 4], f32)>> = (0..fh)
             .into_par_iter()
             .map(|y| {
                 (0..fw)
                     .map(|x| {
                         let (wx, wy) = ((x as f32 + 0.5) / sx - 0.5, (y as f32 + 0.5) / sy - 0.5);
-                        let m = field.sample(wx, wy);
                         // where it was in a, and where it will be in b
-                        let (ax, ay) = (wx - m.0 * t, wy - m.1 * t);
-                        let (bx, by) = (wx + m.0 * (1.0 - t), wy + m.1 * (1.0 - t));
+                        let l = &mt[(wy.round().clamp(0.0, (h - 1) as f32) as usize) * w + wx.round().clamp(0.0, (w - 1) as f32) as usize];
+                        let [ax, ay, bx, by] = ends(l, wx, wy);
                         let ca = samp(a, (ax + 0.5) * sx - 0.5, (ay + 0.5) * sy - 0.5);
                         let cb = samp(b, (bx + 0.5) * sx - 0.5, (by + 0.5) * sy - 0.5);
-                        let wa = (1.0 - t) * sure(&self.miss_a, ax, ay);
-                        let wb = t * sure(&self.miss_b, bx, by);
+                        // each frame sees the spot only if its own motion
+                        // there is this one (else something else is in front)
+                        let (vx, vy) = (bx - ax, by - ay);
+                        let tol = 1.5 + 0.1 * vx.hypot(vy);
+                        let ma = self.ab.sample(ax, ay);
+                        let mb = self.ba.sample(bx, by);
+                        let sees_a = (-((ma.0 - vx).hypot(ma.1 - vy) / tol).powi(2)).exp().max(0.02);
+                        let sees_b = (-((mb.0 + vx).hypot(mb.1 + vy) / tol).powi(2)).exp().max(0.02);
+                        let wa = (1.0 - t) * sees_a;
+                        let wb = t * sees_b;
                         let o = [0, 1, 2, 3].map(|c| (ca[c] * wa + cb[c] * wb) / (wa + wb));
-                        // both sure of this spot yet showing different things:
-                        // the motion is wrong here
+                        // both frames see this spot yet show different
+                        // things: the motion is wrong here
                         let differ = (0..3).map(|c| (ca[c] - cb[c]).abs()).sum::<f32>() / 3.0;
-                        let both = sure(&self.miss_a, ax, ay).min(sure(&self.miss_b, bx, by));
-                        (o, ((differ - 35.0) / 45.0).clamp(0.0, 1.0) * both)
+                        // the safe way, for where the motion is in doubt: the
+                        // two frames faded, each moved as the camera moved
+                        let smooth = match cam {
+                            Some(c) => {
+                                let p = c.back(wx, wy, t);
+                                let q = c.at(p.0, p.1, 1.0);
+                                let ga = samp(a, (p.0 + 0.5) * sx - 0.5, (p.1 + 0.5) * sy - 0.5);
+                                let gb = samp(b, (q.0 + 0.5) * sx - 0.5, (q.1 + 0.5) * sy - 0.5);
+                                [0, 1, 2, 3].map(|c| ga[c] * (1.0 - t) + gb[c] * t)
+                            }
+                            None => {
+                                let (pa, pb) = (a.get_pixel(x, y).0, b.get_pixel(x, y).0);
+                                [0, 1, 2, 3].map(|c| pa[c] as f32 * (1.0 - t) + pb[c] as f32 * t)
+                            }
+                        };
+                        let torn = tear[(wy.round().clamp(0.0, (h - 1) as f32) as usize) * w + wx.round().clamp(0.0, (w - 1) as f32) as usize];
+                        // (where one frame can't see the spot they're bound
+                        // to differ: that's what uncovering looks like)
+                        (o, smooth, (((differ - 35.0) / 45.0).clamp(0.0, 1.0) * sees_a.min(sees_b)).max(torn))
                     })
                     .collect()
             })
             .collect();
         // spread the doubt a little so the fall-back has soft edges
         let (iw, ih) = (fw as usize, fh as usize);
-        let raw: Vec<f32> = rows.iter().flat_map(|r| r.iter().map(|p| p.1)).collect();
+        let raw: Vec<f32> = rows.iter().flat_map(|r| r.iter().map(|p| p.2)).collect();
         let rad = ((fw.max(fh) as f32 / 150.0).ceil() as i64).max(2);
         let blur = |v: &[f32], horiz: bool| -> Vec<f32> {
             (0..iw * ih)
@@ -591,14 +1037,12 @@ impl Pair {
                 .collect()
         };
         let doubt = blur(&blur(&raw, true), false);
-        // where in doubt: the nearer frame as it is
-        let near = if t < 0.5 { a } else { b };
+        // where in doubt: the smooth way
         let mut out = RgbaImage::new(fw, fh);
         for (y, row) in rows.into_iter().enumerate() {
-            for (x, (o, _)) in row.into_iter().enumerate() {
+            for (x, (o, n, _)) in row.into_iter().enumerate() {
                 let k = (doubt[y * iw + x] * 2.0).min(1.0);
-                let n = near.get_pixel(x as u32, y as u32).0;
-                let v = [0, 1, 2, 3].map(|c| o[c] * (1.0 - k) + n[c] as f32 * k);
+                let v = [0, 1, 2, 3].map(|c| o[c] * (1.0 - k) + n[c] * k);
                 out.put_pixel(x as u32, y as u32, Rgba(v.map(|v| v.round().clamp(0.0, 255.0) as u8)));
             }
         }
