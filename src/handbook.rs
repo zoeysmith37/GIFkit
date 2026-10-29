@@ -50,7 +50,13 @@ Moves a layer over time with ready-made motions like slide, hop and spin. Keyfra
 - Trimmed frames are kept. Pull the edge back out to get them back
 - S splits at the playhead and Delete removes a clip
 - Those two keys work with the pointer on the timeline
-- Right-click a GIF clip for Clip Speed and transitions into the next clip
+- Right-click a GIF clip for Clip Speed and transitions
+
+## Speed
+- The Speed tool changes the speed of parts of the GIF
+- Click the GIF track to add a point. Drag it up for faster
+- Double-click a point to set it back to 100%. Right-click for exact values
+- Clip Speed sets one clip's speed the same way
 
 ## Selecting
 - Drag a box on empty space to select clips and keyframes

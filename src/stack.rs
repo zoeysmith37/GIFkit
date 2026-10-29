@@ -539,6 +539,8 @@ pub struct Stack {
     pub next_id: u64,
     /// named points on the timeline (output frames), sorted
     pub markers: Vec<crate::timeline::Marker>,
+    /// how fast each part plays (output frames), sorted; empty: as it is
+    pub speed_env: Vec<crate::timeline::SpeedPoint>,
     /// the GIF track's bar colour on the timeline (None: the accent)
     pub gif_color: Option<[u8; 3]>,
 }
@@ -780,6 +782,9 @@ impl Stack {
         let t = &self.transform;
         let mut h = std::collections::hash_map::DefaultHasher::new();
         (t.cut_on, t.cut_by_time, t.cut_start, t.cut_end, t.cut_t0.to_bits(), t.cut_t1.to_bits(), t.speed_on, format!("{:?}", t.speed_mode), t.speed_val.to_bits(), t.play_on && t.reverse, t.play_on && t.boomerang).hash(&mut h);
+        for p in &self.speed_env {
+            (p.frame, p.pct.to_bits()).hash(&mut h);
+        }
         h.finish()
     }
 
@@ -804,8 +809,16 @@ impl Stack {
                 PlanFrame { src, delay: t.scale_delay(f.delay_cs), enabled: f.enabled }
             })
             .collect();
-        if t.speed_on {
-            let exact: Vec<f64> = plan.iter().map(|f| t.scale_delay_exact(base.frames[f.src].delay_cs)).collect();
+        if t.speed_on || !self.speed_env.is_empty() {
+            let exact: Vec<f64> = plan
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    let d = base.frames[f.src].delay_cs;
+                    let d = if t.speed_on { t.scale_delay_exact(d) } else { crate::anim::effective_delay(d) as f64 };
+                    d * 100.0 / crate::timeline::speed_at(&self.speed_env, i as f32) as f64
+                })
+                .collect();
             retime(&mut plan, &exact);
         }
         plan

@@ -1033,6 +1033,12 @@ pub struct GifKitApp {
     tl_clip: Option<usize>,
     tl_key: Option<usize>,
     tl_razor: bool,
+    /// the speed tool: clicks on the GIF track shape the speed envelope
+    tl_speed_tool: bool,
+    /// a speed point being dragged
+    tl_speed_drag: Option<usize>,
+    /// right-clicked on the speed envelope (a point, or usize::MAX)
+    tl_menu_speed: Option<usize>,
     tl_drag: Option<timeline_ui::TlDrag>,
     /// width of the track name column, and drags on it
     tl_head_w: f32,
@@ -1773,7 +1779,7 @@ fn colour_edit(ui: &mut egui::Ui, c: &mut [u8; 4], alpha: bool) -> egui::Respons
                 }
             }
             let b = egui::Button::image_and_text(crate::icons::image(ui.ctx(), "color-picker", 16.0, pal.fg), "Pick from Screen");
-            if ui.add_sized(vec2(ui.available_width(), CHIP_H), b).on_hover_text("Click anywhere in the window to take its colour. Esc cancels.").clicked() {
+            if ui.add_sized(vec2(ui.available_width(), CHIP_H), b).on_hover_text("Click to pick a colour. Esc cancels.").clicked() {
                 pick = true;
                 ui.close();
             }
@@ -2228,8 +2234,8 @@ fn slider_row(ui: &mut egui::Ui, label: &str, s: egui::Slider<'_>) -> egui::Resp
 fn shadow_rows(ui: &mut egui::Ui, on: &mut bool, sh: &mut crate::shapes::Shadow) {
     form_row(ui, "Shadow", |ui| check(ui, on, "Drop shadow"));
     ui.add_enabled_ui(*on, |ui| {
-        slider_row(ui, "Angle", soft_slider(&mut sh.angle, 0.0..=360.0, "").suffix("°").max_decimals(0)).on_hover_text("Direction the shadow falls. 45° is down and to the right.");
-        slider_row(ui, "Distance", soft_slider(&mut sh.distance, 0.0..=30.0, "").suffix("%").max_decimals(1)).on_hover_text("How far the shadow sits from the shape, as a share of its size");
+        slider_row(ui, "Angle", soft_slider(&mut sh.angle, 0.0..=360.0, "").suffix("°").max_decimals(0)).on_hover_text("45° falls down and to the right");
+        slider_row(ui, "Distance", soft_slider(&mut sh.distance, 0.0..=30.0, "").suffix("%").max_decimals(1)).on_hover_text("Distance from the shape");
         slider_row(ui, "Blur", egui::Slider::new(&mut sh.blur, 0.0..=20.0).suffix("%").max_decimals(1)).on_hover_text("Softness, as a share of the shape's size");
         slider_row(ui, "Strength", egui::Slider::new(&mut sh.opacity, 0.0..=100.0).suffix("%").max_decimals(0));
     });
@@ -2947,6 +2953,9 @@ impl GifKitApp {
             tl_clip: None,
             tl_key: None,
             tl_razor: false,
+            tl_speed_tool: false,
+            tl_speed_drag: None,
+            tl_menu_speed: None,
             tl_drag: None,
             tl_head_w: theme::get_setting("timeline_names").and_then(|v| v.parse().ok()).unwrap_or(170.0),
             tl_head_drag: false,
@@ -3285,7 +3294,7 @@ impl GifKitApp {
             JobOutput::Overlay(Ok(src)) => {
                 self.add_overlay(src);
                 self.tool = Tool::AddImage;
-                self.info("Overlay added – drag it on the preview to position it");
+                self.info("Overlay added. Drag it into place");
             }
             JobOutput::Anim(Err(e)) | JobOutput::Baked(Err(e)) | JobOutput::Loaded(Err(e)) | JobOutput::Overlay(Err(e)) | JobOutput::Fit(Err(e)) | JobOutput::ProjectLoaded(Err(e)) | JobOutput::ProjectSaved(Err(e)) => self.error(format!("{label} failed: {e:#}")),
             JobOutput::ProjectLoaded(Ok((pr, path))) => self.apply_project(pr, path),
@@ -3306,7 +3315,7 @@ impl GifKitApp {
                 self.tl_zone_loop = true;
                 self.export_zone_only = true;
                 self.cur = a;
-                self.info(format!("Best loop: frames {}–{} ({:.0}% different at the seam). In and out are set, and export saves just that.", a + 1, b, d * 100.0));
+                self.info(format!("Best loop: frames {}–{} ({:.0}% off at the seam). In and out are set", a + 1, b, d * 100.0));
             }
             JobOutput::ProjectSaved(Ok(path)) => {
                 self.modified = false;
@@ -3506,7 +3515,7 @@ impl GifKitApp {
                     }
                 }
                 1 => {
-                    if ui.add_sized(size, sel_btn(egui::Button::new("Palette"), o.colors > 0)).on_hover_text("Indexed PNG. Much smaller. Exact when the image has this few colours.").clicked() && o.colors == 0 {
+                    if ui.add_sized(size, sel_btn(egui::Button::new("Palette"), o.colors > 0)).on_hover_text("Indexed PNG. Much smaller").clicked() && o.colors == 0 {
                         o.colors = 256;
                     }
                 }
@@ -3523,7 +3532,7 @@ impl GifKitApp {
 
     /// Frames: file type and colours (Optimize panel).
     fn frames_settings_ui(&mut self, ui: &mut egui::Ui) {
-        form_row(ui, "Files", |ui| seg_row(ui, &mut self.split_fmt, &[(SplitFormat::Png, "PNG"), (SplitFormat::Gif, "GIF")])).on_hover_text("GIF writes single-frame GIFs. ZIP export needs PNG.");
+        form_row(ui, "Files", |ui| seg_row(ui, &mut self.split_fmt, &[(SplitFormat::Png, "PNG"), (SplitFormat::Gif, "GIF")])).on_hover_text("ZIP needs PNG");
         if self.split_fmt == SplitFormat::Png {
             Self::png_colours_ui(ui, &mut self.frames_png);
         } else {
@@ -3548,22 +3557,22 @@ impl GifKitApp {
         let s = &mut self.sheet;
         form_row(ui, "Columns", |ui| num_fill(ui, &mut s.columns, 1.0, |d| d.range(0..=n).custom_formatter(|v, _| if v == 0.0 { "Automatic".into() } else { format!("{v}") }))).on_hover_text("0 picks the layout automatically");
         form_row(ui, "Padding", |ui| num_fill(ui, &mut s.padding, 1.0, |d| d.range(0..=256).suffix(" px")));
-        form_row(ui, "", |ui| check(ui, &mut s.pow2, "Power-of-two size").on_hover_text("Pads the sheet to sizes like 512, 1024 or 2048 as most game engines expect. Automatic columns then pick the smallest such sheet."));
+        form_row(ui, "", |ui| check(ui, &mut s.pow2, "Power-of-two size").on_hover_text("Pads to sizes like 512 or 1024"));
         form_row(ui, "Result", |ui| hint(ui, &h));
     }
 
     /// Options that only matter when writing the file (Export window).
     fn save_options_ui(&mut self, ui: &mut egui::Ui) {
-        let noai_tip = "Marks the file as not for AI training. Adds a “noai” note and the standard XMP “data mining prohibited” field where the format allows it. Some sites and scrapers respect it.";
+        let noai_tip = "Marks the file as not for AI training. Some sites respect it.";
         egui::Grid::new("saveopts").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
             ui.label("Frames:");
             ui.vertical(|ui| {
-                if check(ui, &mut self.export_cut_empty, "Cut empty end frames").on_hover_text("Frames at the end with nothing to see (fully see-through) are left out, so a shortened clip doesn't save a long empty stretch").changed() {
+                if check(ui, &mut self.export_cut_empty, "Cut empty end frames").on_hover_text("Leaves out see-through frames at the end").changed() {
                     theme::set_setting("export_cut_empty", if self.export_cut_empty { "1" } else { "0" });
                 }
                 match self.tl_zone() {
                     Some((a, b)) => {
-                        check(ui, &mut self.export_zone_only, &format!("Only In to Out (frames {}–{})", a + 1, b + 1)).on_hover_text("Save only the part between the timeline's in and out points");
+                        check(ui, &mut self.export_zone_only, &format!("Only In to Out (frames {}–{})", a + 1, b + 1)).on_hover_text("Save only between the in and out points");
                     }
                     None => {
                         ui.add_enabled_ui(false, |ui| {
@@ -4019,7 +4028,7 @@ impl GifKitApp {
             if crate::ffmpeg::recheck() {
                 self.ffmpeg_ready(ctx);
             } else {
-                self.ff_msg = Some((false, "Still not found. If you just installed it, try Locate, or restart GIFkit.".into()));
+                self.ff_msg = Some((false, "Still not found. Try Locate or restart GIFkit.".into()));
             }
         }
         if close || !open {
@@ -4284,7 +4293,7 @@ impl GifKitApp {
             let merging = opt.merge > 0;
             form_row(ui, "Result:", |ui| hint(ui, &if merging { format!("Up to {frames} frames · up to {mem} in memory, less where the video is still") } else { format!("{frames} frames · {mem} in memory") }));
             if gb > 4.0 {
-                let tip = if merging { "⚠ That could be a lot of memory if the video moves a lot. A shorter range, a lower frame rate or a smaller size will be quicker to edit." } else { "⚠ That's a lot of memory. A shorter range, a lower frame rate, a smaller size or merging still parts will be much quicker to edit." };
+                let tip = if merging { "⚠ May use a lot of memory. Try a shorter range, lower frame rate or smaller size." } else { "⚠ That's a lot of memory. Try a shorter range, lower frame rate or smaller size." };
                 form_row(ui, "", |ui| ui.label(RichText::new(tip).color(pal.neutral)));
             }
             ui.add_space(12.0);
@@ -4377,7 +4386,7 @@ impl GifKitApp {
                     if self.base.is_some() {
                         self.add_overlay(OverlaySource { name: "Pasted image".into(), path: None, delays: vec![10], frames: vec![img] });
                         self.tool = Tool::AddImage;
-                        self.info("Pasted as an image layer – drag it on the preview to position it");
+                        self.info("Pasted as an image layer. Drag it into place");
                     } else {
                         let a = Animation { frames: vec![crate::anim::Frame::new(img, 10)], loop_count: None };
                         self.spawn(ctx, "Paste", 1, move |_| JobOutput::Loaded(Ok((a, None, None))));
@@ -5093,7 +5102,7 @@ impl GifKitApp {
     fn toggle_onion(&mut self) {
         self.onion = !self.onion;
         theme::set_setting("onion", if self.onion { "1" } else { "0" });
-        self.info(if self.onion { "Onion skin on: frames before show red, the next one green" } else { "Onion skin off" });
+        self.info(if self.onion { "Onion skin on: before in red, next in green" } else { "Onion skin off" });
     }
 
     /// Onion skin: two frames back in red and one ahead in green, fainter
@@ -6096,13 +6105,13 @@ impl GifKitApp {
                     self.save_project(ctx, true);
                 }
                 ui.separator();
-                if menu_item_tip(ui, "edit-copy", "Copy &Result", "Ctrl+Shift+C", idle && has, "Save the result as Export would and copy the file, to paste into a chat, a post or a folder") {
+                if menu_item_tip(ui, "edit-copy", "Copy &Result", "Ctrl+Shift+C", idle && has, "Export and copy the file, ready to paste") {
                     self.copy_result(ctx);
                 }
                 if menu_item(ui, "document-export", "&Export…", &self.keymap.text(crate::keys::Action::Export), idle && has) {
                     self.export_open = true;
                 }
-                if menu_item_tip(ui, "archive-insert", "&Batch…", "", idle, "Put the same edits and output settings on many files") {
+                if menu_item_tip(ui, "archive-insert", "&Batch…", "", idle, "Apply the same edits to many files") {
                     self.batch.open = true;
                     if has {
                         self.batch.edits = batch_ui::BatchEdits::Current;
@@ -6559,7 +6568,7 @@ impl GifKitApp {
                 if has {
                     ui.add_enabled_ui(idle, |ui| self.format_menu(ui, tb_h));
                     if ui.available_width() > 80.0 {
-                        ui.label(RichText::new("Export as").color(p().fg_muted)).on_hover_text("The format the compressed preview shows and File ▸ Export saves");
+                        ui.label(RichText::new("Export as").color(p().fg_muted)).on_hover_text("The format Export saves");
                     }
                 }
             });
@@ -7081,7 +7090,7 @@ impl GifKitApp {
                         rename_done = Some(Some((li, buf.clone())));
                     }
                 }
-                let resp = resp.on_hover_text("Click to edit. Double-click to rename. Drag to reorder. Right-click for more.");
+                let resp = resp.on_hover_text("Double-click to rename. Drag to reorder");
                 if resp.double_clicked() && !eye.hovered() {
                     self.renaming = Some((id, name.clone()));
                     self.rename_fresh = true;
@@ -7678,7 +7687,7 @@ impl GifKitApp {
                         }
                     })
                     .response
-                    .on_hover_text("Playback speed of the preview. Exports keep their own timing.");
+                    .on_hover_text("Preview speed only. Exports keep their timing");
                 }
                 let mono = |s: String| RichText::new(s).font(egui::FontId::monospace(12.5)).color(pal.fg);
                 if show_frame {
@@ -7892,7 +7901,7 @@ impl GifKitApp {
             // made for the clipboard: put it there
             match r {
                 Ok(_) => match copy_file_to_clipboard(&p) {
-                    Ok(()) => self.info(format!("Copied {} ({}): paste it into a chat, a post or a folder", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), fmt_size(std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0)))),
+                    Ok(()) => self.info(format!("Copied {} ({})", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), fmt_size(std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0)))),
                     Err(e) => self.error(format!("Couldn't copy: {e:#}")),
                 },
                 Err(e) => self.error(format!("{e:#}")),
@@ -7920,7 +7929,7 @@ impl GifKitApp {
             return;
         }
         if self.export_fmt == ExportFormat::Frames {
-            self.info("Frames save as a folder: pick another format to copy");
+            self.info("Can't copy a folder of frames. Pick another format");
             return;
         }
         let dir = std::env::temp_dir().join("gifkit-copied");
@@ -8121,6 +8130,7 @@ impl GifKitApp {
             transform: self.stack.transform.clone(),
             layers,
             markers: self.stack.markers.clone(),
+            speed_env: self.stack.speed_env.clone(),
             gif_color: self.stack.gif_color,
             settings: serde_json::to_value(self.proj_settings()).unwrap_or_default(),
             ..Default::default()
@@ -8281,6 +8291,7 @@ impl GifKitApp {
             }
         }
         self.stack.markers = file.markers;
+        self.stack.speed_env = file.speed_env;
         self.stack.gif_color = file.gif_color;
         self.stack.sync_len(n);
         if let Ok(st) = serde_json::from_value::<ProjSettings>(file.settings) {
@@ -8941,7 +8952,7 @@ impl GifKitApp {
             self.split_frac = 0.5;
             theme::set_setting("split", "0.5");
         }
-        d.on_hover_text("Drag to resize the views. Double-click to make them even.");
+        d.on_hover_text("Drag to resize. Double-click to even out");
     }
 
     /// Canvas editing. `space` says which coordinates the viewport shows:
@@ -9606,7 +9617,7 @@ impl GifKitApp {
         let cur = self.cur;
         let t = &mut self.stack.layers[li].timing;
         if !self.tl_autokey && t.key_at(cur).is_none() {
-            self.info("Auto key is off: add a keyframe here (K) to move it on this frame");
+            self.info("Auto key is off. Press K to key this frame");
             return;
         }
         let k = t.add_key(cur);
@@ -9686,7 +9697,7 @@ impl GifKitApp {
         let (cs, ce) = self.base.as_ref().map(|b| self.stack.transform.cut_range(b)).unwrap_or((0, 0));
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("{n} source frames")).font(theme::medium(14.0)).color(pal.fg));
-            ui.label(RichText::new("ℹ").color(pal.fg_muted)).on_hover_text("Changes here apply under all live edits. Skipped frames are left out of playback and export. Right-click a frame for more.");
+            ui.label(RichText::new("ℹ").color(pal.fg_muted)).on_hover_text("Skipped frames don't play or export. Right-click for more");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().slider_width = 140.0;
                 slider(ui, egui::Slider::new(&mut self.fr_thumb, 32.0..=220.0).show_value(false));
@@ -9752,7 +9763,7 @@ impl GifKitApp {
                                 st.bg_fill = Color32::TRANSPARENT;
                             }
                             child.style_mut().override_font_id = Some(egui::FontId::proportional(12.0));
-                            let d = child.add(egui::DragValue::new(&mut delay).range(1..=6000).speed(0.2).suffix(" cs")).on_hover_text("Delay in hundredths of a second. Drag or click to type.");
+                            let d = child.add(egui::DragValue::new(&mut delay).range(1..=6000).speed(0.2).suffix(" cs")).on_hover_text("Delay in hundredths of a second");
                             if d.changed() {
                                 delay_change = Some((i, delay));
                             }
@@ -9953,7 +9964,7 @@ impl GifKitApp {
             if *by_pct {
                 let mut pct = if tr.rs_pct > 0.0 { tr.rs_pct } else { 100.0 };
                 let r1 = slider_row(ui, "Scale", egui::Slider::new(&mut pct, 1.0..=400.0).suffix(" %").max_decimals(1).clamping(egui::SliderClamping::Never).logarithmic(true))
-                    .on_hover_text("Drag or type any value such as 37.5 or 1200");
+                    .on_hover_text("Any value, like 37.5 or 1200");
                 if r1.changed() {
                     tr.rs_pct = pct.clamp(0.1, 6400.0);
                 }
@@ -10160,18 +10171,18 @@ impl GifKitApp {
         group(ui, "Seamless Loop", |ui| {
             let idle = !self.busy() && self.base.is_some();
             form_row(ui, "", |ui| {
-                let b = ui.add_enabled_ui(idle, |ui| wide_button(ui, egui::Button::new("Find Loop Point"))).inner.on_hover_text("Finds the two frames that look most alike and sets in and out around them, so it loops with the least jump");
+                let b = ui.add_enabled_ui(idle, |ui| wide_button(ui, egui::Button::new("Find Loop Point"))).inner.on_hover_text("Sets in and out at the two frames most alike");
                 if b.clicked() {
                     self.find_loop_point(ctx);
                 }
             });
             form_row(ui, "Blend", |ui| {
                 ui.horizontal(|ui| {
-                    num_fill(ui, &mut self.loop_blend, 1.0, |d| d.range(1..=60).suffix(" frames")).on_hover_text("How many frames the end fades into the start over");
+                    num_fill(ui, &mut self.loop_blend, 1.0, |d| d.range(1..=60).suffix(" frames")).on_hover_text("Frames to fade over");
                 });
             });
             form_row(ui, "", |ui| {
-                let go = ui.add_enabled_ui(idle, |ui| wide_button(ui, egui::Button::new("Blend the Seam"))).inner.on_hover_text("The end fades into the start, and the animation gets that many frames shorter, so the jump back to frame 1 disappears");
+                let go = ui.add_enabled_ui(idle, |ui| wide_button(ui, egui::Button::new("Blend the Seam"))).inner.on_hover_text("Fades the end into the start. It gets that many frames shorter");
                 if go.clicked() {
                     let n = self.loop_blend;
                     self.run_anim(ctx, "Seamless loop", move |a, _| Ok(ops::loop_crossfade(a, n)));
@@ -10225,7 +10236,7 @@ impl GifKitApp {
                 let text = if d < 2.0 { "⚠ Too fast for browsers".to_string() } else { format!("{} cs per frame ({:.2} fps)", d.max(1.0), 100.0 / d.max(1.0)) };
                 form_row(ui, "", |ui| {
                     if d < 2.0 {
-                        ui.label(RichText::new(&text).color(p().neutral)).on_hover_text("Most browsers play delays under 2 cs at 10 cs.");
+                        ui.label(RichText::new(&text).color(p().neutral)).on_hover_text("Browsers play under 2 cs as 10 cs");
                     } else {
                         hint(ui, &text);
                     }
@@ -10313,8 +10324,8 @@ impl GifKitApp {
                 });
                 if let Some(smp) = &c.sample {
                     form_row(ui, "", |ui| {
-                        hint(ui, &format!("Estimated from {} of {} frames to keep editing quick", smp.len(), self.plan.len()));
-                        full = ui.add_enabled(!busy, egui::Button::new("Compress Fully").min_size(vec2(0.0, CHIP_H))).on_hover_text("Encode every frame for the exact size and preview. Takes a while on long clips.").clicked();
+                        hint(ui, &format!("Estimated from {} of {} frames", smp.len(), self.plan.len()));
+                        full = ui.add_enabled(!busy, egui::Button::new("Compress Fully").min_size(vec2(0.0, CHIP_H))).on_hover_text("Encode every frame for the exact size. Slow on long clips").clicked();
                     });
                 }
             }
@@ -10350,7 +10361,7 @@ impl GifKitApp {
                     })
                 });
                 form_row(ui, "", |ui| {
-                    let r = wide_button(ui, drop_button(ui, "Platforms", p().fg)).on_hover_text("Upload limits of popular sites. Emoji sizes shrink the frames too.");
+                    let r = wide_button(ui, drop_button(ui, "Platforms", p().fg)).on_hover_text("Upload limits of popular sites");
                     let mut pick = None;
                     egui::Popup::menu(&r).show(|ui| {
                         ui.set_min_width(190.0);
@@ -10372,9 +10383,9 @@ impl GifKitApp {
                 form_row(ui, "", |ui| {
                     even_grid(ui, 2, 0.0, |ui, i, size| {
                         if i == 0 {
-                            find = ui.add_enabled_ui(idle, |ui| ui.add_sized(size, egui::Button::new("Find Settings").stroke(Stroke::new(1.0, p().highlight)))).inner.on_hover_text("Finds the best quality under the limit and applies it. Quality drops first and size only if needed.").clicked();
+                            find = ui.add_enabled_ui(idle, |ui| ui.add_sized(size, egui::Button::new("Find Settings").stroke(Stroke::new(1.0, p().highlight)))).inner.on_hover_text("Best quality under the limit. Shrinks only if it must").clicked();
                         } else {
-                            reset = ui.add_enabled_ui(idle, |ui| ui.add_sized(size, egui::Button::new("Reset"))).inner.on_hover_text("Back to lossless settings. Also undoes any downscale from Find Settings.").clicked();
+                            reset = ui.add_enabled_ui(idle, |ui| ui.add_sized(size, egui::Button::new("Reset"))).inner.on_hover_text("Back to lossless. Undoes any downscale too").clicked();
                         }
                     })
                 });
@@ -10430,13 +10441,13 @@ impl GifKitApp {
             ExportFormat::Avif => {
                 group(ui, "AVIF", |ui| {
                     slider_row(ui, "Quality", egui::Slider::new(&mut self.avif_quality, 0..=100)).on_hover_text("50–70 is a good balance");
-                    form_row(ui, "", |ui| hint(ui, "Slow to encode so the preview takes a while"));
+                    form_row(ui, "", |ui| hint(ui, "Slow to encode"));
                 });
                 return;
             }
             ExportFormat::Mp4 => {
                 group(ui, "MP4", |ui| {
-                    form_row(ui, "Background", |ui| colour_btn(ui, &mut self.video_bg).on_hover_text("MP4 has no transparency. This colour fills it."));
+                    form_row(ui, "Background", |ui| colour_btn(ui, &mut self.video_bg).on_hover_text("MP4 has no transparency. This fills it"));
                 });
                 return;
             }
@@ -10477,13 +10488,13 @@ impl GifKitApp {
         });
         let o = &mut self.gif_opts;
         group(ui, "Lossy", |ui| {
-            slider_row(ui, "Level", egui::Slider::new(&mut o.lossy, 0..=200).clamping(egui::SliderClamping::Never)).on_hover_text("Lets similar colours merge. 30–80 is usually invisible.");
+            slider_row(ui, "Level", egui::Slider::new(&mut o.lossy, 0..=200).clamping(egui::SliderClamping::Never)).on_hover_text("Merges similar colours. 30–80 is usually invisible");
         });
         group(ui, "Colours", |ui| {
             slider_row(ui, "Maximum", egui::Slider::new(&mut o.colors, 2..=256));
-            slider_row(ui, "Quantizer", egui::Slider::new(&mut o.quant_speed, 1..=30)).on_hover_text("Speed of the palette search. 1 gives the best palette and 30 is fastest.");
+            slider_row(ui, "Quantizer", egui::Slider::new(&mut o.quant_speed, 1..=30)).on_hover_text("1 is best, 30 is fastest");
             form_row(ui, "", |ui| {
-                check(ui, &mut o.global_palette, "One palette for all frames").on_hover_text("Smaller files but may show banding on varied footage");
+                check(ui, &mut o.global_palette, "One palette for all frames").on_hover_text("Smaller but may band");
             });
             dither_row(ui, o);
         });
@@ -10496,7 +10507,7 @@ impl GifKitApp {
                 check(ui, &mut o.merge_duplicates, "Merge identical frames");
             });
             ui.add_enabled_ui(o.merge_duplicates, |ui| {
-                slider_row(ui, "Near matches", egui::Slider::new(&mut o.merge_tolerance, 0..=100).custom_formatter(|v, _| if v == 0.0 { "Off".into() } else { format!("{v:.0}") })).on_hover_text("Also merges frames that barely change. Good for screen recordings and noisy video.");
+                slider_row(ui, "Near matches", egui::Slider::new(&mut o.merge_tolerance, 0..=100).custom_formatter(|v, _| if v == 0.0 { "Off".into() } else { format!("{v:.0}") })).on_hover_text("Merges frames that barely change. Good for screen recordings");
             });
             form_row(ui, "Drop frames", |ui| {
                 even_grid(ui, 2, 0.0, |ui, i, size| {
@@ -10861,7 +10872,7 @@ impl GifKitApp {
         };
         let before = a.clone();
         if sel.is_none() {
-            hint(ui, "Changing anything adds a text layer. Drag it into place on the image.");
+            hint(ui, "Changing anything adds a text layer");
             ui.add_space(6.0);
         }
         group(ui, "Text", |ui| {
@@ -10878,7 +10889,7 @@ impl GifKitApp {
                     }
                 })
                 .response
-                .on_hover_text("Type the text in letter by letter or word by word, from where the layer starts")
+                .on_hover_text("Types the text in letter by letter or word by word")
             });
             ui.add_enabled_ui(a.reveal != text::Reveal::None, |ui| {
                 slider_row(ui, "Over", soft_slider(&mut a.reveal_secs, 0.2..=10.0, "").suffix(" s").max_decimals(1)).on_hover_text("How long typing it all takes");
@@ -10887,11 +10898,11 @@ impl GifKitApp {
         group(ui, "Layout", |ui| {
             use text::Caption;
             form_row(ui, "Caption bar", |ui| seg_row(ui, &mut a.caption, &[(Caption::None, "None"), (Caption::Top, "Top"), (Caption::Bottom, "Bottom")]))
-                .on_hover_text("A strip above or below the picture with the text in it, sized to fit the text");
+                .on_hover_text("A strip above or below the picture for the text");
             let bar = a.caption != Caption::None;
             if bar {
                 form_row(ui, "Bar colour", |ui| colour_btn(ui, &mut a.bar_color));
-                slider_row(ui, "Bar padding", soft_slider(&mut a.bar_pad, 0.0..=150.0, "").suffix("%").max_decimals(0)).on_hover_text("Room above and below the text, as a share of the text size");
+                slider_row(ui, "Bar padding", soft_slider(&mut a.bar_pad, 0.0..=150.0, "").suffix("%").max_decimals(0)).on_hover_text("Room above and below the text");
             }
             ui.add_enabled_ui(!bar, |ui| {
                 let (mut wrap, mut centre) = (a.wrap || bar, a.centre || bar);
@@ -10953,7 +10964,7 @@ impl GifKitApp {
                 even_grid(ui, 2, 0.0, |ui, i, size| {
                     let v = if i == 0 { &mut a.stretch } else { &mut a.stretch_y };
                     let mut pct = *v * 100.0;
-                    let tip = if i == 0 { "Squash or stretch the text sideways. Drag a side handle on the image to do it by hand." } else { "Squash or stretch the text up and down" };
+                    let tip = if i == 0 { "Squash or stretch the text sideways" } else { "Squash or stretch the text up and down" };
                     if spin(ui, size, &mut pct, 1.0, |d| d.range(5.0..=2000.0).speed(0.5).max_decimals(0).prefix(if i == 0 { "X  " } else { "Y  " }).suffix("%")).on_hover_text(tip).changed() {
                         *v = pct / 100.0;
                     }
@@ -11228,7 +11239,7 @@ impl GifKitApp {
                         (Anchor::BottomRight, "Bottom right"),
                     ])
                 });
-                form_row(ui, "Margin", |ui| num_fill(ui, &mut w.margin, 1.0, |d| d.range(0.0..=40.0).speed(0.1).max_decimals(1).suffix(" %")).on_hover_text("Gap to the edge as a share of the frame's shorter side"));
+                form_row(ui, "Margin", |ui| num_fill(ui, &mut w.margin, 1.0, |d| d.range(0.0..=40.0).speed(0.1).max_decimals(1).suffix(" %")).on_hover_text("Gap to the edge"));
             }
         });
         let changed = w != before;
@@ -11606,7 +11617,7 @@ impl GifKitApp {
             s.add_layer(LayerKind::Markup(MarkupSettings::default()));
         });
         if sel.is_none() {
-            hint(ui, "Drag on the image to draw. A markup layer starts with the first stroke.");
+            hint(ui, "Drag on the image to draw");
             ui.add_space(6.0);
         }
         group(ui, "Brush", |ui| {
@@ -11623,7 +11634,7 @@ impl GifKitApp {
             form_row(ui, "", |ui| hint(ui, "Hold Shift for a straight line"));
         });
         group(ui, "Draw On", |ui| {
-            form_row(ui, "Draw on", |ui| seg_row(ui, &mut self.pen_scope, &[(PenScope::All, "All frames"), (PenScope::FromHere, "From here"), (PenScope::ThisFrame, "This frame")])).on_hover_text("This frame lets you step through frames to draw a little animation");
+            form_row(ui, "Draw on", |ui| seg_row(ui, &mut self.pen_scope, &[(PenScope::All, "All frames"), (PenScope::FromHere, "From here"), (PenScope::ThisFrame, "This frame")])).on_hover_text("Step through frames to draw an animation");
         });
         let count = sel
             .map(|i| match &self.stack.layers[i].kind {
@@ -11677,7 +11688,7 @@ impl GifKitApp {
         };
         let before = s.clone();
         group(ui, "Perturbation", |ui| {
-            slider_row(ui, "Strength", soft_slider(&mut s.strength, 0.0..=20.0, "").max_decimals(1)).on_hover_text("How strong the noise is. 4 to 8 is hard to see.");
+            slider_row(ui, "Strength", soft_slider(&mut s.strength, 0.0..=20.0, "").max_decimals(1)).on_hover_text("4 to 8 is hard to see");
             form_row(ui, "Adds", |ui| {
                 check(ui, &mut s.pattern, "High-frequency pattern");
                 check(ui, &mut s.noise, "Colour noise");
@@ -11797,20 +11808,20 @@ impl GifKitApp {
                 })
             });
             form_row(ui, "", |ui| {
-                check(ui, &mut self.fr_follow, "Follow motion").on_hover_text("Moves the picture along with what moves in it, so things slide instead of fading through each other");
+                check(ui, &mut self.fr_follow, "Follow motion").on_hover_text("Slides things along instead of fading them");
             });
             if self.fr_follow {
                 form_row(ui, "Method", |ui| {
                     use crate::interp::Method;
                     combo(ui, "ib_method", &mut self.fr_method, &[(Method::Ai, "AI (RIFE)"), (Method::Tracker, "Tracker")])
-                        .on_hover_text("AI: a neural network made for in-betweens, sharp even on hard moves. Tracker: GIFkit's own motion tracking, with a choice for where it can't follow");
+                        .on_hover_text("AI is sharpest, even on big moves. Tracker is GIFkit's own");
                 });
             }
             if self.fr_follow && self.fr_method == crate::interp::Method::Tracker {
                 form_row(ui, "Unsure", |ui| {
                     use crate::interp::Unsure;
                     combo(ui, "ib_unsure", &mut self.fr_unsure, &[(Unsure::Blur, "Motion blur"), (Unsure::Nearer, "Nearer frame"), (Unsure::Fade, "Fade")])
-                        .on_hover_text("Where something changes too much to follow: smear it along its way, show the nearer frame moved into place, or fade the two");
+                        .on_hover_text("What to show where it can't follow");
                 });
             }
             // too short a delay and browsers slow it down
@@ -11818,11 +11829,11 @@ impl GifKitApp {
             let each = shortest as f32 / (self.fr_crossfade + 1) as f32;
             if each < 2.0 {
                 form_row(ui, "", |ui| {
-                    ui.label(RichText::new("⚠ Not enough time to share: it gets longer").color(p().neutral).size(12.0)).on_hover_text("Each frame's time is shared with its new ones, but no frame goes under 2 cs (browsers slow those down). Use fewer to keep the length.");
+                    ui.label(RichText::new("⚠ Too many frames: it will play longer").color(p().neutral).size(12.0)).on_hover_text("No frame can go under 2 cs. Add fewer to keep the length");
                 });
             }
             form_row(ui, "", |ui| {
-                go = wide_button(ui, egui::Button::new("Make In-Betweens")).on_hover_text("Smoother motion. The length stays the same.").clicked();
+                go = wide_button(ui, egui::Button::new("Make In-Betweens")).on_hover_text("Smoother motion, same length").clicked();
             });
             if go {
                 let (steps, wrap, follow, unsure, method) = (self.fr_crossfade, self.fr_crossfade_wrap, self.fr_follow, self.fr_unsure, self.fr_method);
@@ -11857,6 +11868,14 @@ impl GifKitApp {
                                 if let Some((a, _)) = map(key.frame) {
                                     key.frame = a;
                                 }
+                            }
+                        }
+                        // the speed envelope too (a step between two frames stays a step)
+                        let env = stack.speed_env.clone();
+                        for (i, p) in stack.speed_env.iter_mut().enumerate() {
+                            if let Some((a, cnt)) = map(p.frame) {
+                                let step = env.get(i + 1).is_some_and(|q| q.frame == p.frame + 1);
+                                p.frame = if step { a + cnt.max(1) - 1 } else { a };
                             }
                         }
                         JobOutput::Baked(Ok((out, stack)))
@@ -12009,7 +12028,7 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform, c
         if fx.oil {
             sub_head(ui, "Oil Paint");
             slider_row(ui, "Brush", egui::Slider::new(&mut fx.oil_radius, 1..=16).suffix(" px")).on_hover_text("How far each patch reaches");
-            slider_row(ui, "Detail", egui::Slider::new(&mut fx.oil_detail, 2..=64)).on_hover_text("How many shades it keeps apart. Fewer gives flatter patches.");
+            slider_row(ui, "Detail", egui::Slider::new(&mut fx.oil_detail, 2..=64)).on_hover_text("Fewer gives flatter patches");
         }
         if fx.emboss {
             sub_head(ui, "Emboss");
@@ -12061,7 +12080,7 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform, c
                 ui.horizontal(|ui| {
                     colour_btn(ui, &mut fx.rc_color);
                     if let Some(c) = corner {
-                        if ui.button("From Corner").on_hover_text("The colour of the frame's top-left corner, usually the background").clicked() {
+                        if ui.button("From Corner").on_hover_text("The top-left corner's colour").clicked() {
                             fx.rc_color = c;
                         }
                     }
@@ -12078,8 +12097,8 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform, c
         ui.add_enabled_ui(any, |ui| {
             slider_row(ui, "Fuzz", soft_slider(&mut fx.rc_fuzz, 0.0..=60.0, "").suffix(" %").max_decimals(0)).on_hover_text("How close a colour must be to count");
             ui.add_enabled_ui(fx.rc_custom, |ui| {
-                slider_row(ui, "Soft edge", soft_slider(&mut fx.rc_soft, 0.0..=40.0, "").suffix(" %").max_decimals(0)).on_hover_text("Colours a little past the fuzz fade out instead of staying, for smooth edges (green screen)");
-                form_row(ui, "Spill", |ui| check(ui, &mut fx.rc_despill, "Remove colour spill")).on_hover_text("Takes the removed colour's tint out of what's left, such as a green glow from a green screen");
+                slider_row(ui, "Soft edge", soft_slider(&mut fx.rc_soft, 0.0..=40.0, "").suffix(" %").max_decimals(0)).on_hover_text("Fades edge colours out for smoother edges");
+                form_row(ui, "Spill", |ui| check(ui, &mut fx.rc_despill, "Remove colour spill")).on_hover_text("Removes leftover tint, like a green screen's glow");
             });
             opt_row(ui, "Clean edges", &mut fx.rc_clean_edges, |ui| {
                 num_fill(ui, &mut fx.rc_edge_px, 1.0, |d| d.range(1..=50).suffix(" px")).on_hover_text("Removes leftover fringe around cut-out areas");
@@ -12089,7 +12108,7 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform, c
     // made before the Animation panel: still edited here
     let moving = fx.intro != crate::motion::Transition::None || fx.outro != crate::motion::Transition::None || !fx.loop_fx().is_empty() || fx.fade_in || fx.fade_out;
     if !fx.anim && (moving || fx.counter) {
-        hint(ui, "This layer animates. New animation goes in the Animation panel.");
+        hint(ui, "This layer animates. Edit it in Animation");
         anim_ui(ui, fx);
     }
     group_ex(ui, "Blur & Sharpen", false, on(&[fx.blur, fx.sharpen]), |ui| {
@@ -12155,7 +12174,7 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform, c
         return;
     }
     group_ex(ui, "Transform (Old)", true, on(&[fx.flip_v, fx.flip_h, fx.rot90, fx.rot270, fx.rot_any]), |ui| {
-        hint(ui, "Use the Rotate frame edit instead. These stay for older projects.");
+        hint(ui, "Use the Rotate frame edit instead");
         form_row(ui, "Transform", |ui| {
             toggle_grid(ui, 64.0, &mut [(&mut fx.flip_h, "Flip horizontally", ""), (&mut fx.flip_v, "Flip vertically", ""), (&mut fx.rot90, "Turn 90° clockwise", ""), (&mut fx.rot270, "Turn 90° anticlockwise", "")])
         });
@@ -12167,7 +12186,7 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform, c
 fn dither_row(ui: &mut egui::Ui, o: &mut crate::encode::GifOptions) {
     let mut mode = if o.dither { 1u8 } else if o.ordered_dither { 2 } else { 0 };
     let r = form_row(ui, "Dither", |ui| seg_row(ui, &mut mode, &[(0, "None"), (1, "Diffusion"), (2, "Ordered")]));
-    r.on_hover_text("Diffusion scatters the error between colours and looks smoothest. Ordered uses a fixed pattern: faster on the graphics card, often smaller, and steady between frames.");
+    r.on_hover_text("Diffusion looks smoothest. Ordered is faster and steadier");
     o.dither = mode == 1;
     o.ordered_dither = mode == 2;
 }
@@ -12276,7 +12295,7 @@ fn anim_ui(ui: &mut egui::Ui, fx: &mut EffectSettings) {
     });
     group_ex(ui, "Hidden Parts", false, None, |ui| {
         ui.add_enabled_ui(moving, |ui| {
-            form_row(ui, "Fill", |ui| check(ui, &mut fx.fade_to_transparent, "Transparent").on_hover_text("What shows where the picture moved away. Black otherwise."));
+            form_row(ui, "Fill", |ui| check(ui, &mut fx.fade_to_transparent, "Transparent").on_hover_text("What shows where the picture moved away"));
         });
     });
 }

@@ -46,6 +46,7 @@ pub(super) struct TlDrag {
 enum TbAct {
     Select,
     Razor,
+    Speed,
     Split,
     Join,
     AddClip,
@@ -387,7 +388,7 @@ impl GifKitApp {
         }
     }
 
-    /// Join the selected clip with the one right after it.
+    /// Join with the next clip.
     fn tl_join(&mut self, now: f64) {
         let (Some(track), Some(c)) = (self.tl_track, self.tl_clip) else { return };
         let n = self.plan.len();
@@ -555,33 +556,34 @@ impl GifKitApp {
         type Item = (TbAct, &'static str, &'static str, String, bool, Option<bool>);
         let mut groups: Vec<Vec<Item>> = vec![
             vec![
-                (TbAct::Select, "edit-select", "Selection Tool", format!("Selection tool: move and trim clips{}", k(A::TlRazor)), true, Some(!self.tl_razor)),
-                (TbAct::Razor, "edit-cut", "Razor Tool", format!("Razor tool: click a clip to cut it there{}", k(A::TlRazor)), true, Some(self.tl_razor)),
+                (TbAct::Select, "edit-select", "Selection Tool", format!("Move and trim clips{}", k(A::TlRazor)), true, Some(!self.tl_razor && !self.tl_speed_tool)),
+                (TbAct::Razor, "edit-cut", "Razor Tool", format!("Click a clip to cut it{}", k(A::TlRazor)), true, Some(self.tl_razor)),
+                (TbAct::Speed, "speedometer", "Speed Tool", "Change the speed of parts of the GIF".into(), true, Some(self.tl_speed_tool)),
             ],
             vec![
                 (TbAct::Split, "split", "Split at Playhead", format!("Split the selected track at the playhead{}", k(A::TlSplit)), idle && self.tl_track.is_some() && !locked_sel, None),
-                (TbAct::Join, "merge", "Join with Next Clip", "Join the selected clip with the one right after it".into(), idle && self.tl_can_join() && !locked_sel, None),
-                (TbAct::AddClip, "list-add", "Add Clip at Playhead", "Add a clip at the playhead (on an empty part of the selected track)".into(), idle && gap_here && !locked_sel, None),
-                (TbAct::Delete, "edit-delete", "Delete", format!("Delete the selected clips or keyframe{}. On the GIF track it leaves a gap.", k(A::TlDelete)), idle && (self.tl_clip.is_some() || self.tl_key.is_some() || !self.tl_keys.is_empty() || !self.tl_sel.is_empty()) && !locked_sel, None),
+                (TbAct::Join, "merge", "Join with Next Clip", "Join with the next clip".into(), idle && self.tl_can_join() && !locked_sel, None),
+                (TbAct::AddClip, "list-add", "Add Clip at Playhead", "Add a clip at the playhead".into(), idle && gap_here && !locked_sel, None),
+                (TbAct::Delete, "edit-delete", "Delete", format!("Delete the selection{}", k(A::TlDelete)), idle && (self.tl_clip.is_some() || self.tl_key.is_some() || !self.tl_keys.is_empty() || !self.tl_sel.is_empty()) && !locked_sel, None),
             ],
             vec![
-                (TbAct::Copy, "edit-copy", "Copy", "Copy the selected clips or keyframe (Ctrl+C). GIF clips copy their frames.".into(), any_clips || self.tl_key.is_some(), None),
-                (TbAct::Paste, "edit-paste", "Paste", "Paste at the playhead (Ctrl+V). GIF frames go in after the clip under the playhead.".into(), idle && self.tl_board.is_some() && (gif_board || (sel_layer.is_some() && !locked_sel)), None),
-                (TbAct::Duplicate, "edit-duplicate", "Duplicate", format!("Put a copy of the selected clips right after them{}", k(A::TlDuplicate)), idle && any_clips && !locked_sel, None),
+                (TbAct::Copy, "edit-copy", "Copy", "Copy (Ctrl+C)".into(), any_clips || self.tl_key.is_some(), None),
+                (TbAct::Paste, "edit-paste", "Paste", "Paste at the playhead (Ctrl+V)".into(), idle && self.tl_board.is_some() && (gif_board || (sel_layer.is_some() && !locked_sel)), None),
+                (TbAct::Duplicate, "edit-duplicate", "Duplicate", format!("Duplicate the selection{}", k(A::TlDuplicate)), idle && any_clips && !locked_sel, None),
             ],
             vec![
-                (TbAct::KeyAdd, "keyframe-add", "Add Keyframe", format!("Add a keyframe on the selected layer at the playhead{}", k(A::TlKey)), idle && sel_layer.is_some() && !locked_sel, None),
+                (TbAct::KeyAdd, "keyframe-add", "Add Keyframe", format!("Add a keyframe at the playhead{}", k(A::TlKey)), idle && sel_layer.is_some() && !locked_sel, None),
                 (TbAct::KeyRemove, "keyframe-remove", "Remove Keyframe", "Remove the keyframe at the playhead".into(), idle && on_key && !locked_sel, None),
-                (TbAct::PrevEdit, "keyframe-previous", "Previous Edit", format!("Playhead to the previous clip edge, keyframe or marker{}", k(A::TlPrevEdit)), true, None),
-                (TbAct::NextEdit, "keyframe-next", "Next Edit", format!("Playhead to the next clip edge, keyframe or marker{}", k(A::TlNextEdit)), true, None),
+                (TbAct::PrevEdit, "keyframe-previous", "Previous Edit", format!("Jump to the previous edit{}", k(A::TlPrevEdit)), true, None),
+                (TbAct::NextEdit, "keyframe-next", "Next Edit", format!("Jump to the next edit{}", k(A::TlNextEdit)), true, None),
             ],
             vec![
                 (TbAct::In, "zone-in", "Set In Point", format!("Set the in point at the playhead{}", k(A::TlIn)), true, None),
                 (TbAct::Out, "zone-out", "Set Out Point", format!("Set the out point at the playhead{}", k(A::TlOut)), true, None),
                 (TbAct::Marker, "bookmark-new", "Add Marker", format!("Add a marker at the playhead{}", k(A::TlMarker)), true, None),
-                (TbAct::TrimEnd, "transform-crop", "Trim to Last Clip", "Shorten the animation to where its last clip ends".into(), idle && self.tl_last_clip_end().is_some_and(|e| e + 1 < self.gif_edit_len()), None),
+                (TbAct::TrimEnd, "transform-crop", "Trim to Last Clip", "Cut the end after the last clip".into(), idle && self.tl_last_clip_end().is_some_and(|e| e + 1 < self.gif_edit_len()), None),
             ],
-            vec![(TbAct::Snap, "snap", "Snap", "Snap: clip edges and keyframes jump to the playhead, other clips, keyframes and markers nearby (hold Shift while dragging to place freely)".into(), true, Some(self.tl_snap))],
+            vec![(TbAct::Snap, "snap", "Snap", "Snap to clips, keyframes and markers. Hold Shift to place freely".into(), true, Some(self.tl_snap))],
         ];
         if self.tl_zone().is_some() {
             groups.last_mut().unwrap().push((TbAct::Loop, "media-playlist-repeat", "Loop In to Out", "Loop playback between the in and out points".into(), true, Some(self.tl_zone_loop)));
@@ -674,7 +676,7 @@ impl GifKitApp {
                     // a zoom slider, as in Kdenlive: fit at the left, closest at the right
                     let mut t = ((cur_z / fit).ln() / (top / fit).ln()).clamp(0.0, 1.0);
                     ui.spacing_mut().slider_width = 90.0;
-                    if slider(ui, egui::Slider::new(&mut t, 0.0..=1.0).show_value(false)).on_hover_text("Zoom the timeline (Ctrl+wheel). Drag with the middle button to pan.").changed() {
+                    if slider(ui, egui::Slider::new(&mut t, 0.0..=1.0).show_value(false)).on_hover_text("Zoom (Ctrl+wheel). Middle-drag to pan").changed() {
                         self.tl_zoom_to = Some(fit * (top / fit).powf(t));
                     }
                 }
@@ -695,8 +697,9 @@ impl GifKitApp {
             ui.ctx().data_mut(|d| d.insert_temp(mem, (new_groups, new_title, new_right)));
         });
         match act {
-            Some(TbAct::Select) => self.tl_razor = false,
-            Some(TbAct::Razor) => self.tl_razor = true,
+            Some(TbAct::Select) => (self.tl_razor, self.tl_speed_tool) = (false, false),
+            Some(TbAct::Razor) => (self.tl_razor, self.tl_speed_tool) = (true, false),
+            Some(TbAct::Speed) => (self.tl_razor, self.tl_speed_tool) = (false, !self.tl_speed_tool),
             Some(TbAct::Split) => self.tl_split(now),
             Some(TbAct::Join) => self.tl_join(now),
             Some(TbAct::AddClip) => self.tl_add_clip(now),
@@ -794,7 +797,7 @@ impl GifKitApp {
                         0 => {
                             let b = ui
                                 .add(sel_btn(egui::Button::new("").frame_when_inactive(auto).min_size(vec2(CHIP_H, CHIP_H)), auto))
-                                .on_hover_text(if auto { "Auto key is on: changing a value adds a keyframe at the playhead. Click to turn it off." } else { "Auto key is off: only keyframes already there can be changed. Click to turn it on." });
+                                .on_hover_text(if auto { "Auto key on: changes add keyframes" } else { "Auto key off: only existing keyframes change" });
                             crate::icons::paint(ui.painter(), "keyframe-record", b.rect.center(), 16.0, if auto { pal.fg } else { pal.fg_muted });
                             if b.clicked() {
                                 auto = !auto;
@@ -837,23 +840,23 @@ impl GifKitApp {
                             let on = self.path_draw && can;
                             let pb = ui
                                 .add_enabled(can, sel_btn(egui::Button::new("").frame_when_inactive(on).min_size(vec2(CHIP_H, CHIP_H)), on))
-                                .on_hover_text("Draw Path: drag on the preview and the layer follows that line across its clip")
-                                .on_disabled_hover_text("Select a layer that sits somewhere on the frame to draw its path");
+                                .on_hover_text("Draw Path: the layer follows a line you draw")
+                                .on_disabled_hover_text("Select a layer to draw its path");
                             crate::icons::paint(ui.painter(), "draw-freehand", pb.rect.center(), 16.0, if on { pal.fg } else { pal.fg_muted });
                             if pb.clicked() {
                                 self.path_draw = !self.path_draw;
                                 self.path_track = false;
                                 self.path_pts.clear();
                                 if self.path_draw {
-                                    self.info("Drag on the preview to draw the path. Its start is where the clip starts.");
+                                    self.info("Drag on the preview to draw the path");
                                 }
                             }
                             // stick the layer to something in the picture
                             let on = self.path_track && can;
                             let tb = ui
                                 .add_enabled(can, sel_btn(egui::Button::new("").frame_when_inactive(on).min_size(vec2(CHIP_H, CHIP_H)), on))
-                                .on_hover_text("Track: click something in the picture (or box it) and the layer follows it. Spots on more frames keep it on target. Press again to run.")
-                                .on_disabled_hover_text("Select a layer that sits somewhere on the frame to track with it");
+                                .on_hover_text("Track: click something and the layer follows it")
+                                .on_disabled_hover_text("Select a layer to track with");
                             crate::icons::paint(ui.painter(), "edit-select", tb.rect.center(), 16.0, if on { pal.fg } else { pal.fg_muted });
                             if tb.clicked() {
                                 self.path_draw = false;
@@ -864,7 +867,7 @@ impl GifKitApp {
                                     self.path_track = !self.path_track;
                                     self.track_anchors.clear();
                                     if self.path_track {
-                                        self.info("Click the thing to follow, or drag a box round it. Add spots on other frames where it changes, then press Track again.");
+                                        self.info("Click or box the thing to follow, then press Track");
                                     }
                                 }
                             }
@@ -872,14 +875,14 @@ impl GifKitApp {
                         // effects, watermarks and the AI shield cover the whole frame: they only fade
                         1 => {
                             ui.add_enabled_ui(pos_on, |ui| {
-                                ui.label("Position:").on_hover_text("The layer's left edge, and its bottom edge up from the bottom of the frame, in pixels");
+                                ui.label("Position:").on_hover_text("Left and bottom edges in pixels");
                                 field(ui, "X  ", &mut px, " px", 1.0, 108.0);
                                 field(ui, "Y  ", &mut py, " px", 1.0, 108.0);
                             });
                         }
                         2 => {
                             ui.add_enabled_ui(pos_on, |ui| {
-                                ui.label("Scale:").on_hover_text("Width and height, % of the size it was placed at");
+                                ui.label("Scale:").on_hover_text("Size as placed, in %");
                                 field(ui, "X  ", &mut key.scale_x, "%", 5.0, 88.0);
                                 field(ui, "Y  ", &mut key.scale_y, "%", 5.0, 88.0);
                             });
@@ -907,7 +910,7 @@ impl GifKitApp {
                                         }
                                     })
                                     .response
-                                    .on_hover_text("How the motion arrives at and leaves this keyframe. Hold keeps it still until the next one. Custom lets you draw it.");
+                                    .on_hover_text("How motion eases in and out. Hold stays still");
                                 if key.ease == Ease::Custom {
                                     let r = ui.add(egui::Button::new("Curve…").min_size(vec2(0.0, CHIP_H))).on_hover_text("Shape the timing to the next keyframe");
                                     egui::Popup::menu(&r).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
@@ -1271,6 +1274,44 @@ impl GifKitApp {
                 tp.vline(x, tracks_top..=area.max.y, Stroke::new(1.0, MARK.gamma_multiply(0.45)));
             }
         }
+        // the speed envelope over the GIF track: 100% in the middle, ten
+        // times faster at the top, ten times slower at the bottom
+        let env_top = row_top(0);
+        let env_mid = env_top + gif_h / 2.0;
+        let env_half = (gif_h / 2.0 - 5.0).max(4.0);
+        let pct_y = |p: f32| env_mid - (p / 100.0).log10() * env_half;
+        let y_pct = |y: f32| (100.0 * 10f32.powf((env_mid - y) / env_half)).clamp(crate::timeline::SPEED_MIN, crate::timeline::SPEED_MAX);
+        let speed_col = egui::Color32::from_rgb(246, 116, 0);
+        let env = self.stack.speed_env.clone();
+        if self.tl_speed_tool || !env.is_empty() {
+            let lane0 = Rect::from_min_max(pos2(lanes.min.x, env_top), pos2(area.max.x, env_top + gif_h));
+            let ep = tp.with_clip_rect(tp.clip_rect().intersect(lane0));
+            let strong = self.tl_speed_tool;
+            if strong {
+                ep.rect_filled(lane0, 0.0, pal.view.gamma_multiply(0.55));
+                ep.hline(lane0.x_range(), env_mid, Stroke::new(1.0, pal.fg_muted.gamma_multiply(0.5)));
+            }
+            let f0 = (x0 - PAD / zoom).floor().max(0.0) as usize;
+            let f1 = ((x0 + visible + 1.0).ceil() as usize).min(n);
+            let line: Vec<Pos2> = (f0..f1).map(|f| pos2(fx(f as f32 + 0.5), pct_y(crate::timeline::speed_at(&env, f as f32)))).collect();
+            if line.len() > 1 {
+                ep.add(egui::Shape::line(line, Stroke::new(if strong { 2.0 } else { 1.5 }, speed_col.gamma_multiply(if strong { 1.0 } else { 0.7 }))));
+            }
+            for (i, p) in env.iter().enumerate() {
+                let c = pos2(fx(p.frame as f32 + 0.5), pct_y(p.pct));
+                if c.x < lanes.min.x - 6.0 || c.x > area.max.x + 6.0 {
+                    continue;
+                }
+                let hot = self.tl_speed_drag == Some(i) || (strong && hovered_pos.is_some_and(|h| h.distance(c) < 7.0));
+                ep.circle(c, if hot { 5.0 } else { 3.5 }, if hot { speed_col } else { pal.view }, Stroke::new(1.5, speed_col));
+                // the speed by the point when there's room (or it's in hand)
+                let room = env.get(i + 1).map(|q| fx(q.frame as f32 + 0.5) - c.x).unwrap_or(f32::MAX) > 40.0;
+                if strong && (room || hot) {
+                    let above = c.y > env_top + 14.0;
+                    ep.text(pos2(c.x + 5.0, if above { c.y - 3.0 } else { c.y + 3.0 }), if above { egui::Align2::LEFT_BOTTOM } else { egui::Align2::LEFT_TOP }, format!("{:.0}%", p.pct), egui::FontId::proportional(10.5), pal.fg);
+                }
+            }
+        }
         // what a drag snapped to
         if let Some(f) = self.tl_snap_line.filter(|_| self.tl_drag.is_some()) {
             let x = fx(f as f32);
@@ -1438,8 +1479,83 @@ impl GifKitApp {
                 }
             }
         }
+        // the speed tool on the GIF track
+        let env_lane = Rect::from_min_max(pos2(lanes.min.x, env_top.max(tracks_top)), pos2(area.max.x, env_top + gif_h));
+        let point_at = |me: &Self, p: Pos2| me.stack.speed_env.iter().position(|q| pos2(fx(q.frame as f32 + 0.5), pct_y(q.pct)).distance(p) < 8.0);
+        let mut env_took = false;
+        if self.tl_speed_tool {
+            if let Some(p) = hovered_pos.filter(|p| env_lane.contains(*p)) {
+                ctx.set_cursor_icon(if point_at(self, p).is_some() { egui::CursorIcon::Grab } else { egui::CursorIcon::Crosshair });
+                if self.tl_speed_drag.is_none() {
+                    // the speed under the pointer
+                    let f = (frame_at(p.x) - 0.5).round().clamp(0.0, (n - 1) as f32) as usize;
+                    let text = format!("{:.0}%", crate::timeline::speed_at(&self.stack.speed_env, f as f32));
+                    let g = ui.fonts_mut(|fo| fo.layout_no_wrap(text, egui::FontId::proportional(11.0), pal.fg));
+                    let r = Rect::from_min_size(pos2(p.x + 12.0, p.y - 20.0), g.size() + vec2(8.0, 4.0));
+                    painter.rect_filled(r, 3.0, pal.window);
+                    painter.galley(r.min + vec2(4.0, 2.0), g, pal.fg);
+                }
+            }
+            if resp.double_clicked() {
+                if let Some(i) = hovered_pos.filter(|p| env_lane.contains(*p)).and_then(|p| point_at(self, p)) {
+                    // back to normal speed
+                    self.snapshot(&format!("tl-speed{now}"), now);
+                    self.stack.speed_env[i].pct = 100.0;
+                    crate::timeline::tidy_speed(&mut self.stack.speed_env);
+                    self.modified = true;
+                    env_took = true;
+                }
+            }
+            let pressed = resp.drag_started_by(egui::PointerButton::Primary) || resp.clicked();
+            if pressed && self.tl_speed_drag.is_none() && !self.busy() {
+                if let Some(p) = ui.input(|i| i.pointer.press_origin()).filter(|p| env_lane.contains(*p)) {
+                    env_took = true;
+                    self.snapshot(&format!("tl-speed{now}"), now);
+                    let i = point_at(self, p).unwrap_or_else(|| {
+                        // a new point on the line where it was clicked
+                        let f = (frame_at(p.x) - 0.5).round().clamp(0.0, (n - 1) as f32) as usize;
+                        let pct = crate::timeline::speed_at(&self.stack.speed_env, f as f32);
+                        let env = &mut self.stack.speed_env;
+                        env.retain(|q| q.frame != f);
+                        env.push(crate::timeline::SpeedPoint { frame: f, pct });
+                        env.sort_by_key(|q| q.frame);
+                        env.iter().position(|q| q.frame == f).unwrap_or(0)
+                    });
+                    self.modified = true;
+                    if resp.drag_started() {
+                        self.tl_speed_drag = Some(i);
+                    }
+                }
+            }
+        }
+        if let Some(i) = self.tl_speed_drag {
+            env_took = true;
+            if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
+                let env = &mut self.stack.speed_env;
+                if i < env.len() {
+                    // between its neighbours, never past them
+                    let lo = if i > 0 { env[i - 1].frame + 1 } else { 0 };
+                    let hi = env.get(i + 1).map(|q| q.frame.saturating_sub(1)).unwrap_or(n - 1).max(lo);
+                    env[i].frame = ((frame_at(p.x) - 0.5).round().max(0.0) as usize).clamp(lo, hi);
+                    let mut v = y_pct(p.y);
+                    // a pull toward 100%, and whole steps of 5 with Shift off
+                    if (pct_y(100.0) - p.y).abs() < 5.0 {
+                        v = 100.0;
+                    } else if !ui.input(|i| i.modifiers.shift) {
+                        v = (v / 5.0).round().max(2.0) * 5.0;
+                    }
+                    env[i].pct = v;
+                }
+            }
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            if !ui.input(|i| i.pointer.primary_down()) {
+                self.tl_speed_drag = None;
+                crate::timeline::tidy_speed(&mut self.stack.speed_env);
+                self.modified = true;
+            }
+        }
         let press = resp.drag_started_by(egui::PointerButton::Primary) || resp.clicked();
-        if press && self.tl_drag.is_none() && !self.tl_head_drag && self.tl_bar_drag.is_none() && self.tl_row_drag.is_none() && self.tl_marker_drag.is_none() {
+        if press && !env_took && self.tl_speed_drag.is_none() && self.tl_drag.is_none() && !self.tl_head_drag && self.tl_bar_drag.is_none() && self.tl_row_drag.is_none() && self.tl_marker_drag.is_none() {
             if let Some(p) = ui.input(|i| i.pointer.press_origin()).or(hovered_pos).filter(|p| lanes.contains(*p) && !(scrolls && bar.expand(2.0).contains(*p))) {
                 let f = frame_at(p.x);
                 // clicks pick the nearest frame start, where the playhead sits
@@ -1975,6 +2091,7 @@ impl GifKitApp {
             }
             if x {
                 self.tl_razor = !self.tl_razor;
+                self.tl_speed_tool = false;
             }
             if dup {
                 self.tl_duplicate(now);
@@ -1993,7 +2110,12 @@ impl GifKitApp {
         if resp.secondary_clicked() {
             self.tl_menu_head = None;
             self.tl_menu_marker = None;
-            if let Some(p) = hovered_pos.filter(|p| p.y < tracks_top && p.x >= lanes.min.x) {
+            self.tl_menu_speed = None;
+            if let Some(p) = hovered_pos.filter(|p| self.tl_speed_tool && env_lane.contains(*p)) {
+                self.tl_menu_speed = Some(point_at(self, p).unwrap_or(usize::MAX));
+                self.cur = ((frame_at(p.x) - 0.5).round().max(0.0) as usize).min(n - 1);
+                self.playing = false;
+            } else if let Some(p) = hovered_pos.filter(|p| p.y < tracks_top && p.x >= lanes.min.x) {
                 // the ruler: a marker's menu, or the ruler's own
                 self.tl_menu_marker = Some(marker_at(self, p.x).unwrap_or_else(|| {
                     self.cur = (frame_at(p.x).floor().max(0.0) as usize).min(n - 1);
@@ -2022,6 +2144,53 @@ impl GifKitApp {
             ui.set_min_width(240.0);
             let km = self.keymap.clone();
             use crate::keys::Action as A;
+            // the speed envelope
+            if let Some(pi) = self.tl_menu_speed {
+                let on_point = pi < self.stack.speed_env.len();
+                let mut set: Option<f32> = None;
+                ui.label(RichText::new(if on_point { "Speed Point" } else { "Speed at Playhead" }).color(pal.fg_muted).size(12.0));
+                for pct in [25u32, 50, 75, 100, 150, 200, 300, 400] {
+                    if menu_item(ui, "", &format!("{pct}%"), "", true) {
+                        set = Some(pct as f32);
+                    }
+                }
+                if let Some(v) = set {
+                    self.snapshot(&format!("tl-speed{now}"), now);
+                    if on_point {
+                        self.stack.speed_env[pi].pct = v;
+                    } else {
+                        let f = self.cur;
+                        self.stack.speed_env.retain(|q| q.frame != f);
+                        self.stack.speed_env.push(crate::timeline::SpeedPoint { frame: f, pct: v });
+                    }
+                    crate::timeline::tidy_speed(&mut self.stack.speed_env);
+                    self.modified = true;
+                }
+                ui.separator();
+                if let Some((a, b)) = self.tl_zone() {
+                    sub_menu(ui, "zone-in", "In to Out", |ui| {
+                        for pct in [25u32, 50, 75, 100, 150, 200, 300, 400] {
+                            if menu_item(ui, "", &format!("{pct}%"), "", true) {
+                                self.snapshot(&format!("tl-speed{now}"), now);
+                                crate::timeline::speed_range(&mut self.stack.speed_env, a, b, pct as f32, n);
+                                self.modified = true;
+                            }
+                        }
+                    });
+                }
+                if menu_item(ui, "edit-delete", "&Delete Point", "", on_point) {
+                    self.snapshot(&format!("tl-speed{now}"), now);
+                    self.stack.speed_env.remove(pi);
+                    crate::timeline::tidy_speed(&mut self.stack.speed_env);
+                    self.modified = true;
+                }
+                if menu_item(ui, "edit-clear-all", "&Reset Speed", "", !self.stack.speed_env.is_empty()) {
+                    self.snapshot(&format!("tl-speed{now}"), now);
+                    self.stack.speed_env.clear();
+                    self.modified = true;
+                }
+                return;
+            }
             // the ruler
             if let Some(mi) = self.tl_menu_marker {
                 if mi < self.stack.markers.len() {
@@ -2136,8 +2305,8 @@ impl GifKitApp {
                     ui.separator();
                     sub_menu(ui, "speedometer", "Clip &Speed", |ui| {
                         ui.set_min_width(200.0);
-                        for pct in [25u32, 50, 75, 150, 200, 300, 400] {
-                            let label = format!("{pct}%{}", if pct < 100 { " (slower)" } else { " (faster)" });
+                        for pct in [25u32, 50, 75, 100, 150, 200, 300, 400] {
+                            let label = format!("{pct}%");
                             if menu_item(ui, "", &label, "", idle) {
                                 self.gif_clip_speed(a, b, pct as f32, now);
                             }
@@ -2731,7 +2900,7 @@ impl GifKitApp {
                 let put = starts.len();
                 self.tl_select_placed(track, &starts);
                 self.modified |= put > 0;
-                self.info(if put == c.len() { format!("Pasted {put} clip{}", if put == 1 { "" } else { "s" }) } else { format!("Pasted {put} of {} clips (no room left after the playhead)", c.len()) });
+                self.info(if put == c.len() { format!("Pasted {put} clip{}", if put == 1 { "" } else { "s" }) } else { format!("Pasted {put} of {} clips (no room left)", c.len()) });
             }
             Some(TlBoard::Frames(..)) | None => {}
         }
@@ -2940,7 +3109,7 @@ impl GifKitApp {
         last.map(|l| l.min(n.saturating_sub(1)))
     }
 
-    /// Shorten the animation to where its last clip ends.
+    /// Cut the end after the last clip.
     pub(super) fn tl_trim_to_last(&mut self, now: f64) {
         let Some(e) = self.tl_last_clip_end() else { return };
         if e + 1 >= self.gif_edit_len() {
@@ -3241,26 +3410,17 @@ impl GifKitApp {
         self.gif_write(s, e, d);
     }
 
-    /// Play the GIF's clip `a..=b` at `pct`% speed: its frames are dropped or
-    /// repeated (sharing their pictures), so it gets shorter or longer on the
-    /// timeline and layers over it keep their pace.
+    /// Play the GIF's clip `a..=b` at `pct`% speed, on the speed envelope
+    /// (the frames stay; their times change).
     fn gif_clip_speed(&mut self, a: usize, b: usize, pct: f32, now: f64) {
-        let Some((s, e, mut d)) = self.gif_display() else { return };
-        if b >= d.len() || a > b || pct <= 0.0 {
+        let n = self.plan.len();
+        if a > b || b >= n || pct <= 0.0 {
             return;
         }
         self.snapshot(&format!("tl-speed{now}"), now);
-        let block: Vec<crate::anim::Frame> = d[a..=b].to_vec();
-        let len = block.len();
-        let new_len = ((len as f32 * 100.0 / pct).round() as usize).max(1);
-        let made: Vec<crate::anim::Frame> = (0..new_len).map(|k| crate::anim::Frame { cut: k == 0, ..block[(k * len / new_len).min(len - 1)].clone() }).collect();
-        d.splice(a..=b, made);
-        if let Some(f) = d.get_mut(a + new_len) {
-            f.cut = true;
-        }
-        self.gif_write(s, e, d);
-        self.tl_clip = self.gif_runs().iter().position(|r| r.0 == a);
-        self.info(format!("Clip at {pct:.0}%: {len} frames to {new_len}"));
+        crate::timeline::speed_range(&mut self.stack.speed_env, a, b, pct, n);
+        self.modified = true;
+        self.info(format!("Clip at {pct:.0}%"));
     }
 
     /// Blend the GIF's clip ending at `b` into the one starting after it,

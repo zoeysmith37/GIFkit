@@ -110,6 +110,9 @@ pub struct ProjectFile {
     /// timeline markers
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub markers: Vec<crate::timeline::Marker>,
+    /// the speed envelope
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub speed_env: Vec<crate::timeline::SpeedPoint>,
     /// the GIF track's colour on the timeline
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gif_color: Option<[u8; 3]>,

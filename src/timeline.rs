@@ -484,6 +484,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn speed_envelope_holds_ramps_and_steps() {
+        assert_eq!(speed_at(&[], 3.0), 100.0);
+        let mut p = Vec::new();
+        speed_range(&mut p, 10, 19, 200.0, 40);
+        // a step in and out, 100% either side
+        assert_eq!(speed_at(&p, 9.0), 100.0);
+        assert_eq!(speed_at(&p, 10.0), 200.0);
+        assert_eq!(speed_at(&p, 19.0), 200.0);
+        assert_eq!(speed_at(&p, 20.0), 100.0);
+        // a ramp from 50 to 200 is 100 half way
+        let r = vec![SpeedPoint { frame: 0, pct: 50.0 }, SpeedPoint { frame: 10, pct: 200.0 }];
+        assert!((speed_at(&r, 5.0) - 100.0).abs() < 0.01);
+        // setting it back to 100 leaves nothing
+        speed_range(&mut p, 10, 19, 100.0, 40);
+        assert!(p.is_empty(), "{p:?}");
+    }
+
+    #[test]
     fn follows_a_drawn_path() {
         let mut t = Timing::default();
         // an L: right 100, then down 100
@@ -553,6 +571,96 @@ mod tests {
         assert_eq!((x, y, o.width()), (20, 0, 10));
         let (o, _, _) = transform_sprite(&img, 0, 0, (5.0, 5.0), (0.0, 0.0), motion_matrix(2.0, 2.0, 0.0, 45.0)).unwrap();
         assert!(o.width() > 25, "doubled and turned it needs more room");
+    }
+}
+
+/// A point on the speed envelope: from this output frame on, playing at
+/// `pct` percent (100 = as it is). Between points the speed changes
+/// smoothly; before the first and after the last it holds.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SpeedPoint {
+    pub frame: usize,
+    pub pct: f32,
+}
+
+/// Slowest and fastest the envelope goes.
+pub const SPEED_MIN: f32 = 10.0;
+pub const SPEED_MAX: f32 = 1000.0;
+
+/// The envelope's speed (percent) at output frame `f`. `points` sorted by
+/// frame. Ramps go evenly in steps of doubling (50 → 100 → 200 take as long
+/// as each other), as they sound and look even that way.
+pub fn speed_at(points: &[SpeedPoint], f: f32) -> f32 {
+    let (Some(first), Some(last)) = (points.first(), points.last()) else { return 100.0 };
+    if f <= first.frame as f32 {
+        return first.pct;
+    }
+    if f >= last.frame as f32 {
+        return last.pct;
+    }
+    for w in points.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if f >= a.frame as f32 && f <= b.frame as f32 {
+            if b.frame == a.frame || a.pct == b.pct {
+                return b.pct;
+            }
+            let t = (f - a.frame as f32) / (b.frame - a.frame) as f32;
+            if t <= 0.0 {
+                return a.pct;
+            }
+            if t >= 1.0 {
+                return b.pct;
+            }
+            return (a.pct.ln() * (1.0 - t) + b.pct.ln() * t).exp();
+        }
+    }
+    last.pct
+}
+
+/// Set frames `a..=b` to play at `pct`, the speed either side kept.
+pub fn speed_range(points: &mut Vec<SpeedPoint>, a: usize, b: usize, pct: f32, n: usize) {
+    let before = (a > 0).then(|| speed_at(points, (a - 1) as f32));
+    let after = (b + 1 < n).then(|| speed_at(points, (b + 1) as f32));
+    points.retain(|p| p.frame + 1 < a || p.frame > b + 1);
+    if let Some(v) = before {
+        points.push(SpeedPoint { frame: a - 1, pct: v });
+    }
+    points.push(SpeedPoint { frame: a, pct });
+    if b > a {
+        points.push(SpeedPoint { frame: b, pct });
+    }
+    if let Some(v) = after {
+        points.push(SpeedPoint { frame: b + 1, pct: v });
+    }
+    tidy_speed(points);
+}
+
+/// Sorted, one point a frame, and none that change nothing (a point in a
+/// straight run between its neighbours, or all of them at 100%).
+pub fn tidy_speed(points: &mut Vec<SpeedPoint>) {
+    for p in points.iter_mut() {
+        p.pct = p.pct.clamp(SPEED_MIN, SPEED_MAX);
+    }
+    points.sort_by_key(|p| p.frame);
+    points.dedup_by(|later, earlier| {
+        if later.frame == earlier.frame {
+            earlier.pct = later.pct;
+            true
+        } else {
+            false
+        }
+    });
+    let mut i = 1;
+    while i + 1 < points.len() {
+        let (a, m, b) = (points[i - 1], points[i], points[i + 1]);
+        if (a.pct - m.pct).abs() < 0.05 && (m.pct - b.pct).abs() < 0.05 {
+            points.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+    if points.iter().all(|p| (p.pct - 100.0).abs() < 0.05) {
+        points.clear();
     }
 }
 
