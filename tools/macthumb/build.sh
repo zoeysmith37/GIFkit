@@ -11,7 +11,7 @@ for arch in arm64 x86_64; do
     swiftc -O -module-name GIFkitThumbnail -target "$arch-apple-macos11" -parse-as-library \
         -application-extension -Xlinker -e -Xlinker _NSExtensionMain \
         -framework AppKit -framework QuickLookThumbnailing \
-        "$here/ThumbnailProvider.swift" -o "$here/GIFkitThumbnail-$arch"
+        "$here/Zip.swift" "$here/ThumbnailProvider.swift" -o "$here/GIFkitThumbnail-$arch"
 done
 lipo -create -output "$ext/Contents/MacOS/GIFkitThumbnail" "$here/GIFkitThumbnail-arm64" "$here/GIFkitThumbnail-x86_64"
 rm -f "$here/GIFkitThumbnail-arm64" "$here/GIFkitThumbnail-x86_64"
