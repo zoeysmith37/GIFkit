@@ -3896,6 +3896,12 @@ impl GifKitApp {
             let (src, spr) = g.cache_bytes();
             eprintln!("mem: gpu renderer sources {:.0} sprites {:.0}", mb(src), mb(spr));
         }
+        // the allocator: what's in use, and what it holds freed
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            let m = unsafe { libc::mallinfo2() };
+            eprintln!("mem: heap in use {:.0} free held {:.0} mmapped {:.0}", mb(m.uordblks), mb(m.fordblks), mb(m.hblkhd));
+        }
     }
 
     /// Setting ffmpeg up: point at it, or (on Windows) download a copy.

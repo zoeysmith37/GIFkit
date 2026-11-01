@@ -663,9 +663,6 @@ mod size_tests {
         let p = load(Path::new(&std::env::var("IN").unwrap())).unwrap();
         let stored: usize = p.base.frames.iter().map(|f| f.image.stored_bytes()).sum::<usize>();
         let unique: std::collections::HashSet<u64> = p.base.frames.iter().map(|f| f.image.id()).collect();
-        if let Ok(g) = std::env::var("GIF") {
-            crate::io::save_gif(&p.base, &crate::encode::GifOptions::default(), Path::new(&g), None).unwrap();
-        }
         eprintln!("before {before} MB, after {} MB; {} frames, {} pictures, {} MB stored, cache {} MB", rss(), p.base.len(), unique.len(), stored / 1048576, crate::pixels::cache_bytes() / 1048576);
     }
 

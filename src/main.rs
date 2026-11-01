@@ -78,6 +78,21 @@ fn main() -> eframe::Result {
             let _ = winreg::register(&exe);
         });
     }
+    // glibc keeps memory freed by our many worker threads instead of
+    // handing it back (hundreds of MB over a session): fewer heaps, and
+    // what's free goes back now and then
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe {
+            libc::mallopt(libc::M_ARENA_MAX, 4);
+        }
+        std::thread::spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(15));
+            unsafe {
+                libc::malloc_trim(0);
+            }
+        });
+    }
     // leave a core free for the compositor and the rest of the desktop
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
     let _ = rayon::ThreadPoolBuilder::new().num_threads(cores.saturating_sub(1).max(1)).build_global();
