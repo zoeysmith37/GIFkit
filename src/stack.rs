@@ -717,6 +717,18 @@ pub fn foreground_busy(ms: u64) {
     FG_UNTIL.fetch_max(clock_ms() + ms, Ordering::Relaxed);
 }
 
+static PLAYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The preview is playing: background work on the graphics card goes a
+/// frame at a time with a rest between, so playback never waits on it.
+pub fn set_playing(on: bool) {
+    PLAYING.store(on, Ordering::Relaxed);
+}
+
+pub fn playing() -> bool {
+    PLAYING.load(Ordering::Relaxed)
+}
+
 /// In background work, between frames: wait while the user is busy (or
 /// until the job is stopped).
 pub fn yield_to_foreground(progress: Option<&AtomicUsize>) {
@@ -1442,11 +1454,15 @@ impl Stack {
         // a few frames at a time: enough to keep the card busy, little
         // enough that a stop or other work never waits long
         let (bw, bh) = (base.width().max(1) as usize, base.height().max(1) as usize);
-        let batch = ((128usize << 20) / (bw * bh * 4 * 2)).clamp(1, 8);
+        let batch = if playing() { 1 } else { ((128usize << 20) / (bw * bh * 4 * 2)).clamp(1, 8) };
         for chunk in idx.chunks(batch) {
             let mut texs = Vec::new();
             let mut slots: Vec<Option<Pixels>> = Vec::with_capacity(chunk.len());
             yield_to_foreground(progress);
+            // a rest for the card between frames while the preview plays
+            if playing() && !stopped(progress) {
+                std::thread::sleep(std::time::Duration::from_millis(12));
+            }
             for &i in chunk {
                 let src = plan[i].src;
                 if stopped(progress) {

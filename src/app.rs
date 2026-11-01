@@ -399,6 +399,10 @@ struct GpuFrames {
     tick: u64,
     /// frames in a row the last picture stayed up while the card was busy
     since_busy: u32,
+    /// let go of this frame: freed at the start of the next, once what was
+    /// drawn with them is on screen (freed at once, a view still drawing
+    /// one this frame went black)
+    retired: Vec<(eframe::wgpu::Texture, egui::TextureId)>,
 }
 
 /// Frame thumbnails, made in the background and only for frames someone
@@ -2877,7 +2881,7 @@ impl GifKitApp {
             pending_sig: 0,
             last_comp: None,
             gpu: cc.wgpu_render_state.as_ref().filter(|rs| std::env::var_os("GIFKIT_CPU_PREVIEW").is_none() && crate::gpu_render::worth_using(&rs.adapter.get_info())).map(|rs| (crate::gpu_render::GpuRenderer::new(rs.device.clone(), rs.queue.clone()), rs.renderer.clone())),
-            gpu_frames: GpuFrames { key: 0, map: HashMap::new(), shown: None, bytes: 0, tick: 0, since_busy: 0 },
+            gpu_frames: GpuFrames { key: 0, map: HashMap::new(), shown: None, bytes: 0, tick: 0, since_busy: 0, retired: Vec::new() },
             last_tick: None,
             orig_clock: 0.0,
             resize_by_pct: true,
@@ -3865,6 +3869,34 @@ impl GifKitApp {
     }
 
     /// GIFKIT_MEM: every few seconds, what each copy and cache holds (MB).
+    /// Linux: hand memory freed while working back to the system, once
+    /// things have been quiet a few seconds (never mid-playback, where the
+    /// sweep and the pages faulted back in after it made the picture stutter).
+    fn trim_when_idle(&mut self, ctx: &egui::Context) {
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            use std::cell::Cell;
+            thread_local!(static QUIET: Cell<(f64, bool)> = const { Cell::new((0.0, true)) });
+            let now = ctx.input(|i| i.time);
+            let busy = self.playing || self.cmp_job.is_some() || self.live_job.is_some() || ctx.input(|i| i.pointer.any_down() || !i.events.is_empty());
+            QUIET.with(|q| {
+                let (since, done) = q.get();
+                if busy {
+                    q.set((now, false));
+                } else if !done && now - since > 4.0 {
+                    q.set((since, true));
+                    std::thread::spawn(|| unsafe {
+                        libc::malloc_trim(0);
+                    });
+                } else if !done {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(1000));
+                }
+            });
+        }
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        let _ = ctx;
+    }
+
     fn mem_report(&mut self, ctx: &egui::Context) {
         if std::env::var_os("GIFKIT_MEM").is_none() {
             return;
@@ -5038,13 +5070,11 @@ impl GifKitApp {
             if let Some((t, id, _)) = self.gpu_frames.map.remove(&oldest) {
                 self.gpu_frames.bytes -= t.width() as usize * t.height() as usize * 4;
                 if self.last_comp.as_ref().is_some_and(|c| c.1.id == id) {
-                    if let Some((old, oid)) = self.gpu_frames.shown.replace((t, id)) {
-                        renderer.write().free_texture(&oid);
-                        old.destroy();
+                    if let Some(old) = self.gpu_frames.shown.replace((t, id)) {
+                        self.gpu_frames.retired.push(old);
                     }
                 } else {
-                    renderer.write().free_texture(&id);
-                    t.destroy();
+                    self.gpu_frames.retired.push((t, id));
                 }
             }
         }
@@ -5091,22 +5121,35 @@ impl GifKitApp {
     }
 
     fn free_gpu_frames(&mut self) {
-        let Some((_, renderer)) = &self.gpu else { return };
-        let mut r = renderer.write();
         let shown = self.last_comp.as_ref().map(|c| c.1.id);
-        for (_, (t, id, _)) in self.gpu_frames.map.drain() {
+        let g = &mut self.gpu_frames;
+        for (_, (t, id, _)) in g.map.drain() {
             if Some(id) == shown {
                 // swap it in as the one kept on screen
-                if let Some((old, oid)) = self.gpu_frames.shown.replace((t, id)) {
-                    r.free_texture(&oid);
-                    old.destroy();
+                if let Some(old) = g.shown.replace((t, id)) {
+                    g.retired.push(old);
                 }
             } else {
-                r.free_texture(&id);
-                t.destroy();
+                g.retired.push((t, id));
             }
         }
-        self.gpu_frames.bytes = 0;
+        g.bytes = 0;
+    }
+
+    /// Free the frames let go of last frame (all drawn by now).
+    fn free_retired(&mut self) {
+        if self.gpu_frames.retired.is_empty() {
+            return;
+        }
+        let Some((_, renderer)) = &self.gpu else {
+            self.gpu_frames.retired.clear();
+            return;
+        };
+        let mut r = renderer.write();
+        for (t, id) in self.gpu_frames.retired.drain(..) {
+            r.free_texture(&id);
+            t.destroy();
+        }
     }
 
     fn toggle_onion(&mut self) {
@@ -5145,6 +5188,14 @@ impl GifKitApp {
     }
 
     fn composite_texture(&mut self, ctx: &egui::Context, i: usize) -> Option<Tex> {
+        let t = self.composite_texture_inner(ctx, i);
+        if t.is_none() && std::env::var_os("GIFKIT_STALL").is_some() {
+            eprintln!("blank: frame {i} had no picture (proxy wait {}, live job {})", self.waiting_proxy(), self.live_job.is_some());
+        }
+        t
+    }
+
+    fn composite_texture_inner(&mut self, ctx: &egui::Context, i: usize) -> Option<Tex> {
         if self.waiting_proxy() {
             return None;
         }
@@ -5758,6 +5809,17 @@ impl eframe::App for GifKitApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // GIFKIT_STALL: frames that took long to make, and where the time went
+        if std::env::var_os("GIFKIT_STALL").is_some() {
+            thread_local!(static LAST: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) });
+            let now = std::time::Instant::now();
+            if let Some(prev) = LAST.with(|l| l.replace(Some(now))) {
+                let ms = (now - prev).as_secs_f64() * 1000.0;
+                if ms > 80.0 && self.playing {
+                    eprintln!("stall: {ms:.0} ms between frames (frame {})", self.cur);
+                }
+            }
+        }
         // what was clicked last decides what Copy and Paste work on
         if let Some(p) = ctx.input(|i| i.pointer.any_pressed().then(|| i.pointer.press_origin()).flatten()) {
             // not the menu bar or an open menu: those act on what was clicked before
@@ -5767,6 +5829,9 @@ impl eframe::App for GifKitApp {
             }
         }
         let perf_t0 = std::time::Instant::now();
+        self.free_retired();
+        stack::set_playing(self.playing);
+        self.trim_when_idle(&ctx);
         self.mem_report(&ctx);
         self.smoke_step(&ctx);
         stack::mark_ui_thread();

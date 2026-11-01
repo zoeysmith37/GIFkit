@@ -78,20 +78,16 @@ fn main() -> eframe::Result {
             let _ = winreg::register(&exe);
         });
     }
-    // glibc keeps memory freed by our many worker threads instead of
-    // handing it back (hundreds of MB over a session): fewer heaps, and
-    // what's free goes back now and then
+    // glibc keeps big blocks freed by our many worker threads (frames,
+    // mostly) instead of handing them back, hundreds of MB over a session.
+    // A fixed threshold has blocks of a megabyte and up come straight from
+    // the system and go straight back when freed. The rest is trimmed when
+    // the app goes quiet (app.rs)
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    {
+    if std::env::var_os("GIFKIT_NO_MALLOC_TUNE").is_none() {
         unsafe {
-            libc::mallopt(libc::M_ARENA_MAX, 4);
+            libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20);
         }
-        std::thread::spawn(|| loop {
-            std::thread::sleep(std::time::Duration::from_secs(15));
-            unsafe {
-                libc::malloc_trim(0);
-            }
-        });
     }
     // leave a core free for the compositor and the rest of the desktop
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
