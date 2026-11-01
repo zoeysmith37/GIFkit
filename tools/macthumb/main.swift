@@ -1,4 +1,4 @@
-// swiftc Zip.swift test.swift -o ziptest && ./ziptest project.gifkit
+// swiftc Zip.swift main.swift -o ziptest && ./ziptest project.gifkit
 import Foundation
 
 let path = CommandLine.arguments[1]
