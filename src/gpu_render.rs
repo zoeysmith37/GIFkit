@@ -302,6 +302,11 @@ fn uniform_block(u: &[[f32; 4]]) -> Vec<f32> {
 }
 
 impl GpuRenderer {
+    /// Bytes held in its caches: source frames, sprites.
+    pub fn cache_bytes(&self) -> (usize, usize) {
+        (self.sources.bytes, self.sprites.bytes)
+    }
+
     pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("gifkit-frames"), source: wgpu::ShaderSource::Wgsl(include_str!("gpu_render.wgsl").into()) });
         let fx_module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("gifkit-effects"), source: wgpu::ShaderSource::Wgsl(include_str!("gpu_fx.wgsl").into()) });

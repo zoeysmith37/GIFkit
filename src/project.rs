@@ -332,28 +332,54 @@ fn patch(under: &RgbaImage, img: &RgbaImage) -> Option<(PicMeta, RgbaImage)> {
     Some((PicMeta { over: None, x: x0, y: y0, keep }, out))
 }
 
-/// The pool's pictures whole again, from their decoded PNGs (in order: a
-/// patch's picture always comes before it).
-fn rebuild(meta: &[PicMeta], mut stored: Vec<Option<RgbaImage>>) -> Result<Vec<Arc<RgbaImage>>> {
-    let mut whole: Vec<Arc<RgbaImage>> = Vec::with_capacity(meta.len());
+/// The pool's pictures, from their PNGs (taken out of `raw`), packed for
+/// memory as they're made. A few dozen are decoded at a time, and a whole
+/// picture is kept only while a later patch still needs it, so a big project
+/// never sits unpacked in memory all at once.
+fn unpack_pool(meta: &[PicMeta], raw: &mut HashMap<String, Vec<u8>>) -> Result<Vec<crate::pixels::Pixels>> {
+    // the last picture drawn over each one
+    let mut last_use = vec![usize::MAX; meta.len()];
     for (i, m) in meta.iter().enumerate() {
-        let img = stored[i].take().with_context(|| format!("pics/{i:05}.png is missing"))?;
-        let pic = match m.over {
-            None => img,
-            Some(o) => {
-                let mut base = (*whole.get(o).with_context(|| format!("picture {i} is damaged"))?.clone()).clone();
-                for (x, y, p) in img.enumerate_pixels() {
-                    let (tx, ty) = (x + m.x, y + m.y);
-                    if tx < base.width() && ty < base.height() && !(m.keep && p.0 == [0, 0, 0, 0]) {
-                        base.put_pixel(tx, ty, *p);
-                    }
-                }
-                base
-            }
-        };
-        whole.push(Arc::new(pic));
+        if let Some(o) = m.over {
+            anyhow::ensure!(o < i, "picture {i} is damaged");
+            last_use[o] = i;
+        }
     }
-    Ok(whole)
+    let mut live: HashMap<usize, Arc<RgbaImage>> = HashMap::new();
+    let mut out = Vec::with_capacity(meta.len());
+    for start in (0..meta.len()).step_by(32) {
+        let ids: Vec<usize> = (start..(start + 32).min(meta.len())).collect();
+        let bytes: Vec<(usize, Vec<u8>)> = ids.iter().map(|&i| raw.remove(&format!("pics/{i:05}.png")).map(|b| (i, b)).with_context(|| format!("pics/{i:05}.png is missing"))).collect::<Result<_>>()?;
+        let stored: Vec<RgbaImage> = bytes.par_iter().map(|(i, b)| Ok(image::load_from_memory(b).with_context(|| format!("pics/{i:05}.png is damaged"))?.to_rgba8())).collect::<Result<_>>()?;
+        let mut wholes = Vec::with_capacity(ids.len());
+        for (&i, img) in ids.iter().zip(stored) {
+            let m = &meta[i];
+            let pic = match m.over {
+                None => img,
+                Some(o) => {
+                    let mut base = (**live.get(&o).with_context(|| format!("picture {i} is damaged"))?).clone();
+                    for (x, y, p) in img.enumerate_pixels() {
+                        let (tx, ty) = (x + m.x, y + m.y);
+                        if tx < base.width() && ty < base.height() && !(m.keep && p.0 == [0, 0, 0, 0]) {
+                            base.put_pixel(tx, ty, *p);
+                        }
+                    }
+                    base
+                }
+            };
+            let pic = Arc::new(pic);
+            if last_use[i] != usize::MAX {
+                live.insert(i, pic.clone());
+            }
+            // done with what this one was drawn over?
+            if let Some(o) = m.over.filter(|&o| last_use[o] <= i) {
+                live.remove(&o);
+            }
+            wholes.push(pic);
+        }
+        out.extend(wholes.into_par_iter().map(|p| crate::pixels::Pixels::from_arc(p).packed()).collect::<Vec<_>>());
+    }
+    Ok(out)
 }
 
 fn meta(a: &Animation) -> Vec<FrameMeta> {
@@ -447,11 +473,10 @@ pub fn load(path: &Path) -> Result<Project> {
             raw.insert(name, b);
         }
     }
-    let decoded: HashMap<String, RgbaImage> = raw.into_par_iter().map(|(n, b)| image::load_from_memory(&b).map(|i| (n.clone(), i.to_rgba8())).with_context(|| format!("{n} is damaged"))).collect::<Result<_>>()?;
-    let mut decoded = decoded;
+    let decode = |n: &str, b: &[u8]| -> Result<RgbaImage> { Ok(image::load_from_memory(b).with_context(|| format!("{n} is damaged"))?.to_rgba8()) };
     // the pool (version 2): each picture whole, shared by every frame using it
-    let stored: Vec<Option<RgbaImage>> = (0..file.pics.len()).map(|i| decoded.remove(&format!("pics/{i:05}.png"))).collect();
-    let pics: Vec<crate::pixels::Pixels> = rebuild(&file.pics, stored)?.into_iter().map(crate::pixels::Pixels::from_arc).collect();
+    let pics = unpack_pool(&file.pics, &mut raw)?;
+    let mut decoded = |n: &str| -> Option<Result<RgbaImage>> { raw.remove(n).map(|b| decode(n, &b)) };
     let mut frames_of = |dir: &str, meta: &[FrameMeta], loop_count: Option<u16>| -> Result<Animation> {
         let frames = meta
             .iter()
@@ -459,7 +484,7 @@ pub fn load(path: &Path) -> Result<Project> {
             .map(|(i, m)| {
                 let image = match m.pic {
                     Some(p) => pics.get(p).cloned().with_context(|| format!("picture {p} is missing"))?,
-                    None => crate::pixels::Pixels::new(decoded.remove(&format!("{dir}/{i:05}.png")).with_context(|| format!("{dir}/{i:05}.png is missing"))?),
+                    None => crate::pixels::Pixels::new(decoded(&format!("{dir}/{i:05}.png")).with_context(|| format!("{dir}/{i:05}.png is missing"))??).packed(),
                 };
                 Ok(Frame { image, delay_cs: m.delay, enabled: m.enabled, cut: m.cut, blank: m.blank, trim: m.trim })
             })
@@ -479,19 +504,25 @@ pub fn load(path: &Path) -> Result<Project> {
             ProjLayer::Image { id, delays, .. } => {
                 let fr: Vec<RgbaImage> = match file.overlay_pics.get(id) {
                     Some(v) => v.iter().filter_map(|&p| pics.get(p).map(|x| (*x.get()).clone())).collect(),
-                    None => (0..delays.len().max(1)).filter_map(|i| decoded.remove(&format!("overlays/{id}/{i:05}.png"))).collect(),
+                    None => (0..delays.len().max(1)).filter_map(|i| decoded(&format!("overlays/{id}/{i:05}.png")).and_then(|r| r.ok())).collect(),
                 };
                 if !fr.is_empty() {
                     overlays.insert(*id, fr);
                 }
             }
             ProjLayer::Watermark { id, has_image: true, .. } => {
-                if let Some(img) = decoded.remove(&format!("watermarks/{id}.png")) {
+                if let Some(Ok(img)) = decoded(&format!("watermarks/{id}.png")) {
                     watermarks.insert(*id, img);
                 }
             }
             _ => {}
         }
+    }
+    // the decoding's scratch memory goes back to the system (glibc keeps
+    // freed memory otherwise, hundreds of MB after a big project)
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
     }
     Ok(Project { file, base, original, overlays, watermarks })
 }
@@ -620,6 +651,22 @@ mod size_tests {
         assert_eq!(ov[1].as_raw(), moved.as_raw());
         // repeats are stored once
         assert!(back.file.pics.len() <= 8, "{} pictures", back.file.pics.len());
+    }
+
+    /// Memory a project takes once opened (RSS, MB), without the window.
+    /// IN=… cargo test --release open_memory -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn open_memory() {
+        let rss = || std::fs::read_to_string("/proc/self/status").ok().and_then(|s| s.split("VmRSS:").nth(1).and_then(|v| v.split_whitespace().next().and_then(|n| n.parse::<u64>().ok()))).unwrap_or(0) / 1024;
+        let before = rss();
+        let p = load(Path::new(&std::env::var("IN").unwrap())).unwrap();
+        let stored: usize = p.base.frames.iter().map(|f| f.image.stored_bytes()).sum::<usize>();
+        let unique: std::collections::HashSet<u64> = p.base.frames.iter().map(|f| f.image.id()).collect();
+        if let Ok(g) = std::env::var("GIF") {
+            crate::io::save_gif(&p.base, &crate::encode::GifOptions::default(), Path::new(&g), None).unwrap();
+        }
+        eprintln!("before {before} MB, after {} MB; {} frames, {} pictures, {} MB stored, cache {} MB", rss(), p.base.len(), unique.len(), stored / 1048576, crate::pixels::cache_bytes() / 1048576);
     }
 
     /// A project opened and saved again. IN=… OUT=… cargo test --release resave -- --ignored --nocapture

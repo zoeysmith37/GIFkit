@@ -3892,6 +3892,10 @@ impl GifKitApp {
             mb(rss), mb(crate::pixels::RAW_BYTES.load(Ordering::Relaxed)), mb(self.gpu_frames.bytes), mb(crate::pixels::cache_bytes()), mb(orig), mb(base), mb(proxy), mb(undo), self.undo.len() + self.redo.len(), mb(cmp),
             mb(tex(&self.base_tex)), mb(tex(&self.comp_tex)), mb(tex(&self.orig_tex)), mb(tex(&self.cmp_tex)), mb(tex(&self.crop_tex)), self.thumbs.map.len()
         );
+        if let Some((g, _)) = &self.gpu {
+            let (src, spr) = g.cache_bytes();
+            eprintln!("mem: gpu renderer sources {:.0} sprites {:.0}", mb(src), mb(spr));
+        }
     }
 
     /// Setting ffmpeg up: point at it, or (on Windows) download a copy.
