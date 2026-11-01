@@ -177,6 +177,9 @@ jobs:
           note() { while read -r l; do echo "::notice::$l"; done; }
           limit() { perl -e 'alarm shift; exec @ARGV' "$@"; }
           LSREG=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+          # the extension's zip reading, on real projects
+          swiftc tools/macthumb/Zip.swift tools/macthumb/test.swift -o ziptest
+          ./ziptest testdata/thumbtest.gifkit | note
           cp -R dist/GIFkit.app /Applications/
           EXT=/Applications/GIFkit.app/Contents/PlugIns/GIFkitThumbnail.appex
           codesign -dv --entitlements - "$EXT" 2>&1 | grep -E "Identifier|Signature|sandbox" | note
