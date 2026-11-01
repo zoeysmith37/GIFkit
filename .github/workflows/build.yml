@@ -74,11 +74,24 @@ jobs:
         shell: pwsh
         run: |
           cargo build --release
+          # Explorer thumbnails of projects
+          cargo test --release --manifest-path tools/winthumb/Cargo.toml
+          cargo build --release --manifest-path tools/winthumb/Cargo.toml
+          Copy-Item tools/winthumb/target/release/gifkit_thumbs.dll target/release/
           $d = "dist/gifkit-${{ matrix.name }}"
           New-Item -ItemType Directory -Force $d | Out-Null
-          Copy-Item target/release/gifkit.exe, README.md $d
+          Copy-Item target/release/gifkit.exe, target/release/gifkit_thumbs.dll, README.md $d
           Copy-Item assets/*.txt $d
           Compress-Archive -Path $d -DestinationPath gifkit-${{ matrix.name }}.zip
+
+      - name: Explorer thumbnails (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath target/release/gifkit.exe -ArgumentList "--register" -PassThru -Wait
+          if ($p.ExitCode -ne 0) { Write-Host "::error::register failed ($($p.ExitCode))"; exit 1 }
+          Copy-Item testdata/thumbtest.gifkit "$env:RUNNER_TEMP/thumbtest.gifkit"
+          ./tools/winthumb/check.ps1 -File "$env:RUNNER_TEMP/thumbtest.gifkit"
 
       - name: GUI smoke test (Windows)
         if: runner.os == 'Windows'
@@ -125,12 +138,52 @@ jobs:
               <key>LSItemContentTypes</key><array>
                 <string>com.compuserve.gif</string><string>public.png</string><string>org.webmproject.webp</string>
               </array>
+            </dict><dict>
+              <key>CFBundleTypeName</key><string>GIFkit project</string>
+              <key>CFBundleTypeRole</key><string>Editor</string>
+              <key>LSHandlerRank</key><string>Owner</string>
+              <key>LSItemContentTypes</key><array><string>io.github.zoeysmith37.gifkit.project</string></array>
+            </dict></array>
+            <key>UTExportedTypeDeclarations</key><array><dict>
+              <key>UTTypeIdentifier</key><string>io.github.zoeysmith37.gifkit.project</string>
+              <key>UTTypeDescription</key><string>GIFkit project</string>
+              <key>UTTypeConformsTo</key><array><string>public.data</string></array>
+              <key>UTTypeIconFile</key><string>gifkit</string>
+              <key>UTTypeTagSpecification</key><dict>
+                <key>public.filename-extension</key><array><string>gifkit</string></array>
+                <key>public.mime-type</key><array><string>application/x-gifkit</string></array>
+              </dict>
             </dict></array>
           </dict></plist>
           EOF
-          codesign --force --deep --sign - $APP
+          # Finder thumbnails of projects: a Quick Look extension, signed
+          # with its own sandbox first, then the app around it
+          tools/macthumb/build.sh $APP $VERSION
+          codesign --force --sign - $APP
           cp README.md dist/
           cd dist && zip -qry ../gifkit-${{ matrix.name }}.zip GIFkit.app README.md
+
+      - name: Finder thumbnails (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          LSREG=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+          cp -R dist/GIFkit.app /Applications/
+          $LSREG -f -R /Applications/GIFkit.app
+          pluginkit -a /Applications/GIFkit.app/Contents/PlugIns/GIFkitThumbnail.appex
+          sleep 3
+          pluginkit -m -v -p com.apple.quicklook.thumbnail | grep -i gifkit | while read -r l; do echo "::notice::$l"; done
+          mdls -name kMDItemContentType testdata/thumbtest.gifkit | while read -r l; do echo "::notice::$l"; done
+          qlmanage -r >/dev/null 2>&1; qlmanage -r cache >/dev/null 2>&1
+          mkdir -p qlout
+          qlmanage -t -s 128 -o qlout testdata/thumbtest.gifkit 2>&1 | tail -n 5 | while read -r l; do echo "::notice::$l"; done
+          test -f qlout/thumbtest.gifkit.png
+          python3 -c "
+          import struct, zlib
+          # the middle pixel of the PNG Quick Look made: red, as the project's thumbnail
+          d = open('qlout/thumbtest.gifkit.png','rb').read()
+          w, h = struct.unpack('>II', d[16:24])
+          print(f'::notice::Finder thumbnail {w}x{h}')
+          "
 
       - name: GUI smoke test (macOS)
         if: runner.os == 'macOS'

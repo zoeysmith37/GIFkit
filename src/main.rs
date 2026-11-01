@@ -33,6 +33,8 @@ mod timeline;
 mod track;
 mod interp;
 mod rife;
+#[cfg(windows)]
+mod winreg;
 mod theme;
 #[cfg(test)]
 mod tests;
@@ -59,6 +61,22 @@ fn main() -> eframe::Result {
             std::process::exit(1);
         }
         std::process::exit(0);
+    }
+    // Windows: projects open with GIFkit and get Explorer thumbnails
+    #[cfg(windows)]
+    if let Ok(exe) = std::env::current_exe() {
+        if args.get(1).is_some_and(|a| a == "--register") {
+            match winreg::register(&exe) {
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        std::thread::spawn(move || {
+            let _ = winreg::register(&exe);
+        });
     }
     // leave a core free for the compositor and the rest of the desktop
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
