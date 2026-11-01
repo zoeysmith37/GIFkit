@@ -394,8 +394,10 @@ pub fn save(path: &Path, mut file: ProjectFile, base: &Animation, original: Opti
         jobs.push((format!("watermarks/{id}.png"), img.clone()));
     }
     let mut encoded: Vec<(String, Vec<u8>)> = jobs.par_iter().map(|(n, img)| png(img).map(|b| (n.clone(), b))).collect::<Result<_>>()?;
-    // the thumbnail as a JPEG (a tenth the size) unless it's see-through
-    if let Some(t) = thumb.map(|t| fit(t, THUMB)) {
+    // the thumbnail, marked as a project, as a JPEG (a tenth the size)
+    // unless it's see-through
+    if let Some(mut t) = thumb.map(|t| fit(t, THUMB)) {
+        badge(&mut t);
         if t.pixels().all(|p| p[3] == 255) {
             let mut b = Vec::new();
             let rgb = image::DynamicImage::ImageRgba8(t).to_rgb8();
@@ -497,6 +499,47 @@ pub fn load(path: &Path) -> Result<Project> {
 /// Longest side of the stored thumbnail.
 pub const THUMB: u32 = 256;
 
+/// The GIFkit icon in the bottom-right corner of `img` (with a soft shadow),
+/// so a project's thumbnail doesn't pass for a plain picture.
+pub fn badge(img: &mut RgbaImage) {
+    static ICON: std::sync::OnceLock<Option<RgbaImage>> = std::sync::OnceLock::new();
+    let Some(icon) = ICON.get_or_init(|| image::load_from_memory(include_bytes!("../assets/icon/gifkit-128.png")).ok().map(|i| i.to_rgba8())) else { return };
+    let (w, h) = img.dimensions();
+    let b = ((w.min(h) as f32 * 0.32).round() as u32).clamp(12, 128);
+    if b + 2 > w.min(h) {
+        return;
+    }
+    let ic = image::imageops::resize(icon, b, b, image::imageops::FilterType::Lanczos3);
+    let m = ((b as f32 * 0.08).round() as i64).max(1);
+    let (x0, y0) = (w as i64 - b as i64 - m, h as i64 - b as i64 - m);
+    // the shadow: the icon's shape, blurred, a little down and right
+    let pad = (b / 6).max(2);
+    let mut sh = image::GrayImage::new(b + pad * 2, b + pad * 2);
+    for (x, y, p) in ic.enumerate_pixels() {
+        sh.put_pixel(x + pad, y + pad, image::Luma([p[3]]));
+    }
+    let sh = image::imageops::blur(&sh, (b as f32 / 24.0).max(1.0));
+    let off = (b as i64 / 24).max(1);
+    let mix = |img: &mut RgbaImage, x: i64, y: i64, c: [f32; 3], a: f32| {
+        if x < 0 || y < 0 || x >= w as i64 || y >= h as i64 || a <= 0.0 {
+            return;
+        }
+        let p = img.get_pixel_mut(x as u32, y as u32);
+        let da = p[3] as f32 / 255.0;
+        let oa = a + da * (1.0 - a);
+        for k in 0..3 {
+            p[k] = ((c[k] * a + p[k] as f32 * da * (1.0 - a)) / oa.max(1e-6)).round().clamp(0.0, 255.0) as u8;
+        }
+        p[3] = (oa * 255.0).round() as u8;
+    };
+    for (x, y, p) in sh.enumerate_pixels() {
+        mix(img, x0 + x as i64 - pad as i64 + off, y0 + y as i64 - pad as i64 + off, [0.0; 3], p[0] as f32 / 255.0 * 0.45);
+    }
+    for (x, y, p) in ic.enumerate_pixels() {
+        mix(img, x0 + x as i64, y0 + y as i64, [p[0] as f32, p[1] as f32, p[2] as f32], p[3] as f32 / 255.0);
+    }
+}
+
 /// `img` shrunk to fit `size` on its longer side (never grown).
 fn fit(img: &RgbaImage, size: u32) -> RgbaImage {
     let (w, h) = img.dimensions();
@@ -515,7 +558,12 @@ pub fn thumbnail(path: &Path, size: u32) -> Result<RgbaImage> {
     let name = ["thumbnail.jpg", "thumbnail.png", "pics/00000.png", "frames/00000.png"].into_iter().find(|n| z.by_name(n).is_ok()).context("no picture in the project")?;
     let mut b = Vec::new();
     z.by_name(name)?.read_to_end(&mut b)?;
-    Ok(fit(&image::load_from_memory(&b)?.to_rgba8(), size))
+    let mut t = fit(&image::load_from_memory(&b)?.to_rgba8(), size.max(THUMB));
+    // older projects: their first frame, marked here
+    if !name.starts_with("thumbnail") {
+        badge(&mut t);
+    }
+    Ok(fit(&t, size))
 }
 
 pub fn is_project(p: &Path) -> bool {

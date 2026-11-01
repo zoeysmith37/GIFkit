@@ -14,14 +14,65 @@ pub fn picture(bytes: &[u8], size: u32) -> Option<RgbaImage> {
     let name = ["thumbnail.jpg", "thumbnail.png", "pics/00000.png", "frames/00000.png"].into_iter().find(|n| z.by_name(n).is_ok())?;
     let mut b = Vec::new();
     z.by_name(name).ok()?.read_to_end(&mut b).ok()?;
-    let img = image::load_from_memory(&b).ok()?.to_rgba8();
+    let mut img = fit(image::load_from_memory(&b).ok()?.to_rgba8(), size.max(256));
+    // older projects: their first frame, marked as a project here (newer
+    // ones have the mark in their thumbnail already)
+    if !name.starts_with("thumbnail") {
+        badge(&mut img);
+    }
+    Some(fit(img, size))
+}
+
+fn fit(img: RgbaImage, size: u32) -> RgbaImage {
     let (w, h) = img.dimensions();
     if w.max(h) <= size || size == 0 {
-        return Some(img);
+        return img;
     }
     let k = size as f32 / w.max(h) as f32;
-    Some(image::imageops::resize(&img, ((w as f32 * k).round() as u32).max(1), ((h as f32 * k).round() as u32).max(1), image::imageops::FilterType::Triangle))
+    image::imageops::resize(&img, ((w as f32 * k).round() as u32).max(1), ((h as f32 * k).round() as u32).max(1), image::imageops::FilterType::Triangle)
 }
+
+/// The GIFkit icon in the bottom-right corner of `img` (with a soft shadow),
+/// so a project's thumbnail doesn't pass for a plain picture.
+fn badge(img: &mut RgbaImage) {
+    static ICON: std::sync::OnceLock<Option<RgbaImage>> = std::sync::OnceLock::new();
+    let Some(icon) = ICON.get_or_init(|| image::load_from_memory(include_bytes!("../../../assets/icon/gifkit-128.png")).ok().map(|i| i.to_rgba8())) else { return };
+    let (w, h) = img.dimensions();
+    let b = ((w.min(h) as f32 * 0.32).round() as u32).clamp(12, 128);
+    if b + 2 > w.min(h) {
+        return;
+    }
+    let ic = image::imageops::resize(icon, b, b, image::imageops::FilterType::Lanczos3);
+    let m = ((b as f32 * 0.08).round() as i64).max(1);
+    let (x0, y0) = (w as i64 - b as i64 - m, h as i64 - b as i64 - m);
+    // the shadow: the icon's shape, blurred, a little down and right
+    let pad = (b / 6).max(2);
+    let mut sh = image::GrayImage::new(b + pad * 2, b + pad * 2);
+    for (x, y, p) in ic.enumerate_pixels() {
+        sh.put_pixel(x + pad, y + pad, image::Luma([p[3]]));
+    }
+    let sh = image::imageops::blur(&sh, (b as f32 / 24.0).max(1.0));
+    let off = (b as i64 / 24).max(1);
+    let mix = |img: &mut RgbaImage, x: i64, y: i64, c: [f32; 3], a: f32| {
+        if x < 0 || y < 0 || x >= w as i64 || y >= h as i64 || a <= 0.0 {
+            return;
+        }
+        let p = img.get_pixel_mut(x as u32, y as u32);
+        let da = p[3] as f32 / 255.0;
+        let oa = a + da * (1.0 - a);
+        for k in 0..3 {
+            p[k] = ((c[k] * a + p[k] as f32 * da * (1.0 - a)) / oa.max(1e-6)).round().clamp(0.0, 255.0) as u8;
+        }
+        p[3] = (oa * 255.0).round() as u8;
+    };
+    for (x, y, p) in sh.enumerate_pixels() {
+        mix(img, x0 + x as i64 - pad as i64 + off, y0 + y as i64 - pad as i64 + off, [0.0; 3], p[0] as f32 / 255.0 * 0.45);
+    }
+    for (x, y, p) in ic.enumerate_pixels() {
+        mix(img, x0 + x as i64, y0 + y as i64, [p[0] as f32, p[1] as f32, p[2] as f32], p[3] as f32 / 255.0);
+    }
+}
+
 
 /// The class Explorer asks for (also written to the registry by gifkit.exe).
 pub const CLSID_STR: &str = "{6F3B1C2E-9A4D-4E7B-8C51-2D7A0B9E4F13}";
