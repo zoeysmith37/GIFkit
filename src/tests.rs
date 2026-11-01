@@ -1064,7 +1064,7 @@ fn project_round_trip() {
     let path = dir.join("a.gifkit");
     let ov: HashMap<usize, Vec<image::RgbaImage>> = [(1, overlay.clone())].into();
     let wms: HashMap<usize, Arc<image::RgbaImage>> = [(2, wm.clone())].into();
-    save(&path, file, &base, Some(&original), &ov, &wms).unwrap();
+    save(&path, file, &base, Some(&original), &ov, &wms, None).unwrap();
     let pr = load(&path).unwrap();
     assert_eq!(pr.base.len(), base.len());
     assert_eq!(pr.base.loop_count, base.loop_count);
@@ -1088,7 +1088,7 @@ fn project_round_trip() {
     assert!(pr.file.layers[0].timing.is_default());
     // an unchanged original isn't stored twice
     let f2 = ProjectFile::default();
-    save(&path, f2, &base, Some(&base.clone()), &HashMap::new(), &HashMap::new()).unwrap();
+    save(&path, f2, &base, Some(&base.clone()), &HashMap::new(), &HashMap::new(), None).unwrap();
     assert!(load(&path).unwrap().original.is_none());
     // not a project
     std::fs::write(dir.join("bad.gifkit"), b"nope").unwrap();

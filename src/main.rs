@@ -45,6 +45,21 @@ fn app_icon() -> eframe::egui::IconData {
 }
 
 fn main() -> eframe::Result {
+    // `gifkit --thumbnail <project> <out.png> [size]`: for file managers
+    // (a freedesktop thumbnailer); no window
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|a| a == "--thumbnail") {
+        let size = args.get(4).and_then(|s| s.to_str()).and_then(|s| s.parse().ok()).unwrap_or(256u32);
+        let ok = match (args.get(2), args.get(3)) {
+            (Some(i), Some(o)) => project::thumbnail(std::path::Path::new(i), size).and_then(|t| t.save_with_format(o, image::ImageFormat::Png).map_err(Into::into)),
+            _ => Err(anyhow::anyhow!("usage: gifkit --thumbnail <project> <out.png> [size]")),
+        };
+        if let Err(e) = ok {
+            eprintln!("{e:#}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
     // leave a core free for the compositor and the rest of the desktop
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
     let _ = rayon::ThreadPoolBuilder::new().num_threads(cores.saturating_sub(1).max(1)).build_global();

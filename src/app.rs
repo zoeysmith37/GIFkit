@@ -8083,7 +8083,12 @@ impl GifKitApp {
         };
         let (file, overlays, watermarks) = self.project_parts();
         let original = self.original.clone();
-        self.spawn_in(ctx, "Save project", 1, false, move |_| JobOutput::ProjectSaved(crate::project::save(&path, file, &base, original.as_ref(), &overlays, &watermarks).map(|_| path.clone())));
+        // a picture of the result for file managers: the frame on screen
+        let thumb = self.render_composite(self.cur.min(self.plan.len().saturating_sub(1))).map(|t| {
+            let k = (crate::project::THUMB as f32 / t.width().max(t.height()) as f32).min(1.0);
+            if k < 1.0 { image::imageops::resize(&t, ((t.width() as f32 * k) as u32).max(1), ((t.height() as f32 * k) as u32).max(1), image::imageops::FilterType::Triangle) } else { t }
+        });
+        self.spawn_in(ctx, "Save project", 1, false, move |_| JobOutput::ProjectSaved(crate::project::save(&path, file, &base, original.as_ref(), &overlays, &watermarks, thumb.as_ref()).map(|_| path.clone())));
     }
 
     /// The project as it would be saved: its description, and the pictures
@@ -8172,7 +8177,7 @@ impl GifKitApp {
         std::thread::spawn(move || {
             stack::lower_thread_priority();
             let tmp = path.with_extension("gifkit.part");
-            let ok = stack::bg_pool().install(|| crate::project::save(&tmp, file, &base, original.as_ref(), &overlays, &watermarks)).is_ok() && std::fs::rename(&tmp, &path).is_ok();
+            let ok = stack::bg_pool().install(|| crate::project::save(&tmp, file, &base, original.as_ref(), &overlays, &watermarks, None)).is_ok() && std::fs::rename(&tmp, &path).is_ok();
             if ok {
                 let _ = std::fs::write(&note, info.to_string());
             }

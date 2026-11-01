@@ -8,8 +8,13 @@ bin="$HOME/.local/bin/gifkit"
 apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 icons="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor"
 desktop="$apps/gifkit.desktop"
+data="${XDG_DATA_HOME:-$HOME/.local/share}"
+# .gifkit projects: their own file type, and thumbnails in file managers
+mime="$data/mime/packages/gifkit.xml"
+thumbs="$data/thumbnailers/gifkit.thumbnailer"
 
 refresh() {
+    command -v update-mime-database >/dev/null 2>&1 && update-mime-database "$data/mime" 2>/dev/null || true
     command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$apps" 2>/dev/null || true
     command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -t -f "$icons" 2>/dev/null || true
     # KDE Plasma reads its own cache of menu entries
@@ -26,7 +31,7 @@ cleanup_old() {
 
 if [ "$1" = "--uninstall" ]; then
     cleanup_old
-    rm -f "$bin" "$desktop" "$icons/256x256/apps/gifkit.png" "$icons/scalable/apps/gifkit.svg"
+    rm -f "$bin" "$desktop" "$icons/256x256/apps/gifkit.png" "$icons/scalable/apps/gifkit.svg" "$mime" "$thumbs"
     refresh
     echo "GIFkit removed."
     exit 0
@@ -52,12 +57,33 @@ TryExec=$bin
 Icon=gifkit
 Terminal=false
 Categories=Graphics;2DGraphics;RasterGraphics;
-MimeType=image/gif;image/webp;image/apng;image/png;video/mp4;video/webm;video/quicktime;video/x-matroska;
+MimeType=application/x-gifkit;image/gif;image/webp;image/apng;image/png;video/mp4;video/webm;video/quicktime;video/x-matroska;
 StartupWMClass=gifkit
 DESKTOP
 chmod 644 "$desktop"
+
+mkdir -p "$(dirname "$mime")" "$(dirname "$thumbs")"
+cat > "$mime" <<MIME
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-gifkit">
+    <comment>GIFkit project</comment>
+    <sub-class-of type="application/zip"/>
+    <icon name="gifkit"/>
+    <glob pattern="*.gifkit" weight="90"/>
+  </mime-type>
+</mime-info>
+MIME
+cat > "$thumbs" <<THUMB
+[Thumbnailer Entry]
+TryExec=$bin
+Exec="$bin" --thumbnail %i %o %s
+MimeType=application/x-gifkit;
+THUMB
+chmod 644 "$mime" "$thumbs"
 refresh
 echo "Installed. GIFkit is now in your app menu."
+echo "Project thumbnails: in Dolphin, turn on GIFkit under Configure > Interface > Previews."
 case ":$PATH:" in
     *":$HOME/.local/bin:"*) ;;
     *) echo "Tip: add ~/.local/bin to PATH to start it from a terminal with 'gifkit'." ;;

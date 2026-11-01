@@ -3,6 +3,7 @@
 //! opens the same on any machine, even without the original files.
 //!
 //!   project.json
+//!   thumbnail.jpg (or .png)   a small picture of the result, for file managers
 //!   pics/00000.png …          every picture once (see below)
 //!   watermarks/<n>.png        watermark images
 //!
@@ -198,12 +199,15 @@ fn png(img: &RgbaImage) -> Result<Vec<u8>> {
             for (c, &i) in &index {
                 cols[i as usize] = *c;
             }
+
             let palette: Vec<u8> = cols.iter().flat_map(|c| [c[0], c[1], c[2]]).collect();
             let mut trns: Vec<u8> = cols.iter().map(|c| c[3]).collect();
             while trns.last() == Some(&255) {
                 trns.pop();
             }
             enc.set_color(png::ColorType::Indexed);
+            // palette pictures pack best unfiltered (half the size)
+            enc.set_filter(png::Filter::NoFilter);
             enc.set_palette(palette);
             if !trns.is_empty() {
                 enc.set_trns(trns);
@@ -358,7 +362,7 @@ fn meta(a: &Animation) -> Vec<FrameMeta> {
 
 /// Write a project. `images` are the frames of image layers and watermark
 /// images, keyed by the ids used in `file.layers`.
-pub fn save(path: &Path, mut file: ProjectFile, base: &Animation, original: Option<&Animation>, overlays: &HashMap<usize, Vec<RgbaImage>>, watermarks: &HashMap<usize, Arc<RgbaImage>>) -> Result<()> {
+pub fn save(path: &Path, mut file: ProjectFile, base: &Animation, original: Option<&Animation>, overlays: &HashMap<usize, Vec<RgbaImage>>, watermarks: &HashMap<usize, Arc<RgbaImage>>, thumb: Option<&RgbaImage>) -> Result<()> {
     file.version = VERSION;
     file.app = env!("CARGO_PKG_VERSION").into();
     file.frames = meta(base);
@@ -389,7 +393,18 @@ pub fn save(path: &Path, mut file: ProjectFile, base: &Animation, original: Opti
     for (id, img) in watermarks {
         jobs.push((format!("watermarks/{id}.png"), img.clone()));
     }
-    let encoded: Vec<(String, Vec<u8>)> = jobs.par_iter().map(|(n, img)| png(img).map(|b| (n.clone(), b))).collect::<Result<_>>()?;
+    let mut encoded: Vec<(String, Vec<u8>)> = jobs.par_iter().map(|(n, img)| png(img).map(|b| (n.clone(), b))).collect::<Result<_>>()?;
+    // the thumbnail as a JPEG (a tenth the size) unless it's see-through
+    if let Some(t) = thumb.map(|t| fit(t, THUMB)) {
+        if t.pixels().all(|p| p[3] == 255) {
+            let mut b = Vec::new();
+            let rgb = image::DynamicImage::ImageRgba8(t).to_rgb8();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut b, 85).encode_image(&rgb)?;
+            encoded.push(("thumbnail.jpg".into(), b));
+        } else {
+            encoded.push(("thumbnail.png".into(), png(&t)?));
+        }
+    }
 
     // write next to the target, then move into place, so a failed save never eats the old file
     let tmp = path.with_extension(format!("{EXT}.part"));
@@ -479,6 +494,30 @@ pub fn load(path: &Path) -> Result<Project> {
     Ok(Project { file, base, original, overlays, watermarks })
 }
 
+/// Longest side of the stored thumbnail.
+pub const THUMB: u32 = 256;
+
+/// `img` shrunk to fit `size` on its longer side (never grown).
+fn fit(img: &RgbaImage, size: u32) -> RgbaImage {
+    let (w, h) = img.dimensions();
+    if w.max(h) <= size {
+        return img.clone();
+    }
+    let k = size as f32 / w.max(h) as f32;
+    image::imageops::resize(img, ((w as f32 * k).round() as u32).max(1), ((h as f32 * k).round() as u32).max(1), image::imageops::FilterType::Triangle)
+}
+
+/// A project's thumbnail at most `size` across, without opening all of it:
+/// the stored one, or the first frame for projects saved before there was one.
+pub fn thumbnail(path: &Path, size: u32) -> Result<RgbaImage> {
+    let f = std::fs::File::open(path).with_context(|| format!("can't open {}", path.display()))?;
+    let mut z = zip::ZipArchive::new(std::io::BufReader::new(f)).context("not a GIFkit project")?;
+    let name = ["thumbnail.jpg", "thumbnail.png", "pics/00000.png", "frames/00000.png"].into_iter().find(|n| z.by_name(n).is_ok()).context("no picture in the project")?;
+    let mut b = Vec::new();
+    z.by_name(name)?.read_to_end(&mut b)?;
+    Ok(fit(&image::load_from_memory(&b)?.to_rgba8(), size))
+}
+
 pub fn is_project(p: &Path) -> bool {
     p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case(EXT))
 }
@@ -515,7 +554,12 @@ mod size_tests {
         let out = std::env::temp_dir().join(format!("pics-{}.gifkit", std::process::id()));
         let mut file = ProjectFile::default();
         file.layers = vec![ProjLayerEntry { visible: true, label: None, layer: ProjLayer::Image { id: 5, name: "x".into(), path: None, delays: vec![5; 3], placements: Vec::new(), opacity: 1.0 }, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false }];
-        save(&out, file, &base, Some(&orig), &overlays, &HashMap::new()).unwrap();
+        let big = RgbaImage::from_pixel(600, 300, image::Rgba([10, 200, 30, 255]));
+        save(&out, file, &base, Some(&orig), &overlays, &HashMap::new(), Some(&big)).unwrap();
+        let t = thumbnail(&out, 128).unwrap();
+        assert_eq!(t.dimensions(), (128, 64));
+        let c = t.get_pixel(5, 5).0;
+        assert!(c.iter().zip([10u8, 200, 30, 255]).all(|(a, b)| a.abs_diff(b) < 6), "{c:?}");
         let back = load(&out).unwrap();
         let _ = std::fs::remove_file(&out);
         for (i, (f, want)) in back.base.frames.iter().zip(&frames).enumerate() {
@@ -528,6 +572,44 @@ mod size_tests {
         assert_eq!(ov[1].as_raw(), moved.as_raw());
         // repeats are stored once
         assert!(back.file.pics.len() <= 8, "{} pictures", back.file.pics.len());
+    }
+
+    /// A project opened and saved again. IN=… OUT=… cargo test --release resave -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn resave() {
+        let (i, o) = (std::env::var("IN").unwrap(), std::env::var("OUT").unwrap());
+        let p = load(Path::new(&i)).unwrap();
+        let overlays: HashMap<usize, Vec<RgbaImage>> = p.overlays;
+        let wm: HashMap<usize, Arc<RgbaImage>> = p.watermarks.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
+        let thumb = p.base.frames.first().map(|f| f.image.get());
+        let t = std::time::Instant::now();
+        save(Path::new(&o), p.file, &p.base, p.original.as_ref(), &overlays, &wm, thumb.as_deref()).unwrap();
+        eprintln!("{} KB -> {} KB in {} ms", std::fs::metadata(&i).unwrap().len() / 1024, std::fs::metadata(&o).unwrap().len() / 1024, t.elapsed().as_millis());
+        let back = load(Path::new(&o)).unwrap();
+        let again = load(Path::new(&i)).unwrap();
+        for (a, b) in back.base.frames.iter().zip(&again.base.frames) {
+            assert_eq!(a.image.get().as_raw(), b.image.get().as_raw());
+        }
+    }
+
+    /// PNG sizes for a folder of pictures, re-encoded as projects store them.
+    /// DIR=… cargo test --release png_sizes -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn png_sizes() {
+        let dir = std::env::var("DIR").unwrap();
+        let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.path()).collect();
+        files.sort();
+        files.truncate(std::env::var("N").ok().and_then(|v| v.parse().ok()).unwrap_or(12));
+        let (mut was, mut now) = (0u64, 0u64);
+        let t = std::time::Instant::now();
+        for f in &files {
+            was += std::fs::metadata(f).unwrap().len();
+            let img = image::open(f).unwrap().to_rgba8();
+            now += png(&img).unwrap().len() as u64;
+        }
+        eprintln!("{} files: {} KB as they are, {} KB now, {} ms", files.len(), was / 1024, now / 1024, t.elapsed().as_millis());
     }
 
     /// Projects saved before the pool (every frame whole) still open.
@@ -550,7 +632,10 @@ mod size_tests {
             z.finish().unwrap();
         }
         let back = load(&out);
+        // the first frame stands in for a thumbnail
+        let t = thumbnail(&out, 256);
         let _ = std::fs::remove_file(&out);
+        assert_eq!(t.unwrap().dimensions(), (8, 8));
         let back = back.unwrap();
         assert_eq!(back.base.len(), 2);
         assert_eq!(back.base.frames[1].delay_cs, 6);
@@ -566,7 +651,7 @@ mod size_tests {
         let a = crate::io::load_animation(&src).unwrap();
         let out = std::env::temp_dir().join("size-test.gifkit");
         let t = std::time::Instant::now();
-        save(&out, ProjectFile::default(), &a, None, &HashMap::new(), &HashMap::new()).unwrap();
+        save(&out, ProjectFile::default(), &a, None, &HashMap::new(), &HashMap::new(), a.frames.first().map(|f| f.image.get()).as_deref()).unwrap();
         let ms = t.elapsed().as_millis();
         let size = std::fs::metadata(&out).unwrap().len();
         eprintln!("{}: {} frames {}x{}, file {} KB, project {} KB, saved in {ms} ms", src.display(), a.len(), a.width(), a.height(), std::fs::metadata(&src).unwrap().len() / 1024, size / 1024);
