@@ -90,6 +90,11 @@ jobs:
         run: |
           $p = Start-Process -FilePath target/release/gifkit.exe -ArgumentList "--register" -PassThru -Wait
           if ($p.ExitCode -ne 0) { Write-Host "::error::register failed ($($p.ExitCode))"; exit 1 }
+          # the runner is elevated, and elevated programs ignore per-user COM
+          # classes: copy the class machine-wide for this test only
+          $c = "{6F3B1C2E-9A4D-4E7B-8C51-2D7A0B9E4F13}"
+          reg copy "HKCU\Software\Classes\CLSID\$c" "HKLM\Software\Classes\CLSID\$c" /s /f | Out-Null
+          reg copy "HKCU\Software\Classes\.gifkit" "HKLM\Software\Classes\.gifkit" /s /f | Out-Null
           Copy-Item testdata/thumbtest.gifkit "$env:RUNNER_TEMP/thumbtest.gifkit"
           ./tools/winthumb/check.ps1 -File "$env:RUNNER_TEMP/thumbtest.gifkit"
 
@@ -181,6 +186,8 @@ jobs:
           limit 30 pluginkit -e use -i io.github.zoeysmith37.gifkit.thumbnail || true
           sleep 5
           limit 30 pluginkit -m -A -D -v -p com.apple.quicklook.thumbnail 2>&1 | grep -i gifkit | note
+          limit 30 pluginkit -m -A -D -v -i io.github.zoeysmith37.gifkit.thumbnail 2>&1 | head -n 5 | note
+          limit 30 log show --last 3m --style compact --predicate 'process == "pkd" OR subsystem == "com.apple.PlugInKit"' 2>/dev/null | grep -i -E "gifkit|reject|invalid|error" | tail -n 15 | note
           limit 60 $LSREG -dump 2>/dev/null | grep -i -A2 "gifkit.project" | head -n 6 | note
           cp testdata/thumbtest.gifkit "$RUNNER_TEMP/t.gifkit"
           limit 20 mdls -name kMDItemContentType "$RUNNER_TEMP/t.gifkit" | note
