@@ -256,16 +256,11 @@ jobs:
           name: gifkit-${{ matrix.name }}
           path: gifkit-${{ matrix.name }}.*
 
-  release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
+      # each system adds its own file to the release as soon as it's built,
+      # so one slow or stuck runner never holds the others back
+      - name: Add to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
         with:
-          path: out
-          merge-multiple: true
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: out/*
+          files: gifkit-${{ matrix.name }}.*
           generate_release_notes: true
