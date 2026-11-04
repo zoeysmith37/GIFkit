@@ -15,6 +15,12 @@ fn main() {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
     println!("cargo:rustc-env=GIFKIT_COMMIT={hash}");
+    // release builds (a v1.2.3 tag) report the tag's version, so a release
+    // never calls itself older than it is
+    let tag = std::env::var("GITHUB_REF").ok().and_then(|r| r.strip_prefix("refs/tags/v").map(str::to_string));
+    let version = tag.unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").unwrap_or_default());
+    println!("cargo:rustc-env=GIFKIT_VERSION={version}");
+    println!("cargo:rerun-if-env-changed=GITHUB_REF");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=assets/icon/gifkit.ico");
 

@@ -390,7 +390,7 @@ fn meta(a: &Animation) -> Vec<FrameMeta> {
 /// images, keyed by the ids used in `file.layers`.
 pub fn save(path: &Path, mut file: ProjectFile, base: &Animation, original: Option<&Animation>, overlays: &HashMap<usize, Vec<RgbaImage>>, watermarks: &HashMap<usize, Arc<RgbaImage>>, thumb: Option<&RgbaImage>) -> Result<()> {
     file.version = VERSION;
-    file.app = env!("CARGO_PKG_VERSION").into();
+    file.app = crate::update::VERSION.into();
     file.frames = meta(base);
     file.loop_count = base.loop_count;
     // only keep the original when it isn't simply the same frames

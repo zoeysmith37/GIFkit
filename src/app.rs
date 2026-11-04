@@ -271,11 +271,36 @@ enum JobOutput {
     Track(u64, usize, Vec<(f32, f32)>, (f32, f32)),
 }
 
+/// New versions: the check, what it found, the download and the result.
+#[derive(Default)]
+struct Updater {
+    /// the startup check has been considered
+    started: bool,
+    check: Option<(Receiver<anyhow::Result<crate::update::Release>>, bool)>,
+    avail: Option<crate::update::Release>,
+    /// the Software Update window is up
+    open: bool,
+    dl: Option<(Arc<crate::update::Progress>, Receiver<anyhow::Result<crate::update::Target>>)>,
+    /// installed: its version and where, to start it
+    installed: Option<(String, crate::update::Target)>,
+    err: Option<String>,
+}
+
+fn update_check_on() -> bool {
+    theme::get_setting("update_check").as_deref() != Some("0")
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
 /// Something that would throw away unsaved changes, waiting for an answer.
 #[derive(Clone, Debug, PartialEq)]
 enum Pending {
     New,
     Quit,
+    /// quit and start the updated GIFkit
+    Restart,
     Open(PathBuf),
     Sequence(Vec<PathBuf>),
 }
@@ -916,6 +941,7 @@ pub struct GifKitApp {
     orig_clock: f64,
     resize_by_pct: bool,
     about_open: bool,
+    upd: Updater,
     /// the ffmpeg set-up window
     ff_open: bool,
     /// a download of ffmpeg under way
@@ -2886,6 +2912,7 @@ impl GifKitApp {
             orig_clock: 0.0,
             resize_by_pct: true,
             about_open: false,
+            upd: Updater::default(),
             ff_open: false,
             ff_job: None,
             ff_msg: None,
@@ -3726,6 +3753,230 @@ impl GifKitApp {
         }
     }
 
+    /// Ask GitHub for the latest release, in the background. `manual`: asked
+    /// for from the Help menu, so "up to date" and failures are said too.
+    fn start_update_check(&mut self, manual: bool) {
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::update::check());
+        });
+        self.upd.check = Some((rx, manual));
+        if manual {
+            self.info("Checking for updates…");
+        }
+    }
+
+    /// The check at startup (once a day at most), and answers coming back.
+    fn poll_updates(&mut self, ctx: &egui::Context) {
+        if !self.upd.started && ctx.input(|i| i.time) > 3.0 {
+            self.upd.started = true;
+            let now = unix_now();
+            let last: u64 = theme::get_setting("update_last").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let quiet = std::env::var_os("GIFKIT_SMOKE").is_some() || std::env::var_os("GIFKIT_NO_UPDATE_CHECK").is_some();
+            if update_check_on() && !quiet && (now.saturating_sub(last) > 20 * 3600 || std::env::var_os("GIFKIT_FAKE_VERSION").is_some()) {
+                self.start_update_check(false);
+            }
+        }
+        if let Some((rx, manual)) = &self.upd.check {
+            let manual = *manual;
+            match rx.try_recv() {
+                Ok(Ok(rel)) => {
+                    self.upd.check = None;
+                    theme::set_setting("update_last", &unix_now().to_string());
+                    let cur = crate::update::current();
+                    if crate::update::newer(&rel.version, &cur) {
+                        let skipped = theme::get_setting("update_skip").as_deref() == Some(rel.version.as_str());
+                        if manual || !skipped {
+                            self.upd.open = true;
+                        }
+                        self.upd.avail = Some(rel);
+                        self.upd.err = None;
+                        if manual {
+                            self.status = None;
+                        }
+                    } else if manual {
+                        self.info(format!("GIFkit is up to date ({cur})"));
+                    }
+                }
+                Ok(Err(e)) => {
+                    self.upd.check = None;
+                    if manual {
+                        self.error(format!("Couldn't check for updates: {e}"));
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.upd.check = None,
+                Err(_) => ctx.request_repaint_after(std::time::Duration::from_millis(250)),
+            }
+        }
+        if let Some((p, rx)) = &self.upd.dl {
+            match rx.try_recv() {
+                Ok(r) => {
+                    let stopped = p.stop.load(Ordering::Relaxed);
+                    self.upd.dl = None;
+                    match r {
+                        Ok(target) => {
+                            let v = self.upd.avail.as_ref().map(|r| r.version.clone()).unwrap_or_default();
+                            self.upd.installed = Some((v, target));
+                            self.upd.open = true;
+                        }
+                        Err(_) if stopped => {}
+                        Err(e) => {
+                            self.upd.err = Some(format!("{e:#}"));
+                            self.upd.open = true;
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.upd.dl = None,
+                Err(_) => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
+            }
+        }
+    }
+
+    /// "GIFkit 1.7.0 is available": what's new, and Update, Later or Skip.
+    fn update_window(&mut self, ctx: &egui::Context) {
+        if !self.upd.open {
+            return;
+        }
+        let Some(rel) = self.upd.avail.clone() else {
+            self.upd.open = false;
+            return;
+        };
+        let pal = *p();
+        let mut open = true;
+        // 0 later, 1 update, 2 skip, 3 download page, 4 cancel, 5 restart
+        let mut answer: Option<u8> = None;
+        let target = crate::update::target();
+        let installed = self.upd.installed.is_some();
+        let dl = self.upd.dl.as_ref().map(|(p, _)| (p.done.load(Ordering::Relaxed), p.total.load(Ordering::Relaxed)));
+        let err = self.upd.err.clone();
+        let cur = crate::update::current();
+        dialog(ctx, "update", "Software Update", vec2(480.0, 420.0), false, &mut open, |ui| {
+            ui.horizontal_top(|ui| {
+                let (r, _) = ui.allocate_exact_size(vec2(56.0, 56.0), Sense::hover());
+                paint_app_icon(ui.painter(), r, &pal);
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.add_space(4.0);
+                    let head = if installed { format!("GIFkit {} is installed", rel.version) } else { format!("GIFkit {} is available", rel.version) };
+                    ui.label(RichText::new(head).font(theme::medium(16.0)).color(pal.fg));
+                    hint(ui, &if installed { "Restart GIFkit to start using it.".to_string() } else { format!("You have {cur}.") });
+                });
+            });
+            ui.add_space(10.0);
+            if !rel.notes.is_empty() {
+                egui::Frame::new().fill(pal.view).stroke(Stroke::new(1.0, pal.border)).corner_radius(3.0).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    egui::ScrollArea::vertical().max_height(200.0).auto_shrink([false, true]).show(ui, |ui| {
+                        for l in rel.notes.lines() {
+                            if l.is_empty() {
+                                ui.add_space(4.0);
+                            } else if !l.starts_with('•') && !l.ends_with('.') && l.len() < 48 {
+                                ui.label(RichText::new(l).font(theme::medium(13.5)).color(pal.fg));
+                            } else {
+                                ui.label(RichText::new(l).color(pal.fg));
+                            }
+                        }
+                    });
+                });
+                ui.add_space(10.0);
+            }
+            if let Some(e) = &err {
+                ui.label(RichText::new(e).color(pal.negative));
+                ui.add_space(6.0);
+            }
+            if let Some((done, total)) = dl {
+                let mb = |b: u64| b as f64 / (1u64 << 20) as f64;
+                let f = if total > 0 { (done as f32 / total as f32).min(1.0) } else { 0.0 };
+                ui.add(egui::ProgressBar::new(f).desired_width(ui.available_width()).desired_height(12.0).fill(pal.highlight));
+                hint(ui, &if done >= total && total > 0 { "Installing…".to_string() } else { format!("Downloading… {:.1} of {:.1} MB", mb(done), mb(total)) });
+                ui.add_space(8.0);
+            } else if let Err(why) = &target {
+                if !installed {
+                    hint(ui, &format!("{why}. Get the new version from the download page."));
+                    ui.add_space(8.0);
+                }
+            }
+            ui.horizontal(|ui| {
+                let btn = |ui: &mut egui::Ui, icon: &str, text: &str, default: bool| {
+                    let b = if icon.is_empty() { egui::Button::new(text) } else { egui::Button::image_and_text(crate::icons::image(ui.ctx(), icon, 16.0, pal.fg), text) }.min_size(vec2(96.0, 30.0));
+                    ui.add(if default { b.stroke(Stroke::new(1.0, pal.highlight)) } else { b }).clicked()
+                };
+                if dl.is_none() && !installed && btn(ui, "", "Skip This Version", false) {
+                    answer = Some(2);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if dl.is_some() {
+                        if btn(ui, "dialog-cancel", "Cancel", false) {
+                            answer = Some(4);
+                        }
+                    } else if installed {
+                        if btn(ui, "dialog-cancel", "Later", false) {
+                            answer = Some(0);
+                        }
+                        if btn(ui, "view-refresh", "Restart Now", true) {
+                            answer = Some(5);
+                        }
+                    } else {
+                        if btn(ui, "dialog-cancel", "Later", false) {
+                            answer = Some(0);
+                        }
+                        if target.is_ok() && rel.asset.is_some() {
+                            if btn(ui, "dialog-ok-apply", if err.is_some() { "Try Again" } else { "Update" }, true) {
+                                answer = Some(1);
+                            }
+                        } else if btn(ui, "link", "Download Page", true) {
+                            answer = Some(3);
+                        }
+                    }
+                });
+            });
+        });
+        if !open && answer.is_none() {
+            // closed: a download carries on, and this comes back when it's done
+            self.upd.open = false;
+        }
+        match answer {
+            Some(0) => self.upd.open = false,
+            Some(1) => {
+                if let Ok(t) = target {
+                    self.upd.err = None;
+                    let prog = Arc::new(crate::update::Progress::default());
+                    let (tx, rx) = channel();
+                    let (p2, ctx2) = (prog.clone(), ctx.clone());
+                    std::thread::spawn(move || {
+                        let r = crate::update::download_and_install(&rel, &t, &p2).map(|()| t);
+                        let _ = tx.send(r);
+                        ctx2.request_repaint();
+                    });
+                    self.upd.dl = Some((prog, rx));
+                }
+            }
+            Some(2) => {
+                theme::set_setting("update_skip", &rel.version);
+                self.upd.open = false;
+                self.info(format!("Skipped {}. Help ▸ Check for Updates still finds it", rel.version));
+            }
+            Some(3) => {
+                open_external(&rel.page);
+                self.upd.open = false;
+            }
+            Some(4) => {
+                if let Some((p, _)) = &self.upd.dl {
+                    p.stop.store(true, Ordering::Relaxed);
+                }
+            }
+            Some(5) => {
+                self.upd.open = false;
+                if self.modified && self.base.is_some() {
+                    self.confirm = Some(Pending::Restart);
+                } else {
+                    self.run_pending(ctx, Pending::Restart);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn about_window(&mut self, ctx: &egui::Context) {
         if !self.about_open {
             return;
@@ -3740,7 +3991,7 @@ impl GifKitApp {
                     ui.vertical(|ui| {
                         ui.add_space(6.0);
                         ui.label(RichText::new("GIFkit").font(theme::medium(22.0)).color(pal.fg));
-                        ui.label(RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).color(pal.fg));
+                        ui.label(RichText::new(format!("Version {}", crate::update::VERSION)).color(pal.fg));
                         let commit = env!("GIFKIT_COMMIT");
                         let built = if commit.is_empty() { format!("Built {}", env!("GIFKIT_BUILD_DATE")) } else { format!("Built {} · {commit}", env!("GIFKIT_BUILD_DATE")) };
                         hint(ui, &built);
@@ -6090,6 +6341,8 @@ impl eframe::App for GifKitApp {
         self.export_window(&ctx);
         self.history_window(&ctx);
         self.confirm_window(&ctx);
+        self.poll_updates(&ctx);
+        self.update_window(&ctx);
         self.about_window(&ctx);
         self.restore_window(&ctx);
         self.batch_window(&ctx);
@@ -6391,6 +6644,10 @@ impl GifKitApp {
                         self.info("Applies after a restart");
                     }
                 }
+                let auto = update_check_on();
+                if menu_check(ui, auto, "Check for &Updates at Startup", "") {
+                    theme::set_setting("update_check", if auto { "0" } else { "1" });
+                }
                 ui.separator();
                 if menu_item(ui, "configure-shortcuts", "&Keyboard Shortcuts", "", true) {
                     self.shortcuts_open = true;
@@ -6408,8 +6665,12 @@ impl GifKitApp {
                 if menu_item(ui, "tools-report-bug", "&Report Bug…", "", true) {
                     open_external(&format!("{REPO_URL}/issues"));
                 }
-                if menu_item(ui, "view-refresh", "Check for &Updates", "", true) {
-                    open_external(&format!("{REPO_URL}/releases"));
+                if menu_item(ui, "view-refresh", "Check for &Updates…", "", self.upd.check.is_none() && self.upd.dl.is_none()) {
+                    if self.upd.avail.is_some() {
+                        self.upd.open = true;
+                    } else {
+                        self.start_update_check(true);
+                    }
                 }
                 if menu_item(ui, "", "GIFkit &Website", "", true) {
                     open_external(REPO_URL);
@@ -6475,6 +6736,18 @@ impl GifKitApp {
                 self.quitting = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
+            Pending::Restart => {
+                let Some((_, target)) = self.upd.installed.clone() else { return };
+                let file = self.project_path.clone().or_else(|| self.path.clone());
+                match crate::update::relaunch(&target, file.as_deref()) {
+                    Ok(()) => {
+                        self.clear_autosave();
+                        self.quitting = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    Err(e) => self.error(format!("Couldn't restart: {e}. Close GIFkit and start it again")),
+                }
+            }
             Pending::Open(p) => self.open_path_now(p, ctx),
             Pending::Sequence(ps) => self.open_sequence(ps, ctx),
         }
@@ -6508,6 +6781,7 @@ impl GifKitApp {
         let name = self.project_path.as_ref().or(self.path.as_ref()).and_then(|p| p.file_name()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Untitled".into());
         let title = match what {
             Pending::Quit => "Close Document",
+            Pending::Restart => "Restart GIFkit",
             Pending::New => "New Project",
             _ => "Open",
         };

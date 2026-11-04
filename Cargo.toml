@@ -1,6 +1,6 @@
 [package]
 name = "gifkit"
-version = "1.5.0"
+version = "1.6.0"
 edition = "2021"
 description = "Local, cross-platform animated GIF editor / optimiser"
 license = "Apache-2.0"
@@ -34,6 +34,7 @@ resvg = { version = "0.45", default-features = false }
 memory-stats = "1.2"
 gemm = "0.18"
 half = "2"
+sha2 = "0.10"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc = "0.2"

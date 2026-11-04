@@ -57,6 +57,17 @@ jobs:
           cp assets/linux/install.sh assets/icon/gifkit.svg dist/gifkit-${{ matrix.name }}/
           tar -C dist -czf gifkit-${{ matrix.name }}.tar.gz gifkit-${{ matrix.name }}
 
+      # the updater installs a release over a running copy of itself
+      - name: Update install (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          u=$RUNNER_TEMP/u && mkdir -p $u && tar -xzf gifkit-${{ matrix.name }}.tar.gz -C $u
+          prog=$u/gifkit-${{ matrix.name }}/gifkit
+          printf X >> $prog
+          $prog --install-update "$PWD/gifkit-${{ matrix.name }}.tar.gz"
+          cmp $prog target/release/gifkit
+          $prog --version
+
       # the real window drives itself through the app and writes a report
       - name: GUI smoke test (Linux)
         if: runner.os == 'Linux'
@@ -83,6 +94,23 @@ jobs:
           Copy-Item target/release/gifkit.exe, target/release/gifkit_thumbs.dll, README.md $d
           Copy-Item assets/*.txt $d
           Compress-Archive -Path $d -DestinationPath gifkit-${{ matrix.name }}.zip
+
+      # the updater installs a release over a running copy of itself (the
+      # running program and its DLL can only be renamed out of the way)
+      - name: Update install (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $u = "$env:RUNNER_TEMP\u"
+          Expand-Archive gifkit-${{ matrix.name }}.zip -DestinationPath $u
+          $prog = "$u\gifkit-${{ matrix.name }}\gifkit.exe"
+          [IO.File]::AppendAllText($prog, "X")
+          $p = Start-Process -FilePath $prog -ArgumentList "--install-update", "$PWD\gifkit-${{ matrix.name }}.zip" -PassThru -Wait -RedirectStandardError upd.err
+          Get-Content upd.err | ForEach-Object { Write-Host "::notice::$_" }
+          if ($p.ExitCode -ne 0) { Write-Host "::error::install failed ($($p.ExitCode))"; exit 1 }
+          if ((Get-FileHash $prog).Hash -ne (Get-FileHash target/release/gifkit.exe).Hash) { Write-Host "::error::not replaced"; exit 1 }
+          if (-not (Test-Path "$prog.old")) { Write-Host "::error::no .old left"; exit 1 }
+          Get-ChildItem "$u\gifkit-${{ matrix.name }}" | ForEach-Object { Write-Host "::notice::$($_.Name)" }
 
       - name: Explorer thumbnails (Windows)
         if: runner.os == 'Windows'
@@ -123,6 +151,7 @@ jobs:
             target/x86_64-apple-darwin/release/gifkit
           cp assets/icon/gifkit.icns $APP/Contents/Resources/gifkit.icns
           VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          case "$GITHUB_REF" in refs/tags/v*) VERSION=${GITHUB_REF#refs/tags/v} ;; esac
           cat > $APP/Contents/Info.plist <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -167,6 +196,18 @@ jobs:
           codesign --force --sign - $APP
           cp README.md dist/
           cd dist && zip -qry ../gifkit-${{ matrix.name }}.zip GIFkit.app README.md
+
+      # the updater swaps in a new GIFkit.app under a running copy of itself
+      - name: Update install (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          u=$RUNNER_TEMP/u && mkdir -p $u && ditto -x -k gifkit-${{ matrix.name }}.zip $u
+          printf X >> $u/GIFkit.app/Contents/Resources/marker
+          $u/GIFkit.app/Contents/MacOS/gifkit --install-update "$PWD/gifkit-${{ matrix.name }}.zip"
+          test ! -e $u/GIFkit.app/Contents/Resources/marker
+          $u/GIFkit.app/Contents/MacOS/gifkit --version
+          codesign --verify --deep $u/GIFkit.app && echo "::notice::signature intact"
+          ls -a $u
 
       - name: Finder thumbnails (macOS)
         if: runner.os == 'macOS'

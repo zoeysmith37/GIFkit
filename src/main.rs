@@ -33,6 +33,7 @@ mod timeline;
 mod track;
 mod interp;
 mod rife;
+mod update;
 #[cfg(windows)]
 mod winreg;
 mod theme;
@@ -50,6 +51,22 @@ fn main() -> eframe::Result {
     // `gifkit --thumbnail <project> <out.png> [size]`: for file managers
     // (a freedesktop thumbnailer); no window
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|a| a == "--version") {
+        println!("GIFkit {}", update::VERSION);
+        std::process::exit(0);
+    }
+    if args.get(1).is_some_and(|a| a == "--install-update") {
+        match args.get(2).map(|a| update::install_file(std::path::Path::new(a))) {
+            Some(Ok(())) => std::process::exit(0),
+            Some(Err(e)) => {
+                eprintln!("{e:#}");
+                std::process::exit(1);
+            }
+            None => std::process::exit(2),
+        }
+    }
+    // files a Windows update left behind, now free to go
+    update::clean_up();
     if args.get(1).is_some_and(|a| a == "--thumbnail") {
         let size = args.get(4).and_then(|s| s.to_str()).and_then(|s| s.parse().ok()).unwrap_or(256u32);
         let ok = match (args.get(2), args.get(3)) {
