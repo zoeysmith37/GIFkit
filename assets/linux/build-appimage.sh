@@ -9,9 +9,10 @@ dir=$tmp/GIFkit.AppDir
 mkdir -p "$dir/usr/bin" "$dir/usr/share/applications" "$dir/usr/share/icons/hicolor/scalable/apps"
 install -m 755 "$prog" "$dir/usr/bin/gifkit"
 ln -s usr/bin/gifkit "$dir/AppRun"
-cp "$here/../icon/gifkit.svg" "$dir/gifkit.svg"
+# a PNG for the AppImage's own icon (it must be one), the SVG for desktops
+cp "$here/../icon/gifkit-256.png" "$dir/gifkit.png"
+ln -s gifkit.png "$dir/.DirIcon"
 cp "$here/../icon/gifkit.svg" "$dir/usr/share/icons/hicolor/scalable/apps/gifkit.svg"
-ln -s gifkit.svg "$dir/.DirIcon"
 cat > "$dir/gifkit.desktop" <<DESKTOP
 [Desktop Entry]
 Type=Application
