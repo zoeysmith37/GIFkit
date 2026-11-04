@@ -68,6 +68,22 @@ jobs:
           cmp $prog target/release/gifkit
           $prog --version
 
+      # an AppImage too: one file, runs on most Linux systems
+      - name: AppImage (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          curl -fsSL -o $RUNNER_TEMP/appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x $RUNNER_TEMP/appimagetool
+          assets/linux/build-appimage.sh target/release/gifkit $RUNNER_TEMP/appimagetool "$PWD/gifkit-${{ matrix.name }}.AppImage"
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          ./gifkit-${{ matrix.name }}.AppImage --version
+          # and it updates itself
+          u=$RUNNER_TEMP/ai && mkdir -p $u && cp gifkit-${{ matrix.name }}.AppImage $u/GIFkit.AppImage
+          printf X >> $u/GIFkit.AppImage
+          $u/GIFkit.AppImage --install-update "$PWD/gifkit-${{ matrix.name }}.AppImage"
+          cmp $u/GIFkit.AppImage gifkit-${{ matrix.name }}.AppImage
+          ls -la $u
+
       # the real window drives itself through the app and writes a report
       - name: GUI smoke test (Linux)
         if: runner.os == 'Linux'
@@ -94,6 +110,13 @@ jobs:
           Copy-Item target/release/gifkit.exe, target/release/gifkit_thumbs.dll, README.md $d
           Copy-Item assets/*.txt $d
           Compress-Archive -Path $d -DestinationPath gifkit-${{ matrix.name }}.zip
+          # the installer
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF -like "refs/tags/v*") { $v = $env:GITHUB_REF.Substring(11) }
+          & $iscc /Q "/DAppVersion=$v" "/DSrc=$PWD\$d" "/O$PWD" assets/windows/gifkit.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       # the updater installs a release over a running copy of itself (the
       # running program and its DLL can only be renamed out of the way)
@@ -111,6 +134,32 @@ jobs:
           if ((Get-FileHash $prog).Hash -ne (Get-FileHash target/release/gifkit.exe).Hash) { Write-Host "::error::not replaced"; exit 1 }
           if (-not (Test-Path "$prog.old")) { Write-Host "::error::no .old left"; exit 1 }
           Get-ChildItem "$u\gifkit-${{ matrix.name }}" | ForEach-Object { Write-Host "::notice::$($_.Name)" }
+
+      # install for this user, update in place, uninstall
+      - name: Installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $p = Start-Process gifkit-${{ matrix.name }}-setup.exe -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CURRENTUSER", "/LOG=$PWD\setup.log" -PassThru -Wait
+          if ($p.ExitCode -ne 0) { Get-Content setup.log | Select-Object -Last 20 | ForEach-Object { Write-Host "::notice::$_" }; Write-Host "::error::setup failed ($($p.ExitCode))"; exit 1 }
+          $app = "$env:LOCALAPPDATA\Programs\GIFkit"
+          foreach ($f in "gifkit.exe", "gifkit_thumbs.dll", "unins000.exe") { if (-not (Test-Path "$app\$f")) { Write-Host "::error::$f not installed"; exit 1 } }
+          $q = Start-Process "$app\gifkit.exe" -ArgumentList "--version" -PassThru -Wait -RedirectStandardOutput ver.txt
+          Write-Host "::notice::installed $(Get-Content ver.txt)"
+          $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{8C2E5B71-4D3A-4F6E-9B12-7A0C3E5D9F24}_is1"
+          Write-Host "::notice::Apps list: $((Get-ItemProperty $key).DisplayName) $((Get-ItemProperty $key).DisplayVersion)"
+          if (-not (Test-Path "HKCU:\Software\Classes\.gifkit")) { Write-Host "::error::.gifkit not registered"; exit 1 }
+          # an update from inside the app, over the installed copy
+          [IO.File]::AppendAllText("$app\gifkit.exe", "X")
+          $q = Start-Process "$app\gifkit.exe" -ArgumentList "--install-update", "$PWD\gifkit-${{ matrix.name }}.zip" -PassThru -Wait
+          if ($q.ExitCode -ne 0) { Write-Host "::error::update of the installed copy failed"; exit 1 }
+          if ((Get-FileHash "$app\gifkit.exe").Hash -ne (Get-FileHash target/release/gifkit.exe).Hash) { Write-Host "::error::installed copy not updated"; exit 1 }
+          # uninstall (the uninstaller hands over to a copy of itself and returns)
+          Start-Process "$app\unins000.exe" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait
+          for ($i = 0; $i -lt 60 -and (Test-Path "$app\gifkit.exe"); $i++) { Start-Sleep 1 }
+          if (Test-Path "$app\gifkit.exe") { Write-Host "::error::uninstall left gifkit.exe"; exit 1 }
+          if (Test-Path "HKCU:\Software\Classes\.gifkit") { Write-Host "::error::uninstall left .gifkit registered"; exit 1 }
+          if (Test-Path "$app") { Get-ChildItem $app -Force | ForEach-Object { Write-Host "::notice::left: $($_.Name)" } }
 
       - name: Explorer thumbnails (Windows)
         if: runner.os == 'Windows'
@@ -254,7 +303,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: gifkit-${{ matrix.name }}
-          path: gifkit-${{ matrix.name }}.*
+          path: |
+            gifkit-${{ matrix.name }}.*
+            gifkit-${{ matrix.name }}-setup.exe
 
       # each system adds its own file to the release as soon as it's built,
       # so one slow or stuck runner never holds the others back
@@ -262,5 +313,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: gifkit-${{ matrix.name }}.*
+          files: |
+            gifkit-${{ matrix.name }}.*
+            gifkit-${{ matrix.name }}-setup.exe
           generate_release_notes: true

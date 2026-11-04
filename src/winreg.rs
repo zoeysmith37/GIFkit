@@ -16,6 +16,7 @@ extern "system" {
     fn RegCreateKeyExW(hkey: Hkey, sub: *const u16, reserved: u32, class: *const u16, options: u32, sam: u32, sec: *const c_void, out: *mut Hkey, disposition: *mut u32) -> u32;
     fn RegSetValueExW(hkey: Hkey, name: *const u16, reserved: u32, kind: u32, data: *const u8, len: u32) -> u32;
     fn RegCloseKey(hkey: Hkey) -> u32;
+    fn RegOpenKeyExW(hkey: Hkey, sub: *const u16, options: u32, sam: u32, out: *mut Hkey) -> u32;
 }
 
 #[link(name = "shell32")]
@@ -70,4 +71,21 @@ pub fn register(exe: &Path) -> Result<(), String> {
     const SHCNE_ASSOCCHANGED: i32 = 0x0800_0000;
     unsafe { SHChangeNotify(SHCNE_ASSOCCHANGED, 0, std::ptr::null(), std::ptr::null()) };
     Ok(())
+}
+
+/// Installed with the installer: the version shown in Settings ▸ Apps
+/// follows updates made from inside GIFkit.
+pub fn set_installed_version(version: &str) {
+    let mut h: Hkey = std::ptr::null_mut();
+    let path = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{8C2E5B71-4D3A-4F6E-9B12-7A0C3E5D9F24}_is1");
+    // only an existing entry (made by the installer for this user)
+    if unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, KEY_WRITE, &mut h) } != 0 {
+        return;
+    }
+    for (name, val) in [("DisplayVersion", version.to_string()), ("DisplayName", "GIFkit".to_string())] {
+        let n = wide(name);
+        let d = wide(&val);
+        unsafe { RegSetValueExW(h, n.as_ptr(), 0, REG_SZ, d.as_ptr() as *const u8, (d.len() * 2) as u32) };
+    }
+    unsafe { RegCloseKey(h) };
 }

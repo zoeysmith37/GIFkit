@@ -53,7 +53,7 @@ pub fn newer(a: &str, b: &str) -> bool {
 /// The release file for this computer.
 fn asset_name() -> Option<&'static str> {
     if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        Some("gifkit-linux-x86_64.tar.gz")
+        Some(if appimage().is_some() { "gifkit-linux-x86_64.AppImage" } else { "gifkit-linux-x86_64.tar.gz" })
     } else if cfg!(all(windows, target_arch = "x86_64")) {
         Some("gifkit-windows-x86_64.zip")
     } else if cfg!(target_os = "macos") {
@@ -61,6 +61,15 @@ fn asset_name() -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Running as an AppImage: the .AppImage file (the program itself sits in
+/// a read-only mount while it runs).
+fn appimage() -> Option<PathBuf> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    std::env::var_os("APPIMAGE").map(PathBuf::from).filter(|p| p.is_file())
 }
 
 fn curl() -> Command {
@@ -181,6 +190,8 @@ pub fn target() -> Result<Target, String> {
             return Err("Move GIFkit to Applications first".into());
         }
         Target::Bundle(b.to_path_buf())
+    } else if let Some(img) = appimage() {
+        Target::File(img)
     } else {
         Target::File(exe)
     };
@@ -316,9 +327,28 @@ pub fn install_file(archive: &Path) -> Result<()> {
 
 fn install(archive: &Path, target: &Target, version: &str) -> Result<()> {
     match target {
+        Target::File(img) if archive.to_string_lossy().ends_with(".AppImage") => install_appimage(archive, img, version),
         Target::File(exe) => install_files(archive, exe, version),
         Target::Bundle(app) => install_bundle(archive, app, version),
     }
+}
+
+/// AppImage: the new file in place of the old one. Tried out from the
+/// same folder first (/tmp may not allow running programs).
+fn install_appimage(new: &Path, img: &Path, version: &str) -> Result<()> {
+    let tmp = img.with_file_name(format!(".gifkit-update-{}.AppImage", std::process::id()));
+    std::fs::copy(new, &tmp).with_context(|| format!("Couldn't write {}", img.display()))?;
+    let r = (|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+        }
+        runs_as(&tmp, version)?;
+        std::fs::rename(&tmp, img).with_context(|| format!("Couldn't replace {}", img.display()))
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    r
 }
 
 /// Linux and Windows: the release's files into the program's folder. The

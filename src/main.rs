@@ -93,6 +93,7 @@ fn main() -> eframe::Result {
         }
         std::thread::spawn(move || {
             let _ = winreg::register(&exe);
+            winreg::set_installed_version(update::VERSION);
         });
     }
     // glibc keeps big blocks freed by our many worker threads (frames,
