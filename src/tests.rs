@@ -1647,20 +1647,32 @@ fn compact_project_round_trip() {
         image::Rgba([v, (x + y) as u8, 255 - v, 255])
     });
     let flat = image::RgbaImage::from_fn(200, 150, |x, _| image::Rgba([if x < 100 { 255 } else { 0 }, 0, 0, 255]));
-    let base = Animation { frames: vec![Frame::new(photo.clone(), 4), Frame::new(flat.clone(), 4)], loop_count: None };
+    // a video frame where only two corners changed: saved as a patch whose
+    // clear pixels mean "unchanged"
+    let mut moved = photo.clone();
+    for (x, y, p) in moved.enumerate_pixels_mut() {
+        if (x < 30 && y < 30) || (x > 170 && y > 120) {
+            *p = image::Rgba([(x * 7) as u8, (y * 5) as u8, 90, 255]);
+        }
+    }
+    let base = Animation { frames: vec![Frame::new(photo.clone(), 4), Frame::new(moved.clone(), 4), Frame::new(flat.clone(), 4)], loop_count: None };
     let dir = std::env::temp_dir().join(format!("gf_compact_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let (a, b) = (dir.join("a.gifkit"), dir.join("b.gifkit"));
     save(&a, ProjectFile::default(), &base, None, &HashMap::new(), &HashMap::new(), None).unwrap();
     save(&b, ProjectFile { compact: true, ..Default::default() }, &base, None, &HashMap::new(), &HashMap::new(), None).unwrap();
     let (sa, sb) = (std::fs::metadata(&a).unwrap().len(), std::fs::metadata(&b).unwrap().len());
-    assert!(sb * 3 < sa, "compact is much smaller ({sb} vs {sa})");
+    assert!(sb * 2 < sa, "compact is much smaller ({sb} vs {sa})");
     let p = load(&b).unwrap();
     assert!(p.file.compact);
     let got = p.base.frames[0].image.get();
     let err: f64 = got.pixels().zip(photo.pixels()).map(|(x, y)| (0..3).map(|c| (x[c] as f64 - y[c] as f64).abs()).sum::<f64>()).sum::<f64>() / (200.0 * 150.0 * 3.0);
     assert!(err < 3.0, "close to the original (mean error {err})");
-    assert_eq!(p.base.frames[1].image.get().as_raw(), flat.as_raw(), "few colours stay exact");
+    let got = p.base.frames[1].image.get();
+    assert!(got.pixels().all(|q| q[3] == 255), "a patched video frame has no holes");
+    let err: f64 = got.pixels().zip(moved.pixels()).map(|(x, y)| (0..3).map(|c| (x[c] as f64 - y[c] as f64).abs()).sum::<f64>()).sum::<f64>() / (200.0 * 150.0 * 3.0);
+    assert!(err < 3.0, "the patched frame is close too (mean error {err})");
+    assert_eq!(p.base.frames[2].image.get().as_raw(), flat.as_raw(), "few colours stay exact");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

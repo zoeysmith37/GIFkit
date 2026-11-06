@@ -405,7 +405,10 @@ fn unpack_pool(meta: &[PicMeta], raw: &mut HashMap<String, Vec<u8>>) -> Result<V
                     let mut base = (**live.get(&o).with_context(|| format!("picture {i} is damaged"))?).clone();
                     for (x, y, p) in img.enumerate_pixels() {
                         let (tx, ty) = (x + m.x, y + m.y);
-                        if tx < base.width() && ty < base.height() && !(m.keep && p.0 == [0, 0, 0, 0]) {
+                        // keep patches only cover solid pixels, so any clear one
+                        // means "unchanged": WebP doesn't keep the colour of clear
+                        // pixels, only that they're clear
+                        if tx < base.width() && ty < base.height() && !(m.keep && p.0[3] == 0) {
                             base.put_pixel(tx, ty, *p);
                         }
                     }
