@@ -1407,6 +1407,8 @@ fn layer_masks() {
         ("stays put", vec![(LayerKind::Shape(Box::new(crate::shapes::ShapeSettings { w: 80, h: 60, ..shape.clone() })), false, m(ShapeKind::Ellipse, 40.0, 30.0, 40.0, 30.0, 0.0, 0.0, false, false))], true),
         ("masked base, clipped effect", vec![(LayerKind::Shape(Box::new(shape.clone())), false, m(ShapeKind::Heart, 80.0, 60.0, 90.0, 80.0, 0.0, 0.0, false, true)), (neg.clone(), true, None)], false),
         ("clipped and masked", vec![(LayerKind::Shape(Box::new(shape.clone())), false, None), (neg, true, m(ShapeKind::Rounded, 80.0, 60.0, 60.0, 60.0, 15.0, 4.0, true, true))], false),
+        ("text", vec![(LayerKind::Shape(Box::new(shape.clone())), false, Some(LayerMask { shapes: vec![crate::shapes::MaskShape { form: crate::shapes::MaskForm::Text, text: "HI".into(), cx: 80.0, cy: 60.0, w: 120.0, h: 80.0, angle: 10.0, ..Default::default() }], ..Default::default() }))], false),
+        ("drawn, flipped", vec![(LayerKind::Shape(Box::new(shape.clone())), false, Some(LayerMask { shapes: vec![crate::shapes::MaskShape { form: crate::shapes::MaskForm::Drawn, path: vec![[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5]], flip: [true, false], cx: 80.0, cy: 60.0, w: 100.0, h: 80.0, ..Default::default() }], ..Default::default() }))], false),
     ];
     let mut gpu = crate::gpu_render::GpuRenderer::headless();
     let mut worst_case = 0.0f64;
@@ -1437,6 +1439,12 @@ fn layer_masks() {
             "moves with it" => assert!(blue(70, 40) && !blue(40, 30), "{name}: the hole moves 30 right, 10 down with the shape"),
             "stays put" => assert!(blue(40, 30) && !blue(70, 40) && !blue(75, 65), "{name}: the shape moved, the mask didn't"),
             "masked base, clipped effect" => assert_eq!(cpu.get_pixel(80, 60).0, [255, 255, 0, 255], "{name}: inverted blue inside the heart"),
+            // the triangle's corner is top-left, flipped: top-right
+            "drawn, flipped" => assert!(blue(125, 25) && !blue(35, 25), "{name}"),
+            "text" => {
+                let n = (0..160).flat_map(|x| (0..120).map(move |y| (x, y))).filter(|&(x, y)| blue(x, y)).count();
+                assert!(n > 800 && n < 9000, "{name}: letters' worth of the shape shows ({n})");
+            }
             _ => {}
         }
         let Some(g) = gpu.as_mut() else { continue };

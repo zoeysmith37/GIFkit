@@ -560,11 +560,24 @@ pub fn map_scale(m: &Affine) -> f32 {
 
 // ---------------------------------------------------------------- layer masks
 
+/// What a mask shape is drawn from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum MaskForm {
+    /// a shape: rectangle, ellipse, star...
+    #[default]
+    Shape,
+    /// the letters of some text, stretched to the box
+    Text,
+    /// a line drawn by hand (lasso), closed
+    Drawn,
+}
+
 /// One shape of a mask: where it is, its edge, and whether it adds to the
 /// mask or cuts out of it.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct MaskShape {
+    pub form: MaskForm,
     pub kind: ShapeKind,
     /// its box in source-frame pixels: centre, size, clockwise degrees
     pub cx: f32,
@@ -583,21 +596,61 @@ pub struct MaskShape {
     /// its name in the layer list ("": Mask 1, Mask 2...)
     #[serde(skip_serializing_if = "String::is_empty")]
     pub name: String,
+    /// mirrored left to right, top to bottom, in its box
+    pub flip: [bool; 2],
+    /// Text: the words, and the font's name ("": the first font)
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub font: String,
+    /// Drawn: the line's points, across the box from -0.5 to 0.5
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub path: Vec<[f32; 2]>,
 }
 
 impl Default for MaskShape {
     fn default() -> Self {
-        Self { kind: ShapeKind::Ellipse, cx: 0.0, cy: 0.0, w: 0.0, h: 0.0, angle: 0.0, corner: 20.0, points: 5, feather: 0.0, subtract: false, name: String::new() }
+        Self {
+            form: MaskForm::Shape,
+            kind: ShapeKind::Ellipse,
+            cx: 0.0,
+            cy: 0.0,
+            w: 0.0,
+            h: 0.0,
+            angle: 0.0,
+            corner: 20.0,
+            points: 5,
+            feather: 0.0,
+            subtract: false,
+            name: String::new(),
+            flip: [false; 2],
+            text: String::new(),
+            font: String::new(),
+            path: Vec::new(),
+        }
     }
 }
 
 impl MaskShape {
-    /// Its name, as listed: given, else "Mask 2" for the second.
+    /// Its name, as listed: given, else the text it shows, else "Mask 2"
+    /// for the second.
     pub fn label(&self, k: usize) -> String {
-        if self.name.trim().is_empty() {
-            format!("Mask {}", k + 1)
-        } else {
+        if !self.name.trim().is_empty() {
             self.name.clone()
+        } else if self.form == MaskForm::Text && !self.text.trim().is_empty() {
+            let t: String = self.text.trim().chars().take(24).collect();
+            format!("“{t}”")
+        } else {
+            format!("Mask {}", k + 1)
+        }
+    }
+
+    /// What it is, in a few words.
+    pub fn what(&self) -> &'static str {
+        match self.form {
+            MaskForm::Shape => self.kind.label(),
+            MaskForm::Text => "Text",
+            MaskForm::Drawn => "Drawn",
         }
     }
 
@@ -679,16 +732,64 @@ impl LayerMask {
 /// top-left goes. `boxes`: each shape's box in output space; `scale` turns
 /// source pixels into output pixels. Only the part inside `area` (x0, y0,
 /// x1, y1) is made: past it nothing shows. None: nothing to draw there.
-pub fn mask_sprite(mk: &LayerMask, boxes: &[Obb], scale: f32, area: (f32, f32, f32, f32)) -> Option<(RgbaImage, i64, i64)> {
-    // each shape's path and the region it needs (with room for its edge)
+pub fn mask_sprite(mk: &LayerMask, boxes: &[Obb], scale: f32, area: (f32, f32, f32, f32), fonts: &[crate::text::FontEntry]) -> Option<(RgbaImage, i64, i64)> {
+    enum Fill {
+        Path(tiny_skia::Path),
+        /// letters' coverage, stretched over the box
+        Picture(Pixmap),
+    }
+    // each shape's outline (or letters) and the region it needs (with room
+    // for its edge)
     let mut parts = Vec::new();
     let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
     for (sh, o) in mk.shapes.iter().zip(boxes) {
         if o.w < 0.5 || o.h < 0.5 {
             continue;
         }
-        let s = ShapeSettings { kind: sh.kind, corner: sh.corner, points: sh.points, ..Default::default() };
-        let Some(path) = shape_path(&s, o.w / 2.0, o.h / 2.0) else { continue };
+        let (hw, hh) = (o.w / 2.0, o.h / 2.0);
+        let fill = match sh.form {
+            MaskForm::Shape => {
+                let s = ShapeSettings { kind: sh.kind, corner: sh.corner, points: sh.points, ..Default::default() };
+                match shape_path(&s, hw, hh) {
+                    Some(p) => Fill::Path(p),
+                    None => continue,
+                }
+            }
+            MaskForm::Drawn => {
+                let mut pb = PathBuilder::new();
+                for (k, q) in sh.path.iter().enumerate() {
+                    let (x, y) = (q[0].clamp(-0.5, 0.5) * o.w, q[1].clamp(-0.5, 0.5) * o.h);
+                    if k == 0 {
+                        pb.move_to(x, y);
+                    } else {
+                        pb.line_to(x, y);
+                    }
+                }
+                pb.close();
+                match pb.finish() {
+                    Some(p) if sh.path.len() >= 3 => Fill::Path(p),
+                    _ => continue,
+                }
+            }
+            MaskForm::Text => {
+                if fonts.is_empty() || sh.text.trim().is_empty() {
+                    continue;
+                }
+                let f = fonts.iter().find(|f| f.name == sh.font).unwrap_or(&fonts[0]);
+                // drawn about as tall as the box, then stretched to it
+                let size = (o.h * 0.8).clamp(8.0, 600.0);
+                let (tw, th, cov) = crate::text::rasterize_upto(f, sh.text.trim(), size, crate::text::Align::Center, None);
+                if tw == 0 || th == 0 || (tw as u64 * th as u64) > 40_000_000 {
+                    continue;
+                }
+                let Some(mut pm) = Pixmap::new(tw, th) else { continue };
+                for (px, c) in pm.pixels_mut().iter_mut().zip(cov) {
+                    let a = (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    *px = tiny_skia::PremultipliedColorU8::from_rgba(a, a, a, a).unwrap_or(tiny_skia::PremultipliedColorU8::TRANSPARENT);
+                }
+                Fill::Picture(pm)
+            }
+        };
         let fe = (sh.feather * scale).clamp(0.0, 2000.0);
         let pad = (fe * 1.5).ceil() + 2.0;
         // a cut only matters where something was added
@@ -697,7 +798,7 @@ pub fn mask_sprite(mk: &LayerMask, boxes: &[Obb], scale: f32, area: (f32, f32, f
                 (x0, y0, x1, y1) = (x0.min(c.0 - pad), y0.min(c.1 - pad), x1.max(c.0 + pad), y1.max(c.1 + pad));
             }
         }
-        parts.push((path, *o, fe, sh.subtract));
+        parts.push((fill, *o, fe, sh.subtract, sh.flip));
     }
     let (x0, y0) = (x0.max(area.0 - 2.0).floor(), y0.max(area.1 - 2.0).floor());
     let (x1, y1) = (x1.min(area.2 + 2.0).ceil(), y1.min(area.3 + 2.0).ceil());
@@ -711,10 +812,18 @@ pub fn mask_sprite(mk: &LayerMask, boxes: &[Obb], scale: f32, area: (f32, f32, f
     }
     let mut acc = vec![0.0f32; (w * h) as usize];
     let mut pm = Pixmap::new(w.max(1), h.max(1))?;
-    for (path, o, fe, subtract) in parts {
+    for (fill, o, fe, subtract, flip) in parts {
         pm.fill(tiny_skia::Color::TRANSPARENT);
-        let tf = Transform::from_rotate(o.angle).post_translate(o.cx - x0, o.cy - y0);
-        pm.fill_path(&path, &paint([255, 255, 255], 255), FillRule::Winding, tf, None);
+        let tf = Transform::from_rotate(o.angle).post_translate(o.cx - x0, o.cy - y0).pre_scale(if flip[0] { -1.0 } else { 1.0 }, if flip[1] { -1.0 } else { 1.0 });
+        match &fill {
+            Fill::Path(path) => pm.fill_path(path, &paint([255, 255, 255], 255), FillRule::Winding, tf, None),
+            Fill::Picture(pic) => {
+                // the letters' picture scaled onto the box, centred on it
+                let (pw, ph) = (pic.width() as f32, pic.height() as f32);
+                let ptf = tf.pre_translate(-o.w / 2.0, -o.h / 2.0).pre_scale(o.w / pw, o.h / ph);
+                pm.draw_pixmap(0, 0, pic.as_ref(), &PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..Default::default() }, ptf, None);
+            }
+        }
         let mut a: Vec<u8> = pm.pixels().iter().map(|p| p.alpha()).collect();
         if fe >= 0.3 {
             blur_u8(&mut a, w as usize, h as usize, fe / 2.0);

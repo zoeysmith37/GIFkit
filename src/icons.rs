@@ -24,7 +24,7 @@ static ICONS: &[(&str, &str, &str)] = icon_set!(
     "transform-crop", "transform-scale", "view-fullscreen", "view-grid", "view-history", "view-refresh",
     "view-split-left-right", "view-hidden", "view-visible", "window-close", "zoom-fit-best", "zoom-in", "zoom-original", "zoom-out",
     "snap", "zone-in", "zone-out", "object-locked", "object-unlocked", "edit-copy", "edit-paste", "bookmark-new", "bookmark-remove",
-    "keyframe-next", "keyframe-previous", "view-filter", "animation-stage", "overflow-menu", "edit-find", "edit-clear", "mask-alpha",
+    "keyframe-next", "keyframe-previous", "view-filter", "animation-stage", "overflow-menu", "edit-find", "edit-clear", "mask-alpha", "layer-mask", "draw-freehand-lasso",
 );
 
 fn hex(c: Color32) -> String {
@@ -64,10 +64,26 @@ pub(crate) fn render(svg: &str, px: u32) -> Option<egui::ColorImage> {
     Some(egui::ColorImage::from_rgba_premultiplied([px as usize, px as usize], &rgba))
 }
 
-/// Texture of an icon drawn `size` points wide in `col`.
+/// How many screen pixels an icon `size` points wide is drawn at. Breeze's
+/// designs are drawn on a 16 and a 22 pixel grid: drawn at those sizes (or
+/// twice them) every line lands on a pixel, while at 13 or 19 pixels the
+/// one-pixel lines smear into grey. So within a quarter of a design size,
+/// that size is used: a little bigger or smaller, but sharp.
+pub fn pixels(ctx: &egui::Context, size: f32) -> u32 {
+    let px = (size * ctx.pixels_per_point()).round().max(1.0);
+    let design = if size <= 19.0 { 16.0 } else { 22.0 };
+    for c in [design, design * 2.0] {
+        if (px - c).abs() <= c * 0.25 {
+            return c as u32;
+        }
+    }
+    px as u32
+}
+
+/// Texture of an icon drawn `size` points wide in `col`, `pixels` across.
 pub fn texture(ctx: &egui::Context, name: &str, size: f32, col: Color32) -> Option<TextureHandle> {
     static CACHE: OnceLock<Mutex<HashMap<(String, u32, [u8; 4]), TextureHandle>>> = OnceLock::new();
-    let px = (size * ctx.pixels_per_point()).round().max(1.0) as u32;
+    let px = pixels(ctx, size);
     let theme = crate::theme::icon_theme().unwrap_or_default();
     let key = (format!("{theme}/{name}"), px, col.to_array());
     let cache = CACHE.get_or_init(Default::default);
@@ -84,7 +100,9 @@ pub fn texture(ctx: &egui::Context, name: &str, size: f32, col: Color32) -> Opti
             render(&recolour(if design == 16 { s16 } else { s22 }, col), px)?
         }
     };
-    let t = ctx.load_texture(format!("icon-{name}-{px}"), img, TextureOptions::LINEAR);
+    // shown at exactly its pixels (see `paint`), so no smoothing: a half
+    // pixel off would blur every line
+    let t = ctx.load_texture(format!("icon-{name}-{px}"), img, TextureOptions::NEAREST);
     cache.lock().ok()?.insert(key, t.clone());
     Some(t)
 }
@@ -137,7 +155,10 @@ fn system_svg(theme: &str, name: &str, size: u32) -> Option<String> {
 /// An icon as an egui image, for buttons and menu entries.
 pub fn image(ctx: &egui::Context, name: &str, size: f32, col: Color32) -> egui::Image<'static> {
     match texture(ctx, name, size, col) {
-        Some(t) => egui::Image::from_texture((t.id(), egui::vec2(size, size))).fit_to_exact_size(egui::vec2(size, size)),
+        Some(t) => {
+            let s = pixels(ctx, size) as f32 / ctx.pixels_per_point();
+            egui::Image::from_texture((t.id(), egui::vec2(s, s))).fit_to_exact_size(egui::vec2(s, s))
+        }
         None => egui::Image::from_texture((egui::TextureId::default(), egui::vec2(0.0, 0.0))),
     }
 }
@@ -145,10 +166,12 @@ pub fn image(ctx: &egui::Context, name: &str, size: f32, col: Color32) -> egui::
 /// Paint an icon centred on `c`.
 pub fn paint(painter: &egui::Painter, name: &str, c: egui::Pos2, size: f32, col: Color32) {
     if let Some(t) = texture(painter.ctx(), name, size, col) {
-        // snap to whole pixels so the thin strokes stay crisp
+        // its own pixels, snapped to whole screen pixels, so the thin
+        // strokes stay crisp
         let ppp = painter.ctx().pixels_per_point();
-        let min = ((c.to_vec2() - egui::vec2(size, size) / 2.0) * ppp).round() / ppp;
-        let r = egui::Rect::from_min_size(min.to_pos2(), egui::vec2(size, size));
+        let s = pixels(painter.ctx(), size) as f32 / ppp;
+        let min = ((c.to_vec2() - egui::vec2(s, s) / 2.0) * ppp).round() / ppp;
+        let r = egui::Rect::from_min_size(min.to_pos2(), egui::vec2(s, s));
         painter.image(t.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
     }
 }

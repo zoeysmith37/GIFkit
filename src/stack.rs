@@ -1031,13 +1031,13 @@ impl Stack {
                 } else {
                     (0.0, 0.0, fw, fh)
                 };
-                shapes::mask_sprite(mk, &boxes, shapes::map_scale(m), area)
+                shapes::mask_sprite(mk, &boxes, shapes::map_scale(m), area, fonts)
             })
             .collect();
         let base_mask = self.transform.active_mask().and_then(|mk| {
             let g = self.eff_transform(true).geo_map(base.width(), base.height());
             let boxes: Vec<Obb> = mk.shapes.iter().map(|sh| map_box(&g.m, sh.obb(), false)).collect();
-            shapes::mask_sprite(mk, &boxes, shapes::map_scale(&g.m), (0.0, 0.0, g.w, g.h))
+            shapes::mask_sprite(mk, &boxes, shapes::map_scale(&g.m), (0.0, 0.0, g.w, g.h), fonts)
         });
         static PREP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let id = PREP_ID.fetch_add(1, Ordering::Relaxed) | (1 << 62);
