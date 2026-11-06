@@ -4780,6 +4780,10 @@ impl GifKitApp {
     fn open_path_now(&mut self, p: PathBuf, ctx: &egui::Context) {
         self.add_recent(&p);
         if crate::project::is_project(&p) {
+            if self.busy() {
+                return;
+            }
+            self.unload_for_open();
             self.spawn_in(ctx, "Open project", 1, false, move |_| JobOutput::ProjectLoaded(crate::project::load(&p).map(|pr| (pr, p.clone()))));
             return;
         }
@@ -4810,6 +4814,10 @@ impl GifKitApp {
             }
             return;
         }
+        if self.busy() {
+            return;
+        }
+        self.unload_for_open();
         self.spawn(ctx, "Open", 1, move |_| {
             let size = std::fs::metadata(&p).ok().map(|m| m.len());
             JobOutput::Loaded(io::load_animation(&p).map(|a| (a, Some(p.clone()), size)))
@@ -4819,6 +4827,10 @@ impl GifKitApp {
     /// Import a video with the chosen range, frame rate and size.
     fn import_video(&mut self, ctx: &egui::Context, p: PathBuf, opt: io::VideoImport) {
         let total = opt.frames();
+        if self.busy() {
+            return;
+        }
+        self.unload_for_open();
         self.spawn_in(ctx, "Importing video", total, false, move |pr| {
             // a video's size says nothing about GIF sizes, so don't compare against it
             JobOutput::Loaded(io::load_video_range(&p, &opt, Some(pr)).map(|a| (a, Some(p.clone()), None)))
@@ -4901,6 +4913,10 @@ impl GifKitApp {
             return;
         }
         let n = ps.len();
+        if self.busy() {
+            return;
+        }
+        self.unload_for_open();
         self.spawn(ctx, "Open sequence", n, move |_| JobOutput::Loaded(io::load_sequence(&ps, 10).map(|a| (a, None, None))));
     }
 
@@ -7159,6 +7175,24 @@ impl GifKitApp {
         self.close_document();
     }
 
+    /// Close what's open before another file loads, so it doesn't keep
+    /// playing, compressing and holding memory while the new one opens.
+    /// Only after any "save changes?" question has been answered.
+    fn unload_for_open(&mut self) {
+        if self.base.is_none() {
+            return;
+        }
+        self.playing = false;
+        if let Some(j) = self.cmp_job.take() {
+            j.stop.fetch_or(stack::STOP_BIT, Ordering::Relaxed);
+        }
+        self.live_job = None;
+        self.close_document();
+        self.prep_cache = None;
+        self.last_comp = None;
+        self.free_gpu_frames();
+    }
+
     /// Forget the open animation and everything done to it.
     fn close_document(&mut self) {
         self.clear_autosave();
@@ -8752,6 +8786,17 @@ impl GifKitApp {
         let r = ui.available_rect_before_wrap();
         let resp = ui.allocate_rect(r, Sense::click());
         let c = r.center();
+        // the last one was closed for the one loading now
+        if let Some(j) = &self.job {
+            ui.painter().text(c + vec2(0.0, -6.0), egui::Align2::CENTER_CENTER, format!("{}…", j.label), theme::medium(20.0), mix(pal.canvas, pal.fg, 0.75));
+            let f = j.progress.load(Ordering::Relaxed) as f32 / j.total as f32;
+            if j.total > 1 {
+                ui.put(Rect::from_center_size(c + vec2(0.0, 26.0), vec2(240.0, 8.0)), egui::ProgressBar::new(f.clamp(0.0, 1.0)).desired_height(8.0));
+            } else {
+                ui.put(Rect::from_center_size(c + vec2(0.0, 30.0), vec2(24.0, 24.0)), egui::Spinner::new().size(22.0));
+            }
+            return;
+        }
         crate::icons::paint(ui.painter(), "document-open", c - vec2(0.0, 70.0), 64.0, mix(pal.canvas, pal.fg, 0.4));
         ui.painter().text(c + vec2(0.0, -6.0), egui::Align2::CENTER_CENTER, "No Animation Open", theme::medium(20.0), mix(pal.canvas, pal.fg, 0.75));
         let help = if self.ffmpeg { "Open or drop a GIF, APNG, WebP, video or a set of images" } else { "Open or drop a GIF, APNG, WebP or a set of images" };
@@ -10048,18 +10093,12 @@ impl GifKitApp {
                     } else if encoding {
                         "⚠ Compressing"
                     } else if !self.auto_compress {
-                        "Not compressed · showing the edit"
+                        "Not compressed · Ctrl+R to compress"
                     } else {
                         "⚠ Not compressed yet"
                     };
                     self.onion_paint = self.onion_frames(ctx);
                     let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, None, Some(badge.into()), encoding);
-                    if !self.auto_compress && !encoding && self.preview_format().is_some() {
-                        let at = Rect::from_min_size(rect.left_top() + vec2(10.0, 82.0), vec2(110.0, 26.0));
-                        if ui.put(at, egui::Button::image_and_text(crate::icons::image(ui.ctx(), "view-refresh", 16.0, p().fg), "Compress")).on_hover_text("Compress the preview now (Ctrl+R)").clicked() {
-                            self.cmp_go = self.cmp_key();
-                        }
-                    }
                     if !crop_mode {
                         self.canvas_interaction(ui, &resp, m, (size.x, size.y), Space::Output, vi);
                     }
