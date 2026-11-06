@@ -900,7 +900,7 @@ fn shapes_render_every_kind() {
     for k in ShapeKind::ALL.into_iter().chain([ShapeKind::Emoji]) {
         for shadow in [false, true] {
             let s = ShapeSettings { kind: k, shadow, ..Default::default() };
-            let (img, x, y) = shape_sprite(&s, Obb { cx: 100.0, cy: 80.0, w: 120.0, h: 70.0, angle: 20.0 }, 1.0).unwrap_or_else(|| panic!("{k:?} gave no sprite"));
+            let (img, x, y) = shape_sprite(&s, Obb { cx: 100.0, cy: 80.0, w: 120.0, h: 70.0, angle: 20.0 }, 1.0, [false; 2]).unwrap_or_else(|| panic!("{k:?} gave no sprite"));
             let opaque = img.pixels().filter(|p| p[3] > 200).count();
             assert!(opaque > 200, "{k:?} shadow={shadow}: only {opaque} opaque pixels");
             // the sprite covers the rotated box
@@ -909,7 +909,7 @@ fn shapes_render_every_kind() {
     }
     // fill off + outline on leaves the middle clear
     let s = ShapeSettings { kind: ShapeKind::Rect, fill_on: false, stroke_on: true, stroke_w: 3.0, ..Default::default() };
-    let (img, x, y) = shape_sprite(&s, Obb { cx: 50.0, cy: 50.0, w: 60.0, h: 60.0, angle: 0.0 }, 1.0).unwrap();
+    let (img, x, y) = shape_sprite(&s, Obb { cx: 50.0, cy: 50.0, w: 60.0, h: 60.0, angle: 0.0 }, 1.0, [false; 2]).unwrap();
     assert_eq!(img.get_pixel((50 - x) as u32, (50 - y) as u32)[3], 0);
     assert!(img.get_pixel((20 - x) as u32, (50 - y) as u32)[3] > 200);
 }
@@ -1050,11 +1050,11 @@ fn project_round_trip() {
     let overlay: Vec<image::RgbaImage> = (0..3).map(|i| image::RgbaImage::from_pixel(8, 6, image::Rgba([i * 80, 10, 200, 255]))).collect();
     let wm = Arc::new(image::RgbaImage::from_pixel(5, 5, image::Rgba([1, 2, 3, 128])));
     let layers = vec![
-        ProjLayerEntry { clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: Some("Caption".into()), timing: Default::default(), layer: ProjLayer::Text { text: crate::text::Annotation { text: "hi".into(), stretch: 0.7, ..Default::default() }, font: Some(("builtin".into(), "Sans Bold".into())) } },
-        ProjLayerEntry { clip: false, opacity: 100.0, color: None, locked: false, visible: false, label: None, timing: Default::default(), layer: ProjLayer::Image { id: 1, name: "ov.png".into(), path: None, delays: vec![5, 5, 5], placements: vec![Default::default(); base.len()], opacity: 80.0 } },
-        ProjLayerEntry { clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: Default::default(), layer: ProjLayer::Watermark { id: 2, watermark: Default::default(), has_image: true } },
-        ProjLayerEntry { clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: crate::timeline::Timing { clips: Some(vec![crate::timeline::Clip { start: 2, end: Some(5) }]), keys: vec![crate::timeline::Key { frame: 3, x: 10.0, ..Default::default() }] }, layer: ProjLayer::Emoji { emoji: crate::shapes::EmojiSettings { emoji: "1f525".into(), w: 20, h: 20, ..Default::default() } } },
-        ProjLayerEntry { clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: Default::default(), layer: ProjLayer::Markup { markup: crate::shapes::MarkupSettings { strokes: vec![crate::shapes::PenStroke { points: vec![[1.0, 2.0], [3.0, 4.0]], ..Default::default() }] } } },
+        ProjLayerEntry { flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: Some("Caption".into()), timing: Default::default(), layer: ProjLayer::Text { text: crate::text::Annotation { text: "hi".into(), stretch: 0.7, ..Default::default() }, font: Some(("builtin".into(), "Sans Bold".into())) } },
+        ProjLayerEntry { flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: false, label: None, timing: Default::default(), layer: ProjLayer::Image { id: 1, name: "ov.png".into(), path: None, delays: vec![5, 5, 5], placements: vec![Default::default(); base.len()], opacity: 80.0 } },
+        ProjLayerEntry { flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: Default::default(), layer: ProjLayer::Watermark { id: 2, watermark: Default::default(), has_image: true } },
+        ProjLayerEntry { flip: [true, false], mask: Some(crate::shapes::LayerMask { kind: crate::shapes::ShapeKind::Star, invert: true, feather: 3.0, cx: 5.0, cy: 6.0, w: 7.0, h: 8.0, ..Default::default() }), clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: crate::timeline::Timing { clips: Some(vec![crate::timeline::Clip { start: 2, end: Some(5) }]), keys: vec![crate::timeline::Key { frame: 3, x: 10.0, ..Default::default() }] }, layer: ProjLayer::Emoji { emoji: crate::shapes::EmojiSettings { emoji: "1f525".into(), w: 20, h: 20, ..Default::default() } } },
+        ProjLayerEntry { flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: Default::default(), layer: ProjLayer::Markup { markup: crate::shapes::MarkupSettings { strokes: vec![crate::shapes::PenStroke { points: vec![[1.0, 2.0], [3.0, 4.0]], ..Default::default() }] } } },
     ];
     let mut transform = crate::stack::Transform::default();
     transform.reverse = true;
@@ -1086,6 +1086,11 @@ fn project_round_trip() {
     assert_eq!(pr.file.layers[3].timing.spans(10), vec![(2, 5)]);
     assert_eq!(pr.file.layers[3].timing.keys[0].x, 10.0);
     assert!(pr.file.layers[0].timing.is_default());
+    // a mask and a flip come back; layers without stay without
+    assert_eq!(pr.file.layers[3].flip, [true, false]);
+    let m = pr.file.layers[3].mask.as_ref().unwrap();
+    assert!(m.invert && m.kind == crate::shapes::ShapeKind::Star && m.feather == 3.0 && m.w == 7.0 && m.linked && m.on);
+    assert!(pr.file.layers[0].mask.is_none() && pr.file.layers[0].flip == [false; 2]);
     // an unchanged original isn't stored twice
     let f2 = ProjectFile::default();
     save(&path, f2, &base, Some(&base.clone()), &HashMap::new(), &HashMap::new(), None).unwrap();

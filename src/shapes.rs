@@ -322,7 +322,8 @@ fn pixmap_to_rgba(p: &Pixmap) -> RgbaImage {
 
 /// Draw a shape into an output-space box. Returns the sprite and where its
 /// top-left corner goes. `scale` turns source pixels (stroke width) into output pixels.
-pub fn shape_sprite(s: &ShapeSettings, o: Obb, scale: f32) -> Option<(RgbaImage, i64, i64)> {
+/// `flip`: mirrored left to right, top to bottom (in the shape's own box).
+pub fn shape_sprite(s: &ShapeSettings, o: Obb, scale: f32, flip: [bool; 2]) -> Option<(RgbaImage, i64, i64)> {
     if o.w < 1.0 || o.h < 1.0 {
         return None;
     }
@@ -340,10 +341,10 @@ pub fn shape_sprite(s: &ShapeSettings, o: Obb, scale: f32) -> Option<(RgbaImage,
         return None;
     }
     let mut pm = Pixmap::new(pw, ph)?;
-    let tf = Transform::from_rotate(o.angle).post_translate(o.cx - x0, o.cy - y0);
+    let tf = Transform::from_rotate(o.angle).post_translate(o.cx - x0, o.cy - y0).pre_scale(if flip[0] { -1.0 } else { 1.0 }, if flip[1] { -1.0 } else { 1.0 });
 
     if s.kind == ShapeKind::Emoji {
-        return emoji_sprite(&s.emoji, o, s.shadow.then_some(&s.shadow_style));
+        return emoji_sprite(&s.emoji, o, s.shadow.then_some(&s.shadow_style), flip);
     }
 
     let path = shape_path(s, hw, hh)?;
@@ -417,7 +418,7 @@ impl EmojiSettings {
 }
 
 /// Draw an emoji into an output-space box (vector, so sharp at any size).
-pub fn emoji_sprite(file: &str, o: Obb, shadow: Option<&Shadow>) -> Option<(RgbaImage, i64, i64)> {
+pub fn emoji_sprite(file: &str, o: Obb, shadow: Option<&Shadow>, flip: [bool; 2]) -> Option<(RgbaImage, i64, i64)> {
     if o.w < 1.0 || o.h < 1.0 {
         return None;
     }
@@ -432,7 +433,10 @@ pub fn emoji_sprite(file: &str, o: Obb, shadow: Option<&Shadow>) -> Option<(Rgba
         return None;
     }
     let mut pm = Pixmap::new(pw, ph)?;
-    let tf = Transform::from_rotate(o.angle).post_translate(o.cx - x0, o.cy - y0).pre_translate(-o.w / 2.0, -o.h / 2.0);
+    let tf = Transform::from_rotate(o.angle)
+        .post_translate(o.cx - x0, o.cy - y0)
+        .pre_scale(if flip[0] { -1.0 } else { 1.0 }, if flip[1] { -1.0 } else { 1.0 })
+        .pre_translate(-o.w / 2.0, -o.h / 2.0);
     if let Some(sh) = shadow {
         sh.draw(&mut pm, size, tf, |p, t| crate::emoji::draw(file, &mut p.as_mut(), o.w, o.h, t))?;
     }
@@ -552,4 +556,130 @@ pub fn stroke_sprite(s: &PenStroke, pts: &[(f32, f32)], width: f32) -> Option<St
 /// Average scale of an affine map (for stroke widths).
 pub fn map_scale(m: &Affine) -> f32 {
     m.det().abs().sqrt().max(1e-3)
+}
+
+// ---------------------------------------------------------------- layer masks
+
+/// A layer mask: a shape the layer shows inside (or, inverted, outside of),
+/// with a soft edge. As Photoshop's vector masks.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct LayerMask {
+    pub kind: ShapeKind,
+    /// the shape's box in source-frame pixels: centre, size, clockwise degrees
+    pub cx: f32,
+    pub cy: f32,
+    pub w: f32,
+    pub h: f32,
+    pub angle: f32,
+    /// corner rounding (Rounded), % of the short side
+    pub corner: f32,
+    /// points (Star)
+    pub points: u32,
+    /// soft edge, source pixels
+    pub feather: f32,
+    /// show outside the shape instead: cuts a hole
+    pub invert: bool,
+    /// moves with the layer's keyframes (off: stays put as the layer moves)
+    pub linked: bool,
+    /// off: kept but not used
+    pub on: bool,
+}
+
+impl Default for LayerMask {
+    fn default() -> Self {
+        Self { kind: ShapeKind::Ellipse, cx: 0.0, cy: 0.0, w: 0.0, h: 0.0, angle: 0.0, corner: 20.0, points: 5, feather: 0.0, invert: false, linked: true, on: true }
+    }
+}
+
+impl LayerMask {
+    /// Shapes a mask can be.
+    pub const KINDS: [ShapeKind; 7] = [ShapeKind::Rect, ShapeKind::Rounded, ShapeKind::Ellipse, ShapeKind::Triangle, ShapeKind::Star, ShapeKind::Heart, ShapeKind::Burst];
+
+    pub fn new(o: Obb) -> Self {
+        let mut m = Self::default();
+        m.set_obb(o);
+        m
+    }
+    pub fn obb(&self) -> Obb {
+        Obb { cx: self.cx, cy: self.cy, w: self.w, h: self.h, angle: self.angle }
+    }
+    pub fn set_obb(&mut self, o: Obb) {
+        (self.cx, self.cy, self.w, self.h, self.angle) = (o.cx, o.cy, o.w.max(1.0), o.h.max(1.0), o.angle);
+    }
+}
+
+/// A mask's coverage in an output-space box `o` (white, coverage in alpha),
+/// feathered, and where its top-left goes. `scale` turns source pixels
+/// into output pixels. Only the part inside `area` (x0, y0, x1, y1) is
+/// made: past it nothing shows. None: nothing to draw there.
+pub fn mask_sprite(mk: &LayerMask, o: Obb, scale: f32, area: (f32, f32, f32, f32)) -> Option<(RgbaImage, i64, i64)> {
+    if o.w < 0.5 || o.h < 0.5 {
+        return None;
+    }
+    let s = ShapeSettings { kind: mk.kind, corner: mk.corner, points: mk.points, ..Default::default() };
+    let path = shape_path(&s, o.w / 2.0, o.h / 2.0)?;
+    let fe = (mk.feather * scale).clamp(0.0, 2000.0);
+    let pad = (fe * 1.5).ceil() + 2.0;
+    let cs = o.corners();
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for c in cs {
+        (x0, y0, x1, y1) = (x0.min(c.0), y0.min(c.1), x1.max(c.0), y1.max(c.1));
+    }
+    let (x0, y0) = ((x0 - pad).max(area.0 - pad).floor(), (y0 - pad).max(area.1 - pad).floor());
+    let (x1, y1) = ((x1 + pad).min(area.2 + pad).ceil(), (y1 + pad).min(area.3 + pad).ceil());
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
+    // a mask past any frame's size has nothing more to show
+    if w as u64 * h as u64 > 64_000_000 {
+        return None;
+    }
+    let mut pm = Pixmap::new(w.max(1), h.max(1))?;
+    let tf = Transform::from_rotate(o.angle).post_translate(o.cx - x0, o.cy - y0);
+    pm.fill_path(&path, &paint([255, 255, 255], 255), FillRule::Winding, tf, None);
+    let mut a: Vec<u8> = pm.pixels().iter().map(|p| p.alpha()).collect();
+    if fe >= 0.3 {
+        blur_u8(&mut a, w as usize, h as usize, fe / 2.0);
+    }
+    let img = RgbaImage::from_fn(w, h, |x, y| image::Rgba([255, 255, 255, a[(y * w + x) as usize]]));
+    Some((img, x0 as i64, y0 as i64))
+}
+
+/// A quick gaussian-like blur (three box passes each way) of `sigma`.
+fn blur_u8(v: &mut [u8], w: usize, h: usize, sigma: f32) {
+    let r = ((((4.0 * sigma * sigma + 1.0).sqrt()) - 1.0) / 2.0).round().max(1.0) as usize;
+    let mut f: Vec<f32> = v.iter().map(|&x| x as f32).collect();
+    let mut tmp = vec![0.0f32; w.max(h)];
+    let pass = |line: &mut [f32], tmp: &mut [f32]| {
+        let n = line.len();
+        let k = (2 * r + 1) as f32;
+        // edges held at their value
+        let at = |line: &[f32], i: isize| line[i.clamp(0, n as isize - 1) as usize];
+        let mut s: f32 = (-(r as isize)..=r as isize).map(|i| at(line, i)).sum();
+        for i in 0..n {
+            tmp[i] = s / k;
+            s += at(line, i as isize + r as isize + 1) - at(line, i as isize - r as isize);
+        }
+        line.copy_from_slice(&tmp[..n]);
+    };
+    for _ in 0..3 {
+        for row in f.chunks_mut(w) {
+            pass(row, &mut tmp);
+        }
+        let mut col = vec![0.0f32; h];
+        for x in 0..w {
+            for y in 0..h {
+                col[y] = f[y * w + x];
+            }
+            pass(&mut col, &mut tmp);
+            for y in 0..h {
+                f[y * w + x] = col[y];
+            }
+        }
+    }
+    for (o, x) in v.iter_mut().zip(f) {
+        *o = x.round().clamp(0.0, 255.0) as u8;
+    }
 }

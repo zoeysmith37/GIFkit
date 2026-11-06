@@ -714,6 +714,14 @@ enum Space {
     Output,
 }
 
+/// In-progress canvas edit of a layer's mask (source-space boxes).
+#[derive(Clone, Copy)]
+enum MaskDrag {
+    Move { start: Pos2, src: Obb },
+    Resize { fixed: (f32, f32), out0: Obb, axis: u8 },
+    Rotate { a0: f32, out0: Obb, src: Obb },
+}
+
 /// In-progress canvas edit of a layer box.
 #[derive(Clone, Copy)]
 enum BoxDrag {
@@ -819,6 +827,9 @@ pub struct GifKitApp {
     active_view: usize,
     link_views: bool,
     box_drag: Option<BoxDrag>,
+    /// the selected layer's mask is being moved and sized on the picture
+    mask_edit: bool,
+    mask_drag: Option<MaskDrag>,
     /// what transparent pixels show on in the viewports
     backdrop: Backdrop,
     backdrop_col: [u8; 3],
@@ -1631,6 +1642,12 @@ const GROUP_GAP: f32 = 12.0;
 /// Right-click actions in the layer list.
 #[derive(Clone, Copy)]
 enum LayerAct {
+    /// add a mask, or take it away
+    Mask(usize),
+    MaskInvert(usize),
+    MaskOn(usize),
+    MaskEdit(usize),
+    Flip(usize, usize),
     Rename(usize),
     RenameEdit(Tool),
     Duplicate(usize),
@@ -1641,6 +1658,24 @@ enum LayerAct {
     CollapseTo(usize),
     CollapseAll,
     CollapseEdits,
+}
+
+/// A layer mask's mark (as Photoshop's): a box with a round shape in it,
+/// see-through in the middle when inverted (a hole), crossed out when off.
+fn paint_mask_glyph(painter: &egui::Painter, c: Pos2, size: f32, col: Color32, invert: bool, on: bool) {
+    let r = Rect::from_center_size(c, vec2(size, size * 0.8));
+    let rad = size * 0.24;
+    if invert {
+        painter.rect_filled(r, 2.0, col);
+        painter.circle_filled(c, rad, p().window);
+        painter.circle_stroke(c, rad, Stroke::new(1.0, col));
+    } else {
+        painter.rect_stroke(r, 2.0, Stroke::new(1.2, col), egui::StrokeKind::Inside);
+        painter.circle_filled(c, rad, col);
+    }
+    if !on {
+        painter.line_segment([r.left_bottom(), r.right_top()], Stroke::new(1.6, p().negative));
+    }
 }
 
 /// Breeze checked look: accent tint with an accent outline, not a solid pill.
@@ -2251,8 +2286,19 @@ fn wide_button(ui: &mut egui::Ui, b: egui::Button<'_>) -> egui::Response {
 fn fill_slider(ui: &mut egui::Ui, s: egui::Slider<'_>) -> egui::Response {
     ui.spacing_mut().interact_size.x = 64.0;
     let w = ui.available_width();
-    ui.spacing_mut().slider_width = (w - 64.0 - ui.spacing().item_spacing.x - 2.0).max(40.0);
-    ui.horizontal(|ui| slider(ui, s)).inner
+    // a number wider than its box ("80.0 px") makes the row wider than the
+    // panel, and the panel grew to fit, then the slider with it, frame after
+    // frame. What the row ran over by is taken off the slider next frame.
+    let id = ui.next_auto_id().with("fill-slider-over");
+    let over: f32 = ui.data(|d| d.get_temp(id)).unwrap_or(0.0);
+    ui.spacing_mut().slider_width = (w - 64.0 - ui.spacing().item_spacing.x - 2.0 - over).max(40.0);
+    let r = ui.horizontal(|ui| slider(ui, s));
+    let now = (over + r.response.rect.width() - w).max(0.0);
+    if (now - over).abs() > 0.5 {
+        ui.data_mut(|d| d.insert_temp(id, now));
+        ui.ctx().request_repaint();
+    }
+    r.inner
 }
 
 /// A labelled slider row.
@@ -2811,6 +2857,8 @@ impl GifKitApp {
             active_view: 2,
             link_views: false,
             box_drag: None,
+            mask_edit: false,
+            mask_drag: None,
             backdrop: match theme::get_setting("backdrop").as_deref() {
                 Some("solid") => Backdrop::Solid,
                 Some("canvas") => Backdrop::Canvas,
@@ -5670,6 +5718,8 @@ impl GifKitApp {
                 l.color = src.color;
                 l.opacity = src.opacity;
                 l.clip = src.clip;
+                l.mask = src.mask.clone();
+                l.flip = src.flip;
                 last = Some((l.kind(), id));
             }
         }
@@ -7277,6 +7327,72 @@ impl GifKitApp {
     }
 
     /// Photoshop-style layer list: top of the stack first, drag to reorder.
+    /// The selected layer's mask: its shape, edge and what it does.
+    fn mask_strip(&mut self, ui: &mut egui::Ui, li: usize, now: f64) {
+        let pal = *p();
+        let Some(mut mk) = self.stack.layers[li].mask.clone() else { return };
+        let before = mk.clone();
+        let locked = self.stack.layers[li].locked;
+        let mut act: Option<LayerAct> = None;
+        ui.add_space(4.0);
+        egui::Frame::new().fill(pal.view).stroke(Stroke::new(1.0, pal.border)).corner_radius(3.0).inner_margin(egui::Margin::symmetric(6, 5)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add_enabled_ui(!locked, |ui| {
+                ui.horizontal(|ui| {
+                    let (gr, _) = ui.allocate_exact_size(vec2(18.0, 22.0), Sense::hover());
+                    paint_mask_glyph(ui.painter(), gr.center(), 13.0, pal.fg, mk.invert, mk.on);
+                    ui.label(RichText::new("Mask").color(pal.fg));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        if icon_tool(ui, "edit-delete", "Delete the mask", true).clicked() {
+                            act = Some(LayerAct::Mask(li));
+                        }
+                        if icon_tool(ui, if mk.on { "view-visible" } else { "view-hidden" }, if mk.on { "Turn the mask off" } else { "Turn the mask on" }, true).clicked() {
+                            mk.on = !mk.on;
+                        }
+                        let ed = self.mask_edit;
+                        let e = ui.add(sel_btn(egui::Button::image(crate::icons::image(ui.ctx(), "transform-scale", 16.0, pal.fg)).frame_when_inactive(ed).min_size(vec2(28.0, 26.0)), ed)).on_hover_text(if ed { "Done moving the mask" } else { "Move and size it on the picture" });
+                        if e.clicked() {
+                            act = Some(LayerAct::MaskEdit(li));
+                        }
+                        let inv = ui.add(sel_btn(egui::Button::new("Invert").min_size(vec2(0.0, 26.0)), mk.invert)).on_hover_text("Show outside the shape: cuts a hole");
+                        if inv.clicked() {
+                            mk.invert = !mk.invert;
+                        }
+                        ui.add_space(4.0);
+                        let items: Vec<(ShapeKind, &str)> = crate::shapes::LayerMask::KINDS.iter().map(|k| (*k, k.label())).collect();
+                        combo(ui, "mask-shape", &mut mk.kind, &items).on_hover_text("The mask's shape");
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Feather:").color(pal.fg));
+                    fill_slider(ui, soft_slider(&mut mk.feather, 0.0..=60.0, "").suffix(" px").max_decimals(0)).on_hover_text("A soft edge");
+                });
+                ui.horizontal(|ui| {
+                    check(ui, &mut mk.linked, "Moves with the layer").on_hover_text("Off: the mask stays put while the layer's keyframes move it");
+                    if matches!(mk.kind, ShapeKind::Rounded) {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Corners:").color(pal.fg));
+                        fill_slider(ui, egui::Slider::new(&mut mk.corner, 0.0..=50.0).suffix("%").max_decimals(0));
+                    } else if matches!(mk.kind, ShapeKind::Star | ShapeKind::Burst) {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Points:").color(pal.fg));
+                        fill_slider(ui, egui::Slider::new(&mut mk.points, 3..=24));
+                    }
+                });
+            });
+        });
+        mk.feather = mk.feather.clamp(0.0, 2000.0);
+        if mk != before {
+            self.snapshot(&format!("maskset{li}"), now);
+            self.stack.layers[li].mask = Some(mk);
+            self.modified = true;
+        }
+        if let Some(a) = act {
+            self.apply_layer_act(ui.ctx(), a, now);
+        }
+    }
+
     fn layer_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let pal = *p();
         // the panel takes its height from what it holds: claim all of it up
@@ -7318,6 +7434,7 @@ impl GifKitApp {
         }
         // the selected layer's lock and opacity, as in Photoshop's layer panel
         let sel_li = self.sel_layer_index();
+        let mut menu_act: Option<LayerAct> = None;
         ui.horizontal(|ui| {
             ui.add_enabled_ui(sel_li.is_some(), |ui| {
                 let (locked, mut op) = sel_li.map(|i| (self.stack.layers[i].locked, self.stack.layers[i].opacity)).unwrap_or((false, 100.0));
@@ -7339,6 +7456,17 @@ impl GifKitApp {
                         self.modified = true;
                     }
                 }
+                let has_mask = sel_li.is_some_and(|i| self.stack.layers[i].mask.is_some());
+                let editing = has_mask && self.mask_edit;
+                let mb = ui.add_enabled(sel_li.is_some() && !locked, sel_btn(egui::Button::new("").min_size(vec2(28.0, 26.0)), editing));
+                let mcol = if mb.enabled() { pal.fg } else { pal.fg_muted };
+                paint_mask_glyph(ui.painter(), mb.rect.center(), 14.0, mcol, false, true);
+                let mb = mb.on_hover_text(if !has_mask { "Add a mask: the layer shows only inside a shape" } else if editing { "Done moving the mask" } else { "Move and size the mask on the picture" });
+                if mb.clicked() {
+                    if let Some(i) = sel_li {
+                        menu_act = Some(if has_mask { LayerAct::MaskEdit(i) } else { LayerAct::Mask(i) });
+                    }
+                }
                 ui.add_space(6.0);
                 ui.label(RichText::new("Opacity:").color(if sel_li.is_some() { pal.fg } else { pal.fg_muted }));
                 ui.add_enabled_ui(!locked, |ui| {
@@ -7351,6 +7479,9 @@ impl GifKitApp {
                 });
             });
         });
+        if let Some(li) = sel_li.filter(|&i| self.stack.layers[i].mask.is_some()) {
+            self.mask_strip(ui, li, now);
+        }
         ui.add_space(4.0);
         let find = self.layer_find.trim().to_lowercase();
         // the list, with a row of buttons under it
@@ -7372,17 +7503,17 @@ impl GifKitApp {
         let mut edit_rename_done: Option<Option<(Tool, String)>> = None;
         let mut edit_toggle: Option<Tool> = None;
         let mut edit_remove: Option<Tool> = None;
-        let mut menu_act: Option<LayerAct> = None;
         let idle = !self.busy();
         let frame_edits = !self.stack.transform.is_identity();
         egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             let mut rows: Vec<(usize, Rect)> = Vec::new();
             for li in (0..n).rev() {
-                let (id, name, kind, visible, locked, clipped) = {
+                let (id, name, kind, visible, locked, clipped, mask) = {
                     let l = &self.stack.layers[li];
-                    (l.id, l.name(), l.kind(), l.visible, l.locked, l.clip && li > 0)
+                    (l.id, l.name(), l.kind(), l.visible, l.locked, l.clip && li > 0, l.mask.as_ref().map(|m| (m.invert, m.on)))
                 };
+                let can_flip = self.stack.layers[li].can_flip();
                 if !find.is_empty() && !name.to_lowercase().contains(&find) && !kind_tool(kind).label().to_lowercase().contains(&find) {
                     continue;
                 }
@@ -7417,14 +7548,30 @@ impl GifKitApp {
                 // icon + name (elided)
                 paint_tool_icon(&painter, kind_tool(kind), pos2(r.left() + 38.0 + ind, r.center().y), 14.0, if visible { pal.fg } else { pal.fg_muted });
                 let del_w = 44.0;
-                let name_w = (r.width() - 52.0 - ind - del_w - 6.0).max(10.0);
+                let mask_w = if mask.is_some() { 22.0 } else { 0.0 };
+                let name_w = (r.width() - 52.0 - ind - del_w - mask_w - 6.0).max(10.0);
                 let mut job = egui::text::LayoutJob::simple_singleline(elide(&name, 60), egui::FontId::proportional(13.0), if visible { pal.fg } else { pal.fg_muted });
                 job.wrap = egui::text::TextWrapping { max_width: name_w, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
                 let galley = ui.painter().layout_job(job);
                 let gy = r.center().y - galley.size().y / 2.0;
                 let renaming = self.renaming.as_ref().map(|(rid, _)| *rid == id).unwrap_or(false);
+                let name_end = r.left() + 52.0 + ind + galley.size().x;
                 if !renaming {
                     painter.galley(pos2(r.left() + 52.0 + ind, gy), galley, pal.fg);
+                }
+                // the mask's mark after the name: click to move it on the picture
+                if let Some((inv, on)) = mask {
+                    let mr = Rect::from_center_size(pos2(name_end + 14.0, r.center().y), vec2(20.0, 20.0));
+                    let mresp = ui.interact(mr, egui::Id::unique(("layer-mask", id)), Sense::click()).on_hover_text(match (on, inv) {
+                        (false, _) => "Mask off",
+                        (true, true) => "Mask: a hole in the layer. Click to move it",
+                        (true, false) => "Mask: the layer shows inside it. Click to move it",
+                    });
+                    let col = if mresp.hovered() { pal.fg } else if visible { mix(pal.fg, pal.fg_muted, 0.4) } else { pal.fg_muted };
+                    paint_mask_glyph(&painter, mr.center(), 13.0, col, inv, on);
+                    if mresp.clicked() {
+                        menu_act = Some(LayerAct::MaskEdit(li));
+                    }
                 } else if let Some((_, buf)) = &mut self.renaming {
                     let name_r = Rect::from_min_size(pos2(r.left() + 48.0, r.top() + 4.0), vec2(name_w + 4.0, r.height() - 8.0));
                     let te = ui.put(name_r, egui::TextEdit::singleline(buf).font(egui::FontId::proportional(13.0)).margin(vec2(4.0, 2.0)));
@@ -7460,6 +7607,30 @@ impl GifKitApp {
                     }
                     if menu_check(ui, clipped, "&Clip to Layer Below", "") && li > 0 && !locked {
                         act(LayerAct::Clip(li));
+                    }
+                    ui.separator();
+                    if menu_item(ui, if mask.is_some() { "edit-delete" } else { "shapes" }, if mask.is_some() { "Delete &Mask" } else { "Add &Mask" }, "", !locked) {
+                        act(LayerAct::Mask(li));
+                    }
+                    if let Some((inv, on)) = mask {
+                        if menu_item(ui, "transform-scale", "Move Mas&k on Picture", "", !locked) {
+                            act(LayerAct::MaskEdit(li));
+                        }
+                        if menu_check(ui, inv, "&Invert Mask", "") && !locked {
+                            act(LayerAct::MaskInvert(li));
+                        }
+                        if menu_check(ui, !on, "Turn Mask &Off", "") && !locked {
+                            act(LayerAct::MaskOn(li));
+                        }
+                    }
+                    if can_flip {
+                        ui.separator();
+                        if menu_item(ui, "object-flip-horizontal", "&Flip Horizontally", "", !locked) {
+                            act(LayerAct::Flip(li, 0));
+                        }
+                        if menu_item(ui, "object-flip-vertical", "Flip &Vertically", "", !locked) {
+                            act(LayerAct::Flip(li, 1));
+                        }
                     }
                     ui.separator();
                     if menu_item(ui, "go-top", "Bring to &Front", "", !top) {
@@ -7674,6 +7845,14 @@ impl GifKitApp {
                     _ => {}
                 }
             }
+            let flippable = sel_layer.filter(|&i| self.stack.layers[i].can_flip() && !self.stack.layers[i].locked);
+            ui.add_space(6.0);
+            if icon_tool(ui, "object-flip-horizontal", "Flip the layer left to right", flippable.is_some()).clicked() {
+                menu_act = flippable.map(|i| LayerAct::Flip(i, 0));
+            }
+            if icon_tool(ui, "object-flip-vertical", "Flip the layer upside down", flippable.is_some()).clicked() {
+                menu_act = flippable.map(|i| LayerAct::Flip(i, 1));
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if icon_tool(ui, "merge", "Collapse all layers and frame edits into the frames", idle && (n > 0 || frame_edits)).clicked() {
                     menu_act = Some(LayerAct::CollapseAll);
@@ -7774,9 +7953,58 @@ impl GifKitApp {
     }
 
     /// A layer action from the layer list or the timeline.
+    /// A new mask for layer `li`: an ellipse in the layer's box, or in the
+    /// middle of the frame for layers without one.
+    fn default_mask(&self, li: usize) -> crate::shapes::LayerMask {
+        let (bw, bh) = self.dims();
+        let src = self.plan.get(self.cur).map(|f| f.src).unwrap_or(0);
+        let b = self.stack.layers[li].source_box(src, &self.fonts).filter(|b| b.w >= 4.0 && b.h >= 4.0);
+        let o = b.unwrap_or(Obb { cx: bw as f32 / 2.0, cy: bh as f32 / 2.0, w: bw as f32 * 0.5, h: bh as f32 * 0.5, angle: 0.0 });
+        crate::shapes::LayerMask::new(o)
+    }
+
     fn apply_layer_act(&mut self, ctx: &egui::Context, act: LayerAct, now: f64) {
         let n = self.stack.layers.len();
         match act {
+            LayerAct::Mask(li) => {
+                self.snapshot(&format!("mask{now}"), now);
+                if self.stack.layers[li].mask.take().is_none() {
+                    let m = self.default_mask(li);
+                    self.stack.layers[li].mask = Some(m);
+                    self.mask_edit = true;
+                    self.info("Drag the mask's box on the picture. Invert to cut a hole");
+                } else {
+                    self.mask_edit = false;
+                }
+                self.modified = true;
+            }
+            LayerAct::MaskInvert(li) => {
+                self.snapshot(&format!("maskinv{now}"), now);
+                if let Some(m) = &mut self.stack.layers[li].mask {
+                    m.invert = !m.invert;
+                }
+                self.modified = true;
+            }
+            LayerAct::MaskOn(li) => {
+                self.snapshot(&format!("maskon{now}"), now);
+                if let Some(m) = &mut self.stack.layers[li].mask {
+                    m.on = !m.on;
+                }
+                self.modified = true;
+            }
+            LayerAct::MaskEdit(li) => {
+                let k = self.stack.layers[li].kind();
+                let id = self.stack.layers[li].id;
+                self.tool = kind_tool(k);
+                self.select(k, id);
+                self.mask_edit = !self.mask_edit;
+            }
+            LayerAct::Flip(li, axis) => {
+                self.snapshot(&format!("flip{axis}{now}"), now);
+                let f = &mut self.stack.layers[li].flip[axis.min(1)];
+                *f = !*f;
+                self.modified = true;
+            }
             LayerAct::Rename(li) => {
                 let l = &self.stack.layers[li];
                 self.renaming = Some((l.id, l.name()));
@@ -7798,6 +8026,8 @@ impl GifKitApp {
                     l.color = src.color;
                     l.opacity = src.opacity;
                     l.clip = src.clip;
+                    l.mask = src.mask.clone();
+                    l.flip = src.flip;
                     self.stack.layers.insert(li + 1, l);
                 }
                 self.select(src.kind(), id);
@@ -8474,7 +8704,7 @@ impl GifKitApp {
                     LayerKind::Markup(m) => ProjLayer::Markup { markup: m.clone() },
                     LayerKind::Emoji(e) => ProjLayer::Emoji { emoji: (**e).clone() },
                 };
-                ProjLayerEntry { visible: l.visible, label: l.label.clone(), layer, timing: l.timing.clone(), locked: l.locked, color: l.color, opacity: l.opacity, clip: l.clip }
+                ProjLayerEntry { visible: l.visible, label: l.label.clone(), layer, timing: l.timing.clone(), locked: l.locked, color: l.color, opacity: l.opacity, clip: l.clip, mask: l.mask.clone(), flip: l.flip }
             })
             .collect();
         let file = ProjectFile {
@@ -8642,6 +8872,8 @@ impl GifKitApp {
                 l.color = e.color;
                 l.opacity = e.opacity;
                 l.clip = e.clip;
+                l.mask = e.mask.clone();
+                l.flip = e.flip;
             }
         }
         self.stack.markers = file.markers;
@@ -9311,6 +9543,173 @@ impl GifKitApp {
 
     /// Canvas editing. `space` says which coordinates the viewport shows:
     /// source frames (original / crop view) or the edited output.
+    /// The selected layer's mask on the picture: drag it, its corners and
+    /// sides, and its turning handle. False when there's no mask to edit.
+    fn mask_interaction(&mut self, ui: &mut egui::Ui, resp: &egui::Response, m: Mapper, space: Space, show: bool, (started, dragged, stopped): (bool, bool, bool)) -> bool {
+        let Some(li) = self.sel_layer_index().filter(|&i| self.stack.layers[i].mask.is_some() && !self.stack.layers[i].locked) else {
+            self.mask_edit = false;
+            self.mask_drag = None;
+            return false;
+        };
+        let Some(mk) = self.stack.layers[li].mask.clone() else { return false };
+        let pal = *p();
+        let (bw, bh) = self.dims();
+        let mp = match space {
+            Space::Output => self.stack.layer_maps(bw, bh)[li].m,
+            Space::Source => Affine::IDENTITY,
+        };
+        let sb = mk.obb();
+        let o = map_box(&mp, sb, false);
+        let to_screen = |p: (f32, f32)| m.to_screen(pos2(p.0, p.1));
+        let rot_handle = |o: &Obb| to_screen(o.from_local(0.0, -o.h / 2.0 - 30.0 / m.scale));
+        let ptr_img = resp.interact_pointer_pos().map(|p| m.to_img(p));
+        let shift = ui.input(|i| i.modifiers.shift);
+        let hit = |o: &Obb, sp: Pos2| -> Option<MaskDrag> {
+            if rot_handle(o).distance(sp) <= HANDLE_HIT {
+                return None;
+            }
+            if let Some(k) = o.corners().iter().position(|c| to_screen(*c).distance(sp) <= HANDLE_HIT) {
+                let c = o.corners()[(k + 2) % 4];
+                return Some(MaskDrag::Resize { fixed: o.to_local(c.0, c.1), out0: *o, axis: 0 });
+            }
+            edge_mids(o).iter().position(|c| to_screen(*c).distance(sp) <= HANDLE_HIT).map(|k| {
+                let f = [(0.0, o.h / 2.0), (-o.w / 2.0, 0.0), (0.0, -o.h / 2.0), (o.w / 2.0, 0.0)][k];
+                MaskDrag::Resize { fixed: f, out0: *o, axis: if k % 2 == 0 { 2 } else { 1 } }
+            })
+        };
+        if started {
+            let origin = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos());
+            if let Some(sp) = origin {
+                let pi = m.to_img(sp);
+                self.mask_drag = if rot_handle(&o).distance(sp) <= HANDLE_HIT {
+                    Some(MaskDrag::Rotate { a0: (pi.y - o.cy).atan2(pi.x - o.cx).to_degrees(), out0: o, src: sb })
+                } else if let Some(d) = hit(&o, sp) {
+                    Some(d)
+                } else if o.contains(pi.x, pi.y) {
+                    Some(MaskDrag::Move { start: pi, src: sb })
+                } else {
+                    None
+                };
+                if self.mask_drag.is_some() {
+                    let now = ui.input(|i| i.time);
+                    self.snapshot(&format!("maskdrag{now}"), now);
+                }
+            }
+        }
+        if dragged {
+            if let (Some(d), Some(pi)) = (self.mask_drag, ptr_img) {
+                let nb = match d {
+                    MaskDrag::Move { start, src } => {
+                        let (mut ox, mut oy) = (pi.x - start.x, pi.y - start.y);
+                        if shift {
+                            if ox.abs() >= oy.abs() {
+                                oy = 0.0;
+                            } else {
+                                ox = 0.0;
+                            }
+                        }
+                        let (dx, dy) = mp.inverse().apply_vec(ox, oy);
+                        Obb { cx: src.cx + dx, cy: src.cy + dy, ..src }
+                    }
+                    MaskDrag::Resize { fixed, out0, axis } => {
+                        let lp = out0.to_local(pi.x, pi.y);
+                        let (mut w, mut h) = ((lp.0 - fixed.0).abs().max(1.0), (lp.1 - fixed.1).abs().max(1.0));
+                        match axis {
+                            1 => h = out0.h,
+                            2 => w = out0.w,
+                            _ if shift => {
+                                let r = out0.w / out0.h.max(1e-3);
+                                w = w.max(h * r);
+                                h = w / r;
+                            }
+                            _ => {}
+                        }
+                        let sx = if lp.0 >= fixed.0 { 1.0 } else { -1.0 };
+                        let sy = if lp.1 >= fixed.1 { 1.0 } else { -1.0 };
+                        let lcx = if axis == 2 { 0.0 } else { fixed.0 + sx * w / 2.0 };
+                        let lcy = if axis == 1 { 0.0 } else { fixed.1 + sy * h / 2.0 };
+                        let c = out0.from_local(lcx, lcy);
+                        unmap_box(&mp, Obb { cx: c.0, cy: c.1, w, h, angle: out0.angle }, sb.angle)
+                    }
+                    MaskDrag::Rotate { a0, out0, src } => {
+                        let a = (pi.y - out0.cy).atan2(pi.x - out0.cx).to_degrees();
+                        let mut phi = out0.angle + (a - a0);
+                        if shift {
+                            phi = (phi / 15.0).round() * 15.0;
+                        }
+                        Obb { angle: source_angle(&mp, phi, false), ..src }
+                    }
+                };
+                if let Some(mm) = &mut self.stack.layers[li].mask {
+                    mm.set_obb(nb);
+                }
+                self.modified = true;
+            }
+        }
+        if stopped {
+            self.mask_drag = None;
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Enter)) {
+            self.mask_edit = false;
+            self.mask_drag = None;
+        }
+        if !show {
+            return true;
+        }
+        // the mask's box, drawn dashed so it doesn't pass for the layer's own
+        let Some(mk) = self.stack.layers[li].mask.clone() else { return true };
+        let o = map_box(&mp, mk.obb(), false);
+        let painter = ui.painter_at(resp.rect);
+        let mut pts: Vec<Pos2> = o.corners().iter().map(|c| to_screen(*c)).collect();
+        pts.push(pts[0]);
+        painter.add(egui::Shape::line(pts.clone(), Stroke::new(2.5, Color32::from_black_alpha(140))));
+        painter.extend(egui::Shape::dashed_line(&pts, Stroke::new(1.5, Color32::WHITE), 6.0, 4.0));
+        if mk.kind == ShapeKind::Ellipse {
+            let ring: Vec<Pos2> = (0..=64).map(|k| {
+                let t = k as f32 / 64.0 * std::f32::consts::TAU;
+                to_screen(o.from_local(t.cos() * o.w / 2.0, t.sin() * o.h / 2.0))
+            }).collect();
+            painter.add(egui::Shape::line(ring, Stroke::new(1.2, pal.highlight)));
+        }
+        let top_mid = to_screen(o.from_local(0.0, -o.h / 2.0));
+        let rh = rot_handle(&o);
+        painter.line_segment([top_mid, rh], Stroke::new(1.2, Color32::WHITE));
+        painter.circle_filled(rh, 7.0, pal.highlight);
+        painter.circle_stroke(rh, 7.0, Stroke::new(1.5, Color32::WHITE));
+        for c in &pts[..4] {
+            let h = Rect::from_center_size(*c, vec2(10.0, 10.0));
+            painter.rect_filled(h, 5.0, pal.highlight);
+            painter.rect_stroke(h, 5.0, Stroke::new(1.0, Color32::WHITE), egui::StrokeKind::Middle);
+        }
+        for c in edge_mids(&o) {
+            let h = Rect::from_center_size(to_screen(c), vec2(7.0, 7.0));
+            painter.rect_filled(h, 3.5, pal.highlight);
+            painter.rect_stroke(h, 3.5, Stroke::new(1.0, Color32::WHITE), egui::StrokeKind::Middle);
+        }
+        let label = if mk.invert { "Mask · hole" } else { "Mask" };
+        let lp = to_screen(o.corners()[0]) + vec2(0.0, -8.0);
+        painter.text(lp + vec2(1.0, 1.0), egui::Align2::LEFT_BOTTOM, label, egui::FontId::proportional(12.0), Color32::from_black_alpha(180));
+        painter.text(lp, egui::Align2::LEFT_BOTTOM, label, egui::FontId::proportional(12.0), Color32::WHITE);
+        if let Some(pp) = resp.hover_pos() {
+            if self.mask_drag.is_none() {
+                let pi = m.to_img(pp);
+                let icon = if rot_handle(&o).distance(pp) <= HANDLE_HIT {
+                    Some(egui::CursorIcon::Alias)
+                } else if hit(&o, pp).is_some() {
+                    Some(egui::CursorIcon::Crosshair)
+                } else if o.contains(pi.x, pi.y) {
+                    Some(egui::CursorIcon::Move)
+                } else {
+                    None
+                };
+                if let Some(c) = icon {
+                    ui.ctx().set_cursor_icon(c);
+                }
+            }
+        }
+        true
+    }
+
     fn canvas_interaction(&mut self, ui: &mut egui::Ui, resp: &egui::Response, m: Mapper, bounds: (f32, f32), space: Space, vi: usize) {
         if space == Space::Output {
             self.drop_views.push((resp.rect, m));
@@ -9326,6 +9725,9 @@ impl GifKitApp {
         let started = resp.drag_started_by(PointerButton::Primary) && !alt;
         let dragged = resp.dragged_by(PointerButton::Primary) && !alt;
         let stopped = resp.drag_stopped();
+        if self.mask_edit && self.mask_interaction(ui, resp, m, space, show, (started, dragged, stopped)) {
+            return;
+        }
         if self.tool == Tool::Crop {
             if space != Space::Source {
                 return;

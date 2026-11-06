@@ -283,8 +283,29 @@ fn case(seed: u64, stage: &Mutex<&'static str>) -> String {
         let vis = !r.chance(0.1);
         let op = r.pick(&[100.0f32, 100.0, 50.0, 0.0, -10.0, 300.0]);
         let clip = r.chance(0.3);
+        let mask = r.chance(0.25).then(|| crate::shapes::LayerMask {
+            kind: crate::shapes::LayerMask::KINDS[r.below(7)],
+            cx: r.pick(&[0.0, w as f32 / 2.0, -50.0, w as f32 * 3.0]),
+            cy: r.pick(&[0.0, h as f32 / 2.0]),
+            w: r.pick(&[0.0, 1.0, w as f32 / 2.0, w as f32 * 5.0]),
+            h: r.pick(&[0.5, h as f32 / 3.0, 20000.0]),
+            angle: r.pick(&[0.0, 33.0, -720.0]),
+            feather: r.pick(&[0.0, 2.0, 40.0, 5000.0, -3.0]),
+            invert: r.chance(0.5),
+            linked: r.chance(0.5),
+            on: r.chance(0.9),
+            ..Default::default()
+        });
+        let flip = [r.chance(0.2), r.chance(0.2)];
         if let Some(l) = st.layers.iter_mut().find(|l| l.id == id) {
             l.clip = clip;
+            if std::env::var_os("FUZZ_NO_MASK").is_none() {
+                l.mask = mask;
+                l.flip = flip;
+            }
+            if std::env::var_os("FUZZ_VERBOSE").is_some() {
+                println!("mask {:?} flip {:?}", l.mask, l.flip);
+            }
             l.timing = tm;
             l.visible = vis;
             l.opacity = op;
@@ -1330,5 +1351,126 @@ fn motion_continues_over_held_frames() {
         let out = st.flatten(&base, &[], None);
         let same = out.frames.windows(2).filter(|w| w[0].image.get().as_raw() == w[1].image.get().as_raw()).count();
         assert!(same <= 1, "shared {shared}: {same} of 7 steps didn't move");
+    }
+}
+
+/// Layer masks: the layer shows inside the shape (or outside, inverted),
+/// moving with it or not, on the CPU and the graphics card alike.
+#[test]
+#[ignore]
+fn layer_masks() {
+    use crate::shapes::{LayerMask, ShapeKind};
+    let fonts = crate::text::builtin_fonts();
+    let img = RgbaImage::from_fn(160, 120, |x, y| Rgba([(x * 255 / 160) as u8, (y * 2) as u8, 90, 255]));
+    let base = Animation { frames: vec![Frame::new(img.clone(), 10), Frame::new(img, 10)], loop_count: None };
+    let shape = crate::shapes::ShapeSettings { x: 0, y: 0, w: 160, h: 120, fill: [0, 0, 255], ..Default::default() };
+    let neg = LayerKind::Effects(Box::new(crate::effects::EffectSettings { negative: true, ..Default::default() }));
+    let text = crate::text::Annotation { text: "MASK".into(), size: 60.0, x: 10, y: 20, color: [255, 255, 0, 255], ..Default::default() };
+    let m = |kind, cx, cy, w, h, angle, feather, invert, linked| Some(LayerMask { kind, cx, cy, w, h, angle, feather, invert, linked, ..Default::default() });
+    let key = crate::timeline::Key { frame: 0, x: 30.0, y: 10.0, scale_x: 100.0, scale_y: 100.0, angle: 0.0, opacity: 100.0, ease: crate::timeline::Ease::Linear, curve: crate::timeline::CURVE_SMOOTH };
+    type Case = (&'static str, Vec<(LayerKind, bool, Option<LayerMask>)>, bool);
+    let cases: Vec<Case> = vec![
+        ("ellipse", vec![(LayerKind::Shape(Box::new(shape.clone())), false, m(ShapeKind::Ellipse, 80.0, 60.0, 80.0, 50.0, 0.0, 0.0, false, true))], false),
+        ("hole feathered", vec![(LayerKind::Shape(Box::new(shape.clone())), false, m(ShapeKind::Ellipse, 80.0, 60.0, 80.0, 50.0, 0.0, 10.0, true, true))], false),
+        ("effect in a turned box", vec![(neg.clone(), false, m(ShapeKind::Rect, 80.0, 60.0, 90.0, 40.0, 30.0, 0.0, false, true))], false),
+        ("text in a star", vec![(LayerKind::Text(text), false, m(ShapeKind::Star, 80.0, 50.0, 120.0, 100.0, 0.0, 2.0, false, true))], false),
+        ("moves with it", vec![(LayerKind::Shape(Box::new(crate::shapes::ShapeSettings { w: 80, h: 60, ..shape.clone() })), false, m(ShapeKind::Ellipse, 40.0, 30.0, 40.0, 30.0, 0.0, 0.0, false, true))], true),
+        ("stays put", vec![(LayerKind::Shape(Box::new(crate::shapes::ShapeSettings { w: 80, h: 60, ..shape.clone() })), false, m(ShapeKind::Ellipse, 40.0, 30.0, 40.0, 30.0, 0.0, 0.0, false, false))], true),
+        ("masked base, clipped effect", vec![(LayerKind::Shape(Box::new(shape.clone())), false, m(ShapeKind::Heart, 80.0, 60.0, 90.0, 80.0, 0.0, 0.0, false, true)), (neg.clone(), true, None)], false),
+        ("clipped and masked", vec![(LayerKind::Shape(Box::new(shape.clone())), false, None), (neg, true, m(ShapeKind::Rounded, 80.0, 60.0, 60.0, 60.0, 15.0, 4.0, true, true))], false),
+    ];
+    let mut gpu = crate::gpu_render::GpuRenderer::headless();
+    let mut worst_case = 0.0f64;
+    for (ci, (name, ls, moving)) in cases.into_iter().enumerate() {
+        let mut st = Stack::default();
+        for (kind, clip, mask) in ls {
+            let id = st.push(kind);
+            let l = st.layers.iter_mut().find(|l| l.id == id).unwrap();
+            l.clip = clip;
+            l.mask = mask;
+            if moving {
+                l.timing.keys = vec![key];
+            }
+        }
+        st.layout_text(160, 120, &fonts);
+        let plan = st.plan(&base);
+        let times = crate::stack::plan_times(&plan);
+        let prep = st.prepare(&base, &fonts);
+        let cpu = st.render_frame(&base, &plan, &times, 0, &fonts, &prep);
+        if let Ok(dir) = std::env::var("GPU_OUT") {
+            cpu.save(format!("{dir}/mask_{}.png", name.replace(' ', "_"))).unwrap();
+        }
+        // what the CPU shows, case by case
+        let blue = |x: u32, y: u32| cpu.get_pixel(x, y).0 == [0, 0, 255, 255];
+        match name {
+            "ellipse" => assert!(blue(80, 60) && !blue(5, 5) && !blue(80, 30), "{name}"),
+            "hole feathered" => assert!(!blue(80, 60) && blue(5, 5) && blue(150, 110), "{name}"),
+            "moves with it" => assert!(blue(70, 40) && !blue(40, 30), "{name}: the hole moves 30 right, 10 down with the shape"),
+            "stays put" => assert!(blue(40, 30) && !blue(70, 40) && !blue(75, 65), "{name}: the shape moved, the mask didn't"),
+            "masked base, clipped effect" => assert_eq!(cpu.get_pixel(80, 60).0, [255, 255, 0, 255], "{name}: inverted blue inside the heart"),
+            _ => {}
+        }
+        let Some(g) = gpu.as_mut() else { continue };
+        let Some(job) = st.gpu_frame(&base, &plan, &times, 0, &fonts, &prep) else {
+            panic!("{name}: not on the GPU");
+        };
+        let tex = g.render(&base.frames[0].image.get(), 1, &job, ci as u64 + 100);
+        let out = g.read(&tex);
+        assert_eq!(out.dimensions(), cpu.dimensions());
+        let (mut sum, mut max, mut bad) = (0f64, 0i32, 0usize);
+        for (a, b) in out.pixels().zip(cpu.pixels()) {
+            let d = (0..4).map(|c| (a[c] as i32 - b[c] as i32).abs()).max().unwrap();
+            sum += d as f64;
+            max = max.max(d);
+            if d > 24 {
+                bad += 1;
+            }
+        }
+        let npx = (out.width() * out.height()) as f64;
+        println!("{name:28} mean {:5.2} max {max:3} off {:5.2}%", sum / npx, bad as f64 * 100.0 / npx);
+        if let Ok(dir) = std::env::var("GPU_OUT") {
+            out.save(format!("{dir}/mask_{}_gpu.png", name.replace(' ', "_"))).unwrap();
+        }
+        worst_case = worst_case.max(bad as f64 * 100.0 / npx);
+        assert!(sum / npx < 2.0 && bad as f64 / npx < 0.01, "{name}: the card differs from the CPU");
+    }
+    println!("worst {worst_case:.2}% off");
+}
+
+/// Mirrored layers: the picture flipped in its own box, the same on the
+/// CPU and the graphics card.
+#[test]
+#[ignore]
+fn flipped_layers() {
+    let fonts = crate::text::builtin_fonts();
+    let img = RgbaImage::from_fn(160, 120, |x, y| Rgba([(x * 255 / 160) as u8, (y * 2) as u8, 90, 255]));
+    let base = Animation { frames: vec![Frame::new(img, 10)], loop_count: None };
+    let arrow = crate::shapes::ShapeSettings { kind: crate::shapes::ShapeKind::Speech, x: 20, y: 30, w: 100, h: 50, angle: 15.0, ..Default::default() };
+    let emoji = crate::shapes::EmojiSettings { emoji: "1f449".into(), x: 100, y: 60, w: 40, h: 40, ..Default::default() };
+    let text = crate::text::Annotation { text: "Flip".into(), size: 30.0, x: 10, y: 70, color: [255, 255, 0, 255], ..Default::default() };
+    let ov = crate::overlay::OverlaySource { name: "o".into(), path: None, frames: vec![RgbaImage::from_fn(30, 20, |x, y| Rgba([255, (x * 8) as u8, (y * 12) as u8, 255]))], delays: vec![10] };
+    let mut gpu = crate::gpu_render::GpuRenderer::headless();
+    for (ci, kind) in [LayerKind::Shape(Box::new(arrow)), LayerKind::Emoji(Box::new(emoji)), LayerKind::Text(text), LayerKind::Overlay(crate::stack::OverlayLayer { src: Arc::new(ov), placements: vec![crate::overlay::Placement { enabled: true, x: 20, y: 50, w: 60, h: 40, angle: 25.0 }], opacity: 100.0 })].into_iter().enumerate() {
+        for flip in [[false, false], [true, false], [false, true]] {
+            let mut st = Stack::default();
+            let id = st.push(kind.clone());
+            st.layout_text(160, 120, &fonts);
+            let plan = st.plan(&base);
+            let times = crate::stack::plan_times(&plan);
+            let plain = st.render_frame(&base, &plan, &times, 0, &fonts, &st.prepare(&base, &fonts));
+            st.layers.iter_mut().find(|l| l.id == id).unwrap().flip = flip;
+            let prep = st.prepare(&base, &fonts);
+            let cpu = st.render_frame(&base, &plan, &times, 0, &fonts, &prep);
+            assert!(flip == [false; 2] || plain != cpu, "case {ci} {flip:?}: flipping changed nothing");
+            let Some(g) = gpu.as_mut() else { continue };
+            let job = st.gpu_frame(&base, &plan, &times, 0, &fonts, &prep).expect("on the GPU");
+            let tex = g.render(&base.frames[0].image.get(), 1, &job, 500 + ci as u64 * 4 + flip[0] as u64 + 2 * flip[1] as u64);
+            let out = g.read(&tex);
+            let bad = out.pixels().zip(cpu.pixels()).filter(|(a, b)| (0..4).any(|c| (a[c] as i32 - b[c] as i32).abs() > 24)).count();
+            println!("case {ci} {flip:?}: {bad} pixels off");
+            // a turned image's edges are resampled a little differently on the card
+            let allowed = if ci == 3 { 400 } else { 80 };
+            assert!(bad < allowed, "case {ci} {flip:?}: the card differs ({bad} pixels)");
+        }
     }
 }

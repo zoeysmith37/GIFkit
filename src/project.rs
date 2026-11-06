@@ -114,6 +114,16 @@ pub struct ProjLayerEntry {
     /// clipped to the layer below
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub clip: bool,
+    /// its layer mask
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask: Option<crate::shapes::LayerMask>,
+    /// mirrored left to right, top to bottom
+    #[serde(default, skip_serializing_if = "no_flip")]
+    pub flip: [bool; 2],
+}
+
+fn no_flip(f: &[bool; 2]) -> bool {
+    *f == [false; 2]
 }
 
 fn full() -> f32 {
@@ -632,7 +642,7 @@ mod size_tests {
         overlays.insert(5usize, vec![clear.clone(), moved.clone(), clear]);
         let out = std::env::temp_dir().join(format!("pics-{}.gifkit", std::process::id()));
         let mut file = ProjectFile::default();
-        file.layers = vec![ProjLayerEntry { visible: true, label: None, layer: ProjLayer::Image { id: 5, name: "x".into(), path: None, delays: vec![5; 3], placements: Vec::new(), opacity: 1.0 }, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false }];
+        file.layers = vec![ProjLayerEntry { visible: true, label: None, layer: ProjLayer::Image { id: 5, name: "x".into(), path: None, delays: vec![5; 3], placements: Vec::new(), opacity: 1.0 }, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2] }];
         let big = RgbaImage::from_pixel(600, 300, image::Rgba([10, 200, 30, 255]));
         save(&out, file, &base, Some(&orig), &overlays, &HashMap::new(), Some(&big)).unwrap();
         let t = thumbnail(&out, 128).unwrap();

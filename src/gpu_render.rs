@@ -107,8 +107,10 @@ pub enum GpuOp<'a> {
     /// an animation clipped to base `slot`: the base is lifted off what's
     /// under it, animated alone and put back
     AnimClip { slot: usize, passes: Vec<GpuPass<'a>>, mix: f32 },
-    /// and ends: its result shows only where mask `slot` is
-    ClipEnd { slot: usize },
+    /// and ends: its result shows only where mask `slot` is (or isn't)
+    ClipEnd { slot: usize, invert: bool },
+    /// mask `slot` kept only where mask `by` is (or isn't)
+    MaskMul { slot: usize, by: usize, invert: bool },
 }
 
 /// Everything needed to make one output frame.
@@ -138,7 +140,7 @@ impl GpuFrame<'_> {
         self.ops.iter().all(|op| match op {
             GpuOp::Draw(d) => draw_ok(d),
             GpuOp::Mask { draws, .. } => draws.iter().all(draw_ok),
-            GpuOp::ClipBegin | GpuOp::ClipEnd { .. } | GpuOp::Under { .. } => true,
+            GpuOp::ClipBegin | GpuOp::ClipEnd { .. } | GpuOp::Under { .. } | GpuOp::MaskMul { .. } => true,
             GpuOp::AnimClip { passes, .. } => passes.iter().all(|p| ok(p.size.0, p.size.1) && p.ins.iter().all(|i| !matches!(i, Some(GpuIn::Img(i)) if !img_ok(i)))),
             GpuOp::Effect { passes, .. } => passes.iter().all(|p| ok(p.size.0, p.size.1) && p.ins.iter().all(|i| !matches!(i, Some(GpuIn::Img(i)) if !img_ok(i)))),
         })
@@ -836,14 +838,22 @@ impl GpuRenderer {
                     let (_, v) = self.fx_raw(&mut enc, 0.0, [&cur_view, &self.blank, &self.blank], cur_size, &[]);
                     kept.push((v, cur_size));
                 }
-                GpuOp::ClipEnd { slot } => {
+                GpuOp::ClipEnd { slot, invert } => {
                     self.draw_quads(&mut enc, &cur_view, &quads);
                     quads.clear();
                     let before = kept.pop();
                     if let (Some((bv, bs)), Some((mv, ms))) = (before, masks.get(slot)) {
                         // as the CPU: only when nothing changed the frame's size
                         if bs == cur_size && *ms == cur_size {
-                            (cur_tex, cur_view) = self.fx_raw(&mut enc, 52.0, [&cur_view, &bv, mv], cur_size, &[]);
+                            (cur_tex, cur_view) = self.fx_raw(&mut enc, 52.0, [&cur_view, &bv, mv], cur_size, &[[if *invert { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0]]);
+                        }
+                    }
+                }
+                GpuOp::MaskMul { slot, by, invert } => {
+                    if let (Some((sv, ss)), Some((bv, bs))) = (masks.get(slot).cloned(), masks.get(by).cloned()) {
+                        if ss == bs {
+                            let (_, v) = self.fx_raw(&mut enc, 57.0, [&sv, &self.blank, &bv], ss, &[[if *invert { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0]]);
+                            masks.insert(*slot, (v, ss));
                         }
                     }
                 }

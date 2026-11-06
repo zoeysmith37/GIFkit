@@ -49,7 +49,7 @@ impl OverlaySource {
 }
 
 /// Draw `img` (already the right frame) into `dst` filling the oriented box `b`.
-pub fn draw_in_obb(dst: &mut RgbaImage, img: &RgbaImage, b: crate::geo::Obb, opacity: f32) {
+pub fn draw_in_obb(dst: &mut RgbaImage, img: &RgbaImage, b: crate::geo::Obb, opacity: f32, flip: [bool; 2]) {
     let w = b.w.round().max(1.0) as u32;
     let h = b.h.round().max(1.0) as u32;
     if w > 16384 || h > 16384 {
@@ -62,6 +62,18 @@ pub fn draw_in_obb(dst: &mut RgbaImage, img: &RgbaImage, b: crate::geo::Obb, opa
         scaled = imageops::resize(img, w, h, imageops::FilterType::Triangle);
         &scaled
     };
+    let mirrored;
+    if flip[0] || flip[1] {
+        let mut m = s.clone();
+        if flip[0] {
+            imageops::flip_horizontal_in_place(&mut m);
+        }
+        if flip[1] {
+            imageops::flip_vertical_in_place(&mut m);
+        }
+        mirrored = m;
+        s = &mirrored;
+    }
     let rotated;
     if (b.angle % 360.0).abs() > 0.01 {
         rotated = crate::ops::rotate_any_image(s, b.angle, image::Rgba([0, 0, 0, 0]), true);

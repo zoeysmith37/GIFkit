@@ -411,9 +411,23 @@ pub struct Layer {
     /// a clipping mask: shows only where the nearest unclipped layer below
     /// it has drawn something, as in Photoshop
     pub clip: bool,
+    /// a shape the layer shows only inside (or outside, inverted)
+    pub mask: Option<crate::shapes::LayerMask>,
+    /// mirrored left to right, top to bottom, in its own box
+    pub flip: [bool; 2],
 }
 
 impl Layer {
+    /// Can it be mirrored? (things drawn in a box)
+    pub fn can_flip(&self) -> bool {
+        matches!(self.kind, LayerKind::Text(_) | LayerKind::Shape(_) | LayerKind::Emoji(_) | LayerKind::Overlay(_))
+    }
+
+    /// Its mask, when one is on.
+    pub fn active_mask(&self) -> Option<&crate::shapes::LayerMask> {
+        self.mask.as_ref().filter(|m| m.on)
+    }
+
     /// Its motion at plan frame `i`, with the layer's own opacity in.
     pub fn motion(&self, i: usize) -> crate::timeline::Motion {
         let mut m = self.timing.motion(i);
@@ -528,6 +542,12 @@ pub fn layer_signature(l: &Layer) -> u64 {
     if l.clip {
         "clip".hash(&mut h);
     }
+    if let Some(m) = &l.mask {
+        format!("{m:?}").hash(&mut h);
+    }
+    if l.flip != [false; 2] {
+        l.flip.hash(&mut h);
+    }
     h.finish()
 }
 
@@ -599,13 +619,16 @@ pub struct Prepared {
     watermarks: Vec<Option<WatermarkSprite>>,
     /// shape and markup sprites per layer, each with its source frame range
     stamps: Vec<Vec<StrokeSprite>>,
+    /// each layer's mask shape, feathered, where it sits before any motion
+    /// (None: no mask, or one too small to draw)
+    lmasks: Vec<Option<(RgbaImage, i64, i64)>>,
 }
 
 impl Prepared {
     /// Was this made for `st`'s layers? (one entry per layer)
     pub fn fits(&self, st: &Stack) -> bool {
         let n = st.layers.len();
-        self.maps.len() == n && self.sprites.len() == n && self.watermarks.len() == n && self.stamps.len() == n && self.reveals.len() == n
+        self.maps.len() == n && self.sprites.len() == n && self.watermarks.len() == n && self.stamps.len() == n && self.reveals.len() == n && self.lmasks.len() == n
     }
 }
 
@@ -633,6 +656,16 @@ fn lift(img: &RgbaImage, under: &RgbaImage, mask: &image::GrayImage) -> RgbaImag
         o[3] = (ba * 255.0).round() as u8;
     });
     out
+}
+
+/// Mirror a sprite (before it's turned into place).
+fn flip_image(img: &mut RgbaImage, flip: [bool; 2]) {
+    if flip[0] {
+        image::imageops::flip_horizontal_in_place(img);
+    }
+    if flip[1] {
+        image::imageops::flip_vertical_in_place(img);
+    }
 }
 
 /// Mix `img` back toward `before` where `mask` is clear: a clipped layer
@@ -759,7 +792,7 @@ impl Stack {
     pub fn push(&mut self, kind: LayerKind) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
-        self.layers.push(Layer { id, visible: true, kind, label: None, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false });
+        self.layers.push(Layer { id, visible: true, kind, label: None, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2] });
         id
     }
 
@@ -880,6 +913,7 @@ impl Stack {
                     t2.size = (t.size * scale).clamp(1.0, 4000.0);
                     t2.wrap_px = t.wrap_px * scale;
                     let mut sp = text::render_sprite(fonts, &t2);
+                    flip_image(&mut sp, l.flip);
                     if (o.angle % 360.0).abs() > 0.01 {
                         sp = crate::ops::rotate_any_image(&sp, o.angle, image::Rgba([0, 0, 0, 0]), true);
                     }
@@ -912,12 +946,12 @@ impl Stack {
                     LayerKind::Shape(s) => {
                         let Some(b) = l.source_box(0, fonts) else { return Vec::new() };
                         let o = map_box(m, b, l.readable());
-                        shapes::shape_sprite(s, o, shapes::map_scale(m)).map(|(img, x, y)| vec![StrokeSprite { img, x, y, from: s.from, to: s.to }]).unwrap_or_default()
+                        shapes::shape_sprite(s, o, shapes::map_scale(m), l.flip).map(|(img, x, y)| vec![StrokeSprite { img, x, y, from: s.from, to: s.to }]).unwrap_or_default()
                     }
                     LayerKind::Emoji(e) => {
                         let Some(b) = l.source_box(0, fonts) else { return Vec::new() };
                         let o = map_box(m, b, true);
-                        shapes::emoji_sprite(&e.emoji, o, e.shadow.then_some(&e.shadow_style)).map(|(img, x, y)| vec![StrokeSprite { img, x, y, from: e.from, to: e.to }]).unwrap_or_default()
+                        shapes::emoji_sprite(&e.emoji, o, e.shadow.then_some(&e.shadow_style), l.flip).map(|(img, x, y)| vec![StrokeSprite { img, x, y, from: e.from, to: e.to }]).unwrap_or_default()
                     }
                     LayerKind::Markup(mk) => {
                         let sc = shapes::map_scale(m);
@@ -953,6 +987,7 @@ impl Stack {
                         .par_iter()
                         .map(|&k| {
                             let mut sp = text::render_sprite_upto(fonts, &t2, Some(k));
+                            flip_image(&mut sp, l.flip);
                             if (o.angle % 360.0).abs() > 0.01 {
                                 sp = crate::ops::rotate_any_image(&sp, o.angle, image::Rgba([0, 0, 0, 0]), true);
                             }
@@ -963,7 +998,26 @@ impl Stack {
                 _ => Vec::new(),
             })
             .collect();
-        Prepared { maps, sprites, watermarks, stamps, reveals }
+        let lmasks = self
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(li, l)| {
+                let mk = l.active_mask()?;
+                let m = &maps[li].m;
+                // the frame, and room around it for a mask the layer's motion carries in
+                let (fw, fh) = (maps[li].w, maps[li].h);
+                let area = if mk.linked && !l.timing.keys.is_empty() {
+                    let far = l.timing.keys.iter().map(|k| k.x.abs().max(k.y.abs())).fold(0.0f32, f32::max) * shapes::map_scale(m);
+                    let r = fw.max(fh) + far.min(1e5);
+                    (-r, -r, fw + r, fh + r)
+                } else {
+                    (0.0, 0.0, fw, fh)
+                };
+                shapes::mask_sprite(mk, map_box(m, mk.obb(), false), shapes::map_scale(m), area)
+            })
+            .collect();
+        Prepared { maps, sprites, watermarks, stamps, reveals, lmasks }
     }
 
     /// The transformed frame before any layer (geometry only).
@@ -1014,7 +1068,7 @@ impl Stack {
                     let Some(mask) = &masks[b] else {
                         // a base that draws nothing here hides what's clipped to it
                         if self.layer_shows(b, i, n) && !Self::coverage_kind(&self.layers[b].kind) {
-                            self.draw_layer(&mut img, li, i, plan, times, fonts, prep);
+                            self.draw_layer_masked(&mut img, li, i, plan, times, fonts, prep, None);
                         }
                         continue;
                     };
@@ -1036,28 +1090,100 @@ impl Stack {
                             continue;
                         }
                     }
-                    let before = img.clone();
-                    self.draw_layer(&mut img, li, i, plan, times, fonts, prep);
-                    if img.dimensions() == before.dimensions() && img.dimensions() == mask.dimensions() {
-                        mask_blend(&mut img, &before, mask);
+                    if mask.dimensions() == img.dimensions() {
+                        self.draw_layer_masked(&mut img, li, i, plan, times, fonts, prep, Some(mask));
+                    } else {
+                        self.draw_layer_masked(&mut img, li, i, plan, times, fonts, prep, None);
                     }
                 }
                 None => {
                     let clips_anim = has_clips(li) && self.layers[li + 1..].iter().take_while(|l| l.clip).any(|l| matches!(&l.kind, LayerKind::Effects(fx) if fx.anim && l.active()));
                     let under = (clips_anim && Self::coverage_kind(&self.layers[li].kind)).then(|| img.clone());
-                    self.draw_layer(&mut img, li, i, plan, times, fonts, prep);
+                    self.draw_layer_masked(&mut img, li, i, plan, times, fonts, prep, None);
                     unders[li] = under;
                     if has_clips(li) && Self::coverage_kind(&self.layers[li].kind) && self.layer_shows(li, i, n) {
-                        // what this layer draws, on its own, as the mask for those clipped to it
+                        // what this layer draws, on its own (within its own
+                        // mask), as the mask for those clipped to it
                         let (w, h) = img.dimensions();
                         let mut alone = RgbaImage::new(w, h);
                         self.draw_layer(&mut alone, li, i, plan, times, fonts, prep);
-                        masks[li] = Some(image::GrayImage::from_fn(w, h, |x, y| image::Luma([alone.get_pixel(x, y)[3]])));
+                        let lm = self.mask_coverage(li, i, plan, fonts, prep, (w, h));
+                        masks[li] = Some(image::GrayImage::from_fn(w, h, |x, y| {
+                            let a = alone.get_pixel(x, y)[3];
+                            image::Luma([lm.as_ref().map(|m| ((a as u32 * m.get_pixel(x, y)[0] as u32 + 127) / 255) as u8).unwrap_or(a)])
+                        }));
                     }
                 }
             }
         }
         img
+    }
+
+    /// Where layer `li`'s mask lets it show at plan frame `i`, at `size`:
+    /// None when it has no mask.
+    fn mask_coverage(&self, li: usize, i: usize, plan: &[PlanFrame], fonts: &[FontEntry], prep: &Prepared, size: (u32, u32)) -> Option<image::GrayImage> {
+        let l = &self.layers[li];
+        let mk = l.active_mask()?;
+        let mut cov = RgbaImage::new(size.0, size.1);
+        if let Some((sp, x, y)) = prep.lmasks.get(li).and_then(|m| m.as_ref()) {
+            let mo = l.motion(i);
+            let place = mk.linked && mo.moves();
+            if place {
+                let (centre, d, lin) = self.mask_place(li, i, plan, fonts, prep, sp, *x, *y);
+                if let Some((t, tx, ty)) = crate::timeline::transform_sprite(sp, *x, *y, centre, d, lin) {
+                    crate::ops::overlay_with_opacity(&mut cov, &t, tx, ty, 1.0);
+                }
+            } else {
+                crate::ops::overlay_with_opacity(&mut cov, sp, *x, *y, 1.0);
+            }
+        }
+        Some(image::GrayImage::from_fn(size.0, size.1, |x, y| {
+            let a = cov.get_pixel(x, y)[3];
+            image::Luma([if mk.invert { 255 - a } else { a }])
+        }))
+    }
+
+    /// Where a sprite of layer `li` at (x, y) goes at plan frame `i`, with
+    /// the layer's motion (as `draw_layer` moves its sprites).
+    #[allow(clippy::too_many_arguments)]
+    fn mask_place(&self, li: usize, i: usize, plan: &[PlanFrame], fonts: &[FontEntry], prep: &Prepared, sp: &RgbaImage, x: i64, y: i64) -> ((f32, f32), (f32, f32), [f32; 4]) {
+        let l = &self.layers[li];
+        let mo = l.motion(i);
+        let m = &prep.maps[li].m;
+        let src = plan[i].src;
+        let ob = l.source_box(src, fonts).map(|b| map_box(m, b, false));
+        let (cx, cy) = ob.map(|o| (o.cx, o.cy)).unwrap_or((x as f32 + sp.width() as f32 / 2.0, y as f32 + sp.height() as f32 / 2.0));
+        let d = m.apply_vec(mo.dx, mo.dy);
+        ((cx, cy), d, crate::timeline::motion_matrix(mo.sx, mo.sy, ob.map(|o| o.angle).unwrap_or(0.0), mo.angle * m.det().signum()))
+    }
+
+    /// Draw layer `li`, kept to its mask and to `clip` (a clipping base's
+    /// coverage) where it has them.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_layer_masked(&self, img: &mut RgbaImage, li: usize, i: usize, plan: &[PlanFrame], times: &[f32], fonts: &[FontEntry], prep: &Prepared, clip: Option<&image::GrayImage>) {
+        let n = plan.len();
+        let lm = if self.layer_shows(li, i, n) { self.mask_coverage(li, i, plan, fonts, prep, img.dimensions()) } else { None };
+        if lm.is_none() && clip.is_none() {
+            self.draw_layer(img, li, i, plan, times, fonts, prep);
+            return;
+        }
+        let before = img.clone();
+        self.draw_layer(img, li, i, plan, times, fonts, prep);
+        if img.dimensions() != before.dimensions() {
+            return;
+        }
+        let m = match (lm, clip) {
+            (Some(mut a), Some(c)) if c.dimensions() == a.dimensions() => {
+                for (p, q) in a.iter_mut().zip(c.iter()) {
+                    *p = ((*p as u32 * *q as u32 + 127) / 255) as u8;
+                }
+                a
+            }
+            (Some(a), _) => a,
+            (None, Some(c)) if c.dimensions() == img.dimensions() => c.clone(),
+            _ => return,
+        };
+        mask_blend(img, &before, &m);
     }
 
     /// Does layer `li` show at plan frame `i`?
@@ -1133,7 +1259,7 @@ impl Stack {
             LayerKind::Overlay(o) => {
                 if let Some(b) = l.source_box(src, fonts) {
                     let frame = o.src.frame_at(times[i]);
-                    crate::overlay::draw_in_obb(&mut img, frame, map_box(m, mo.apply(b), true), o.opacity / 100.0);
+                    crate::overlay::draw_in_obb(&mut img, frame, map_box(m, mo.apply(b), true), o.opacity / 100.0, l.flip);
                 }
             }
             LayerKind::Watermark(w) => {
@@ -1696,18 +1822,28 @@ impl Stack {
         // a clipped layer's ops to close, or a base's draws to make a mask of
         let mut open_clip: Option<usize> = None;
         let mut mask_from: Option<(usize, usize)> = None;
-        let close = |draws: &mut Vec<GpuOp<'a>>, open_clip: &mut Option<usize>, mask_from: &mut Option<(usize, usize)>, masked: &mut Vec<bool>| {
+        // a layer mask's slot and whether it's inverted, to close
+        let mut open_lmask: Option<(usize, bool)> = None;
+        let close = |draws: &mut Vec<GpuOp<'a>>, open_clip: &mut Option<usize>, mask_from: &mut Option<(usize, usize)>, masked: &mut Vec<bool>, open_lmask: &mut Option<(usize, bool)>| {
+            let lmask = open_lmask.take();
+            if let Some((slot, invert)) = lmask {
+                draws.push(GpuOp::ClipEnd { slot, invert });
+            }
             if let Some(b) = open_clip.take() {
-                draws.push(GpuOp::ClipEnd { slot: b });
+                draws.push(GpuOp::ClipEnd { slot: b, invert: false });
             }
             if let Some((b, from)) = mask_from.take() {
                 let ds: Vec<GpuDraw<'a>> = draws[from..].iter().filter_map(|o| if let GpuOp::Draw(d) = o { Some(*d) } else { None }).collect();
                 draws.push(GpuOp::Mask { draws: ds, slot: b });
+                // a masked base clips to what shows of it
+                if let Some((by, invert)) = lmask {
+                    draws.push(GpuOp::MaskMul { slot: b, by, invert });
+                }
                 masked[b] = true;
             }
         };
         for (li, l) in self.layers.iter().enumerate() {
-            close(&mut draws, &mut open_clip, &mut mask_from, &mut masked);
+            close(&mut draws, &mut open_clip, &mut mask_from, &mut masked, &mut open_lmask);
             if !l.active() || !l.timing.shows(i, n) {
                 continue;
             }
@@ -1753,6 +1889,18 @@ impl Stack {
             };
             let k = mo.opacity;
             let mk = |sp: &'a RgbaImage, x: i64, y: i64, alpha: f32| GpuOp::Draw(GpuDraw { src: GpuSrc::Img(sp), m: place(sp, x, y), opacity: alpha * k });
+            // a layer mask: the frame is kept, the layer drawn, and it shows
+            // only where the mask is (as render_frame)
+            if let Some(lm) = l.active_mask() {
+                let slot = self.layers.len() + li;
+                let ds = match prep.lmasks.get(li).and_then(|x| x.as_ref()) {
+                    Some((sp, x, y)) => vec![GpuDraw { src: GpuSrc::Img(sp), m: if lm.linked { place(sp, *x, *y) } else { Affine::translate(*x as f32, *y as f32) }, opacity: 1.0 }],
+                    None => Vec::new(),
+                };
+                draws.push(GpuOp::Mask { draws: ds, slot });
+                draws.push(GpuOp::ClipBegin);
+                open_lmask = Some((slot, lm.invert));
+            }
             match &l.kind {
                 LayerKind::Effects(fx) => {
                     // as render_frame: from the layer's first frame to its last
@@ -1805,6 +1953,7 @@ impl Stack {
                         let (iw, ih) = (frame.width().max(1) as f32, frame.height().max(1) as f32);
                         let am = Affine::scale(ob.w.round().max(1.0) / iw, ob.h.round().max(1.0) / ih)
                             .then(Affine::translate(-ob.w.round().max(1.0) / 2.0, -ob.h.round().max(1.0) / 2.0))
+                            .then(Affine::scale(if l.flip[0] { -1.0 } else { 1.0 }, if l.flip[1] { -1.0 } else { 1.0 }))
                             .then(Affine::rotate(ob.angle))
                             .then(Affine::translate(ob.cx, ob.cy));
                         draws.push(GpuOp::Draw(GpuDraw { src: GpuSrc::Img(frame), m: am, opacity: o.opacity / 100.0 * k }));
@@ -1875,7 +2024,7 @@ impl Stack {
                 }
             }
         }
-        close(&mut draws, &mut open_clip, &mut mask_from, &mut masked);
+        close(&mut draws, &mut open_clip, &mut mask_from, &mut masked, &mut open_lmask);
         Some(GpuFrame { size: (ow, oh), geo, ops: draws, owned })
     }
 }

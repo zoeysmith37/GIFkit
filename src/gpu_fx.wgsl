@@ -1117,7 +1117,11 @@ fn fs_fx(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         case 52: {
             let qs = unpremul8(textureLoad(t0, ip, 0));
             let ps = unpremul8(textureLoad(t1, ip, 0));
-            let m = round(textureLoad(t2, ip, 0).a * 255.0) / 255.0;
+            var m = round(textureLoad(t2, ip, 0).a * 255.0) / 255.0;
+            // a.x: an inverted layer mask (shows outside its shape)
+            if (a.x > 0.5) {
+                m = 1.0 - m;
+            }
             let o = rnd4(ps + (qs - ps) * m);
             return vec4<f32>(rnd4(vec4<f32>(o.rgb * o.a / 255.0, o.a))) / 255.0;
         }
@@ -1144,6 +1148,15 @@ fn fs_fx(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             let g = ld(t0, ip) / 255.0;
             let u = textureLoad(t1, ip, 0);
             return vec4<f32>(g.rgb * g.a + u.rgb * (1.0 - g.a), g.a + u.a * (1.0 - g.a));
+        }
+        // 57 mask t0 kept where mask t2 is (a.x: where it isn't); masks are alpha
+        case 57: {
+            let k = round(textureLoad(t0, ip, 0).a * 255.0);
+            var m = round(textureLoad(t2, ip, 0).a * 255.0);
+            if (a.x > 0.5) {
+                m = 255.0 - m;
+            }
+            return vec4<f32>(0.0, 0.0, 0.0, floor((k * m + 127.0) / 255.0) / 255.0);
         }
         // 53 clear to transparent
         case 53: {
