@@ -839,6 +839,9 @@ pub struct GifKitApp {
     mask_drag: Option<MaskDrag>,
     /// which of the mask's shapes is picked
     mask_shape: usize,
+    /// the GIF's own mask is picked (from its mark on the Frames row),
+    /// whatever tool is open
+    mask_gif: bool,
     /// what transparent pixels show on in the viewports
     backdrop: Backdrop,
     backdrop_col: [u8; 3],
@@ -2881,6 +2884,7 @@ impl GifKitApp {
             mask_edit: false,
             mask_drag: None,
             mask_shape: 0,
+            mask_gif: false,
             backdrop: match theme::get_setting("backdrop").as_deref() {
                 Some("solid") => Backdrop::Solid,
                 Some("canvas") => Backdrop::Canvas,
@@ -4514,6 +4518,8 @@ impl GifKitApp {
 
     fn select(&mut self, k: Kind, id: u64) {
         self.sel.insert(kind_key(k), id);
+        // a layer picked: its mask, not the GIF's
+        self.mask_gif = false;
     }
 
     fn add_layer(&mut self, kind: LayerKind) -> u64 {
@@ -7349,14 +7355,14 @@ impl GifKitApp {
     }
 
     /// Photoshop-style layer list: top of the stack first, drag to reorder.
-    /// Whose mask the mask button and strip are for: the selected layer,
-    /// or the GIF when its Frames row is picked.
+    /// Whose mask the mask button and strip are for: the GIF's when it was
+    /// picked on the Frames row, else the selected layer's, else (no layer
+    /// selected) the GIF's.
     fn mask_target(&self) -> Option<MaskOf> {
-        if self.tool == Tool::Frames {
-            Some(MaskOf::Gif)
-        } else {
-            self.sel_layer_index().map(MaskOf::Layer)
+        if self.mask_gif {
+            return Some(MaskOf::Gif);
         }
+        Some(self.sel_layer_index().map(MaskOf::Layer).unwrap_or(MaskOf::Gif))
     }
 
     fn mask_of(&self, t: MaskOf) -> Option<&crate::shapes::LayerMask> {
@@ -7866,9 +7872,19 @@ impl GifKitApp {
                     let galley = ui.painter().layout_job(job);
                     let end = r.left() + 52.0 + galley.size().x;
                     painter.galley(pos2(r.left() + 52.0, r.center().y - galley.size().y / 2.0), galley, col);
-                    // the GIF's mask, on its row
-                    if let (Tool::Frames, Some(mk)) = (t, &self.stack.transform.mask) {
-                        paint_mask_glyph(painter, pos2(end + 14.0, r.center().y), 13.0, if sel { Color32::WHITE } else { pal.fg }, mk.invert, mk.on);
+                    // the GIF's mask, on its row: click to pick it and move it
+                    if let (Tool::Frames, Some(mk)) = (t, self.stack.transform.mask.clone()) {
+                        let mr = Rect::from_center_size(pos2(end + 14.0, r.center().y), vec2(20.0, 20.0));
+                        let mresp = ui.interact(mr, egui::Id::unique("gif-mask-mark"), Sense::click()).on_hover_text("The GIF's mask. Click to move it");
+                        let picked = self.mask_gif && self.mask_edit;
+                        if picked {
+                            painter.rect_stroke(mr.expand(1.0), 3.0, Stroke::new(1.0, if sel { Color32::WHITE } else { pal.highlight }), egui::StrokeKind::Inside);
+                        }
+                        paint_mask_glyph(painter, mr.center(), 13.0, if sel || mresp.hovered() { if sel { Color32::WHITE } else { pal.fg } } else { mix(pal.fg, pal.fg_muted, 0.3) }, mk.invert, mk.on);
+                        if mresp.clicked() {
+                            menu_act = Some(LayerAct::MaskEdit(MaskOf::Gif));
+                        }
+                        eye_hit |= mresp.hovered();
                     }
                 } else if let Some((_, buf)) = &mut self.edit_renaming {
                     let name_r = Rect::from_min_size(pos2(r.left() + 48.0, r.top() + 3.0), vec2((r.width() - 80.0).max(40.0), r.height() - 6.0));
@@ -7888,8 +7904,26 @@ impl GifKitApp {
                     self.edit_renaming = Some((t, custom.clone().unwrap_or_else(|| t.label().to_string())));
                     self.rename_fresh = true;
                 }
+                let gif_mask = self.stack.transform.mask.as_ref().map(|m| (m.invert, m.on));
                 resp.context_menu(|ui| {
                     ui.set_min_width(230.0);
+                    if t == Tool::Frames {
+                        if menu_item(ui, if gif_mask.is_some() { "edit-delete" } else { "shapes" }, if gif_mask.is_some() { "Delete the GIF's &Mask" } else { "Add a &Mask to the GIF" }, "", true) {
+                            menu_act = Some(LayerAct::Mask(MaskOf::Gif));
+                        }
+                        if let Some((inv, on)) = gif_mask {
+                            if menu_item(ui, "transform-scale", "Move the GIF's Mas&k", "", true) {
+                                menu_act = Some(LayerAct::MaskEdit(MaskOf::Gif));
+                            }
+                            if menu_check(ui, inv, "&Invert Mask", "") {
+                                menu_act = Some(LayerAct::MaskInvert(MaskOf::Gif));
+                            }
+                            if menu_check(ui, !on, "Turn Mask &Off", "") {
+                                menu_act = Some(LayerAct::MaskOn(MaskOf::Gif));
+                            }
+                        }
+                        ui.separator();
+                    }
                     if let Some(on) = enabled {
                         if menu_item(ui, "edit-rename", "&Rename", "", true) {
                             menu_act = Some(LayerAct::RenameEdit(t));
@@ -8093,6 +8127,7 @@ impl GifKitApp {
         match act {
             LayerAct::Mask(t) => {
                 self.snapshot(&format!("mask{now}"), now);
+                self.mask_gif = t == MaskOf::Gif;
                 if self.mask_slot(t).take().is_none() {
                     let m = crate::shapes::LayerMask::new(self.new_mask_box(t));
                     *self.mask_slot(t) = Some(m);
@@ -8126,7 +8161,13 @@ impl GifKitApp {
                         self.tool = kind_tool(k);
                         self.select(k, id);
                     }
-                    MaskOf::Gif => self.tool = Tool::Frames,
+                    // the GIF's: picked where you are, no change of tool
+                    MaskOf::Gif => {
+                        if !self.mask_gif {
+                            self.mask_edit = false;
+                        }
+                        self.mask_gif = true;
+                    }
                 }
                 self.mask_edit = !self.mask_edit;
             }
@@ -9330,7 +9371,8 @@ impl GifKitApp {
                 self.pan_by(vi, vec2(scroll.x, 0.0));
             }
         }
-        let left_pans = !self.tool.uses_canvas_drag() || ui.input(|i| i.modifiers.alt);
+        // moving a mask takes the left drag in any tool (Frames, Effects...)
+        let left_pans = !(self.tool.uses_canvas_drag() || self.mask_edit) || ui.input(|i| i.modifiers.alt);
         if resp.dragged_by(PointerButton::Middle) || resp.dragged_by(PointerButton::Secondary) || (left_pans && resp.dragged_by(PointerButton::Primary)) {
             self.pan_by(vi, resp.drag_delta());
             ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
