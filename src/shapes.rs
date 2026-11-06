@@ -560,13 +560,13 @@ pub fn map_scale(m: &Affine) -> f32 {
 
 // ---------------------------------------------------------------- layer masks
 
-/// A layer mask: a shape the layer shows inside (or, inverted, outside of),
-/// with a soft edge. As Photoshop's vector masks.
+/// One shape of a mask: where it is, its edge, and whether it adds to the
+/// mask or cuts out of it.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
-pub struct LayerMask {
+pub struct MaskShape {
     pub kind: ShapeKind,
-    /// the shape's box in source-frame pixels: centre, size, clockwise degrees
+    /// its box in source-frame pixels: centre, size, clockwise degrees
     pub cx: f32,
     pub cy: f32,
     pub w: f32,
@@ -574,28 +574,21 @@ pub struct LayerMask {
     pub angle: f32,
     /// corner rounding (Rounded), % of the short side
     pub corner: f32,
-    /// points (Star)
+    /// points (Star, Burst)
     pub points: u32,
     /// soft edge, source pixels
     pub feather: f32,
-    /// show outside the shape instead: cuts a hole
-    pub invert: bool,
-    /// moves with the layer's keyframes (off: stays put as the layer moves)
-    pub linked: bool,
-    /// off: kept but not used
-    pub on: bool,
+    /// takes away from the shapes before it instead of adding
+    pub subtract: bool,
 }
 
-impl Default for LayerMask {
+impl Default for MaskShape {
     fn default() -> Self {
-        Self { kind: ShapeKind::Ellipse, cx: 0.0, cy: 0.0, w: 0.0, h: 0.0, angle: 0.0, corner: 20.0, points: 5, feather: 0.0, invert: false, linked: true, on: true }
+        Self { kind: ShapeKind::Ellipse, cx: 0.0, cy: 0.0, w: 0.0, h: 0.0, angle: 0.0, corner: 20.0, points: 5, feather: 0.0, subtract: false }
     }
 }
 
-impl LayerMask {
-    /// Shapes a mask can be.
-    pub const KINDS: [ShapeKind; 7] = [ShapeKind::Rect, ShapeKind::Rounded, ShapeKind::Ellipse, ShapeKind::Triangle, ShapeKind::Star, ShapeKind::Heart, ShapeKind::Burst];
-
+impl MaskShape {
     pub fn new(o: Obb) -> Self {
         let mut m = Self::default();
         m.set_obb(o);
@@ -609,26 +602,94 @@ impl LayerMask {
     }
 }
 
-/// A mask's coverage in an output-space box `o` (white, coverage in alpha),
-/// feathered, and where its top-left goes. `scale` turns source pixels
-/// into output pixels. Only the part inside `area` (x0, y0, x1, y1) is
-/// made: past it nothing shows. None: nothing to draw there.
-pub fn mask_sprite(mk: &LayerMask, o: Obb, scale: f32, area: (f32, f32, f32, f32)) -> Option<(RgbaImage, i64, i64)> {
-    if o.w < 0.5 || o.h < 0.5 {
-        return None;
+/// A layer mask, as Photoshop's vector masks: shapes the layer shows
+/// inside (or, inverted, outside of), each adding to the mask or cutting
+/// out of it, in order.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct LayerMask {
+    pub shapes: Vec<MaskShape>,
+    /// show outside the shapes instead: cuts holes
+    pub invert: bool,
+    /// moves with the layer's keyframes (off: stays put as the layer moves)
+    pub linked: bool,
+    /// off: kept but not used
+    pub on: bool,
+}
+
+impl Default for LayerMask {
+    fn default() -> Self {
+        Self { shapes: Vec::new(), invert: false, linked: true, on: true }
     }
-    let s = ShapeSettings { kind: mk.kind, corner: mk.corner, points: mk.points, ..Default::default() };
-    let path = shape_path(&s, o.w / 2.0, o.h / 2.0)?;
-    let fe = (mk.feather * scale).clamp(0.0, 2000.0);
-    let pad = (fe * 1.5).ceil() + 2.0;
-    let cs = o.corners();
+}
+
+/// As saved: also reads the first masks, which had one shape and kept it
+/// in the mask itself.
+#[derive(serde::Deserialize)]
+#[serde(default)]
+struct LayerMaskFile {
+    shapes: Vec<MaskShape>,
+    invert: bool,
+    linked: bool,
+    on: bool,
+    #[serde(flatten)]
+    one: Option<MaskShape>,
+}
+
+impl Default for LayerMaskFile {
+    fn default() -> Self {
+        let d = LayerMask::default();
+        Self { shapes: Vec::new(), invert: d.invert, linked: d.linked, on: d.on, one: None }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for LayerMask {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let f = LayerMaskFile::deserialize(d)?;
+        let mut shapes = f.shapes;
+        if shapes.is_empty() {
+            shapes.extend(f.one.filter(|s| s.w > 0.0 && s.h > 0.0));
+        }
+        Ok(LayerMask { shapes, invert: f.invert, linked: f.linked, on: f.on })
+    }
+}
+
+impl LayerMask {
+    /// Shapes a mask can be.
+    pub const KINDS: [ShapeKind; 7] = [ShapeKind::Rect, ShapeKind::Rounded, ShapeKind::Ellipse, ShapeKind::Triangle, ShapeKind::Star, ShapeKind::Heart, ShapeKind::Burst];
+
+    /// A mask of one shape in box `o`.
+    pub fn new(o: Obb) -> Self {
+        Self { shapes: vec![MaskShape::new(o)], ..Default::default() }
+    }
+}
+
+/// A mask's coverage (white, coverage in alpha), feathered, and where its
+/// top-left goes. `boxes`: each shape's box in output space; `scale` turns
+/// source pixels into output pixels. Only the part inside `area` (x0, y0,
+/// x1, y1) is made: past it nothing shows. None: nothing to draw there.
+pub fn mask_sprite(mk: &LayerMask, boxes: &[Obb], scale: f32, area: (f32, f32, f32, f32)) -> Option<(RgbaImage, i64, i64)> {
+    // each shape's path and the region it needs (with room for its edge)
+    let mut parts = Vec::new();
     let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-    for c in cs {
-        (x0, y0, x1, y1) = (x0.min(c.0), y0.min(c.1), x1.max(c.0), y1.max(c.1));
+    for (sh, o) in mk.shapes.iter().zip(boxes) {
+        if o.w < 0.5 || o.h < 0.5 {
+            continue;
+        }
+        let s = ShapeSettings { kind: sh.kind, corner: sh.corner, points: sh.points, ..Default::default() };
+        let Some(path) = shape_path(&s, o.w / 2.0, o.h / 2.0) else { continue };
+        let fe = (sh.feather * scale).clamp(0.0, 2000.0);
+        let pad = (fe * 1.5).ceil() + 2.0;
+        // a cut only matters where something was added
+        if !sh.subtract {
+            for c in o.corners() {
+                (x0, y0, x1, y1) = (x0.min(c.0 - pad), y0.min(c.1 - pad), x1.max(c.0 + pad), y1.max(c.1 + pad));
+            }
+        }
+        parts.push((path, *o, fe, sh.subtract));
     }
-    let (x0, y0) = ((x0 - pad).max(area.0 - pad).floor(), (y0 - pad).max(area.1 - pad).floor());
-    let (x1, y1) = ((x1 + pad).min(area.2 + pad).ceil(), (y1 + pad).min(area.3 + pad).ceil());
-    if x1 <= x0 || y1 <= y0 {
+    let (x0, y0) = (x0.max(area.0 - 2.0).floor(), y0.max(area.1 - 2.0).floor());
+    let (x1, y1) = (x1.min(area.2 + 2.0).ceil(), y1.min(area.3 + 2.0).ceil());
+    if parts.is_empty() || x1 <= x0 || y1 <= y0 {
         return None;
     }
     let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
@@ -636,14 +697,22 @@ pub fn mask_sprite(mk: &LayerMask, o: Obb, scale: f32, area: (f32, f32, f32, f32
     if w as u64 * h as u64 > 64_000_000 {
         return None;
     }
+    let mut acc = vec![0.0f32; (w * h) as usize];
     let mut pm = Pixmap::new(w.max(1), h.max(1))?;
-    let tf = Transform::from_rotate(o.angle).post_translate(o.cx - x0, o.cy - y0);
-    pm.fill_path(&path, &paint([255, 255, 255], 255), FillRule::Winding, tf, None);
-    let mut a: Vec<u8> = pm.pixels().iter().map(|p| p.alpha()).collect();
-    if fe >= 0.3 {
-        blur_u8(&mut a, w as usize, h as usize, fe / 2.0);
+    for (path, o, fe, subtract) in parts {
+        pm.fill(tiny_skia::Color::TRANSPARENT);
+        let tf = Transform::from_rotate(o.angle).post_translate(o.cx - x0, o.cy - y0);
+        pm.fill_path(&path, &paint([255, 255, 255], 255), FillRule::Winding, tf, None);
+        let mut a: Vec<u8> = pm.pixels().iter().map(|p| p.alpha()).collect();
+        if fe >= 0.3 {
+            blur_u8(&mut a, w as usize, h as usize, fe / 2.0);
+        }
+        for (v, s) in acc.iter_mut().zip(a) {
+            let s = s as f32 / 255.0;
+            *v = if subtract { *v * (1.0 - s) } else { *v + s - *v * s };
+        }
     }
-    let img = RgbaImage::from_fn(w, h, |x, y| image::Rgba([255, 255, 255, a[(y * w + x) as usize]]));
+    let img = RgbaImage::from_fn(w, h, |x, y| image::Rgba([255, 255, 255, (acc[(y * w + x) as usize] * 255.0).round() as u8]));
     Some((img, x0 as i64, y0 as i64))
 }
 

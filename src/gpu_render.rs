@@ -111,6 +111,8 @@ pub enum GpuOp<'a> {
     ClipEnd { slot: usize, invert: bool },
     /// mask `slot` kept only where mask `by` is (or isn't)
     MaskMul { slot: usize, by: usize, invert: bool },
+    /// the frame kept only where mask `slot` is (or isn't), see-through past it
+    KeepIn { slot: usize, invert: bool },
 }
 
 /// Everything needed to make one output frame.
@@ -140,7 +142,7 @@ impl GpuFrame<'_> {
         self.ops.iter().all(|op| match op {
             GpuOp::Draw(d) => draw_ok(d),
             GpuOp::Mask { draws, .. } => draws.iter().all(draw_ok),
-            GpuOp::ClipBegin | GpuOp::ClipEnd { .. } | GpuOp::Under { .. } | GpuOp::MaskMul { .. } => true,
+            GpuOp::ClipBegin | GpuOp::ClipEnd { .. } | GpuOp::Under { .. } | GpuOp::MaskMul { .. } | GpuOp::KeepIn { .. } => true,
             GpuOp::AnimClip { passes, .. } => passes.iter().all(|p| ok(p.size.0, p.size.1) && p.ins.iter().all(|i| !matches!(i, Some(GpuIn::Img(i)) if !img_ok(i)))),
             GpuOp::Effect { passes, .. } => passes.iter().all(|p| ok(p.size.0, p.size.1) && p.ins.iter().all(|i| !matches!(i, Some(GpuIn::Img(i)) if !img_ok(i)))),
         })
@@ -846,6 +848,15 @@ impl GpuRenderer {
                         // as the CPU: only when nothing changed the frame's size
                         if bs == cur_size && *ms == cur_size {
                             (cur_tex, cur_view) = self.fx_raw(&mut enc, 52.0, [&cur_view, &bv, mv], cur_size, &[[if *invert { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0]]);
+                        }
+                    }
+                }
+                GpuOp::KeepIn { slot, invert } => {
+                    self.draw_quads(&mut enc, &cur_view, &quads);
+                    quads.clear();
+                    if let Some((mv, ms)) = masks.get(slot) {
+                        if *ms == cur_size {
+                            (cur_tex, cur_view) = self.fx_raw(&mut enc, 58.0, [&cur_view, &self.blank, mv], cur_size, &[[if *invert { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0]]);
                         }
                     }
                 }

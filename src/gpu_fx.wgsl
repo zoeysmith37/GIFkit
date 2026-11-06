@@ -1149,6 +1149,17 @@ fn fs_fx(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             let u = textureLoad(t1, ip, 0);
             return vec4<f32>(g.rgb * g.a + u.rgb * (1.0 - g.a), g.a + u.a * (1.0 - g.a));
         }
+        // 58 the frame t0 kept where mask t2 is (a.x: where it isn't), see-through
+        // past it (stack::render_frame's GIF mask)
+        case 58: {
+            let q = unpremul8(textureLoad(t0, ip, 0));
+            var m = round(textureLoad(t2, ip, 0).a * 255.0);
+            if (a.x > 0.5) {
+                m = 255.0 - m;
+            }
+            let al = floor((q.a * m + 127.0) / 255.0);
+            return vec4<f32>(rnd4(vec4<f32>(q.rgb * al / 255.0, al))) / 255.0;
+        }
         // 57 mask t0 kept where mask t2 is (a.x: where it isn't); masks are alpha
         case 57: {
             let k = round(textureLoad(t0, ip, 0).a * 255.0);

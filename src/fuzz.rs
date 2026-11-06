@@ -270,6 +270,27 @@ fn case(seed: u64, stage: &Mutex<&'static str>) -> String {
             *v = (*v).min(300);
         }
     }
+    if r.chance(0.2) {
+        let n = r.pick(&[0usize, 1, 2]);
+        st.transform.mask = Some(crate::shapes::LayerMask {
+            shapes: (0..n)
+                .map(|_| crate::shapes::MaskShape {
+                    kind: crate::shapes::LayerMask::KINDS[r.below(7)],
+                    cx: r.pick(&[w as f32 / 2.0, 0.0, w as f32 * 2.0]),
+                    cy: h as f32 / 2.0,
+                    w: r.pick(&[w as f32 / 2.0, 0.0, 9000.0]),
+                    h: r.pick(&[h as f32 / 2.0, 1.0]),
+                    angle: r.pick(&[0.0, 45.0]),
+                    feather: r.pick(&[0.0, 3.0, 900.0]),
+                    subtract: r.chance(0.3),
+                    ..Default::default()
+                })
+                .collect(),
+            invert: r.chance(0.5),
+            on: r.chance(0.9),
+            ..Default::default()
+        });
+    }
     // outputs bigger than this test machine can hold aren't interesting here
     let g = st.transform.geo_map(w, h);
     if g.w * g.h > 9_000_000.0 {
@@ -283,18 +304,26 @@ fn case(seed: u64, stage: &Mutex<&'static str>) -> String {
         let vis = !r.chance(0.1);
         let op = r.pick(&[100.0f32, 100.0, 50.0, 0.0, -10.0, 300.0]);
         let clip = r.chance(0.3);
-        let mask = r.chance(0.25).then(|| crate::shapes::LayerMask {
-            kind: crate::shapes::LayerMask::KINDS[r.below(7)],
-            cx: r.pick(&[0.0, w as f32 / 2.0, -50.0, w as f32 * 3.0]),
-            cy: r.pick(&[0.0, h as f32 / 2.0]),
-            w: r.pick(&[0.0, 1.0, w as f32 / 2.0, w as f32 * 5.0]),
-            h: r.pick(&[0.5, h as f32 / 3.0, 20000.0]),
-            angle: r.pick(&[0.0, 33.0, -720.0]),
-            feather: r.pick(&[0.0, 2.0, 40.0, 5000.0, -3.0]),
-            invert: r.chance(0.5),
-            linked: r.chance(0.5),
-            on: r.chance(0.9),
-            ..Default::default()
+        let mask = r.chance(0.25).then(|| {
+            let n = r.pick(&[0usize, 1, 1, 2, 3]);
+            crate::shapes::LayerMask {
+                shapes: (0..n)
+                    .map(|_| crate::shapes::MaskShape {
+                        kind: crate::shapes::LayerMask::KINDS[r.below(7)],
+                        cx: r.pick(&[0.0, w as f32 / 2.0, -50.0, w as f32 * 3.0]),
+                        cy: r.pick(&[0.0, h as f32 / 2.0]),
+                        w: r.pick(&[0.0, 1.0, w as f32 / 2.0, w as f32 * 5.0]),
+                        h: r.pick(&[0.5, h as f32 / 3.0, 20000.0]),
+                        angle: r.pick(&[0.0, 33.0, -720.0]),
+                        feather: r.pick(&[0.0, 2.0, 40.0, 5000.0, -3.0]),
+                        subtract: r.chance(0.3),
+                        ..Default::default()
+                    })
+                    .collect(),
+                invert: r.chance(0.5),
+                linked: r.chance(0.5),
+                on: r.chance(0.9),
+            }
         });
         let flip = [r.chance(0.2), r.chance(0.2)];
         if let Some(l) = st.layers.iter_mut().find(|l| l.id == id) {
@@ -1366,7 +1395,7 @@ fn layer_masks() {
     let shape = crate::shapes::ShapeSettings { x: 0, y: 0, w: 160, h: 120, fill: [0, 0, 255], ..Default::default() };
     let neg = LayerKind::Effects(Box::new(crate::effects::EffectSettings { negative: true, ..Default::default() }));
     let text = crate::text::Annotation { text: "MASK".into(), size: 60.0, x: 10, y: 20, color: [255, 255, 0, 255], ..Default::default() };
-    let m = |kind, cx, cy, w, h, angle, feather, invert, linked| Some(LayerMask { kind, cx, cy, w, h, angle, feather, invert, linked, ..Default::default() });
+    let m = |kind, cx, cy, w, h, angle, feather, invert, linked| Some(LayerMask { shapes: vec![crate::shapes::MaskShape { kind, cx, cy, w, h, angle, feather, ..Default::default() }], invert, linked, ..Default::default() });
     let key = crate::timeline::Key { frame: 0, x: 30.0, y: 10.0, scale_x: 100.0, scale_y: 100.0, angle: 0.0, opacity: 100.0, ease: crate::timeline::Ease::Linear, curve: crate::timeline::CURVE_SMOOTH };
     type Case = (&'static str, Vec<(LayerKind, bool, Option<LayerMask>)>, bool);
     let cases: Vec<Case> = vec![
@@ -1435,6 +1464,38 @@ fn layer_masks() {
         assert!(sum / npx < 2.0 && bad as f64 / npx < 0.01, "{name}: the card differs from the CPU");
     }
     println!("worst {worst_case:.2}% off");
+
+    // the GIF's own mask, of two shapes, the second cutting a hole in the
+    // first, with a layer on top that it doesn't touch
+    let mut st = Stack::default();
+    let ring = |cx, w, subtract| crate::shapes::MaskShape { kind: ShapeKind::Ellipse, cx, cy: 60.0, w, h: w * 0.8, subtract, ..Default::default() };
+    st.transform.mask = Some(LayerMask { shapes: vec![ring(80.0, 100.0, false), ring(80.0, 40.0, true)], ..Default::default() });
+    st.push(LayerKind::Shape(Box::new(crate::shapes::ShapeSettings { x: 0, y: 0, w: 30, h: 30, fill: [0, 255, 0], ..Default::default() })));
+    let plan = st.plan(&base);
+    let times = crate::stack::plan_times(&plan);
+    let prep = st.prepare(&base, &fonts);
+    let cpu = st.render_frame(&base, &plan, &times, 0, &fonts, &prep);
+    assert_eq!(cpu.get_pixel(80, 60)[3], 0, "the hole");
+    assert_eq!(cpu.get_pixel(50, 60)[3], 255, "the ring");
+    assert_eq!(cpu.get_pixel(150, 115)[3], 0, "past it");
+    assert_eq!(cpu.get_pixel(5, 5).0, [0, 255, 0, 255], "the layer isn't masked");
+    if let Some(g) = gpu.as_mut() {
+        let job = st.gpu_frame(&base, &plan, &times, 0, &fonts, &prep).expect("on the GPU");
+        let tex = g.render(&base.frames[0].image.get(), 1, &job, 900);
+        let out = g.read(&tex);
+        // (the colour of a nearly see-through pixel is stored premultiplied on
+        // the card, coarse: only its alpha is held to)
+        let bad = out.pixels().zip(cpu.pixels()).filter(|(a, b)| ((a[3] as i32 - b[3] as i32).abs() > 2 || (b[3] >= 64 && (0..3).any(|c| (a[c] as i32 - b[c] as i32).abs() > 4)))).count();
+        println!("GIF mask: {bad} pixels off");
+        for (i, (a, b)) in out.pixels().zip(cpu.pixels()).enumerate().filter(|(_, (a, b))| ((a[3] as i32 - b[3] as i32).abs() > 2 || (b[3] >= 64 && (0..3).any(|c| (a[c] as i32 - b[c] as i32).abs() > 4)))).take(5) {
+            println!("  at {} {}: card {:?} cpu {:?}", i % 160, i / 160, a.0, b.0);
+        }
+        if let Ok(dir) = std::env::var("GPU_OUT") {
+            out.save(format!("{dir}/gifmask_gpu.png")).unwrap();
+            cpu.save(format!("{dir}/gifmask_cpu.png")).unwrap();
+        }
+        assert!(bad < 20, "GIF mask: the card differs ({bad} pixels)");
+    }
 }
 
 /// Mirrored layers: the picture flipped in its own box, the same on the

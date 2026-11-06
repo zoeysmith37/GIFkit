@@ -1053,7 +1053,7 @@ fn project_round_trip() {
         ProjLayerEntry { flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: Some("Caption".into()), timing: Default::default(), layer: ProjLayer::Text { text: crate::text::Annotation { text: "hi".into(), stretch: 0.7, ..Default::default() }, font: Some(("builtin".into(), "Sans Bold".into())) } },
         ProjLayerEntry { flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: false, label: None, timing: Default::default(), layer: ProjLayer::Image { id: 1, name: "ov.png".into(), path: None, delays: vec![5, 5, 5], placements: vec![Default::default(); base.len()], opacity: 80.0 } },
         ProjLayerEntry { flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: Default::default(), layer: ProjLayer::Watermark { id: 2, watermark: Default::default(), has_image: true } },
-        ProjLayerEntry { flip: [true, false], mask: Some(crate::shapes::LayerMask { kind: crate::shapes::ShapeKind::Star, invert: true, feather: 3.0, cx: 5.0, cy: 6.0, w: 7.0, h: 8.0, ..Default::default() }), clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: crate::timeline::Timing { clips: Some(vec![crate::timeline::Clip { start: 2, end: Some(5) }]), keys: vec![crate::timeline::Key { frame: 3, x: 10.0, ..Default::default() }] }, layer: ProjLayer::Emoji { emoji: crate::shapes::EmojiSettings { emoji: "1f525".into(), w: 20, h: 20, ..Default::default() } } },
+        ProjLayerEntry { flip: [true, false], mask: Some(crate::shapes::LayerMask { shapes: vec![crate::shapes::MaskShape { kind: crate::shapes::ShapeKind::Star, feather: 3.0, cx: 5.0, cy: 6.0, w: 7.0, h: 8.0, ..Default::default() }, crate::shapes::MaskShape { subtract: true, w: 2.0, h: 2.0, ..Default::default() }], invert: true, ..Default::default() }), clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: crate::timeline::Timing { clips: Some(vec![crate::timeline::Clip { start: 2, end: Some(5) }]), keys: vec![crate::timeline::Key { frame: 3, x: 10.0, ..Default::default() }] }, layer: ProjLayer::Emoji { emoji: crate::shapes::EmojiSettings { emoji: "1f525".into(), w: 20, h: 20, ..Default::default() } } },
         ProjLayerEntry { flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: Default::default(), layer: ProjLayer::Markup { markup: crate::shapes::MarkupSettings { strokes: vec![crate::shapes::PenStroke { points: vec![[1.0, 2.0], [3.0, 4.0]], ..Default::default() }] } } },
     ];
     let mut transform = crate::stack::Transform::default();
@@ -1089,7 +1089,11 @@ fn project_round_trip() {
     // a mask and a flip come back; layers without stay without
     assert_eq!(pr.file.layers[3].flip, [true, false]);
     let m = pr.file.layers[3].mask.as_ref().unwrap();
-    assert!(m.invert && m.kind == crate::shapes::ShapeKind::Star && m.feather == 3.0 && m.w == 7.0 && m.linked && m.on);
+    assert!(m.invert && m.linked && m.on && m.shapes.len() == 2 && m.shapes[1].subtract);
+    assert!(m.shapes[0].kind == crate::shapes::ShapeKind::Star && m.shapes[0].feather == 3.0 && m.shapes[0].w == 7.0);
+    // the first masks had their one shape in the mask itself
+    let old: crate::shapes::LayerMask = serde_json::from_str(r#"{"kind":"Rect","cx":4.0,"cy":5.0,"w":6.0,"h":7.0,"feather":2.0,"invert":true}"#).unwrap();
+    assert!(old.invert && old.on && old.shapes.len() == 1 && old.shapes[0].kind == crate::shapes::ShapeKind::Rect && old.shapes[0].w == 6.0);
     assert!(pr.file.layers[0].mask.is_none() && pr.file.layers[0].flip == [false; 2]);
     // an unchanged original isn't stored twice
     let f2 = ProjectFile::default();

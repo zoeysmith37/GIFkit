@@ -83,6 +83,9 @@ pub struct Transform {
     /// source (0 or 1 = full size); never saved
     #[serde(skip)]
     pub pre_scale: f32,
+    /// a shape the GIF itself shows only inside (or outside): see-through past it
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mask: Option<crate::shapes::LayerMask>,
 }
 
 impl Default for Transform {
@@ -124,6 +127,7 @@ impl Default for Transform {
             pad_transparent: false,
             pad_color: [255, 255, 255],
             pre_scale: 1.0,
+            mask: None,
         }
     }
 }
@@ -190,8 +194,13 @@ impl Transform {
         out
     }
 
+    /// The GIF's mask, when one is on.
+    pub fn active_mask(&self) -> Option<&crate::shapes::LayerMask> {
+        self.mask.as_ref().filter(|m| m.on)
+    }
+
     pub fn is_identity(&self) -> bool {
-        self.geometry_identity() && !self.cut_on && !(self.speed_on && !(self.speed_mode == SpeedMode::Percent && self.speed_val == 100.0)) && !(self.play_on && (self.reverse || self.boomerang || self.set_loop))
+        self.active_mask().is_none() && self.geometry_identity() && !self.cut_on && !(self.speed_on && !(self.speed_mode == SpeedMode::Percent && self.speed_val == 100.0)) && !(self.play_on && (self.reverse || self.boomerang || self.set_loop))
     }
 
     pub fn rotates(&self) -> bool {
@@ -622,6 +631,8 @@ pub struct Prepared {
     /// each layer's mask shape, feathered, where it sits before any motion
     /// (None: no mask, or one too small to draw)
     lmasks: Vec<Option<(RgbaImage, i64, i64)>>,
+    /// the GIF's own mask, the same way
+    base_mask: Option<(RgbaImage, i64, i64)>,
 }
 
 impl Prepared {
@@ -801,7 +812,7 @@ impl Stack {
     }
 
     pub fn needs_render(&self) -> bool {
-        !self.eff_transform(true).geometry_identity() || self.layers.iter().any(|l| l.active())
+        !self.eff_transform(true).geometry_identity() || self.transform.active_mask().is_some() || self.layers.iter().any(|l| l.active())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1007,6 +1018,7 @@ impl Stack {
                 let m = &maps[li].m;
                 // the frame, and room around it for a mask the layer's motion carries in
                 let (fw, fh) = (maps[li].w, maps[li].h);
+                let boxes: Vec<Obb> = mk.shapes.iter().map(|sh| map_box(m, sh.obb(), false)).collect();
                 let area = if mk.linked && !l.timing.keys.is_empty() {
                     let far = l.timing.keys.iter().map(|k| k.x.abs().max(k.y.abs())).fold(0.0f32, f32::max) * shapes::map_scale(m);
                     let r = fw.max(fh) + far.min(1e5);
@@ -1014,10 +1026,15 @@ impl Stack {
                 } else {
                     (0.0, 0.0, fw, fh)
                 };
-                shapes::mask_sprite(mk, map_box(m, mk.obb(), false), shapes::map_scale(m), area)
+                shapes::mask_sprite(mk, &boxes, shapes::map_scale(m), area)
             })
             .collect();
-        Prepared { maps, sprites, watermarks, stamps, reveals, lmasks }
+        let base_mask = self.transform.active_mask().and_then(|mk| {
+            let g = self.eff_transform(true).geo_map(base.width(), base.height());
+            let boxes: Vec<Obb> = mk.shapes.iter().map(|sh| map_box(&g.m, sh.obb(), false)).collect();
+            shapes::mask_sprite(mk, &boxes, shapes::map_scale(&g.m), (0.0, 0.0, g.w, g.h))
+        });
+        Prepared { maps, sprites, watermarks, stamps, reveals, lmasks, base_mask }
     }
 
     /// The transformed frame before any layer (geometry only).
@@ -1047,6 +1064,18 @@ impl Stack {
         };
         let n = plan.len();
         let mut img = self.geometry_frame(base, plan, i);
+        // the GIF's mask: see-through past it
+        if let Some(mk) = self.transform.active_mask() {
+            let (w, h) = img.dimensions();
+            let mut cov = RgbaImage::new(w, h);
+            if let Some((sp, x, y)) = &prep.base_mask {
+                crate::ops::overlay_with_opacity(&mut cov, sp, *x, *y, 1.0);
+            }
+            for (p, c) in img.pixels_mut().zip(cov.pixels()) {
+                let m = if mk.invert { 255 - c[3] } else { c[3] } as u32;
+                p[3] = ((p[3] as u32 * m + 127) / 255) as u8;
+            }
+        }
         // each clipped layer's base: the nearest unclipped layer below it
         let mut base_of: Vec<Option<usize>> = vec![None; self.layers.len()];
         let mut last = None;
@@ -1820,6 +1849,16 @@ impl Stack {
         let mut undered = vec![false; self.layers.len()];
         let clips_anim = |li: usize| self.layers[li + 1..].iter().take_while(|l| l.clip).any(|l| matches!(&l.kind, LayerKind::Effects(fx) if fx.anim && l.active()));
         // a clipped layer's ops to close, or a base's draws to make a mask of
+        // the GIF's mask, as render_frame: see-through past it
+        if let Some(mk) = self.transform.active_mask() {
+            let slot = 2 * self.layers.len() + 1;
+            let ds = match &prep.base_mask {
+                Some((sp, x, y)) => vec![GpuDraw { src: GpuSrc::Img(sp), m: Affine::translate(*x as f32, *y as f32), opacity: 1.0 }],
+                None => Vec::new(),
+            };
+            draws.push(GpuOp::Mask { draws: ds, slot });
+            draws.push(GpuOp::KeepIn { slot, invert: mk.invert });
+        }
         let mut open_clip: Option<usize> = None;
         let mut mask_from: Option<(usize, usize)> = None;
         // a layer mask's slot and whether it's inverted, to close
