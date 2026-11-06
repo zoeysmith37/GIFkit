@@ -580,15 +580,27 @@ pub struct MaskShape {
     pub feather: f32,
     /// takes away from the shapes before it instead of adding
     pub subtract: bool,
+    /// its name in the layer list ("": Mask 1, Mask 2...)
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub name: String,
 }
 
 impl Default for MaskShape {
     fn default() -> Self {
-        Self { kind: ShapeKind::Ellipse, cx: 0.0, cy: 0.0, w: 0.0, h: 0.0, angle: 0.0, corner: 20.0, points: 5, feather: 0.0, subtract: false }
+        Self { kind: ShapeKind::Ellipse, cx: 0.0, cy: 0.0, w: 0.0, h: 0.0, angle: 0.0, corner: 20.0, points: 5, feather: 0.0, subtract: false, name: String::new() }
     }
 }
 
 impl MaskShape {
+    /// Its name, as listed: given, else "Mask 2" for the second.
+    pub fn label(&self, k: usize) -> String {
+        if self.name.trim().is_empty() {
+            format!("Mask {}", k + 1)
+        } else {
+            self.name.clone()
+        }
+    }
+
     pub fn new(o: Obb) -> Self {
         let mut m = Self::default();
         m.set_obb(o);

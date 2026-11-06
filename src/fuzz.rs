@@ -1535,3 +1535,33 @@ fn flipped_layers() {
         }
     }
 }
+
+/// Flipping a layer and back gives the same layer signature, and a fresh
+/// Prepared can land at the old one's addresses: the card's sprites must
+/// still be the right ones (they were keyed by the signature, and other
+/// layers' old pictures showed up).
+#[test]
+#[ignore]
+fn sprites_after_flip_and_back() {
+    let fonts = crate::text::builtin_fonts();
+    let img = RgbaImage::from_fn(160, 120, |x, y| Rgba([(x * 255 / 160) as u8, (y * 2) as u8, 90, 255]));
+    let base = Animation { frames: vec![Frame::new(img, 10)], loop_count: None };
+    let mut st = Stack::default();
+    st.push(LayerKind::Shape(Box::new(crate::shapes::ShapeSettings { kind: crate::shapes::ShapeKind::Ellipse, x: 90, y: 50, w: 60, h: 50, fill: [255, 120, 0], ..Default::default() })));
+    st.push(LayerKind::Emoji(Box::new(crate::shapes::EmojiSettings { emoji: "1f604".into(), x: 40, y: 50, w: 40, h: 40, ..Default::default() })));
+    let tid = st.push(LayerKind::Text(crate::text::Annotation { text: "happy".into(), size: 30.0, x: 5, y: 5, color: [0, 0, 0, 255], ..Default::default() }));
+    st.layout_text(160, 120, &fonts);
+    let Some(mut g) = crate::gpu_render::GpuRenderer::headless() else { return };
+    let plan = st.plan(&base);
+    let times = crate::stack::plan_times(&plan);
+    for round in 0..12 {
+        st.layers.iter_mut().find(|l| l.id == tid).unwrap().flip[0] = round % 2 == 1;
+        let prep = st.prepare(&base, &fonts);
+        let cpu = st.render_frame(&base, &plan, &times, 0, &fonts, &prep);
+        let job = st.gpu_frame(&base, &plan, &times, 0, &fonts, &prep).expect("on the GPU");
+        let tex = g.render(&base.frames[0].image.get(), 1, &job, prep.id);
+        let out = g.read(&tex);
+        let bad = out.pixels().zip(cpu.pixels()).filter(|(a, b)| (0..4).any(|c| (a[c] as i32 - b[c] as i32).abs() > 24)).count();
+        assert!(bad < 60, "round {round}: the card shows other sprites ({bad} pixels off)");
+    }
+}

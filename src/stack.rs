@@ -621,6 +621,11 @@ pub struct PlanFrame {
 /// Per-render cache: layer maps and text sprites (already scaled / rotated
 /// into output space), computed once per render.
 pub struct Prepared {
+    /// this one alone: the graphics card keeps its sprites by their address,
+    /// and a new Prepared can reuse an old one's addresses. Keyed by the
+    /// layers' signature instead, flipping a layer and back (the same
+    /// signature again) showed old sprites of other layers.
+    pub id: u64,
     pub maps: Vec<GeoMap>,
     sprites: Vec<Option<(RgbaImage, i64, i64)>>,
     /// typing text: the picture after each step (the last step is `sprites`)
@@ -1034,7 +1039,9 @@ impl Stack {
             let boxes: Vec<Obb> = mk.shapes.iter().map(|sh| map_box(&g.m, sh.obb(), false)).collect();
             shapes::mask_sprite(mk, &boxes, shapes::map_scale(&g.m), (0.0, 0.0, g.w, g.h))
         });
-        Prepared { maps, sprites, watermarks, stamps, reveals, lmasks, base_mask }
+        static PREP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = PREP_ID.fetch_add(1, Ordering::Relaxed) | (1 << 62);
+        Prepared { id, maps, sprites, watermarks, stamps, reveals, lmasks, base_mask }
     }
 
     /// The transformed frame before any layer (geometry only).
