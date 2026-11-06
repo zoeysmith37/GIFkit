@@ -885,6 +885,62 @@ impl Stack {
         plan
     }
 
+    /// The source frames the timeline uses: the Cut range (first, last).
+    /// None when that's all of them.
+    pub fn unused_source(&self, base: &Animation) -> Option<(usize, usize)> {
+        if base.is_empty() {
+            return None;
+        }
+        let (s, e) = self.transform.cut_range(base);
+        (s > 0 || e + 1 < base.len()).then_some((s, e))
+    }
+
+    /// Keep only source frames `s..=e` (the Cut range), so the frames the
+    /// timeline doesn't use aren't kept or saved. Everything that counts in
+    /// source frames moves down with them; the Cut is taken off, as the
+    /// frames left are just the ones it kept. The timeline plays the same.
+    pub fn trim_source(&mut self, base: &mut Animation, (s, e): (usize, usize)) {
+        let n = e + 1 - s;
+        // a 1-based range (`to` 0: to the end) in the frames left; None: none of it is left
+        let shift = |from: usize, to: usize| -> Option<(usize, usize)> {
+            let (from, to) = (from.max(1), if to == 0 { usize::MAX } else { to });
+            if to < s + 1 || from > e + 1 {
+                return None;
+            }
+            let nf = from.saturating_sub(s).max(1);
+            let nt = if to > e + 1 { 0 } else { to - s };
+            Some((nf, nt))
+        };
+        // a layer's own range: out of the frames left, it shows on none
+        let never = (n + 1, n + 1);
+        for l in &mut self.layers {
+            match &mut l.kind {
+                LayerKind::Text(t) => (t.from, t.to) = shift(t.from, t.to).unwrap_or(never),
+                LayerKind::Censor(c) => (c.from, c.to) = shift(c.from, c.to).unwrap_or(never),
+                LayerKind::Shape(sh) => (sh.from, sh.to) = shift(sh.from, sh.to).unwrap_or(never),
+                LayerKind::Emoji(em) => (em.from, em.to) = shift(em.from, em.to).unwrap_or(never),
+                LayerKind::Markup(mk) => {
+                    mk.strokes.retain_mut(|st| match shift(st.from, st.to) {
+                        Some((f, t)) => {
+                            (st.from, st.to) = (f, t);
+                            true
+                        }
+                        None => false,
+                    });
+                }
+                _ => {}
+            }
+        }
+        base.frames.truncate(e + 1);
+        base.frames.drain(..s);
+        debug_assert_eq!(base.len(), n);
+        let t = &mut self.transform;
+        t.cut_on = false;
+        t.cut_by_time = false;
+        t.cut_start = 1;
+        t.cut_end = 0;
+    }
+
     pub fn loop_count(&self, base: &Animation) -> Option<u16> {
         let t = &self.transform;
         if t.play_on && t.set_loop {

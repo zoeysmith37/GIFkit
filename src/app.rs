@@ -976,6 +976,12 @@ pub struct GifKitApp {
     orig_clock: f64,
     resize_by_pct: bool,
     about_open: bool,
+    /// the Reduce Project Size window: up, and its two choices
+    shrink_open: bool,
+    shrink_drop: bool,
+    shrink_compact: bool,
+    /// this project keeps full-colour frames as WebP (see project::ProjectFile::compact)
+    compact_pics: bool,
     upd: Updater,
     /// the ffmpeg set-up window
     ff_open: bool,
@@ -3073,6 +3079,10 @@ impl GifKitApp {
             orig_clock: 0.0,
             resize_by_pct: true,
             about_open: false,
+            shrink_open: false,
+            shrink_drop: true,
+            shrink_compact: true,
+            compact_pics: false,
             upd: Updater::default(),
             ff_open: false,
             ff_job: None,
@@ -4135,6 +4145,112 @@ impl GifKitApp {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Reduce Project Size: drop the source frames the timeline doesn't use,
+    /// and/or keep full-colour frames as nearly lossless WebP.
+    fn shrink_window(&mut self, ctx: &egui::Context) {
+        if !self.shrink_open {
+            return;
+        }
+        let Some(base) = self.base.as_ref() else {
+            self.shrink_open = false;
+            return;
+        };
+        let unused = self.stack.unused_source(base);
+        let n_unused = unused.map(|(s, e)| base.len() - (e + 1 - s)).unwrap_or(0);
+        let total = base.len();
+        // how many frames are full colour (video), from a sample
+        let step = (total / 24).max(1);
+        let sampled: Vec<bool> = (0..total).step_by(step).map(|i| {
+            let img = base.frames[i].image.get();
+            let mut seen = std::collections::HashSet::new();
+            img.pixels().any(|p| {
+                seen.insert(p.0);
+                seen.len() > 256
+            })
+        }).collect();
+        let colourful = sampled.iter().filter(|b| **b).count() * 2 >= sampled.len().max(1);
+        let pal = *p();
+        let mut open = true;
+        let mut go = false;
+        let mut cancel = false;
+        dialog(ctx, "shrink", "Reduce Project Size", vec2(460.0, 300.0), false, &mut open, |ui| {
+            ui.add_space(2.0);
+            ui.add_enabled_ui(n_unused > 0, |ui| {
+                let label = if n_unused > 0 { format!("Drop the {n_unused} source frames the timeline doesn't use") } else { "Drop unused frames".to_string() };
+                check(ui, &mut self.shrink_drop, label);
+            });
+            ui.indent("shrink-drop", |ui| {
+                hint(ui, if n_unused > 0 { "Frames outside the Cut, kept in case it's lengthened again. Undo brings them back" } else { "The timeline uses every frame" });
+            });
+            ui.add_space(8.0);
+            check(ui, &mut self.shrink_compact, "Store full-colour frames compressed");
+            ui.indent("shrink-compact", |ui| {
+                hint(ui, if colourful { "Video frames as nearly lossless WebP: about a tenth of the space" } else { "Video frames as nearly lossless WebP. These frames are mostly few colours: little to gain" });
+                hint(ui, "Takes effect when saved. GIFkit 1.7.1 and older can't open it");
+            });
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::new("Cancel").min_size(vec2(90.0, 30.0))).clicked() {
+                        cancel = true;
+                    }
+                    let any = (self.shrink_drop && n_unused > 0) || self.shrink_compact != self.compact_pics;
+                    if ui.add_enabled(any, egui::Button::new("Reduce").min_size(vec2(90.0, 30.0)).stroke(Stroke::new(1.0, pal.highlight))).clicked() {
+                        go = true;
+                    }
+                });
+            });
+        });
+        if !open || cancel {
+            self.shrink_open = false;
+        }
+        if !go {
+            return;
+        }
+        self.shrink_open = false;
+        let now = ctx.input(|i| i.time);
+        let mut said = Vec::new();
+        if let (true, Some(range)) = (self.shrink_drop, unused) {
+            self.snapshot(&format!("shrink{now}"), now);
+            let before: Vec<(usize, u16, bool)> = self.plan.iter().map(|f| (f.src, f.delay, f.enabled)).collect();
+            let mut base = self.base.clone().unwrap();
+            let mut st = self.stack.clone();
+            st.trim_source(&mut base, range);
+            // the timeline must play just as before, a frame for a frame
+            let after: Vec<(usize, u16, bool)> = st.plan(&base).iter().map(|f| (f.src + range.0, f.delay, f.enabled)).collect();
+            if after != before {
+                self.error("Couldn't drop the frames: the timeline would change");
+                return;
+            }
+            // the original (for the Original view) shrinks with it
+            let olen = self.base.as_ref().map(|b| b.len()).unwrap_or(0);
+            if let Some(o) = &mut self.original {
+                if o.len() == olen {
+                    o.frames.truncate(range.1 + 1);
+                    o.frames.drain(..range.0);
+                } else {
+                    *o = base.clone();
+                }
+            }
+            self.base = Some(base);
+            self.stack = st;
+            self.cur = self.cur.min(self.plan.len().saturating_sub(1));
+            self.bump();
+            self.after_base_change(false);
+            said.push(format!("Dropped {n_unused} unused frames"));
+        }
+        if self.shrink_compact != self.compact_pics {
+            self.compact_pics = self.shrink_compact;
+            self.modified = true;
+            said.push(if self.compact_pics { "video frames will be stored compressed".to_string() } else { "frames will be stored as PNG".to_string() });
+        }
+        if !said.is_empty() {
+            let mut msg = said.join(", ");
+            msg = msg[..1].to_uppercase() + &msg[1..];
+            self.info(format!("{msg}. Save to shrink the file"));
         }
     }
 
@@ -6508,6 +6624,7 @@ impl eframe::App for GifKitApp {
         self.poll_updates(&ctx);
         self.update_window(&ctx);
         self.about_window(&ctx);
+        self.shrink_window(&ctx);
         self.restore_window(&ctx);
         self.batch_window(&ctx);
         self.handbook_window(&ctx);
@@ -6595,6 +6712,11 @@ impl GifKitApp {
                 }
                 if menu_item(ui, "document-save-as", "Save &As…", &self.keymap.text(crate::keys::Action::SaveAs), idle && has) {
                     self.save_project(ctx, true);
+                }
+                if menu_item_tip(ui, "archive-insert", "Reduce Project Si&ze…", "", idle && has, "Drop frames the timeline doesn't use, store video frames compressed") {
+                    self.shrink_drop = true;
+                    self.shrink_compact = true;
+                    self.shrink_open = true;
                 }
                 ui.separator();
                 if menu_item_tip(ui, "edit-copy", "Copy &Result", "Ctrl+Shift+C", idle && has, "Export and copy the file, ready to paste") {
@@ -9131,6 +9253,7 @@ impl GifKitApp {
             markers: self.stack.markers.clone(),
             speed_env: self.stack.speed_env.clone(),
             gif_color: self.stack.gif_color,
+            compact: self.compact_pics,
             settings: serde_json::to_value(self.proj_settings()).unwrap_or_default(),
             ..Default::default()
         };
@@ -9294,6 +9417,7 @@ impl GifKitApp {
         self.stack.markers = file.markers;
         self.stack.speed_env = file.speed_env;
         self.stack.gif_color = file.gif_color;
+        self.compact_pics = file.compact;
         self.stack.sync_len(n);
         if let Ok(st) = serde_json::from_value::<ProjSettings>(file.settings) {
             if let Some(v) = st.gif {

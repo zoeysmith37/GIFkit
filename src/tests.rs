@@ -1598,3 +1598,86 @@ fn inbetweens_follow_motion() {
     let mid = fade.frames[1].image.get();
     assert!((100..160).contains(&mid.get_pixel(21, 32)[0]), "a plain blend is half there");
 }
+
+/// Reduce Project Size: dropping the frames outside the Cut plays the
+/// same, and layers' own source-frame ranges move with the frames.
+#[test]
+fn trim_source_keeps_the_timeline() {
+    use crate::stack::{LayerKind, Stack};
+    let mut base = synth(true);
+    while base.len() < 20 {
+        let f = base.frames[base.len() % 3].clone();
+        base.frames.push(f);
+    }
+    let mut st = Stack::default();
+    st.transform.cut_on = true;
+    st.transform.cut_start = 6;
+    st.transform.cut_end = 15;
+    st.transform.play_on = true;
+    st.transform.boomerang = true;
+    let tid = st.push(LayerKind::Text(crate::text::Annotation { text: "a".into(), from: 8, to: 12, ..Default::default() }));
+    let gone = st.push(LayerKind::Text(crate::text::Annotation { text: "b".into(), from: 1, to: 3, ..Default::default() }));
+    let mid = st.push(LayerKind::Markup(crate::shapes::MarkupSettings {
+        strokes: vec![crate::shapes::PenStroke { from: 2, to: 4, ..Default::default() }, crate::shapes::PenStroke { from: 10, to: 0, ..Default::default() }],
+    }));
+    let before: Vec<(usize, u16)> = st.plan(&base).iter().map(|f| (f.src, f.delay)).collect();
+    let shown_before: Vec<Vec<bool>> = [tid, gone].iter().map(|id| st.legacy_shown(st.index_of(*id).unwrap(), &st.plan(&base))).collect();
+    let range = st.unused_source(&base).unwrap();
+    assert_eq!(range, (5, 14));
+    st.trim_source(&mut base, range);
+    assert_eq!(base.len(), 10);
+    assert!(st.unused_source(&base).is_none());
+    let after: Vec<(usize, u16)> = st.plan(&base).iter().map(|f| (f.src + 5, f.delay)).collect();
+    assert_eq!(after, before, "plays the same");
+    let shown_after: Vec<Vec<bool>> = [tid, gone].iter().map(|id| st.legacy_shown(st.index_of(*id).unwrap(), &st.plan(&base))).collect();
+    assert_eq!(shown_after, shown_before, "layers show on the same frames");
+    let LayerKind::Markup(m) = &st.layers[st.index_of(mid).unwrap()].kind else { panic!() };
+    assert_eq!(m.strokes.len(), 1, "a stroke only on dropped frames goes");
+    assert_eq!((m.strokes[0].from, m.strokes[0].to), (5, 0));
+}
+
+/// Compact projects keep full-colour pictures as WebP: much smaller, close
+/// to the original, and few-colour pictures stay exact PNG.
+#[test]
+fn compact_project_round_trip() {
+    use crate::project::{load, save, ProjectFile};
+    use std::collections::HashMap;
+    let photo = image::RgbaImage::from_fn(200, 150, |x, y| {
+        let v = ((x as f32 * 0.07).sin() * 60.0 + (y as f32 * 0.05).cos() * 60.0 + 128.0) as u8;
+        image::Rgba([v, (x + y) as u8, 255 - v, 255])
+    });
+    let flat = image::RgbaImage::from_fn(200, 150, |x, _| image::Rgba([if x < 100 { 255 } else { 0 }, 0, 0, 255]));
+    let base = Animation { frames: vec![Frame::new(photo.clone(), 4), Frame::new(flat.clone(), 4)], loop_count: None };
+    let dir = std::env::temp_dir().join(format!("gf_compact_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (a, b) = (dir.join("a.gifkit"), dir.join("b.gifkit"));
+    save(&a, ProjectFile::default(), &base, None, &HashMap::new(), &HashMap::new(), None).unwrap();
+    save(&b, ProjectFile { compact: true, ..Default::default() }, &base, None, &HashMap::new(), &HashMap::new(), None).unwrap();
+    let (sa, sb) = (std::fs::metadata(&a).unwrap().len(), std::fs::metadata(&b).unwrap().len());
+    assert!(sb * 3 < sa, "compact is much smaller ({sb} vs {sa})");
+    let p = load(&b).unwrap();
+    assert!(p.file.compact);
+    let got = p.base.frames[0].image.get();
+    let err: f64 = got.pixels().zip(photo.pixels()).map(|(x, y)| (0..3).map(|c| (x[c] as f64 - y[c] as f64).abs()).sum::<f64>()).sum::<f64>() / (200.0 * 150.0 * 3.0);
+    assert!(err < 3.0, "close to the original (mean error {err})");
+    assert_eq!(p.base.frames[1].image.get().as_raw(), flat.as_raw(), "few colours stay exact");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// How big a video project is, as PNG and compact. VIDEO=path.
+#[test]
+#[ignore]
+fn compact_video_size() {
+    use crate::project::{save, ProjectFile};
+    use std::collections::HashMap;
+    let base = crate::io::load_video(std::path::Path::new(&std::env::var("VIDEO").unwrap())).unwrap();
+    let dir = std::env::temp_dir().join(format!("gf_cv_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for compact in [false, true] {
+        let p = dir.join(format!("{compact}.gifkit"));
+        let t = std::time::Instant::now();
+        save(&p, ProjectFile { compact, ..Default::default() }, &base, None, &HashMap::new(), &HashMap::new(), None).unwrap();
+        println!("{} frames {}x{} compact {compact}: {:.1} MB in {:.1}s", base.len(), base.width(), base.height(), std::fs::metadata(&p).unwrap().len() as f64 / 1e6, t.elapsed().as_secs_f64());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

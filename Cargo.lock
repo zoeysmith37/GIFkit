@@ -1293,6 +1293,7 @@ dependencies = [
  "half",
  "image",
  "libc",
+ "libwebp-sys2 0.2.0",
  "lz4_flex",
  "memory-stats",
  "png 0.18.1",

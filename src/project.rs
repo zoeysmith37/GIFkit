@@ -165,6 +165,10 @@ pub struct ProjectFile {
     /// the GIF track's colour on the timeline
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gif_color: Option<[u8; 3]>,
+    /// full-colour pictures (video frames) stored as nearly lossless WebP
+    /// instead of PNG: a fraction of the size
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compact: bool,
     /// output and tool settings, kept loose so new fields never break old files
     pub settings: serde_json::Value,
 }
@@ -176,6 +180,33 @@ pub struct Project {
     pub original: Option<Animation>,
     pub overlays: HashMap<usize, Vec<RgbaImage>>,
     pub watermarks: HashMap<usize, RgbaImage>,
+}
+
+/// More colours than a palette holds (a photo, a video frame)?
+fn full_colour(img: &RgbaImage) -> bool {
+    let mut seen = std::collections::HashSet::with_capacity(300);
+    img.pixels().any(|p| {
+        seen.insert(p.0);
+        seen.len() > 256
+    })
+}
+
+/// WebP quality for compact projects' full-colour pictures: past what the
+/// GIF's 256 colours can tell apart, at about a tenth of a PNG's size.
+const COMPACT_QUALITY: f32 = 92.0;
+
+/// A picture as a lossy WebP (its see-through parts kept exact).
+fn webp(img: &RgbaImage) -> Result<Vec<u8>> {
+    let (w, h) = img.dimensions();
+    anyhow::ensure!(w > 0 && h > 0 && w <= 16383 && h <= 16383, "too big for WebP");
+    let mut out: *mut u8 = std::ptr::null_mut();
+    // SAFETY: the buffer is w*h*4 bytes with a stride of w*4; libwebp
+    // allocates `out` and we free it with WebPFree after copying
+    let n = unsafe { libwebp_sys::WebPEncodeRGBA(img.as_raw().as_ptr(), w as i32, h as i32, (w * 4) as i32, COMPACT_QUALITY, &mut out) };
+    anyhow::ensure!(n > 0 && !out.is_null(), "WebP encoding failed");
+    let v = unsafe { std::slice::from_raw_parts(out, n) }.to_vec();
+    unsafe { libwebp_sys::WebPFree(out as *mut std::ffi::c_void) };
+    Ok(v)
 }
 
 fn png(img: &RgbaImage) -> Result<Vec<u8>> {
@@ -359,8 +390,12 @@ fn unpack_pool(meta: &[PicMeta], raw: &mut HashMap<String, Vec<u8>>) -> Result<V
     let mut out = Vec::with_capacity(meta.len());
     for start in (0..meta.len()).step_by(32) {
         let ids: Vec<usize> = (start..(start + 32).min(meta.len())).collect();
-        let bytes: Vec<(usize, Vec<u8>)> = ids.iter().map(|&i| raw.remove(&format!("pics/{i:05}.png")).map(|b| (i, b)).with_context(|| format!("pics/{i:05}.png is missing"))).collect::<Result<_>>()?;
-        let stored: Vec<RgbaImage> = bytes.par_iter().map(|(i, b)| Ok(image::load_from_memory(b).with_context(|| format!("pics/{i:05}.png is damaged"))?.to_rgba8())).collect::<Result<_>>()?;
+        // PNG, or WebP in compact projects
+        let bytes: Vec<(usize, Vec<u8>)> = ids
+            .iter()
+            .map(|&i| raw.remove(&format!("pics/{i:05}.png")).or_else(|| raw.remove(&format!("pics/{i:05}.webp"))).map(|b| (i, b)).with_context(|| format!("picture {i} is missing")))
+            .collect::<Result<_>>()?;
+        let stored: Vec<RgbaImage> = bytes.par_iter().map(|(i, b)| Ok(image::load_from_memory(b).with_context(|| format!("picture {i} is damaged"))?.to_rgba8())).collect::<Result<_>>()?;
         let mut wholes = Vec::with_capacity(ids.len());
         for (&i, img) in ids.iter().zip(stored) {
             let m = &meta[i];
@@ -425,11 +460,23 @@ pub fn save(path: &Path, mut file: ProjectFile, base: &Animation, original: Opti
         file.overlay_pics.insert(*id, v);
     }
     file.pics = pool.meta;
-    let mut jobs: Vec<(String, Arc<RgbaImage>)> = pool.stored.into_iter().enumerate().map(|(i, img)| (format!("pics/{i:05}.png"), img)).collect();
+    // (name without its extension, picture, may be WebP)
+    let compact = file.compact;
+    let mut jobs: Vec<(String, Arc<RgbaImage>, bool)> = pool.stored.into_iter().enumerate().map(|(i, img)| (format!("pics/{i:05}"), img, compact)).collect();
     for (id, img) in watermarks {
-        jobs.push((format!("watermarks/{id}.png"), img.clone()));
+        jobs.push((format!("watermarks/{id}"), img.clone(), false));
     }
-    let mut encoded: Vec<(String, Vec<u8>)> = jobs.par_iter().map(|(n, img)| png(img).map(|b| (n.clone(), b))).collect::<Result<_>>()?;
+    let mut encoded: Vec<(String, Vec<u8>)> = jobs
+        .par_iter()
+        .map(|(n, img, may_webp)| {
+            if *may_webp && full_colour(img) {
+                if let Ok(b) = webp(img) {
+                    return Ok((format!("{n}.webp"), b));
+                }
+            }
+            png(img).map(|b| (format!("{n}.png"), b))
+        })
+        .collect::<Result<_>>()?;
     // the thumbnail, marked as a project, as a JPEG (a tenth the size)
     // unless it's see-through
     if let Some(mut t) = thumb.map(|t| fit(t, THUMB)) {
@@ -472,12 +519,13 @@ pub fn load(path: &Path) -> Result<Project> {
     let file: ProjectFile = serde_json::from_str(&json).context("project.json is damaged")?;
     anyhow::ensure!(file.version <= VERSION, "this project was made by a newer GIFkit ({})", file.app);
 
-    // pull every PNG out, then decode them in parallel
+    // pull every picture out (PNG, or WebP in compact projects), then
+    // decode them in parallel
     let mut raw: HashMap<String, Vec<u8>> = HashMap::new();
     for i in 0..z.len() {
         let mut e = z.by_index(i)?;
         let name = e.name().to_string();
-        if name.ends_with(".png") {
+        if name.ends_with(".png") || name.ends_with(".webp") {
             let mut b = Vec::with_capacity(e.size() as usize);
             e.read_to_end(&mut b)?;
             raw.insert(name, b);
