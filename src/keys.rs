@@ -40,10 +40,11 @@ pub enum Action {
     TlNudgeRight,
     Duplicate,
     OnionSkin,
+    Compress,
 }
 
 impl Action {
-    pub const ALL: [Action; 34] = [
+    pub const ALL: [Action; 35] = [
         Action::New,
         Action::Open,
         Action::Save,
@@ -78,6 +79,7 @@ impl Action {
         Action::TlNudgeRight,
         Action::Duplicate,
         Action::OnionSkin,
+        Action::Compress,
     ];
 
     /// The groups the shortcuts dialog shows, in order.
@@ -90,7 +92,7 @@ impl Action {
             New | Open | Save | SaveAs | Export | Quit => "File",
             Undo | Redo | History | Duplicate | DeleteObject => "Edit",
             PlayPause | PrevFrame | NextFrame => "Playback",
-            ZoomIn | ZoomOut | Fit | ActualSize | SplitView | FullScreen | OnionSkin => "View",
+            ZoomIn | ZoomOut | Fit | ActualSize | SplitView | FullScreen | OnionSkin | Compress => "View",
             TlSplit | TlKey | TlRazor | TlDelete | TlIn | TlOut | TlMarker | TlPrevEdit | TlNextEdit | TlDuplicate | TlNudgeLeft | TlNudgeRight => "Timeline",
             Handbook => "Help",
         }
@@ -132,6 +134,7 @@ impl Action {
             Action::TlNudgeRight => "Timeline: nudge the selection a frame later",
             Action::Duplicate => "Duplicate the selected layer",
             Action::OnionSkin => "Onion skin",
+            Action::Compress => "Compress preview",
         }
     }
 
@@ -172,6 +175,7 @@ impl Action {
             Action::TlNudgeRight => "tl_nudge_right",
             Action::Duplicate => "duplicate",
             Action::OnionSkin => "onion",
+            Action::Compress => "compress",
         }
     }
 
@@ -215,6 +219,7 @@ impl Action {
             Action::TlNudgeRight => a(Key::ArrowRight),
             Action::Duplicate => c(Key::D),
             Action::OnionSkin => Some(Binding { ctrl: false, shift: true, alt: false, key: Key::O }),
+            Action::Compress => c(Key::R),
         }
     }
 

@@ -1015,6 +1015,10 @@ pub struct GifKitApp {
     video_import: Option<(PathBuf, io::VideoInfo, io::VideoImport)>,
     /// estimate long animations' compressed size from a sample (setting)
     sample_preview: bool,
+    /// Off: the compressed preview only runs when asked, for slow machines.
+    auto_compress: bool,
+    /// The edit the user asked to compress (with auto_compress off).
+    cmp_go: u64,
     /// the settings the user asked to compress fully once
     cmp_full_key: u64,
     shortcuts_open: bool,
@@ -3103,6 +3107,8 @@ impl GifKitApp {
             play_speed: 1.0,
             video_import: None,
             sample_preview: theme::get_setting("sample_preview").as_deref() != Some("0"),
+            auto_compress: theme::get_setting("auto_compress").as_deref() != Some("0"),
+            cmp_go: 0,
             cmp_full_key: 0,
             shortcuts_open: false,
             win_title: String::new(),
@@ -5054,6 +5060,9 @@ impl GifKitApp {
             let on = ctx.input(|i| i.viewport().fullscreen).unwrap_or(false);
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!on));
         }
+        if hit(A::Compress) && self.base.is_some() {
+            self.cmp_go = self.cmp_key();
+        }
         if hit(A::OnionSkin) && !typing {
             self.toggle_onion();
         }
@@ -6112,6 +6121,11 @@ impl GifKitApp {
         if up_to_date || self.cmp_job.is_some() {
             return;
         }
+        // asked for: no waiting for edits to settle
+        let asked = self.cmp_go == key;
+        if !self.auto_compress && !asked {
+            return;
+        }
         // wait until edits settle (and the user isn't mid-drag)
         // wait until edits have settled and nothing is being dragged / held
         let busy_input = ctx.input(|i| i.pointer.any_down()) || ctx.dragged_id().is_some() || self.box_drag.is_some() || self.drag.is_some();
@@ -6119,7 +6133,7 @@ impl GifKitApp {
             self.cmp_key_since = now;
         }
         // half a second after the last change, so quick tweaks don't each start an encode
-        if now - self.cmp_key_since < 0.5 || busy_input {
+        if !asked && (now - self.cmp_key_since < 0.5 || busy_input) {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
             return;
         }
@@ -6904,6 +6918,10 @@ impl GifKitApp {
                         }
                     }
                 });
+                if menu_check(ui, self.auto_compress, "Compress Preview &Automatically", "") {
+                    self.auto_compress = !self.auto_compress;
+                    theme::set_setting("auto_compress", if self.auto_compress { "1" } else { "0" });
+                }
                 if menu_check(ui, self.sample_preview, "&Estimate Size of Long Animations", "") {
                     self.sample_preview = !self.sample_preview;
                     theme::set_setting("sample_preview", if self.sample_preview { "1" } else { "0" });
@@ -10029,11 +10047,19 @@ impl GifKitApp {
                         if self.export_fmt.needs_ffmpeg() && !self.ffmpeg { "⚠ Needs ffmpeg to preview" } else { "Uncompressed output" }
                     } else if encoding {
                         "⚠ Compressing"
+                    } else if !self.auto_compress {
+                        "Not compressed · showing the edit"
                     } else {
                         "⚠ Not compressed yet"
                     };
                     self.onion_paint = self.onion_frames(ctx);
                     let (resp, m) = self.viewport(ui, ctx, vi, rect, tex, size, None, Some(badge.into()), encoding);
+                    if !self.auto_compress && !encoding && self.preview_format().is_some() {
+                        let at = Rect::from_min_size(rect.left_top() + vec2(10.0, 82.0), vec2(110.0, 26.0));
+                        if ui.put(at, egui::Button::image_and_text(crate::icons::image(ui.ctx(), "view-refresh", 16.0, p().fg), "Compress")).on_hover_text("Compress the preview now (Ctrl+R)").clicked() {
+                            self.cmp_go = self.cmp_key();
+                        }
+                    }
                     if !crop_mode {
                         self.canvas_interaction(ui, &resp, m, (size.x, size.y), Space::Output, vi);
                     }
@@ -11759,6 +11785,8 @@ impl GifKitApp {
         let cur_key = self.cmp_key();
         let busy = self.cmp_job.is_some();
         let mut full = false;
+        let mut go = false;
+        let manual = !self.auto_compress;
         group(ui, "Result", |ui| match &self.cmp {
             Some(c) => {
                 let n = c.size;
@@ -11770,8 +11798,10 @@ impl GifKitApp {
                         if let Some(orig) = self.file_size {
                             hint(ui, &format!("{:+.0}% vs original", (n as f64 / orig as f64 - 1.0) * 100.0));
                         }
-                        if stale || busy {
+                        if busy || (stale && !manual) {
                             ui.spinner();
+                        } else if stale {
+                            go = ui.add(egui::Button::new("Compress").min_size(vec2(0.0, CHIP_H))).on_hover_text("Out of date. Automatic compression is off in Settings (Ctrl+R)").clicked();
                         }
                     });
                 });
@@ -11781,6 +11811,11 @@ impl GifKitApp {
                         full = ui.add_enabled(!busy, egui::Button::new("Compress Fully").min_size(vec2(0.0, CHIP_H))).on_hover_text("Encode every frame for the exact size. Slow on long clips").clicked();
                     });
                 }
+            }
+            None if !busy && manual => {
+                form_row(ui, "Size", |ui| {
+                    go = ui.add(egui::Button::new("Compress").min_size(vec2(0.0, CHIP_H))).on_hover_text("Automatic compression is off in Settings (Ctrl+R)").clicked();
+                });
             }
             None => {
                 form_row(ui, "Size", |ui| {
@@ -11794,6 +11829,9 @@ impl GifKitApp {
         if full {
             self.cmp_full_key = cur_key;
             self.cmp = None;
+        }
+        if full || go {
+            self.cmp_go = cur_key;
         }
         let mut find = false;
         let mut reset = false;

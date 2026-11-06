@@ -1,5 +1,5 @@
 ; GIFkit installer (Inno Setup 6).
-;   iscc /DAppVersion=1.7.1 /DSrc=<folder with gifkit.exe> /O<out folder> gifkit.iss
+;   iscc /DAppVersion=1.8.0 /DSrc=<folder with gifkit.exe> /O<out folder> gifkit.iss
 ; Installs for the current user by default (no admin rights), so GIFkit can
 ; update itself in place. All users is offered too.
 
