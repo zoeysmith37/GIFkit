@@ -978,6 +978,9 @@ pub struct GifKitApp {
     about_open: bool,
     /// the Reduce Project Size window: up, and its two choices
     shrink_open: bool,
+    /// the Speed tool's Change Frame Rate: the rate and how (0: not set yet)
+    refps_fps: f64,
+    refps_blend: bool,
     shrink_drop: bool,
     shrink_compact: bool,
     /// this project keeps full-colour frames as WebP (see project::ProjectFile::compact)
@@ -2468,6 +2471,38 @@ fn chevron(ui: &egui::Ui, rect: Rect, visuals: &egui::style::WidgetVisuals, _ope
 }
 
 /// A full-width combo box in the field column.
+/// A frame rate: typed in, or picked from the common ones.
+fn fps_picker(ui: &mut egui::Ui, id: &str, fps: &mut f64) -> egui::Response {
+    let mut out = None;
+    even_grid(ui, 2, 0.0, |ui, i, size| {
+        if i == 0 {
+            let r = spin(ui, size, fps, 1.0, |d| d.range(io::MIN_FPS..=io::MAX_FPS).speed(0.1).max_decimals(3).suffix(" fps"));
+            out = Some(r);
+        } else {
+            let mut pick = io::VIDEO_RATES.iter().copied().find(|r| (r - *fps).abs() < 1e-6).unwrap_or(-1.0);
+            let labels: Vec<(f64, String)> = io::VIDEO_RATES.iter().map(|r| (*r, format!("{r} fps"))).chain([(-1.0, "Presets".to_string())]).collect();
+            let items: Vec<(f64, &str)> = labels.iter().filter(|(r, _)| *r >= 0.0 || pick < 0.0).map(|(r, l)| (*r, l.as_str())).collect();
+            ui.allocate_ui(size, |ui| {
+                if combo(ui, &format!("{id}-presets"), &mut pick, &items).changed() || (pick >= 0.0 && (pick - *fps).abs() > 1e-6) {
+                    *fps = pick;
+                }
+            });
+        }
+    });
+    *fps = fps.clamp(io::MIN_FPS, io::MAX_FPS);
+    out.unwrap()
+}
+
+/// What GIF delays a frame rate comes out as.
+fn fps_note(fps: f64) -> String {
+    if io::exact_rate(fps) {
+        format!("{} cs per frame, exact", (100.0 / fps).round())
+    } else {
+        let lo = (100.0 / fps).floor();
+        format!("Delays alternate {lo} and {} cs to keep time", lo + 1.0)
+    }
+}
+
 fn combo<T: PartialEq + Copy>(ui: &mut egui::Ui, id: &str, current: &mut T, items: &[(T, &str)]) -> egui::Response {
     let text = items.iter().find(|i| i.0 == *current).map(|i| i.1).unwrap_or("");
     let w = ui.available_width();
@@ -3084,6 +3119,8 @@ impl GifKitApp {
             resize_by_pct: true,
             about_open: false,
             shrink_open: false,
+            refps_fps: 0.0,
+            refps_blend: false,
             shrink_drop: true,
             shrink_compact: true,
             compact_pics: false,
@@ -4803,7 +4840,7 @@ impl GifKitApp {
                     if let Some(v) = std::env::var("GIFKIT_VIDEO_IMPORT").ok() {
                         let n: Vec<u32> = v.split(',').filter_map(|x| x.parse().ok()).collect();
                         if let [side, delay, merge] = n[..] {
-                            (opt.max_side, opt.delay_cs, opt.merge) = (side, delay as u16, merge as usize);
+                            (opt.max_side, opt.fps, opt.merge) = (side, 100.0 / delay.max(1) as f64, merge as usize);
                             self.import_video(ctx, p, opt);
                             return;
                         }
@@ -4853,9 +4890,15 @@ impl GifKitApp {
             if opt.end <= opt.start {
                 opt.end = (opt.start + 0.1).min(info.duration);
             }
-            let rates: Vec<(u16, String)> = io::VIDEO_DELAYS.iter().map(|d| (*d, format!("{:.1} fps", 100.0 / *d as f64).replace(".0 ", " "))).collect();
-            let items: Vec<(u16, &str)> = rates.iter().map(|(d, l)| (*d, l.as_str())).collect();
-            form_row(ui, "Frame rate:", |ui| combo(ui, "vid-fps", &mut opt.delay_cs, &items)).on_hover_text("GIFs can only show these rates exactly");
+            form_row(ui, "Frame rate:", |ui| fps_picker(ui, "vid-fps", &mut opt.fps)).on_hover_text("Any rate up to 50 fps, the fastest GIFs can play");
+            form_row(ui, "", |ui| {
+                let note = fps_note(opt.fps);
+                if opt.fps > info.fps + 0.01 {
+                    hint(ui, &format!("Above the video's {:.2} fps: frames repeat", info.fps));
+                } else {
+                    hint(ui, &note);
+                }
+            });
             let sizes: Vec<(u32, String)> = [240u32, 320, 480, 640, 800, 1080, 0]
                 .iter()
                 .filter(|m| **m == 0 || **m < info.width.max(info.height))
@@ -6809,6 +6852,9 @@ impl GifKitApp {
                 }
                 if menu_item(ui, "bookmarks", "&Presets", "", has) {
                     self.open_tool(Tool::Presets);
+                }
+                if menu_item(ui, "speedometer", "Change &Frame Rate…", "", idle && has) {
+                    self.open_tool(Tool::Speed);
                 }
                 ui.separator();
                 if menu_item(ui, "merge", "&Collapse All", "", idle && has && !self.stack.is_empty()) {
@@ -11765,6 +11811,61 @@ impl GifKitApp {
         if before != (tr.speed_mode, tr.speed_val.to_bits()) {
             tr.speed_on = true;
         }
+        self.ui_frame_rate(ui, ctx, avg_fps as f64);
+    }
+
+    /// Change Frame Rate: more or fewer frames, the same length.
+    fn ui_frame_rate(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, avg_fps: f64) {
+        let Some(base) = &self.base else { return };
+        if self.refps_fps <= 0.0 {
+            self.refps_fps = (avg_fps.round()).clamp(1.0, io::MAX_FPS);
+        }
+        let n = crate::refps::frames_at(base, self.refps_fps);
+        let old = base.enabled_count();
+        let tr = &self.stack.transform;
+        let fixed = tr.speed_on && tr.speed_mode != SpeedMode::Percent;
+        let mut go = false;
+        group(ui, "Change Frame Rate", |ui| {
+            hint(ui, "More or fewer frames, the same length. Layers and keyframes stay in time");
+            ui.add_space(4.0);
+            form_row(ui, "Rate", |ui| fps_picker(ui, "refps", &mut self.refps_fps));
+            form_row(ui, "", |ui| hint(ui, &fps_note(self.refps_fps)));
+            form_row(ui, "Frames", |ui| {
+                seg_row(ui, &mut self.refps_blend, &[(false, "Repeat or drop"), (true, "Blend")])
+            })
+            .on_hover_text("Repeat or drop: each new frame is the one showing at that moment.\nBlend: fewer frames mix the ones they cover (a motion blur), more frames fade between them");
+            form_row(ui, "Result", |ui| cell(ui, vec2(ui.available_width(), CHIP_H), |ui| hint(ui, &format!("{old} → {n} frames"))));
+            if fixed {
+                form_row(ui, "", |ui| hint(ui, "Set Speed back to % first: a fixed delay or rate would change the length"));
+            }
+            form_row(ui, "", |ui| {
+                go = ui.add_enabled(!fixed && !self.busy(), egui::Button::new("Apply").min_size(vec2(90.0, CHIP_H))).on_hover_text("Undo puts the old frames back").clicked();
+            });
+        });
+        if !go {
+            return;
+        }
+        let now = ctx.input(|i| i.time);
+        let mut base = self.base.clone().unwrap();
+        let mut st = self.stack.clone();
+        let how = if self.refps_blend { crate::refps::Resample::Blend } else { crate::refps::Resample::Nearest };
+        let at = self.plan_times.get(self.cur).copied().unwrap_or(0.0);
+        if !st.change_frame_rate(&mut base, self.refps_fps, how) {
+            self.error("Nothing to change: the animation has no length");
+            return;
+        }
+        self.snapshot(&format!("refps{now}"), now);
+        // the Original view shows the frames as they are now
+        self.original = Some(base.clone());
+        let n = base.len();
+        self.base = Some(base);
+        self.stack = st;
+        self.bump();
+        self.after_base_change(false);
+        // stay at the same moment
+        self.cur = self.plan_times.partition_point(|t| *t <= at + 1e-4).saturating_sub(1).min(self.plan.len().saturating_sub(1));
+        let r = self.refps_fps;
+        self.info(format!("Now {n} frames at {} fps", if r.fract() == 0.0 { format!("{r:.0}") } else { format!("{r:.2}") }));
     }
 
     fn ui_cut(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {

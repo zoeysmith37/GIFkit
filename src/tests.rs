@@ -1693,3 +1693,73 @@ fn compact_video_size() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Odd frame rates keep time: delays alternate so the whole adds up.
+#[test]
+fn any_frame_rate_keeps_time() {
+    for fps in [24.0, 30.0, 15.0, 23.976, 7.0, 50.0, 0.5] {
+        let n = 200usize;
+        let sum: u32 = (0..n).map(|k| crate::io::rate_delay(fps, k) as u32).sum();
+        let want = (n as f64 * 100.0 / fps).round() as u32;
+        assert_eq!(sum, want, "{fps} fps");
+        assert!((0..n).all(|k| crate::io::rate_delay(fps, k) >= 2 || fps > 50.0));
+    }
+    assert!(crate::io::exact_rate(25.0) && crate::io::exact_rate(12.5) && !crate::io::exact_rate(24.0));
+}
+
+/// Change Frame Rate: the same length, layers and keyframes at the same
+/// moments, new frames from the right old ones.
+#[test]
+fn change_frame_rate_keeps_everything_in_time() {
+    use crate::refps::Resample;
+    use crate::stack::{plan_times, LayerKind, Stack};
+    use crate::timeline::{Clip, Key, Marker};
+    let pic = |v: u8| image::RgbaImage::from_pixel(8, 8, image::Rgba([v, 0, 0, 255]));
+    let base0 = Animation { frames: (0..10).map(|i| Frame::new(pic(i as u8 * 20), 10)).collect(), loop_count: None };
+    let mut st0 = Stack::default();
+    let tid = st0.push(LayerKind::Text(crate::text::Annotation { text: "a".into(), from: 3, to: 5, ..Default::default() }));
+    let li = st0.index_of(tid).unwrap();
+    st0.layers[li].timing.clips = Some(vec![Clip { start: 2, end: Some(5) }]);
+    st0.layers[li].timing.keys = vec![Key { frame: 4, ..Default::default() }];
+    st0.markers.push(Marker { frame: 9, label: "m".into() });
+    let length = |a: &Animation, s: &Stack| plan_times(&s.plan(a)).len().min(0) as f32 + a.duration_secs();
+
+    // twice the rate: every frame twice
+    let (mut a, mut s) = (base0.clone(), st0.clone());
+    assert!(s.change_frame_rate(&mut a, 20.0, Resample::Nearest));
+    assert_eq!(a.len(), 20);
+    assert!(a.frames.iter().all(|f| f.delay_cs == 5));
+    assert!((length(&a, &s) - 1.0).abs() < 1e-4, "same length");
+    for k in 0..20 {
+        assert!(crate::pixels::Pixels::ptr_eq(&a.frames[k].image, &base0.frames[k / 2].image), "frame {k} repeats {}", k / 2);
+    }
+    let l = &s.layers[li];
+    let LayerKind::Text(t) = &l.kind else { panic!() };
+    assert_eq!((t.from, t.to), (5, 10), "source range doubles");
+    assert_eq!(l.timing.clips.as_ref().unwrap()[0], Clip { start: 4, end: Some(11) });
+    assert_eq!(l.timing.keys[0].frame, 8);
+    assert_eq!(s.markers[0].frame, 18);
+
+    // half the rate, blended: each new frame mixes two old ones
+    let (mut a, mut s) = (base0.clone(), st0.clone());
+    assert!(s.change_frame_rate(&mut a, 5.0, Resample::Blend));
+    assert_eq!(a.len(), 5);
+    assert!(a.frames.iter().all(|f| f.delay_cs == 20));
+    assert_eq!(a.frames[1].image.get().get_pixel(0, 0)[0], 50, "frames 2 and 3 mixed");
+    let LayerKind::Text(t) = &s.layers[li].kind else { panic!() };
+    assert_eq!((t.from, t.to), (2, 3));
+    assert_eq!(s.layers[li].timing.keys[0].frame, 2);
+
+    // 24 fps from 10: alternating delays, still one second
+    let (mut a, mut s) = (base0.clone(), st0.clone());
+    assert!(s.change_frame_rate(&mut a, 24.0, Resample::Blend));
+    assert_eq!(a.len(), 24);
+    assert_eq!(a.frames.iter().map(|f| f.delay_cs as u32).sum::<u32>(), 100);
+    assert!(a.frames.iter().all(|f| f.delay_cs == 4 || f.delay_cs == 5));
+    // fades between neighbours, never past them
+    for f in &a.frames {
+        let v = f.image.get().get_pixel(0, 0)[0];
+        assert!(v <= 180);
+    }
+    assert_eq!(s.markers[0].frame, 21);
+}

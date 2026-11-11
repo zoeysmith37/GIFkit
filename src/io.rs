@@ -82,8 +82,9 @@ pub struct VideoInfo {
 pub struct VideoImport {
     pub start: f64,
     pub end: f64,
-    /// GIF delay per frame in 1/100 s (2 = 50 fps … 10 = 10 fps)
-    pub delay_cs: u16,
+    /// frames per second, any rate up to [`MAX_FPS`]. Rates that aren't
+    /// 100 / a whole number get delays that alternate to keep the time
+    pub fps: f64,
     /// longest side, 0 = keep the video's size
     pub max_side: u32,
     /// how much a frame may differ from the last one kept and still be
@@ -113,14 +114,35 @@ pub fn changed_share(a: &[u8], b: &[u8], limit: f64) -> f64 {
     changed as f64 / n.max(1) as f64
 }
 
-/// Frame delays GIFs can show exactly, fastest first.
-pub const VIDEO_DELAYS: [u16; 7] = [2, 3, 4, 5, 6, 8, 10];
+/// Common frame rates, fastest first. GIFs show 50, 33.3, 25, 20, 16.7,
+/// 12.5 and 10 exactly; the rest alternate delays to keep time.
+pub const VIDEO_RATES: [f64; 12] = [50.0, 30.0, 25.0, 24.0, 20.0, 15.0, 12.0, 10.0, 8.0, 6.0, 5.0, 1.0];
+
+/// GIF delays are hundredths of a second and players show under 2 as 10.
+pub const MAX_FPS: f64 = 50.0;
+pub const MIN_FPS: f64 = 0.1;
+
+/// Delay of frame `k` at `fps`, in hundredths of a second: each frame
+/// ends at its exact time rounded, so 24 fps goes 4, 4, 4, 5, 4, 4, 4, 5…
+/// and the whole keeps time.
+pub fn rate_delay(fps: f64, k: usize) -> u16 {
+    let at = |k: usize| (k as f64 * 100.0 / fps).round() as i64;
+    (at(k + 1) - at(k)).clamp(1, u16::MAX as i64) as u16
+}
+
+/// Whether GIFs show `fps` exactly (one delay for every frame).
+pub fn exact_rate(fps: f64) -> bool {
+    let d = 100.0 / fps;
+    (d - d.round()).abs() < 1e-6
+}
 
 impl VideoImport {
     pub fn defaults(info: &VideoInfo) -> Self {
-        // the fastest exact GIF rate that isn't above the source
-        let delay_cs = VIDEO_DELAYS.into_iter().find(|d| 100.0 / *d as f64 <= info.fps + 0.01).unwrap_or(10);
-        Self { start: 0.0, end: info.duration, delay_cs, max_side: VIDEO_MAX_SIDE, merge: 0 }
+        // the video's own rate, as fast as GIFs go
+        let fps = if info.fps > 0.0 { ((info.fps * 1000.0).round() / 1000.0).clamp(MIN_FPS, MAX_FPS) } else { 25.0 };
+        // a small video keeps its size
+        let max_side = if VIDEO_MAX_SIDE >= info.width.max(info.height) { 0 } else { VIDEO_MAX_SIDE };
+        Self { start: 0.0, end: info.duration, fps, max_side, merge: 0 }
     }
 
     /// Output frame size (even numbers, as video scalers need).
@@ -133,7 +155,7 @@ impl VideoImport {
     }
 
     pub fn frames(&self) -> usize {
-        ((self.end - self.start).max(0.0) * 100.0 / self.delay_cs as f64).round().max(1.0) as usize
+        ((self.end - self.start).max(0.0) * self.fps.clamp(MIN_FPS, MAX_FPS)).round().max(1.0) as usize
     }
 
     /// Memory the frames take once loaded.
@@ -193,7 +215,8 @@ fn load_video_range_with(path: &Path, opt: &VideoImport, progress: Option<&std::
     use std::io::Read;
     let info = probe_video(path)?;
     let (w, h) = opt.size(&info);
-    let fps = 100.0 / opt.delay_cs as f64;
+    let fps = opt.fps.clamp(MIN_FPS, MAX_FPS);
+    let mut k = 0usize;
     let mut cmd = crate::io::hidden_cmd("ffmpeg");
     cmd.args(["-v", "error", "-nostdin"]);
     if hw {
@@ -206,7 +229,7 @@ fn load_video_range_with(path: &Path, opt: &VideoImport, progress: Option<&std::
     if opt.end < info.duration {
         cmd.args(["-t", &format!("{:.3}", (opt.end - opt.start).max(0.01))]);
     }
-    cmd.args(["-an", "-vf", &format!("fps={fps},scale={w}:{h}:flags=lanczos,format=rgba"), "-f", "rawvideo", "-pix_fmt", "rgba", "-"]);
+    cmd.args(["-an", "-vf", &format!("fps={fps:.4},scale={w}:{h}:flags=lanczos,format=rgba"), "-f", "rawvideo", "-pix_fmt", "rgba", "-"]);
     cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     #[cfg(windows)]
     {
@@ -231,12 +254,14 @@ fn load_video_range_with(path: &Path, opt: &VideoImport, progress: Option<&std::
     loop {
         match stdout.read_exact(&mut buf) {
             Ok(()) => {
+                let delay = rate_delay(fps, k);
+                k += 1;
                 // a frame close enough to the last one kept only adds its time to it
-                let last = frames.last_mut().filter(|f| limit >= 0.0 && f.delay_cs as u32 + (opt.delay_cs as u32) < 65535);
+                let last = frames.last_mut().filter(|f| limit >= 0.0 && f.delay_cs as u32 + (delay as u32) < 65535);
                 match last {
-                    Some(f) if changed_share(f.image.get().as_raw(), &buf, limit) <= limit => f.delay_cs += opt.delay_cs,
+                    Some(f) if changed_share(f.image.get().as_raw(), &buf, limit) <= limit => f.delay_cs += delay,
                     _ => {
-                        frames.push(Frame::new(RgbaImage::from_raw(w, h, std::mem::replace(&mut buf, vec![0u8; frame_len])).context("frame size")?, opt.delay_cs));
+                        frames.push(Frame::new(RgbaImage::from_raw(w, h, std::mem::replace(&mut buf, vec![0u8; frame_len])).context("frame size")?, delay));
                         let i = frames.len() - 1;
                         pk.add(&mut frames, i);
                     }
