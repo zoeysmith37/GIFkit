@@ -118,7 +118,7 @@ impl<'a> Spin<'a> {
         }
     }
 
-    fn from_frac(&self, t: f64) -> f64 {
+    fn value_at(&self, t: f64) -> f64 {
         let (a, b) = (*self.range.start(), *self.range.end());
         let t = t.clamp(0.0, 1.0);
         if self.log && a > 0.0 && b > 0.0 {
@@ -195,7 +195,7 @@ impl egui::Widget for Spin<'_> {
             let dx = resp.drag_delta().x as f64 / rect.width().max(1.0) as f64;
             t += dx * if shift { 0.1 } else { 1.0 };
             ui.data_mut(|d| d.insert_temp(grab_id, (t, start)));
-            let mut nv = self.from_frac(t);
+            let mut nv = self.value_at(t);
             if ctrl {
                 // round numbers: steps of a tenth of a power of ten of the span
                 let span = (self.range.end() - self.range.start()).abs().max(1e-9);
