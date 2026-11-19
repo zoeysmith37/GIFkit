@@ -131,6 +131,13 @@ fn curve_editor(ui: &mut egui::Ui, pts: &mut Vec<[f32; 2]>, hist: Option<&[u32; 
         painter.line_segment([pos2(rect.left(), rect.top() + f * side), pos2(rect.right(), rect.top() + f * side)], grid);
     }
     painter.line_segment([rect.left_bottom(), rect.right_top()], Stroke::new(1.0, mix(pal.view, pal.fg, 0.22)));
+    if let Some(others) = ui.data(|d| d.get_temp::<Vec<(usize, Vec<[f32; 2]>)>>(id.with("ghosts"))) {
+        for (k, g) in others {
+            let ys = adjust::curve_samples(&g, 64);
+            let line: Vec<Pos2> = ys.iter().enumerate().map(|(i, y)| to_screen([i as f32 / 63.0 * 255.0, y * 255.0])).collect();
+            painter.add(egui::Shape::line(line, Stroke::new(1.0, ch_colour(k).gamma_multiply(0.55))));
+        }
+    }
     let ys = adjust::curve_samples(pts, 128);
     let line: Vec<Pos2> = ys.iter().enumerate().map(|(i, y)| to_screen([i as f32 / 127.0 * 255.0, y * 255.0])).collect();
     painter.add(egui::Shape::line(line, Stroke::new(1.8, ch_colour(ch))));
@@ -332,7 +339,7 @@ impl GifKitApp {
         egui::containers::menu::MenuButton::from_button(menu).ui(ui, |ui| {
             ui.set_min_width(220.0);
             for (k, name) in adjust::KINDS.iter().enumerate() {
-                if k == 2 || k == 5 || k == 9 || k == 11 {
+                if adjust::MENU_BREAKS.contains(&k) {
                     ui.separator();
                 }
                 let b = egui::Button::image_and_text(crate::icons::image(ui.ctx(), Adjust::icon(k), 16.0, pal.fg), *name);
@@ -345,6 +352,19 @@ impl GifKitApp {
         ui.add_space(8.0);
         if pick.is_some() {
             ui.ctx().request_repaint();
+        }
+        // how the whole layer meets what's under it
+        if let Some(li) = sel {
+            if let LayerKind::Effects(fx) = &mut self.stack.layers[li].kind {
+                let items: Vec<(adjust::Blend, &str)> = adjust::Blend::ALL.iter().map(|b| (*b, b.label())).collect();
+                let before = fx.adjust_mode;
+                form_row(ui, "Blend", |ui| combo(ui, "adj-blend", &mut fx.adjust_mode, &items))
+                    .on_hover_text("Luminosity: tones change but colours don't shift. Color: colours change, tones stay. Opacity is in the Layers panel");
+                if fx.adjust_mode != before {
+                    self.modified = true;
+                }
+                ui.add_space(4.0);
+            }
         }
         let hist = self.adjust_histogram();
         let Some(li) = sel else {
@@ -396,17 +416,21 @@ impl GifKitApp {
 
 fn adjust_tip(k: usize) -> &'static str {
     [
-        "Set the black, white and middle points, per channel",
-        "Reshape the tones with a curve, per channel",
+        "Set the black, white and middle points, per channel (Ctrl+L)",
+        "Reshape the tones with a curve, per channel (Ctrl+M)",
         "Stops of light, worked in linear light",
+        "Simple brighter or darker, more or less contrast",
         "Boost dull colours more than strong ones; skin is held back",
-        "Push shadows, midtones and highlights toward a colour",
+        "Turn the hues, change how strong colours are, or paint one hue over it all (Ctrl+U)",
+        "Push shadows, midtones and highlights toward a colour (Ctrl+B)",
         "Grey from colour, with how bright each colour turns out",
         "A coloured lens filter",
         "Each channel made from a mix of the others",
         "Change the ink in each colour range",
-        "Map dark to light onto a gradient",
+        "A negative (Ctrl+I)",
+        "Only a few steps of each colour",
         "Pure black and white at a level",
+        "Map dark to light onto a gradient",
         "Ready-made colour grades",
         "Load a .cube lookup table from Resolve, Premiere and others",
     ][k]
@@ -470,7 +494,10 @@ fn adjust_editor(ui: &mut egui::Ui, adj: &mut Adjust, id: egui::Id, hist: Option
             painter.rect_filled(r, 2.0, mix(p().view, p().window, 0.5));
             if let Some(h) = hist {
                 paint_hist(&painter, r.shrink(1.0), &h.bins[if ch == 0 { 3 } else { ch - 1 }], mix(ch_colour(ch), p().view, 0.35));
+                let (mean, sd, median, n) = h.stats(if ch == 0 { 3 } else { ch - 1 });
+                painter.text(r.right_top() + vec2(-6.0, 4.0), egui::Align2::RIGHT_TOP, format!("Mean {mean:.1}  Std dev {sd:.1}  Median {median}  Pixels {n}"), egui::FontId::proportional(10.5), p().fg_muted);
             }
+            levels_droppers(ui, l, id);
             let c = &mut l.ch[ch];
             // the grey handle sits where the middle grey lands: t = 0.5^gamma
             let mid = c.in_black + (c.in_white - c.in_black) * 0.5f32.powf(c.gamma);
@@ -540,6 +567,9 @@ fn adjust_editor(ui: &mut egui::Ui, adj: &mut Adjust, id: egui::Id, hist: Option
             let ch = channel_pick(ui, id.with("ch"));
             ui.add_space(4.0);
             let bins = hist.map(|h| &h.bins[if ch == 0 { 3 } else { ch - 1 }]);
+            // the colour channels' curves show faintly behind the RGB one
+            let ghosts: Vec<(usize, Vec<[f32; 2]>)> = if ch == 0 { (1..4).filter(|k| c.ch[*k] != adjust::identity_curve()).map(|k| (k, c.ch[k].clone())).collect() } else { Vec::new() };
+            ui.data_mut(|d| d.insert_temp(id.with(("curve", ch)).with("ghosts"), ghosts));
             curve_editor(ui, &mut c.ch[ch], bins, ch, id.with(("curve", ch)));
             ui.add_space(4.0);
             {
@@ -696,6 +726,53 @@ fn adjust_editor(ui: &mut egui::Ui, adj: &mut Adjust, id: egui::Id, hist: Option
             });
             slide(ui, "Amount", &mut l.amount, 0.0..=100.0, "%", 0);
         }
+        Adjust::BrightContrast(b) => {
+            let (br, cr) = if b.legacy { (-100.0..=100.0, -100.0..=100.0) } else { (-150.0..=150.0, -50.0..=100.0) };
+            slide(ui, "Brightness", &mut b.brightness, br, "", 0);
+            slide(ui, "Contrast", &mut b.contrast, cr, "", 0);
+            form_row(ui, "", |ui| check(ui, &mut b.legacy, "Use legacy").on_hover_text("The old straight-line version: it can clip the brightest and darkest tones. Older GIFkit Effects layers used it"));
+        }
+        Adjust::HueSat(h) => {
+            let was = h.colorize;
+            if h.colorize {
+                let mut hue = h.hue.rem_euclid(360.0);
+                form_row(ui, "Hue", |ui| fill_slider(ui, egui::Slider::new(&mut hue, 0.0..=360.0).suffix("°").max_decimals(0)));
+                h.hue = hue;
+                slide(ui, "Saturation", &mut h.saturation, 0.0..=100.0, "", 0);
+            } else {
+                slide(ui, "Hue", &mut h.hue, -180.0..=180.0, "°", 0);
+                slide(ui, "Saturation", &mut h.saturation, -100.0..=100.0, "", 0);
+            }
+            slide(ui, "Lightness", &mut h.lightness, -100.0..=100.0, "", 0);
+            // the hue strip: where each hue ends up
+            let w = ui.available_width().min(300.0);
+            let (r, _) = ui.allocate_exact_size(vec2(w, 20.0), Sense::hover());
+            let painter = ui.painter_at(r);
+            let item = AdjustItem::new(Adjust::HueSat(h.clone()));
+            let n = 90;
+            for i in 0..n {
+                let t = i as f32 / n as f32;
+                let src = hue_colour(t);
+                let dst = adjust::map_one(&item, src);
+                let x0 = r.left() + r.width() * t;
+                let x1 = x0 + r.width() / n as f32 + 0.6;
+                let c = |c: [f32; 3]| Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8);
+                painter.rect_filled(Rect::from_min_max(pos2(x0, r.top()), pos2(x1, r.center().y - 1.0)), 0.0, c(src));
+                painter.rect_filled(Rect::from_min_max(pos2(x0, r.center().y + 1.0), pos2(x1, r.bottom())), 0.0, c(dst));
+            }
+            form_row(ui, "", |ui| check(ui, &mut h.colorize, "Colorize").on_hover_text("One hue over everything, like a tinted photo"));
+            if h.colorize && !was {
+                // Photoshop starts colorize at a soft red
+                (h.hue, h.saturation) = (0.0, 25.0);
+            }
+        }
+        Adjust::Invert(_) => {
+            hint(ui, "Every colour turned to its opposite. Nothing to set");
+        }
+        Adjust::Posterize(pz) => {
+            form_row(ui, "Levels", |ui| fill_slider(ui, egui::Slider::new(&mut pz.levels, 2..=32).clamping(egui::SliderClamping::Never))).on_hover_text("Steps of each colour. Type more for up to 255");
+            pz.levels = pz.levels.clamp(2, 255);
+        }
         Adjust::Cube(c) => {
             form_row(ui, "File", |ui| {
                 ui.horizontal(|ui| {
@@ -724,6 +801,63 @@ fn adjust_editor(ui: &mut egui::Ui, adj: &mut Adjust, id: egui::Id, hist: Option
             }
             slide(ui, "Amount", &mut c.amount, 0.0..=100.0, "%", 0);
             form_row(ui, "", |ui| hint(ui, "Saved inside the project"));
+        }
+    }
+}
+
+/// A fully saturated colour at hue `t` (0..1).
+fn hue_colour(t: f32) -> [f32; 3] {
+    let h = t.rem_euclid(1.0) * 6.0;
+    [((h - 3.0).abs() - 1.0).clamp(0.0, 1.0), (2.0 - (h - 2.0).abs()).clamp(0.0, 1.0), (2.0 - (h - 4.0).abs()).clamp(0.0, 1.0)]
+}
+
+/// Levels' three eyedroppers: click the picture for the black, grey or
+/// white point (per channel, as Photoshop sets them).
+fn levels_droppers(ui: &mut egui::Ui, l: &mut adjust::Levels, id: egui::Id) {
+    let pal = *p();
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for (k, (tip, fill)) in [("Set the black point: click something that should be black", Color32::BLACK), ("Set the grey point: click something that should be neutral grey", Color32::from_gray(128)), ("Set the white point: click something that should be white", Color32::WHITE)].iter().enumerate() {
+            let did = id.with(("dropper", k));
+            let r = ui.add(egui::Button::new("").min_size(vec2(30.0, 24.0))).on_hover_text(*tip);
+            crate::icons::paint(ui.painter(), "color-picker", r.rect.center() - vec2(3.0, 0.0), 16.0, pal.fg);
+            ui.painter().circle_filled(r.rect.right_bottom() - vec2(7.0, 7.0), 4.0, *fill);
+            ui.painter().circle_stroke(r.rect.right_bottom() - vec2(7.0, 7.0), 4.0, Stroke::new(1.0, pal.fg_muted));
+            if r.clicked() {
+                let frame = ui.ctx().cumulative_frame_nr();
+                if let Ok(mut e) = EYEDROP.lock() {
+                    *e = Some(Eyedrop { target: did, since: frame, asked: false, shot: None });
+                }
+                ui.ctx().request_repaint();
+            }
+            if let Some(px) = ui.ctx().data_mut(|d| d.remove_temp::<[u8; 3]>(eyedrop_picked_id(did))) {
+                set_point(l, k, px);
+            }
+        }
+        hint(ui, "  Pick from the Original view");
+    });
+}
+
+/// The black (0), grey (1) or white (2) point set from colour `px`.
+fn set_point(l: &mut adjust::Levels, k: usize, px: [u8; 3]) {
+    for ch in 0..3 {
+        let v = px[ch] as f32;
+        let c = &mut l.ch[ch + 1];
+        match k {
+            0 => c.in_black = v.min(c.in_white - 2.0).max(0.0),
+            2 => c.in_white = v.max(c.in_black + 2.0).min(255.0),
+            _ => {}
+        }
+    }
+    if k == 1 {
+        // each channel's middle bent so this colour comes out grey
+        let after: [f32; 3] = std::array::from_fn(|ch| adjust::levels(&adjust::LevelsCh { gamma: 1.0, ..l.ch[ch + 1] }, px[ch] as f32 / 255.0));
+        let target = (after[0] + after[1] + after[2]) / 3.0;
+        for ch in 0..3 {
+            let c = &mut l.ch[ch + 1];
+            let u = ((px[ch] as f32 - c.in_black) / (c.in_white - c.in_black).max(1.0)).clamp(0.01, 0.99);
+            let want = ((target * 255.0 - c.out_black) / (c.out_white - c.out_black).max(1.0)).clamp(0.01, 0.99);
+            c.gamma = (u.ln() / want.ln()).clamp(0.1, 9.99);
         }
     }
 }

@@ -5137,6 +5137,13 @@ impl GifKitApp {
         if hit(A::Compress) && self.base.is_some() {
             self.cmp_go = self.cmp_key();
         }
+        if !typing && self.base.is_some() && !self.busy() {
+            for (a, q) in [(A::AdjLevels, Quick::Kind(0)), (A::AdjCurves, Quick::Kind(1)), (A::AdjHueSat, Quick::Kind(5)), (A::AdjBalance, Quick::Kind(6)), (A::AdjBlackWhite, Quick::Kind(7)), (A::AdjInvert, Quick::Kind(11)), (A::AdjDesaturate, Quick::Desaturate), (A::AutoTone, Quick::AutoTone), (A::AutoContrast, Quick::AutoContrast), (A::AutoColor, Quick::AutoColor)] {
+                if hit(a) {
+                    self.quick_adjust(q);
+                }
+            }
+        }
         if hit(A::OnionSkin) && !typing {
             self.toggle_onion();
         }
@@ -6870,6 +6877,38 @@ impl GifKitApp {
                 }
                 if menu_item(ui, "speedometer", "Change &Frame Rate…", "", idle && has) {
                     self.open_tool(Tool::Speed);
+                }
+                ui.separator();
+                let mut quick = None;
+                sub_menu(ui, "view-object-histogram-linear", "&Adjustments", |ui| {
+                    use crate::keys::Action as A;
+                    let key_of = |k: usize| match k {
+                        0 => Some(A::AdjLevels),
+                        1 => Some(A::AdjCurves),
+                        5 => Some(A::AdjHueSat),
+                        6 => Some(A::AdjBalance),
+                        7 => Some(A::AdjBlackWhite),
+                        11 => Some(A::AdjInvert),
+                        _ => None,
+                    };
+                    for (k, name) in crate::adjust::KINDS.iter().enumerate() {
+                        if crate::adjust::MENU_BREAKS.contains(&k) {
+                            ui.separator();
+                        }
+                        let sc = key_of(k).map(|a| self.keymap.text(a)).unwrap_or_default();
+                        if menu_item(ui, crate::adjust::Adjust::icon(k), &format!("{}…", name.replace('&', "&&")), &sc, idle && has) {
+                            quick = Some(Quick::Kind(k));
+                        }
+                    }
+                    ui.separator();
+                    for (q, name, a) in [(Quick::Desaturate, "Desaturate", A::AdjDesaturate), (Quick::AutoTone, "Auto Tone", A::AutoTone), (Quick::AutoContrast, "Auto Contrast", A::AutoContrast), (Quick::AutoColor, "Auto Color", A::AutoColor)] {
+                        if menu_item(ui, "", name, &self.keymap.text(a), idle && has) {
+                            quick = Some(q);
+                        }
+                    }
+                });
+                if let Some(q) = quick {
+                    self.quick_adjust(q);
                 }
                 ui.separator();
                 if menu_item(ui, "merge", "&Collapse All", "", idle && has && !self.stack.is_empty()) {
@@ -12204,11 +12243,66 @@ impl GifKitApp {
             },
             None => &mut self.fx_draft,
         };
-        effects_ui(ui, fx, transform, corner);
+        let convert = effects_ui(ui, fx, transform, corner);
+        if let (true, Some(li)) = (convert, sel) {
+            self.legacy_to_adjust(li);
+            return;
+        }
         if sel.is_none() && self.fx_draft != EffectSettings::default() {
             let fx = std::mem::take(&mut self.fx_draft);
             self.add_layer(LayerKind::Effects(Box::new(fx)));
         }
+    }
+
+    /// An adjustment from the menu or a shortcut: added to the adjustment
+    /// layer being edited, or as a new layer, with the Adjust tool opened.
+    fn quick_adjust(&mut self, q: Quick) {
+        use crate::adjust::{Adjust, AdjustItem, HueSat};
+        let hist = self.base.as_ref().and_then(|b| b.frames.get(self.plan.get(self.cur).map(|f| f.src).unwrap_or(0))).map(|f| crate::adjust::histogram(&f.image.get()));
+        let (adj, what) = match q {
+            Quick::Kind(k) => (Adjust::make(k), crate::adjust::KINDS[k].to_string()),
+            Quick::Desaturate => (Adjust::HueSat(HueSat { saturation: -100.0, ..Default::default() }), "Desaturate".into()),
+            Quick::AutoTone => (Adjust::Levels(hist.map(|h| h.auto_levels()).unwrap_or_default()), "Auto Tone".into()),
+            Quick::AutoContrast => (Adjust::Levels(hist.map(|h| h.auto_contrast()).unwrap_or_default()), "Auto Contrast".into()),
+            Quick::AutoColor => (Adjust::Levels(hist.map(|h| h.auto_color()).unwrap_or_default()), "Auto Color".into()),
+        };
+        let item = AdjustItem::new(adj);
+        let cur = (self.tool == Tool::Adjust).then(|| self.sel_index(Kind::Adjust)).flatten();
+        match cur.map(|li| &mut self.stack.layers[li].kind) {
+            Some(LayerKind::Effects(fx)) => fx.adjust.push(item),
+            _ => {
+                let fx = EffectSettings { adjust: vec![item], adjust_layer: true, ..Default::default() };
+                self.add_layer(LayerKind::Effects(Box::new(fx)));
+            }
+        }
+        self.tool = Tool::Adjust;
+        self.modified = true;
+        self.info(format!("Added {what}"));
+    }
+
+    /// An Effects layer's older colour settings moved to an adjustment layer
+    /// just under it (so they run first, as they did), or the layer itself
+    /// turned into one when that was all it had.
+    fn legacy_to_adjust(&mut self, li: usize) {
+        let LayerKind::Effects(fx) = &mut self.stack.layers[li].kind else { return };
+        let items = crate::adjust::from_legacy(fx);
+        crate::adjust::clear_legacy(fx);
+        let empty = **fx == EffectSettings::default();
+        let id = if empty {
+            **fx = EffectSettings { adjust: items, adjust_layer: true, ..Default::default() };
+            self.stack.layers[li].id
+        } else {
+            let mut l = self.stack.layers[li].clone();
+            let id = self.stack.push(LayerKind::Effects(Box::new(EffectSettings { adjust: items, adjust_layer: true, ..Default::default() })));
+            let fresh = self.stack.layers.pop().expect("just pushed");
+            (l.id, l.kind, l.label) = (fresh.id, fresh.kind, None);
+            self.stack.layers.insert(li, l);
+            id
+        };
+        self.select(Kind::Adjust, id);
+        self.tool = Tool::Adjust;
+        self.modified = true;
+        self.info(if empty { "Turned into an adjustment layer" } else { "Colour settings moved to an adjustment layer under it" });
     }
 
     fn ui_animation(&mut self, ui: &mut egui::Ui) {
@@ -13774,34 +13868,57 @@ fn on(b: &[bool]) -> Option<String> {
     (n > 0).then(|| n.to_string())
 }
 
-fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform, corner: Option<[u8; 3]>) {
+/// The Effects panel. True when "Move to an Adjustment Layer" was asked for.
+fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform, corner: Option<[u8; 3]>) -> bool {
     let d = EffectSettings::default();
-    let colour_changed = fx.hue != d.hue || fx.saturation != d.saturation || fx.lightness != d.lightness || fx.brightness != d.brightness || fx.contrast != d.contrast;
-    group_ex(ui, "Colour", true, colour_changed.then(|| "●".to_string()), |ui| {
-        slider_row(ui, "Hue", soft_slider(&mut fx.hue, 0.0..=200.0, "").max_decimals(0));
-        slider_row(ui, "Saturation", soft_slider(&mut fx.saturation, 0.0..=200.0, "").max_decimals(0));
-        slider_row(ui, "Lightness", soft_slider(&mut fx.lightness, 0.0..=200.0, "").max_decimals(0));
-        slider_row(ui, "Brightness", soft_slider(&mut fx.brightness, -100.0..=100.0, "").max_decimals(0));
-        slider_row(ui, "Contrast", soft_slider(&mut fx.contrast, -100.0..=100.0, "").max_decimals(0));
-        form_row(ui, "", |ui| {
-            ui.add_enabled_ui(colour_changed, |ui| {
-                if wide_button(ui, egui::Button::new("Reset Colour")).clicked() {
-                    fx.hue = 100.0;
-                    fx.saturation = 100.0;
-                    fx.lightness = 100.0;
-                    fx.brightness = 0.0;
-                    fx.contrast = 0.0;
+    let mut convert = false;
+    // colour work lives in the Adjust tool now; a layer still using the older
+    // settings keeps them here, working as before
+    if crate::adjust::has_legacy(fx) {
+        group_ex(ui, "Older colour settings", true, Some("●".to_string()), |ui| {
+            hint(ui, "Colour work moved to the Adjust tool. These still work as they did");
+            ui.add_space(4.0);
+            let b = egui::Button::image_and_text(crate::icons::image(ui.ctx(), "view-object-histogram-linear", 16.0, p().fg), "Move to an Adjustment Layer");
+            if wide_button(ui, b).on_hover_text("The same settings as Hue/Saturation, Brightness/Contrast and so on, which you can then edit with curves, blend modes and the rest").clicked() {
+                convert = true;
+            }
+            ui.add_space(4.0);
+            let colour_changed = fx.hue != d.hue || fx.saturation != d.saturation || fx.lightness != d.lightness || fx.brightness != d.brightness || fx.contrast != d.contrast;
+            if colour_changed {
+                slider_row(ui, "Hue", soft_slider(&mut fx.hue, 0.0..=200.0, "").max_decimals(0));
+                slider_row(ui, "Saturation", soft_slider(&mut fx.saturation, 0.0..=200.0, "").max_decimals(0));
+                slider_row(ui, "Lightness", soft_slider(&mut fx.lightness, 0.0..=200.0, "").max_decimals(0));
+                slider_row(ui, "Brightness", soft_slider(&mut fx.brightness, -100.0..=100.0, "").max_decimals(0));
+                slider_row(ui, "Contrast", soft_slider(&mut fx.contrast, -100.0..=100.0, "").max_decimals(0));
+            }
+            let mut toggles: Vec<(&mut bool, &str, &str)> = Vec::new();
+            for (on, name) in [(&mut fx.grayscale, "Grayscale"), (&mut fx.sepia, "Sepia"), (&mut fx.monochrome, "Mono"), (&mut fx.negative, "Invert"), (&mut fx.posterize, "Posterize"), (&mut fx.gotham, "Gotham"), (&mut fx.nashville, "Nashville")] {
+                if *on {
+                    toggles.push((on, name, ""));
                 }
-            });
+            }
+            if !toggles.is_empty() {
+                form_row(ui, "On", |ui| toggle_grid(ui, 92.0, &mut toggles));
+            }
+            if fx.tint {
+                opt_row(ui, "Tint", &mut fx.tint, |ui| {
+                    colour_btn(ui, &mut fx.tint_color);
+                    num_fill(ui, &mut fx.tint_amount, 1.0, |d| d.range(0.0..=100.0).max_decimals(0).suffix("%"));
+                });
+            }
+            if fx.posterize {
+                slider_row(ui, "Posterize", egui::Slider::new(&mut fx.posterize_levels, 2..=16).clamping(egui::SliderClamping::Never));
+            }
+            if fx.gotham {
+                slider_row(ui, "Gotham", soft_slider(&mut fx.gotham_amount, 0.0..=100.0, "").suffix("%").max_decimals(0));
+            }
+            if fx.nashville {
+                slider_row(ui, "Nashville", soft_slider(&mut fx.nashville_amount, 0.0..=100.0, "").suffix("%").max_decimals(0));
+            }
         });
-    });
-    group_ex(ui, "Looks", true, on(&[fx.grayscale, fx.sepia, fx.monochrome, fx.negative, fx.tint, fx.change_bg]), |ui| {
-        form_row(ui, "Style", |ui| toggle_grid(ui, 72.0, &mut [(&mut fx.grayscale, "Grayscale", ""), (&mut fx.sepia, "Sepia", ""), (&mut fx.monochrome, "Mono", "Black and white only"), (&mut fx.negative, "Invert", "Negative colours")]));
-        opt_row(ui, "Tint", &mut fx.tint, |ui| {
-            colour_btn(ui, &mut fx.tint_color);
-            num_fill(ui, &mut fx.tint_amount, 1.0, |d| d.range(0.0..=100.0).max_decimals(0).suffix("%"));
-        });
-        opt_row(ui, "Background", &mut fx.change_bg, |ui| {
+    }
+    group_ex(ui, "Background", false, on(&[fx.change_bg]), |ui| {
+        opt_row(ui, "Fill", &mut fx.change_bg, |ui| {
             colour_btn(ui, &mut fx.bg_color).on_hover_text("Fills transparent areas");
         });
     });
@@ -13821,14 +13938,13 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform, c
         fx.warp = BoothFx::None;
     }
     // photo booth looks, artistic styles and filters: one place for how it looks
-    let styled = !fx.looks.is_empty() || fx.oil || fx.emboss || fx.posterize || fx.solarize || fx.noise || fx.pixelate || fx.gotham || fx.lomo || fx.nashville || fx.toaster || fx.vignette || fx.polaroid;
+    let styled = !fx.looks.is_empty() || fx.oil || fx.emboss || fx.solarize || fx.noise || fx.pixelate || fx.lomo || fx.toaster || fx.vignette || fx.polaroid;
     group_ex(ui, "Styles", true, styled.then(|| "●".to_string()), |ui| {
         form_row(ui, "Photo booth", |ui| stack_grid(ui, &BoothFx::LOOKS, &mut fx.looks, None));
         form_row(ui, "Artistic", |ui| {
             toggle_grid(ui, 92.0, &mut [
                 (&mut fx.oil, "Oil Paint", "Smooths detail into brush-like patches"),
                 (&mut fx.emboss, "Emboss", "Raised relief look"),
-                (&mut fx.posterize, "Posterize", "Fewer colour steps"),
                 (&mut fx.solarize, "Solarize", "Inverts the brightest tones"),
                 (&mut fx.noise, "Noise", "Adds random grain"),
                 (&mut fx.pixelate, "Pixelate", "Big square pixels"),
@@ -13836,9 +13952,7 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform, c
         });
         form_row(ui, "Filter", |ui| {
             toggle_grid(ui, 92.0, &mut [
-                (&mut fx.gotham, "Gotham", "Cool and gritty high contrast"),
                 (&mut fx.lomo, "Lomo", "Saturated with dark corners"),
-                (&mut fx.nashville, "Nashville", "Warm pink vintage tint"),
                 (&mut fx.toaster, "Toaster", "Warm faded film look"),
                 (&mut fx.vignette, "Vignette", "Darkens the corners"),
                 (&mut fx.polaroid, "Polaroid", "White instant-photo frame"),
@@ -13860,10 +13974,6 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform, c
             form_row(ui, "Light from", |ui| combo(ui, "fx_emboss_dir", &mut fx.emboss_dir, &DIRS));
             form_row(ui, "", |ui| check(ui, &mut fx.emboss_colour, "Keep colours").on_hover_text("Raised relief over the picture instead of grey"));
         }
-        if fx.posterize {
-            sub_head(ui, "Posterize");
-            slider_row(ui, "Levels", egui::Slider::new(&mut fx.posterize_levels, 2..=16).clamping(egui::SliderClamping::Never));
-        }
         if fx.solarize {
             sub_head(ui, "Solarize");
             slider_row(ui, "Threshold", egui::Slider::new(&mut fx.solarize_threshold, 0.0..=255.0).max_decimals(0)).on_hover_text("Tones past this flip");
@@ -13884,9 +13994,7 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform, c
             slider_row(ui, "Block size", egui::Slider::new(&mut fx.pixelate_size, 2..=64).suffix(" px").clamping(egui::SliderClamping::Never));
         }
         for (on, name, v) in [
-            (fx.gotham, "Gotham", &mut fx.gotham_amount),
             (fx.lomo, "Lomo", &mut fx.lomo_amount),
-            (fx.nashville, "Nashville", &mut fx.nashville_amount),
             (fx.toaster, "Toaster", &mut fx.toaster_amount),
             (fx.vignette, "Vignette", &mut fx.vignette_amount),
         ] {
@@ -13994,7 +14102,7 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform, c
     });
     // flips and rotation live in the Rotate frame edit; only shown for old layers that use them
     if !(fx.flip_v || fx.flip_h || fx.rot90 || fx.rot270 || fx.rot_any) {
-        return;
+        return convert;
     }
     group_ex(ui, "Transform (Old)", true, on(&[fx.flip_v, fx.flip_h, fx.rot90, fx.rot270, fx.rot_any]), |ui| {
         hint(ui, "Use the Rotate frame edit instead");
@@ -14003,6 +14111,7 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform, c
         });
         opt_row(ui, "Rotate", &mut fx.rot_any, |ui| num_fill(ui, &mut fx.rot_deg, 1.0, |d| d.speed(0.5).suffix("°")));
     });
+    convert
 }
 
 /// GIF dithering: off, error diffusion or an ordered pattern.
@@ -14319,4 +14428,15 @@ fn rect_tool(drag: &mut Option<DragMode>, started: bool, dragged: bool, stopped:
     if stopped {
         *drag = None;
     }
+}
+
+/// What a quick adjustment (menu or shortcut) adds.
+#[derive(Clone, Copy)]
+enum Quick {
+    /// a fresh one of `adjust::KINDS[k]`
+    Kind(usize),
+    Desaturate,
+    AutoTone,
+    AutoContrast,
+    AutoColor,
 }

@@ -1772,13 +1772,13 @@ fn adjustments() {
     let grey = |v: u8| image::RgbaImage::from_pixel(4, 4, image::Rgba([v, v, v, 255]));
     let run = |items: &[AdjustItem], img: &image::RgbaImage| {
         let mut i = img.clone();
-        apply(&mut i, items);
+        apply(&mut i, items, Blend::Normal);
         i
     };
     let one = |a: Adjust| vec![AdjustItem::new(a)];
     // every kind at its defaults (Levels, Curves...) changes nothing
     let photo = image::RgbaImage::from_fn(64, 64, |x, y| image::Rgba([(x * 4) as u8, (y * 4) as u8, ((x * y) % 256) as u8, 255]));
-    for k in [0, 1, 2, 3, 4, 7, 8] {
+    for k in [0, 1, 2, 3, 4, 5, 6, 9, 10] {
         assert_eq!(run(&one(Adjust::make(k)), &photo).as_raw(), photo.as_raw(), "{} at its defaults", KINDS[k]);
     }
     // Levels 50..200: 125 is the middle
@@ -1828,4 +1828,72 @@ fn adjustments() {
     let back: crate::effects::EffectSettings = serde_json::from_str(&json).unwrap();
     assert_eq!(back, fx, "saved and loaded the same");
     assert!(parse_cube("LUT_3D_SIZE 3\n0 0 0\n").is_err());
+}
+
+/// The older Effects colour settings moved to adjustments look the same.
+#[test]
+fn legacy_colour_moves_to_adjustments() {
+    use crate::adjust::*;
+    use crate::effects::EffectSettings as E;
+    let photo = image::RgbaImage::from_fn(96, 64, |x, y| image::Rgba([(x * 255 / 95) as u8, (y * 4) as u8, ((x * 7 + y * 3) % 256) as u8, 255]));
+    let cases: Vec<(&str, E, u8)> = vec![
+        ("brightness contrast", E { brightness: 15.0, contrast: 30.0, ..Default::default() }, 2),
+        ("grayscale", E { grayscale: true, ..Default::default() }, 2),
+        ("sepia", E { sepia: true, ..Default::default() }, 2),
+        ("negative", E { negative: true, ..Default::default() }, 1),
+        ("tint", E { tint: true, tint_color: [200, 120, 40], tint_amount: 60.0, ..Default::default() }, 2),
+        ("hue and saturation", E { hue: 140.0, saturation: 60.0, ..Default::default() }, 3),
+        ("gotham", E { gotham: true, ..Default::default() }, 5),
+        ("nashville", E { nashville: true, ..Default::default() }, 5),
+        ("several", E { brightness: -10.0, sepia: true, negative: true, ..Default::default() }, 3),
+    ];
+    for (name, fx, tol) in cases {
+        assert!(has_legacy(&fx), "{name}");
+        let old = crate::effects::apply_frame(&photo, 0, 1, 0.0, 1.0, &fx, &[]);
+        let items = from_legacy(&fx);
+        let mut cleared = fx.clone();
+        clear_legacy(&mut cleared);
+        assert!(!has_legacy(&cleared) && cleared == E::default(), "{name}: all taken");
+        let mut new = photo.clone();
+        apply(&mut new, &items, Blend::Normal);
+        let worst = old.as_raw().iter().zip(new.as_raw()).map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs() as u8).max().unwrap();
+        assert!(worst <= tol, "{name}: off by {worst}");
+    }
+}
+
+/// Blend modes on an adjustment layer: Luminosity keeps colours, Color keeps tones.
+#[test]
+fn adjustment_blend_modes() {
+    use crate::adjust::*;
+    let px = image::RgbaImage::from_pixel(2, 2, image::Rgba([200, 60, 40, 255]));
+    let bw = vec![AdjustItem::new(Adjust::BlackWhite(BlackWhite::default()))];
+    // grey through Color: the colour stays as it was
+    let mut a = px.clone();
+    apply(&mut a, &bw, Blend::Luminosity);
+    let q = a.get_pixel(0, 0);
+    assert!(q[0] > q[1] && q[1] >= q[2], "Luminosity of grey keeps the hue: {q:?}");
+    let mut b = px.clone();
+    apply(&mut b, &vec![AdjustItem::new(Adjust::Invert(Invert {}))], Blend::Difference);
+    assert!(b.get_pixel(0, 0)[0] > 100, "difference with the negative");
+    // Normal is the adjustment as it is
+    let mut n = px.clone();
+    apply(&mut n, &bw, Blend::Normal);
+    let g = n.get_pixel(0, 0);
+    assert!(g[0] == g[1] && g[1] == g[2]);
+}
+
+/// A project with an Effects layer using the older colour settings, for
+/// trying the panel by hand: OLD_PROJECT=path IMAGE=picture.
+#[test]
+#[ignore]
+fn make_old_colour_project() {
+    use crate::project::{save, ProjLayer, ProjLayerEntry, ProjectFile};
+    let (Ok(out), Ok(src)) = (std::env::var("OLD_PROJECT"), std::env::var("IMAGE")) else { return };
+    let img = image::open(src).unwrap().to_rgba8();
+    let base = Animation { frames: vec![Frame::new(img, 10)], loop_count: None };
+    let fx = crate::effects::EffectSettings { grayscale: true, brightness: 10.0, contrast: 25.0, vignette: true, ..Default::default() };
+    let mut file = ProjectFile::default();
+    file.frames = vec![Default::default()];
+    file.layers = vec![ProjLayerEntry { visible: true, label: None, layer: ProjLayer::Effects { fx }, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2] }];
+    save(std::path::Path::new(&out), file, &base, None, &std::collections::HashMap::new(), &std::collections::HashMap::new(), None).unwrap();
 }

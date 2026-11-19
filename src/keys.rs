@@ -41,10 +41,20 @@ pub enum Action {
     Duplicate,
     OnionSkin,
     Compress,
+    AdjLevels,
+    AdjCurves,
+    AdjHueSat,
+    AdjBalance,
+    AdjBlackWhite,
+    AdjInvert,
+    AdjDesaturate,
+    AutoTone,
+    AutoContrast,
+    AutoColor,
 }
 
 impl Action {
-    pub const ALL: [Action; 35] = [
+    pub const ALL: [Action; 45] = [
         Action::New,
         Action::Open,
         Action::Save,
@@ -80,6 +90,16 @@ impl Action {
         Action::Duplicate,
         Action::OnionSkin,
         Action::Compress,
+        Action::AdjLevels,
+        Action::AdjCurves,
+        Action::AdjHueSat,
+        Action::AdjBalance,
+        Action::AdjBlackWhite,
+        Action::AdjInvert,
+        Action::AdjDesaturate,
+        Action::AutoTone,
+        Action::AutoContrast,
+        Action::AutoColor,
     ];
 
     /// The groups the shortcuts dialog shows, in order.
@@ -93,6 +113,7 @@ impl Action {
             Undo | Redo | History | Duplicate | DeleteObject => "Edit",
             PlayPause | PrevFrame | NextFrame => "Playback",
             ZoomIn | ZoomOut | Fit | ActualSize | SplitView | FullScreen | OnionSkin | Compress => "View",
+            AdjLevels | AdjCurves | AdjHueSat | AdjBalance | AdjBlackWhite | AdjInvert | AdjDesaturate | AutoTone | AutoContrast | AutoColor => "Adjustments",
             TlSplit | TlKey | TlRazor | TlDelete | TlIn | TlOut | TlMarker | TlPrevEdit | TlNextEdit | TlDuplicate | TlNudgeLeft | TlNudgeRight => "Timeline",
             Handbook => "Help",
         }
@@ -135,6 +156,16 @@ impl Action {
             Action::Duplicate => "Duplicate the selected layer",
             Action::OnionSkin => "Onion skin",
             Action::Compress => "Compress preview",
+            Action::AdjLevels => "Levels",
+            Action::AdjCurves => "Curves",
+            Action::AdjHueSat => "Hue/Saturation",
+            Action::AdjBalance => "Color Balance",
+            Action::AdjBlackWhite => "Black & White",
+            Action::AdjInvert => "Invert",
+            Action::AdjDesaturate => "Desaturate",
+            Action::AutoTone => "Auto Tone",
+            Action::AutoContrast => "Auto Contrast",
+            Action::AutoColor => "Auto Color",
         }
     }
 
@@ -176,6 +207,16 @@ impl Action {
             Action::Duplicate => "duplicate",
             Action::OnionSkin => "onion",
             Action::Compress => "compress",
+            Action::AdjLevels => "adj_levels",
+            Action::AdjCurves => "adj_curves",
+            Action::AdjHueSat => "adj_huesat",
+            Action::AdjBalance => "adj_balance",
+            Action::AdjBlackWhite => "adj_bw",
+            Action::AdjInvert => "adj_invert",
+            Action::AdjDesaturate => "adj_desaturate",
+            Action::AutoTone => "auto_tone",
+            Action::AutoContrast => "auto_contrast",
+            Action::AutoColor => "auto_color",
         }
     }
 
@@ -220,6 +261,16 @@ impl Action {
             Action::Duplicate => c(Key::D),
             Action::OnionSkin => Some(Binding { ctrl: false, shift: true, alt: false, key: Key::O }),
             Action::Compress => c(Key::R),
+            Action::AdjLevels => c(Key::L),
+            Action::AdjCurves => c(Key::M),
+            Action::AdjHueSat => c(Key::U),
+            Action::AdjBalance => c(Key::B),
+            Action::AdjBlackWhite => Some(Binding { ctrl: true, shift: true, alt: true, key: Key::B }),
+            Action::AdjInvert => c(Key::I),
+            Action::AdjDesaturate => cs(Key::U),
+            Action::AutoTone => cs(Key::L),
+            Action::AutoContrast => Some(Binding { ctrl: true, shift: true, alt: true, key: Key::L }),
+            Action::AutoColor => cs(Key::B),
         }
     }
 

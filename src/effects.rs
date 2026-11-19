@@ -180,6 +180,8 @@ pub struct EffectSettings {
     pub adjust: Vec<crate::adjust::AdjustItem>,
     /// made in the Adjust panel (shows there, named after its adjustments)
     pub adjust_layer: bool,
+    /// how the adjustments meet what's under them
+    pub adjust_mode: crate::adjust::Blend,
 }
 
 impl Default for EffectSettings {
@@ -307,6 +309,7 @@ impl Default for EffectSettings {
             counter_size: 7.0,
             adjust: Vec::new(),
             adjust_layer: false,
+            adjust_mode: crate::adjust::Blend::Normal,
         }
     }
 }
@@ -790,7 +793,7 @@ fn wave(img: &RgbaImage, amp: f32, len: f32, phase: f32) -> RgbaImage {
     warp(img, true, |x, y| (x, y + amp * ((2.0 * std::f32::consts::PI * x / l) + phase).sin()))
 }
 
-fn gotham(img: &mut RgbaImage) {
+pub(crate) fn gotham(img: &mut RgbaImage) {
     modulate(img, 100.0, 10.0, 120.0);
     colorize(img, [0x22, 0x2b, 0x6d], 0.2);
     gamma(img, 0.5);
@@ -803,7 +806,7 @@ fn lomo(img: &mut RgbaImage) {
     vignette(img, 0.85, [0, 0, 0]);
 }
 
-fn nashville(img: &mut RgbaImage) {
+pub(crate) fn nashville(img: &mut RgbaImage) {
     colorize(img, [0xf7, 0xda, 0xae], 0.25);
     map_rgb(img, |r, g, b| (r * 0.87 + 0.13 * 255.0 * 0.6, g * 0.87 + 0.13 * 255.0 * 0.2, b * 0.87 + 0.13 * 255.0 * 0.3));
     brightness_contrast(img, 5.0, 15.0);
@@ -920,7 +923,7 @@ pub fn apply_frame(src: &RgbaImage, idx: usize, n: usize, elapsed_s: f32, clip_s
     let mut img = src.clone();
     let d = EffectSettings::default();
 
-    crate::adjust::apply(&mut img, &s.adjust);
+    crate::adjust::apply(&mut img, &s.adjust, s.adjust_mode);
     if s.hue != d.hue || s.saturation != d.saturation || s.lightness != d.lightness {
         modulate(&mut img, s.hue, s.saturation, s.lightness);
     }

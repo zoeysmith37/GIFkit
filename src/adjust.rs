@@ -49,7 +49,9 @@ pub enum Adjust {
     Levels(Levels),
     Curves(Curves),
     Exposure(Exposure),
+    BrightContrast(BrightContrast),
     Vibrance(Vibrance),
+    HueSat(HueSat),
     ColorBalance(ColorBalance),
     BlackWhite(BlackWhite),
     PhotoFilter(PhotoFilter),
@@ -57,12 +59,19 @@ pub enum Adjust {
     SelectiveColor(SelectiveColor),
     GradientMap(GradientMap),
     Threshold(Threshold),
+    Invert(Invert),
+    Posterize(Posterize),
     Look(LookAdj),
     Cube(Cube),
 }
 
 /// What the Add menu offers, in order.
-pub const KINDS: [&str; 13] = ["Levels", "Curves", "Exposure", "Vibrance", "Color Balance", "Black & White", "Photo Filter", "Channel Mixer", "Selective Color", "Gradient Map", "Threshold", "Looks", "Color Lookup"];
+pub const KINDS: [&str; 17] = [
+    "Levels", "Curves", "Exposure", "Brightness/Contrast", "Vibrance", "Hue/Saturation", "Color Balance", "Black & White", "Photo Filter", "Channel Mixer", "Selective Color", "Invert", "Posterize", "Threshold", "Gradient Map", "Looks", "Color Lookup",
+];
+
+/// Where the Add menu puts a line: before these.
+pub const MENU_BREAKS: [usize; 3] = [4, 11, 15];
 
 impl Adjust {
     /// A fresh one of `KINDS[k]`.
@@ -71,15 +80,19 @@ impl Adjust {
             0 => Adjust::Levels(Levels::default()),
             1 => Adjust::Curves(Curves::default()),
             2 => Adjust::Exposure(Exposure::default()),
-            3 => Adjust::Vibrance(Vibrance::default()),
-            4 => Adjust::ColorBalance(ColorBalance::default()),
-            5 => Adjust::BlackWhite(BlackWhite::default()),
-            6 => Adjust::PhotoFilter(PhotoFilter::default()),
-            7 => Adjust::ChannelMixer(ChannelMixer::default()),
-            8 => Adjust::SelectiveColor(SelectiveColor::default()),
-            9 => Adjust::GradientMap(GradientMap::default()),
-            10 => Adjust::Threshold(Threshold::default()),
-            11 => Adjust::Look(LookAdj::default()),
+            3 => Adjust::BrightContrast(BrightContrast::default()),
+            4 => Adjust::Vibrance(Vibrance::default()),
+            5 => Adjust::HueSat(HueSat::default()),
+            6 => Adjust::ColorBalance(ColorBalance::default()),
+            7 => Adjust::BlackWhite(BlackWhite::default()),
+            8 => Adjust::PhotoFilter(PhotoFilter::default()),
+            9 => Adjust::ChannelMixer(ChannelMixer::default()),
+            10 => Adjust::SelectiveColor(SelectiveColor::default()),
+            11 => Adjust::Invert(Invert {}),
+            12 => Adjust::Posterize(Posterize::default()),
+            13 => Adjust::Threshold(Threshold::default()),
+            14 => Adjust::GradientMap(GradientMap::default()),
+            15 => Adjust::Look(LookAdj::default()),
             _ => Adjust::Cube(Cube::default()),
         }
     }
@@ -89,16 +102,20 @@ impl Adjust {
             Adjust::Levels(_) => 0,
             Adjust::Curves(_) => 1,
             Adjust::Exposure(_) => 2,
-            Adjust::Vibrance(_) => 3,
-            Adjust::ColorBalance(_) => 4,
-            Adjust::BlackWhite(_) => 5,
-            Adjust::PhotoFilter(_) => 6,
-            Adjust::ChannelMixer(_) => 7,
-            Adjust::SelectiveColor(_) => 8,
-            Adjust::GradientMap(_) => 9,
-            Adjust::Threshold(_) => 10,
-            Adjust::Look(_) => 11,
-            Adjust::Cube(_) => 12,
+            Adjust::BrightContrast(_) => 3,
+            Adjust::Vibrance(_) => 4,
+            Adjust::HueSat(_) => 5,
+            Adjust::ColorBalance(_) => 6,
+            Adjust::BlackWhite(_) => 7,
+            Adjust::PhotoFilter(_) => 8,
+            Adjust::ChannelMixer(_) => 9,
+            Adjust::SelectiveColor(_) => 10,
+            Adjust::Invert(_) => 11,
+            Adjust::Posterize(_) => 12,
+            Adjust::Threshold(_) => 13,
+            Adjust::GradientMap(_) => 14,
+            Adjust::Look(_) => 15,
+            Adjust::Cube(_) => 16,
         }
     }
 
@@ -108,7 +125,140 @@ impl Adjust {
 
     /// Breeze icon for it.
     pub fn icon(k: usize) -> &'static str {
-        ["view-object-histogram-linear", "draw-bezier-curves", "colors-luma", "color-mode-hue-shift-positive", "color-management", "color-mode-black-white", "view-filter", "colors-chromared", "color-picker-grey", "color-gradient", "color-fill", "tool_imageeffects", "kstars_colors"][k]
+        [
+            "view-object-histogram-linear", "draw-bezier-curves", "photo", "colors-luma", "format-fill-color", "color-mode-hue-shift-positive", "color-management", "color-mode-black-white", "view-filter", "colors-chromared", "color-picker-grey", "color-mode-invert-image", "pixelate", "color-fill", "color-gradient", "tool_imageeffects", "kstars_colors",
+        ][k]
+    }
+}
+
+/// How an adjustment layer's result meets what's under it (Photoshop's
+/// blend modes, worked into the lookup table).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, Hash)]
+pub enum Blend {
+    #[default]
+    Normal,
+    Darken,
+    Multiply,
+    ColorBurn,
+    Lighten,
+    Screen,
+    ColorDodge,
+    Overlay,
+    SoftLight,
+    HardLight,
+    Difference,
+    Exclusion,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
+}
+
+impl Blend {
+    pub const ALL: [Blend; 16] = [
+        Blend::Normal, Blend::Darken, Blend::Multiply, Blend::ColorBurn, Blend::Lighten, Blend::Screen, Blend::ColorDodge, Blend::Overlay, Blend::SoftLight, Blend::HardLight, Blend::Difference, Blend::Exclusion, Blend::Hue, Blend::Saturation, Blend::Color, Blend::Luminosity,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Blend::Normal => "Normal",
+            Blend::Darken => "Darken",
+            Blend::Multiply => "Multiply",
+            Blend::ColorBurn => "Color Burn",
+            Blend::Lighten => "Lighten",
+            Blend::Screen => "Screen",
+            Blend::ColorDodge => "Color Dodge",
+            Blend::Overlay => "Overlay",
+            Blend::SoftLight => "Soft Light",
+            Blend::HardLight => "Hard Light",
+            Blend::Difference => "Difference",
+            Blend::Exclusion => "Exclusion",
+            Blend::Hue => "Hue",
+            Blend::Saturation => "Saturation",
+            Blend::Color => "Color",
+            Blend::Luminosity => "Luminosity",
+        }
+    }
+
+    /// The adjusted colour `s` laid over the original `b` (W3C compositing).
+    pub fn apply(self, b: [f32; 3], s: [f32; 3]) -> [f32; 3] {
+        let sep = |f: &dyn Fn(f32, f32) -> f32| -> [f32; 3] { std::array::from_fn(|i| f(b[i], s[i]).clamp(0.0, 1.0)) };
+        let hard = |cb: f32, cs: f32| if cs <= 0.5 { cb * 2.0 * cs } else { let t = 2.0 * cs - 1.0; cb + t - cb * t };
+        match self {
+            Blend::Normal => s,
+            Blend::Darken => sep(&|cb, cs| cb.min(cs)),
+            Blend::Multiply => sep(&|cb, cs| cb * cs),
+            Blend::ColorBurn => sep(&|cb, cs| if cb >= 1.0 { 1.0 } else if cs <= 0.0 { 0.0 } else { 1.0 - ((1.0 - cb) / cs).min(1.0) }),
+            Blend::Lighten => sep(&|cb, cs| cb.max(cs)),
+            Blend::Screen => sep(&|cb, cs| cb + cs - cb * cs),
+            Blend::ColorDodge => sep(&|cb, cs| if cb <= 0.0 { 0.0 } else if cs >= 1.0 { 1.0 } else { (cb / (1.0 - cs)).min(1.0) }),
+            Blend::Overlay => sep(&|cb, cs| hard(cs, cb)),
+            Blend::SoftLight => sep(&|cb, cs| {
+                if cs <= 0.5 {
+                    cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb)
+                } else {
+                    let d = if cb <= 0.25 { ((16.0 * cb - 12.0) * cb + 4.0) * cb } else { cb.sqrt() };
+                    cb + (2.0 * cs - 1.0) * (d - cb)
+                }
+            }),
+            Blend::HardLight => sep(&hard),
+            Blend::Difference => sep(&|cb, cs| (cb - cs).abs()),
+            Blend::Exclusion => sep(&|cb, cs| cb + cs - 2.0 * cb * cs),
+            Blend::Hue => set_lum(set_sat(s, sat(b)), lum(b)),
+            Blend::Saturation => set_lum(set_sat(b, sat(s)), lum(b)),
+            Blend::Color => set_lum(s, lum(b)),
+            Blend::Luminosity => set_lum(b, lum(s)),
+        }
+    }
+}
+
+fn sat(c: [f32; 3]) -> f32 {
+    c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2])
+}
+
+/// `c` with its saturation (max − min) set to `s`, its hue kept.
+fn set_sat(c: [f32; 3], s: f32) -> [f32; 3] {
+    let mx = c[0].max(c[1]).max(c[2]);
+    let mn = c[0].min(c[1]).min(c[2]);
+    if mx - mn <= 1e-9 {
+        return [0.0; 3];
+    }
+    c.map(|v| (v - mn) * s / (mx - mn))
+}
+
+/// Photoshop's Hue/Saturation: hue −180..180°, saturation and lightness
+/// −100..100; colorize paints one hue over the lightness.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct HueSat {
+    pub hue: f32,
+    pub saturation: f32,
+    pub lightness: f32,
+    pub colorize: bool,
+}
+
+/// Brightness −150..150, contrast −50..100. Legacy: the old straight-line
+/// version (and GIFkit's older Effects sliders), −100..100 each.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BrightContrast {
+    pub brightness: f32,
+    pub contrast: f32,
+    pub legacy: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+pub struct Invert {}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Posterize {
+    pub levels: u32,
+}
+
+impl Default for Posterize {
+    fn default() -> Self {
+        Posterize { levels: 4 }
     }
 }
 
@@ -318,10 +468,12 @@ pub enum Look {
     Matte,
     Noir,
     Vaporwave,
+    Gotham,
+    Nashville,
 }
 
 impl Look {
-    pub const ALL: [Look; 9] = [Look::TealOrange, Look::FadedFilm, Look::BleachBypass, Look::CrossProcess, Look::DayForNight, Look::GoldenHour, Look::Matte, Look::Noir, Look::Vaporwave];
+    pub const ALL: [Look; 11] = [Look::TealOrange, Look::FadedFilm, Look::BleachBypass, Look::CrossProcess, Look::DayForNight, Look::GoldenHour, Look::Matte, Look::Noir, Look::Vaporwave, Look::Gotham, Look::Nashville];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -334,6 +486,8 @@ impl Look {
             Look::Matte => "Matte",
             Look::Noir => "Noir",
             Look::Vaporwave => "Vaporwave",
+            Look::Gotham => "Gotham",
+            Look::Nashville => "Nashville",
         }
     }
 }
@@ -928,6 +1082,8 @@ fn look(l: Look, c: [f32; 3]) -> [f32; 3] {
             let tint = mix3(a, b, t);
             mix3(c, set_lum(tint, (y * 1.05 + 0.04).min(1.0)), 0.55)
         }
+        // run from the older filters' own code instead (legacy_cube)
+        Look::Gotham | Look::Nashville => c,
     }
 }
 
@@ -948,6 +1104,9 @@ enum Stage {
     Threshold(f32),
     Look(Look, f32),
     Cube(CubeData, f32),
+    HueSat(f32, f32, f32, bool),
+    Invert,
+    Posterize(f32),
 }
 
 fn compile(items: &[AdjustItem]) -> Vec<Stage> {
@@ -974,6 +1133,13 @@ fn compile(items: &[AdjustItem]) -> Vec<Stage> {
             Adjust::SelectiveColor(sc) if sc.ranges == [[0.0; 4]; 9] => continue,
             Adjust::PhotoFilter(pf) if pf.density <= 0.0 => continue,
             Adjust::Look(l) if l.amount <= 0.0 => continue,
+            Adjust::HueSat(h) if *h == HueSat::default() => continue,
+            Adjust::BrightContrast(b) if b.brightness == 0.0 && b.contrast == 0.0 => continue,
+            Adjust::HueSat(h) => Stage::HueSat(h.hue, h.saturation.clamp(-100.0, 100.0) / 100.0, h.lightness.clamp(-100.0, 100.0) / 100.0, h.colorize),
+            Adjust::BrightContrast(b) => Stage::Tables([Some(bc_table(b)), None, None, None]),
+            Adjust::Invert(_) => Stage::Invert,
+            Adjust::Posterize(p) => Stage::Posterize(p.levels.clamp(2, 255) as f32),
+            Adjust::Look(l) if matches!(l.look, Look::Gotham | Look::Nashville) => Stage::Cube(legacy_cube(l.look), (l.amount / 100.0).clamp(0.0, 1.0)),
             Adjust::Exposure(e) => Stage::Exposure(2f32.powf(e.exposure.clamp(-20.0, 20.0)), e.offset, e.gamma.clamp(0.01, 9.99)),
             Adjust::Vibrance(v) => Stage::Vibrance(v.vibrance.clamp(-100.0, 100.0) / 100.0, v.saturation.clamp(-100.0, 100.0) / 100.0),
             Adjust::ColorBalance(b) => Stage::Balance(std::array::from_fn(|ch| Balance::new(b.tones, b.preserve, ch)), b.preserve),
@@ -1067,6 +1233,13 @@ fn run(stage: &Stage, c: [f32; 3]) -> [f32; 3] {
         Stage::Threshold(level) => [if lum(c) * 255.0 >= *level - 0.5 { 1.0 } else { 0.0 }; 3],
         Stage::Look(l, k) => mix3(c, look(*l, c), *k),
         Stage::Cube(lut, k) => mix3(c, lut.sample(c), *k),
+        Stage::HueSat(hue, s, l, colorize) => hue_saturation(c, *hue, *s, *l, *colorize),
+        Stage::Invert => c.map(|v| 1.0 - v),
+        Stage::Posterize(n) => c.map(|v| {
+            let x = (v * 255.0).round();
+            let bin = (x * n / 256.0).floor().min(n - 1.0);
+            (bin * 255.0 / (n - 1.0)).floor() / 255.0
+        }),
     }
 }
 
@@ -1086,7 +1259,7 @@ pub fn map_one(item: &AdjustItem, c: [f32; 3]) -> [f32; 3] {
 /// The lookup table for `items`, as a picture: slice `b` (blue) is tile
 /// `(b % TILES, b / TILES)`, red across it and green down. Kept for the
 /// last few lists asked for, as building one takes a few milliseconds.
-pub fn lut(items: &[AdjustItem]) -> Option<Arc<RgbaImage>> {
+pub fn lut(items: &[AdjustItem], mode: Blend) -> Option<Arc<RgbaImage>> {
     static CACHE: Mutex<Vec<(u64, Arc<RgbaImage>)>> = Mutex::new(Vec::new());
     let stages = compile(items);
     if stages.is_empty() {
@@ -1096,6 +1269,7 @@ pub fn lut(items: &[AdjustItem]) -> Option<Arc<RgbaImage>> {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         format!("{:?}", items.iter().filter(|i| i.on).collect::<Vec<_>>()).hash(&mut h);
+        mode.hash(&mut h);
         h.finish()
     };
     if let Ok(c) = CACHE.lock() {
@@ -1115,7 +1289,8 @@ pub fn lut(items: &[AdjustItem]) -> Option<Arc<RgbaImage>> {
             if b >= N {
                 continue;
             }
-            let c = eval(&stages, [r as f32 * step, g as f32 * step, b as f32 * step]);
+            let src = [r as f32 * step, g as f32 * step, b as f32 * step];
+            let c = mode.apply(src, eval(&stages, src));
             px[0] = (c[0] * 255.0).round() as u8;
             px[1] = (c[1] * 255.0).round() as u8;
             px[2] = (c[2] * 255.0).round() as u8;
@@ -1162,8 +1337,8 @@ fn c8(v: f32) -> u8 {
 }
 
 /// `items` on every pixel of `img`.
-pub fn apply(img: &mut RgbaImage, items: &[AdjustItem]) {
-    let Some(lut) = lut(items) else { return };
+pub fn apply(img: &mut RgbaImage, items: &[AdjustItem], mode: Blend) {
+    let Some(lut) = lut(items, mode) else { return };
     let w = img.width() as usize;
     img.as_mut().par_chunks_mut(w.max(1) * 4).for_each(|row| {
         for px in row.chunks_exact_mut(4) {
@@ -1355,8 +1530,305 @@ pub fn sample_list() -> Vec<AdjustItem> {
         Adjust::Threshold(Threshold { level: 110.0 }),
         Adjust::Look(LookAdj { look: Look::BleachBypass, amount: 70.0 }),
         Adjust::Cube(Cube { name: "swap".into(), lut: cube, amount: 100.0 }),
+        Adjust::HueSat(HueSat { hue: 40.0, saturation: 25.0, lightness: -10.0, colorize: false }),
+        Adjust::BrightContrast(BrightContrast { brightness: 30.0, contrast: 20.0, legacy: false }),
+        Adjust::Invert(Invert {}),
+        Adjust::Posterize(Posterize { levels: 6 }),
+        Adjust::Look(LookAdj { look: Look::Gotham, amount: 80.0 }),
     ]
     .into_iter()
     .map(AdjustItem::new)
     .collect()
+}
+
+fn rgb_to_hsl(c: [f32; 3]) -> (f32, f32, f32) {
+    let max = c[0].max(c[1]).max(c[2]);
+    let min = c[0].min(c[1]).min(c[2]);
+    let l = (max + min) / 2.0;
+    if (max - min).abs() < 1e-7 {
+        return (0.0, 0.0, l);
+    }
+    let d = max - min;
+    let s = if l > 0.5 { d / (2.0 - max - min) } else { d / (max + min) };
+    (hsv_hue(c, max, min) / 360.0, s, l)
+}
+
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> [f32; 3] {
+    if s <= 0.0 {
+        return [l; 3];
+    }
+    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let p = 2.0 * l - q;
+    let f = |t: f32| {
+        let t = t.rem_euclid(1.0);
+        if t < 1.0 / 6.0 {
+            p + (q - p) * 6.0 * t
+        } else if t < 0.5 {
+            q
+        } else if t < 2.0 / 3.0 {
+            p + (q - p) * (2.0 / 3.0 - t) * 6.0
+        } else {
+            p
+        }
+    };
+    [f(h + 1.0 / 3.0), f(h), f(h - 1.0 / 3.0)]
+}
+
+/// Photoshop's Hue/Saturation (PhotoCraft's measurements): lightness first,
+/// then the hue turned and the saturation scaled; colorize paints one hue.
+fn hue_saturation(c: [f32; 3], hue: f32, s: f32, l: f32, colorize: bool) -> [f32; 3] {
+    let lighten = |v: f32| if l > 0.0 { v + (1.0 - v) * l } else { v * (1.0 + l) };
+    if colorize {
+        let (_, _, ll) = rgb_to_hsl(c);
+        let sat = if s == 0.0 { 0.25 } else { (s.abs()).min(1.0) };
+        return hsl_to_rgb(hue.rem_euclid(360.0) / 360.0, sat, lighten(ll));
+    }
+    let lc = c.map(lighten);
+    let (hh, ss, ll) = rgb_to_hsl(lc);
+    let hh = (hh + hue / 360.0).rem_euclid(1.0);
+    let ss = if s > 0.0 { ss / (1.0 - s).max(1.0 / 512.0) } else { ss * (1.0 + s) }.clamp(0.0, 1.0);
+    hsl_to_rgb(hh, ss, ll)
+}
+
+/// Brightness/Contrast as one channel's table.
+fn bc_table(b: &BrightContrast) -> Vec<f32> {
+    let n = 1024;
+    if b.legacy {
+        // GIFkit's older Effects sliders, the classic straight lines
+        let c = b.contrast.clamp(-100.0, 100.0) * 2.55;
+        let cf = (259.0 * (c + 255.0)) / (255.0 * (259.0 - c));
+        let br = b.brightness * 2.55;
+        return (0..n).map(|k| (((k as f32 / (n - 1) as f32 * 255.0 - 128.0) * cf + 128.0 + br) / 255.0).clamp(0.0, 1.0)).collect();
+    }
+    let step = |k: usize, n: usize| k as f32 / (n - 1) as f32;
+    let br = b.brightness.clamp(-150.0, 150.0);
+    let bright: Vec<f32> = if br == 0.0 {
+        (0..n).map(|k| step(k, n)).collect()
+    } else if br > 0.0 {
+        let c = BrightCurve::new(br);
+        (0..n).map(|k| c.raised(step(k, n))).collect()
+    } else {
+        // lowered: the raised curve turned around
+        let c = BrightCurve::new(-br);
+        let fine = 4 * n;
+        let ys: Vec<f32> = (0..fine).map(|j| c.raised(step(j, fine))).collect();
+        let mut j = 0;
+        (0..n)
+            .map(|k| {
+                let y = step(k, n);
+                while j + 2 < fine && ys[j + 1] < y {
+                    j += 1;
+                }
+                let (y0, y1) = (ys[j], ys[j + 1]);
+                let f = if y1 > y0 { ((y - y0) / (y1 - y0)).clamp(0.0, 1.0) } else { 0.0 };
+                (step(j, fine) + f / (fine - 1) as f32).clamp(0.0, 1.0)
+            })
+            .collect()
+    };
+    let ct = b.contrast.clamp(-50.0, 100.0);
+    bright.into_iter().map(|v| modern_contrast(v, ct).clamp(0.0, 1.0)).collect()
+}
+
+/// Photoshop's modern Brightness curve (PhotoCraft's fit): a line to a
+/// knee, then a roll-off that pins white.
+struct BrightCurve {
+    s: f32,
+    e: f32,
+    x0: f32,
+    alpha: f32,
+    hermite: bool,
+}
+
+impl BrightCurve {
+    fn new(b: f32) -> Self {
+        let b = b.abs();
+        let s = 1.375f32.powf(b / 50.0);
+        let e = 1.0 / (1.0 + 0.084 * b);
+        let knee = 126.0 / 255.0;
+        let x0 = (knee / s).min(1.0);
+        let secant = (1.0 - knee) / (1.0 - x0).max(1e-6);
+        let (alpha, beta) = (s / secant, e / secant);
+        BrightCurve { s, e, x0, alpha, hermite: alpha * alpha + beta * beta <= 9.0 }
+    }
+
+    fn raised(&self, x: f32) -> f32 {
+        let y0: f32 = 126.0 / 255.0;
+        if x <= self.x0 {
+            return y0.min(self.s * x);
+        }
+        let h = (1.0 - self.x0).max(1e-6);
+        let t = ((x - self.x0) / h).clamp(0.0, 1.0);
+        let y = if self.hermite {
+            let (t2, t3) = (t * t, t * t * t);
+            (2.0 * t3 - 3.0 * t2 + 1.0) * y0 + (t3 - 2.0 * t2 + t) * h * self.s + (-2.0 * t3 + 3.0 * t2) + (t3 - t2) * h * self.e
+        } else {
+            1.0 - (1.0 - y0) * (1.0 - t).powf(self.alpha)
+        };
+        y.clamp(0.0, 1.0)
+    }
+}
+
+/// Photoshop's modern Contrast: an S around the middle that pins black and white.
+fn modern_contrast(v: f32, contrast: f32) -> f32 {
+    if contrast == 0.0 {
+        return v;
+    }
+    let k = contrast / 128.0;
+    let (end, mid) = (1.0 - k, 1.0 + k);
+    let half = |t: f32| end * 0.5 * (t * t * t - 2.0 * t * t + t) + (-2.0 * t * t * t + 3.0 * t * t) * 0.5 + mid * 0.5 * (t * t * t - t * t);
+    let v = v.clamp(0.0, 1.0);
+    if v <= 0.5 {
+        half(v / 0.5)
+    } else {
+        1.0 - half((1.0 - v) / 0.5)
+    }
+}
+
+/// Gotham and Nashville from the older Effects filters, run once over every
+/// colour of the table's grid so they come out the same.
+fn legacy_cube(l: Look) -> CubeData {
+    static CACHE: Mutex<Vec<(Look, CubeData)>> = Mutex::new(Vec::new());
+    if let Ok(c) = CACHE.lock() {
+        if let Some((_, d)) = c.iter().find(|(k, _)| *k == l) {
+            return d.clone();
+        }
+    }
+    // as fine as the layer's own table, so nothing is read between points twice
+    let n = N;
+    let mut img = RgbaImage::new((n * n) as u32, n as u32);
+    for b in 0..n {
+        for g in 0..n {
+            for r in 0..n {
+                let v = |i: usize| ((i * 255) as f32 / (n - 1) as f32).round() as u8;
+                img.put_pixel((r + b * n) as u32, g as u32, image::Rgba([v(r), v(g), v(b), 255]));
+            }
+        }
+    }
+    match l {
+        Look::Gotham => crate::effects::gotham(&mut img),
+        _ => crate::effects::nashville(&mut img),
+    }
+    let mut data = Vec::with_capacity(n * n * n * 3);
+    for b in 0..n {
+        for g in 0..n {
+            for r in 0..n {
+                data.extend_from_slice(&img.get_pixel((r + b * n) as u32, g as u32).0[..3]);
+            }
+        }
+    }
+    let d = CubeData::new(n, data);
+    if let Ok(mut c) = CACHE.lock() {
+        c.push((l, d.clone()));
+    }
+    d
+}
+
+/// The older Effects colour settings as adjustments that look the same (or
+/// close: Hue/Saturation's lightness and Posterize's steps differ a little).
+pub fn from_legacy(fx: &crate::effects::EffectSettings) -> Vec<AdjustItem> {
+    let mut out = Vec::new();
+    let mut push = |a: Adjust| out.push(AdjustItem::new(a));
+    if fx.hue != 100.0 || fx.saturation != 100.0 || fx.lightness != 100.0 {
+        let sm = fx.saturation / 100.0;
+        let lm = fx.lightness / 100.0;
+        push(Adjust::HueSat(HueSat {
+            hue: ((fx.hue - 100.0) * 1.8 + 180.0).rem_euclid(360.0) - 180.0,
+            saturation: (if sm <= 1.0 { sm - 1.0 } else { 1.0 - 1.0 / sm }) * 100.0,
+            lightness: ((lm - 1.0) * 100.0).clamp(-100.0, 100.0),
+            colorize: false,
+        }));
+    }
+    if fx.brightness != 0.0 || fx.contrast != 0.0 {
+        push(Adjust::BrightContrast(BrightContrast { brightness: fx.brightness, contrast: fx.contrast, legacy: true }));
+    }
+    let grey = [29.9, 58.7, 11.4];
+    if fx.grayscale {
+        push(Adjust::ChannelMixer(ChannelMixer { rows: [[grey[0], grey[1], grey[2], 0.0]; 3], mono: true }));
+    }
+    if fx.sepia {
+        push(Adjust::ChannelMixer(ChannelMixer { rows: [[39.3, 76.9, 18.9, 0.0], [34.9, 68.6, 16.8, 0.0], [27.2, 53.4, 13.1, 0.0]], mono: false }));
+    }
+    if fx.monochrome {
+        push(Adjust::Threshold(Threshold { level: 128.0 }));
+    }
+    if fx.negative {
+        push(Adjust::Invert(Invert {}));
+    }
+    if fx.tint {
+        // the colour times the grey, mixed in by the amount: a straight mix
+        let a = (fx.tint_amount / 100.0).clamp(0.0, 1.0);
+        let rows: [[f32; 4]; 3] = std::array::from_fn(|ch| {
+            let t = fx.tint_color[ch] as f32 / 255.0 * a;
+            let mut r = [grey[0] * t, grey[1] * t, grey[2] * t, 0.0];
+            r[ch] += (1.0 - a) * 100.0;
+            r
+        });
+        push(Adjust::ChannelMixer(ChannelMixer { rows, mono: false }));
+    }
+    if fx.posterize {
+        push(Adjust::Posterize(Posterize { levels: fx.posterize_levels.max(2) as u32 }));
+    }
+    for (on, look, amt) in [(fx.gotham, Look::Gotham, fx.gotham_amount), (fx.nashville, Look::Nashville, fx.nashville_amount)] {
+        if on {
+            push(Adjust::Look(LookAdj { look, amount: amt.clamp(0.0, 100.0) }));
+        }
+    }
+    out
+}
+
+/// Those settings cleared, what `from_legacy` took.
+pub fn clear_legacy(fx: &mut crate::effects::EffectSettings) {
+    let d = crate::effects::EffectSettings::default();
+    (fx.hue, fx.saturation, fx.lightness, fx.brightness, fx.contrast) = (d.hue, d.saturation, d.lightness, d.brightness, d.contrast);
+    (fx.grayscale, fx.sepia, fx.monochrome, fx.negative, fx.tint, fx.posterize, fx.gotham, fx.nashville) = (false, false, false, false, false, false, false, false);
+    // and the numbers that went with them, so an emptied layer is empty
+    (fx.tint_color, fx.tint_amount, fx.posterize_levels, fx.gotham_amount, fx.nashville_amount) = (d.tint_color, d.tint_amount, d.posterize_levels, d.gotham_amount, d.nashville_amount);
+}
+
+/// Whether a layer still has older colour settings on.
+pub fn has_legacy(fx: &crate::effects::EffectSettings) -> bool {
+    let mut c = fx.clone();
+    clear_legacy(&mut c);
+    c != *fx
+}
+
+impl Histogram {
+    /// Mean, standard deviation, median and pixel count of channel `c`.
+    pub fn stats(&self, c: usize) -> (f64, f64, usize, u64) {
+        let b = &self.bins[c];
+        let n: u64 = b.iter().map(|v| *v as u64).sum();
+        if n == 0 {
+            return (0.0, 0.0, 0, 0);
+        }
+        let mean = b.iter().enumerate().map(|(i, v)| i as f64 * *v as f64).sum::<f64>() / n as f64;
+        let var = b.iter().enumerate().map(|(i, v)| (i as f64 - mean).powi(2) * *v as f64).sum::<f64>() / n as f64;
+        let mut acc = 0u64;
+        let median = (0..256).find(|&i| {
+            acc += b[i] as u64;
+            acc * 2 >= n
+        });
+        (mean, var.sqrt(), median.unwrap_or(0), n)
+    }
+}
+
+impl Histogram {
+    /// Auto Color: each channel stretched, then the middles bent so the
+    /// channels' averages meet (neutral midtones stay neutral).
+    pub fn auto_color(&self) -> Levels {
+        let mut l = self.auto_levels();
+        let means: Vec<f32> = (0..3)
+            .map(|c| {
+                let (m, ..) = self.stats(c);
+                levels(&l.ch[c + 1], m as f32 / 255.0)
+            })
+            .collect();
+        let target = (means[0] + means[1] + means[2]) / 3.0;
+        for c in 0..3 {
+            let (m, ..) = self.stats(c);
+            let ch = &mut l.ch[c + 1];
+            let u = ((m as f32 - ch.in_black) / (ch.in_white - ch.in_black).max(1.0)).clamp(0.02, 0.98);
+            ch.gamma = (u.ln() / target.clamp(0.02, 0.98).ln()).clamp(0.4, 2.5);
+        }
+        l
+    }
 }
