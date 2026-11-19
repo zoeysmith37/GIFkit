@@ -65,10 +65,12 @@ fn paint_hist(painter: &egui::Painter, r: Rect, bins: &[u32; 256], col: Color32)
 /// or double-click it to take it away. True when the curve changed.
 fn curve_editor(ui: &mut egui::Ui, pts: &mut Vec<[f32; 2]>, hist: Option<&[u32; 256]>, ch: usize, id: egui::Id) -> bool {
     let pal = *p();
-    let side = ui.available_width().min(300.0);
-    let (rect, resp) = ui.allocate_exact_size(vec2(side, side), Sense::click_and_drag());
-    let to_screen = |v: [f32; 2]| pos2(rect.left() + v[0] / 255.0 * side, rect.bottom() - v[1] / 255.0 * side);
-    let to_val = |p: Pos2| [((p.x - rect.left()) / side * 255.0).clamp(0.0, 255.0), ((rect.bottom() - p.y) / side * 255.0).clamp(0.0, 255.0)];
+    // as wide as the panel, square until it would get too tall
+    let side = ui.available_width();
+    let tall = side.min(420.0);
+    let (rect, resp) = ui.allocate_exact_size(vec2(side, tall), Sense::click_and_drag());
+    let to_screen = |v: [f32; 2]| pos2(rect.left() + v[0] / 255.0 * side, rect.bottom() - v[1] / 255.0 * tall);
+    let to_val = |p: Pos2| [((p.x - rect.left()) / side * 255.0).clamp(0.0, 255.0), ((rect.bottom() - p.y) / tall * 255.0).clamp(0.0, 255.0)];
     let drag_id = id.with("drag");
     let mut changed = false;
     pts.sort_by(|a, b| a[0].total_cmp(&b[0]));
@@ -128,7 +130,7 @@ fn curve_editor(ui: &mut egui::Ui, pts: &mut Vec<[f32; 2]>, hist: Option<&[u32; 
     for q in 1..4 {
         let f = q as f32 / 4.0;
         painter.line_segment([pos2(rect.left() + f * side, rect.top()), pos2(rect.left() + f * side, rect.bottom())], grid);
-        painter.line_segment([pos2(rect.left(), rect.top() + f * side), pos2(rect.right(), rect.top() + f * side)], grid);
+        painter.line_segment([pos2(rect.left(), rect.top() + f * tall), pos2(rect.right(), rect.top() + f * tall)], grid);
     }
     painter.line_segment([rect.left_bottom(), rect.right_top()], Stroke::new(1.0, mix(pal.view, pal.fg, 0.22)));
     if let Some(others) = ui.data(|d| d.get_temp::<Vec<(usize, Vec<[f32; 2]>)>>(id.with("ghosts"))) {
@@ -169,7 +171,7 @@ fn curve_editor(ui: &mut egui::Ui, pts: &mut Vec<[f32; 2]>, hist: Option<&[u32; 
 /// A level bar with triangle handles at `vals` (0..255): which one moved.
 fn level_bar(ui: &mut egui::Ui, id: egui::Id, vals: &mut [f32], fills: &[Color32], gradient: bool) -> bool {
     let pal = *p();
-    let w = ui.available_width().min(300.0);
+    let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(vec2(w, 18.0), Sense::click_and_drag());
     let bar = Rect::from_min_size(rect.left_top(), vec2(w, 7.0));
     let painter = ui.painter_at(rect.expand(6.0));
@@ -240,7 +242,7 @@ fn gradient_editor(ui: &mut egui::Ui, g: &mut adjust::GradientMap, id: egui::Id)
     let pal = *p();
     let sel_id = id.with("sel");
     let mut sel: usize = ui.data(|d| d.get_temp(sel_id)).unwrap_or(0);
-    let w = ui.available_width().min(300.0);
+    let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(vec2(w, 40.0), Sense::click_and_drag());
     let bar = Rect::from_min_size(rect.left_top(), vec2(w, 22.0));
     let painter = ui.painter_at(rect.expand(6.0));
@@ -597,7 +599,7 @@ fn adjust_editor(ui: &mut egui::Ui, adj: &mut Adjust, id: egui::Id, hist: Option
         Adjust::Levels(l) => {
             let ch = channel_pick(ui, id.with("ch"));
             ui.add_space(4.0);
-            let w = ui.available_width().min(300.0);
+            let w = ui.available_width();
             let (r, _) = ui.allocate_exact_size(vec2(w, 80.0), Sense::hover());
             let painter = ui.painter_at(r);
             painter.rect_filled(r, 2.0, mix(p().view, p().window, 0.5));
@@ -814,7 +816,7 @@ fn adjust_editor(ui: &mut egui::Ui, adj: &mut Adjust, id: egui::Id, hist: Option
             });
         }
         Adjust::Threshold(t) => {
-            let w = ui.available_width().min(300.0);
+            let w = ui.available_width();
             let (r, _) = ui.allocate_exact_size(vec2(w, 60.0), Sense::hover());
             let painter = ui.painter_at(r);
             painter.rect_filled(r, 2.0, mix(p().view, p().window, 0.5));
@@ -855,7 +857,7 @@ fn adjust_editor(ui: &mut egui::Ui, adj: &mut Adjust, id: egui::Id, hist: Option
             }
             slide(ui, "Lightness", &mut h.lightness, -100.0..=100.0, "", 0);
             // the hue strip: where each hue ends up
-            let w = ui.available_width().min(300.0);
+            let w = ui.available_width();
             let (r, _) = ui.allocate_exact_size(vec2(w, 20.0), Sense::hover());
             let painter = ui.painter_at(r);
             let item = AdjustItem::new(Adjust::HueSat(h.clone()));

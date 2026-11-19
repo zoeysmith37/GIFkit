@@ -1970,7 +1970,7 @@ fn guides_snap_and_save() {
     // the nearest line wins, and nothing past the threshold
     assert_eq!(crate::app::guides_snap_for_test(&[10.0, 50.0, 90.0], &[0.0, 52.0, 200.0], 6.0), Some((2.0, 52.0)));
     assert_eq!(crate::app::guides_snap_for_test(&[10.0], &[30.0], 6.0), None);
-    let f = ProjectFile { guides: vec![Guide { vertical: true, at: 12.0 }, Guide { vertical: false, at: 40.0 }], ..Default::default() };
+    let f = ProjectFile { guides: vec![Guide { vertical: true, at: 12.0, source: false }, Guide { vertical: false, at: 40.0, source: true }], ..Default::default() };
     let back: ProjectFile = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
     assert_eq!(back.guides, f.guides);
     // older projects have none
@@ -2068,6 +2068,14 @@ fn layer_groups() {
     let f = crate::project::ProjectFile { groups: st.groups.clone(), ..Default::default() };
     let back: crate::project::ProjectFile = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
     assert_eq!(back.groups, st.groups);
+    // several layers gathered into one new group where the top one was
+    let ids: Vec<u64> = vec![st.layers[0].id, st.layers[3].id];
+    st.ungroup(g);
+    let g2 = st.group_layers(&ids).unwrap();
+    assert_eq!(st.group_range(g2), Some(2..4));
+    assert_eq!(st.layers[2].id, ids[0]);
+    assert_eq!(st.layers[3].id, ids[1]);
+    let g = g2;
     // ungrouping keeps the layers; an empty group goes
     st.ungroup(g);
     assert!(st.groups.is_empty());

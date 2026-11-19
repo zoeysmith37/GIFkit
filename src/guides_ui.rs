@@ -43,7 +43,7 @@ impl GifKitApp {
     pub(super) fn snap_targets(&self, skip: usize, bounds: (f32, f32)) -> (Vec<f32>, Vec<f32>, Vec<[f32; 4]>) {
         let (mut xs, mut ys) = (vec![0.0, bounds.0 / 2.0, bounds.0], vec![0.0, bounds.1 / 2.0, bounds.1]);
         if self.show_guides {
-            for g in &self.stack.guides {
+            for g in self.stack.guides.iter().filter(|g| !g.source) {
                 if g.vertical { xs.push(g.at) } else { ys.push(g.at) }
             }
         }
@@ -130,7 +130,7 @@ impl GifKitApp {
 
     /// The rulers, the guides and the smart guide lines for view `vi`.
     /// `full` is the view with its rulers, `inner` the picture's part.
-    pub(super) fn guides_ui(&mut self, ui: &mut egui::Ui, full: Rect, inner: Rect, vi: usize) {
+    pub(super) fn guides_ui(&mut self, ui: &mut egui::Ui, full: Rect, inner: Rect, vi: usize, source: bool) {
         if self.base.is_none() {
             return;
         }
@@ -177,7 +177,9 @@ impl GifKitApp {
 
         // ---- the guides, and grabbing them
         if self.show_guides {
-            for (i, g) in self.stack.guides.iter().enumerate() {
+            // each guide shows in the views it was made for: the original
+            // file's own, or the result's
+            for (i, g) in self.stack.guides.iter().enumerate().filter(|(_, g)| g.source == source) {
                 let (a, b) = if g.vertical {
                     let x = pic.round_to_pixel_center(m.to_screen(pos2(g.at, 0.0)).x);
                     (pos2(x, inner.top()), pos2(x, inner.bottom()))
@@ -191,7 +193,7 @@ impl GifKitApp {
             // grabbed after the picture so they win over it
             if self.guide_drag.is_none() {
                 let mut grab = None;
-                for (i, g) in self.stack.guides.iter().enumerate() {
+                for (i, g) in self.stack.guides.iter().enumerate().filter(|(_, g)| g.source == source) {
                     let hit = if g.vertical {
                         let x = m.to_screen(pos2(g.at, 0.0)).x;
                         Rect::from_min_max(pos2(x - 3.0, inner.top()), pos2(x + 3.0, inner.bottom()))
@@ -338,7 +340,7 @@ impl GifKitApp {
                 Some(i) if i < self.stack.guides.len() => self.stack.guides[i].at = at,
                 Some(_) => {}
                 None if over_picture => {
-                    self.stack.guides.push(Guide { vertical: d.vertical, at });
+                    self.stack.guides.push(Guide { vertical: d.vertical, at, source });
                     d.idx = Some(self.stack.guides.len() - 1);
                 }
                 None => {}

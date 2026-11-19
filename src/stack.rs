@@ -629,6 +629,9 @@ impl Default for Group {
 pub struct Guide {
     pub vertical: bool,
     pub at: f32,
+    /// made on the original file's view (its own pixels), not the result's
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub source: bool,
 }
 
 /// Size of a preview frame `s` times the source size.
@@ -944,6 +947,45 @@ impl Stack {
         self.layers[li].group = Some(id);
         self.tidy_groups();
         Some(id)
+    }
+
+    /// Moves the layers `ids` (keeping their order) so they sit together
+    /// at `pos` (a place between layers, 0 = the bottom, counted before
+    /// the move). Gives where the block starts.
+    pub fn move_block(&mut self, ids: &[u64], pos: usize) -> usize {
+        let pos = pos.min(self.layers.len());
+        let below = self.layers[..pos].iter().filter(|l| ids.contains(&l.id)).count();
+        let mut block = Vec::new();
+        let mut i = 0;
+        while i < self.layers.len() {
+            if ids.contains(&self.layers[i].id) {
+                block.push(self.layers.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        let at = (pos - below).min(self.layers.len());
+        for (k, l) in block.into_iter().enumerate() {
+            self.layers.insert(at + k, l);
+        }
+        at
+    }
+
+    /// Puts the layers `ids` in one new group, gathered where the top one
+    /// was. Gives the group's id.
+    pub fn group_layers(&mut self, ids: &[u64]) -> Option<u64> {
+        let top = self.layers.iter().rposition(|l| ids.contains(&l.id))?;
+        let at = self.move_block(ids, top + 1);
+        let gid = self.next_id;
+        self.next_id += 1;
+        let n = self.groups.len() + 1;
+        self.groups.push(Group { id: gid, name: format!("Group {n}"), ..Default::default() });
+        let count = ids.iter().filter(|id| self.index_of(**id).is_some()).count();
+        for l in &mut self.layers[at..at + count] {
+            l.group = Some(gid);
+        }
+        self.tidy_groups();
+        Some(gid)
     }
 
     /// Takes the group away, keeping its layers where they are.

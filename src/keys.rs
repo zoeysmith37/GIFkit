@@ -402,6 +402,15 @@ impl Binding {
             Key::ArrowRight => "→",
             Key::ArrowUp => "↑",
             Key::ArrowDown => "↓",
+            Key::OpenBracket => "[",
+            Key::CloseBracket => "]",
+            Key::Semicolon => ";",
+            Key::Quote => "'",
+            Key::Backslash => "\\",
+            Key::Slash => "/",
+            Key::Comma => ",",
+            Key::Period => ".",
+            Key::Backtick => "`",
             k => k.name(),
         });
         s

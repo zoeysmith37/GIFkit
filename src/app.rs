@@ -1135,6 +1135,9 @@ pub struct GifKitApp {
     snap_gaps: Vec<[f32; 4]>,
     show_grid: bool,
     grid_snap: bool,
+    /// layers picked together in the Layers panel (ids); the active one,
+    /// the one settings show, is `sel`'s
+    multi: Vec<u64>,
     /// a group being renamed in the Layers panel
     group_renaming: Option<(u64, String)>,
     /// a group being dragged to a new place
@@ -2245,7 +2248,9 @@ fn colour_picker_body(ui: &mut egui::Ui, id: egui::Id, c: &mut [u8; 4], alpha: b
         set(c, hsv);
         changed = true;
     }
-    if alpha {
+    // every picker has the same parts: where a colour has to be solid, its
+    // see-through strip and A box are there but greyed out
+    {
         let rgb = [c[0], c[1], c[2]];
         let alpha_paint = move |pt: &egui::Painter, rr: Rect| {
             let cell = rr.height() / 2.0;
@@ -2269,7 +2274,8 @@ fn colour_picker_body(ui: &mut egui::Ui, id: egui::Id, c: &mut [u8; 4], alpha: b
             m.add_triangle(1, 3, 2);
             pt.add(m);
         };
-        if let Some(a) = strip(ui, c[3] as f32 / 255.0, &alpha_paint) {
+        let got = ui.add_enabled_ui(alpha, |ui| strip(ui, c[3] as f32 / 255.0, &alpha_paint)).inner;
+        if let Some(a) = got.filter(|_| alpha) {
             c[3] = (a * 255.0).round() as u8;
             changed = true;
         }
@@ -2277,13 +2283,16 @@ fn colour_picker_body(ui: &mut egui::Ui, id: egui::Id, c: &mut [u8; 4], alpha: b
 
     // number boxes, all the same width so the popup never changes size
     ui.add_space(8.0);
-    let n = if alpha { 4 } else { 3 };
+    let n = 4;
     let gap = ui.spacing().item_spacing.x;
     let w = ((PICK_W - gap * (n as f32 - 1.0)) / n as f32).floor();
     let before = *c;
     ui.horizontal(|ui| {
         for (i, name) in ["R", "G", "B", "A"].iter().take(n).enumerate() {
-            ui.add_sized(vec2(w, CHIP_H), egui::DragValue::new(&mut c[i]).range(0..=255).prefix(format!("{name} ")));
+            let solid = i == 3 && !alpha;
+            ui.add_enabled_ui(!solid, |ui| ui.add_sized(vec2(w, CHIP_H), egui::DragValue::new(&mut c[i]).range(0..=255).prefix(format!("{name} "))))
+                .inner
+                .on_disabled_hover_text("This colour is always solid");
         }
     });
     // recent picks, then the picture's own colours
@@ -3555,6 +3564,7 @@ impl GifKitApp {
             snap_gaps: Vec::new(),
             show_grid: theme::get_setting("grid").as_deref() == Some("1"),
             group_renaming: None,
+            multi: Vec::new(),
             group_drag: None,
             group_rename_done: None,
             picture_colours_key: None,
@@ -5516,7 +5526,9 @@ impl GifKitApp {
         if !typing && self.base.is_some() {
             let li = self.tool.layer_kind().and_then(|k| self.sel_index(k));
             let now = ctx.input(|i| i.time);
-            if hit(A::GroupLayer) {
+            if hit(A::GroupLayer) && self.multi.len() > 1 {
+                self.group_picked(now);
+            } else if hit(A::GroupLayer) {
                 if let Some(li) = li.filter(|li| self.stack.layers[*li].group.is_none()) {
                     self.apply_layer_act(ctx, LayerAct::Group(li), now);
                 }
@@ -6865,6 +6877,7 @@ impl eframe::App for GifKitApp {
         let ctx = ui.ctx().clone();
         // groups stay whole however the layers were moved
         self.stack.tidy_groups();
+        self.sync_multi();
         // GIFKIT_STALL: frames that took long to make, and where the time went
         if std::env::var_os("GIFKIT_STALL").is_some() {
             thread_local!(static LAST: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) });
@@ -7658,6 +7671,65 @@ impl GifKitApp {
         true
     }
 
+    /// The picked layers follow the active one: gone layers drop out, and
+    /// picking another layer some other way starts afresh with it.
+    fn sync_multi(&mut self) {
+        match self.sel_layer_index().map(|i| self.stack.layers[i].id) {
+            Some(a) => {
+                let st = &self.stack;
+                self.multi.retain(|id| st.index_of(*id).is_some());
+                if !self.multi.contains(&a) {
+                    self.multi = vec![a];
+                }
+            }
+            None => self.multi.clear(),
+        }
+    }
+
+    /// The layers a Layers panel change goes to: the active one, or every
+    /// picked one with Alt held.
+    fn edit_targets(&self, ui: &egui::Ui) -> Vec<usize> {
+        let active = self.sel_layer_index();
+        if ui.input(|i| i.modifiers.alt) && self.multi.len() > 1 {
+            let mut v: Vec<usize> = self.multi.iter().filter_map(|id| self.stack.index_of(*id)).collect();
+            v.sort();
+            v
+        } else {
+            active.into_iter().collect()
+        }
+    }
+
+    /// The picked layers, bottom to top.
+    fn picked(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = self.multi.iter().filter_map(|id| self.stack.index_of(*id)).collect();
+        v.sort();
+        v
+    }
+
+    /// Ctrl+G on several picked layers: one group for them all.
+    fn group_picked(&mut self, now: f64) {
+        let ids: Vec<u64> = self.picked().iter().map(|&i| self.stack.layers[i].id).collect();
+        if ids.len() < 2 {
+            return;
+        }
+        self.snapshot(&format!("group{now}"), now);
+        self.stack.group_layers(&ids);
+        self.modified = true;
+        self.info(format!("{} layers grouped", ids.len()));
+    }
+
+    fn delete_picked(&mut self, now: f64) {
+        let ids: Vec<u64> = self.multi.clone();
+        if ids.is_empty() {
+            return;
+        }
+        self.snapshot(&format!("del{now}"), now);
+        self.stack.layers.retain(|l| !ids.contains(&l.id));
+        self.stack.tidy_groups();
+        self.multi.clear();
+        self.modified = true;
+    }
+
     /// A group's own row in the Layers panel: its eye, fold, folder, name
     /// and lock. Clicking picks its top layer. Gives the row's place.
     fn group_row(&mut self, ui: &mut egui::Ui, g: &crate::stack::Group, top: usize, row_h: f32, menu_act: &mut Option<LayerAct>, select: &mut Option<(Kind, u64)>) -> Rect {
@@ -8197,7 +8269,7 @@ impl GifKitApp {
             let fixed: Vec<(&str, &str)> = FIXED.iter().copied().filter(|(k, w)| q.is_empty() || k.to_lowercase().contains(&q) || w.to_lowercase().contains(&q)).collect();
             // each group a card; cards go into columns, each to the shortest
             let groups: Vec<(&str, Vec<Action>)> = Action::GROUPS.iter().map(|g| (*g, Action::ALL.iter().copied().filter(|a| a.group() == *g && hit(*a)).collect::<Vec<_>>())).filter(|(_, v)| !v.is_empty()).collect();
-            let cols = ((ui.available_width() / 340.0).floor() as usize).clamp(1, 4);
+            let cols = ((ui.available_width() / 360.0).floor() as usize).clamp(1, 4);
             let mut col_of = vec![Vec::new(); cols];
             let mut heights = vec![0usize; cols];
             // the longest cards first, each to the shortest column, so the
@@ -8241,9 +8313,13 @@ impl GifKitApp {
                                             Some(r) => r[..1].to_uppercase() + &r[1..],
                                             None => full.to_string(),
                                         };
-                                        let room = (ui.available_width() - 166.0).max(40.0);
-                                        ui.allocate_ui_with_layout(vec2(room, CHIP_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                            ui.add(egui::Label::new(RichText::new(name).color(pal.fg)).truncate()).on_hover_text(full);
+                                        // the key button and its reset take a fixed width; the
+                                        // name wraps onto a second line rather than being cut
+                                        let room = (ui.available_width() - 170.0).max(60.0);
+                                        ui.allocate_ui_with_layout(vec2(room, CHIP_H), egui::Layout::top_down(egui::Align::Min), |ui| {
+                                            ui.set_width(room);
+                                            ui.add_space(4.0);
+                                            ui.add(egui::Label::new(RichText::new(name).color(pal.fg)).wrap());
                                         });
                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                             let changed = km.get(a) != a.default_binding();
@@ -8254,7 +8330,7 @@ impl GifKitApp {
                                             let waiting = capture == Some(a);
                                             let text = if waiting { "Press keys…".to_string() } else { km.get(a).map(|b| b.text()).unwrap_or_else(|| "None".into()) };
                                             let col = if km.get(a).is_some() || waiting { pal.fg } else { pal.fg_muted };
-                                            let b = ui.add(sel_btn(egui::Button::new(RichText::new(text).font(theme::medium(13.0)).color(col)).min_size(vec2(124.0, 26.0)), waiting));
+                                            let b = ui.add_sized(vec2(124.0, 26.0), sel_btn(egui::Button::new(RichText::new(text).font(theme::medium(13.0)).color(col)).truncate(), waiting));
                                             if b.clicked() {
                                                 capture = if waiting { None } else { Some(a) };
                                             }
@@ -8691,7 +8767,7 @@ impl GifKitApp {
                 let icon = crate::icons::image(ui.ctx(), if locked { "object-locked" } else { "object-unlocked" }, 16.0, pal.fg);
                 let b = ui.add(sel_btn(egui::Button::image(icon).min_size(vec2(28.0, 26.0)), locked)).on_hover_text(if locked { "Unlock the layer" } else { "Lock the layer so it can't be changed" });
                 if b.clicked() {
-                    if let Some(i) = sel_li {
+                    for i in self.edit_targets(ui) {
                         self.stack.layers[i].locked = !locked;
                         self.modified = true;
                     }
@@ -8730,8 +8806,8 @@ impl GifKitApp {
                 ui.add_space(6.0);
                 ui.label(RichText::new("Opacity:").color(if sel_li.is_some() { pal.fg } else { pal.fg_muted }));
                 ui.add_enabled_ui(!locked, |ui| {
-                    if fill_slider(ui, egui::Slider::new(&mut op, 0.0..=100.0).suffix("%").max_decimals(0)).on_hover_text("The whole layer's opacity").changed() {
-                        if let Some(i) = sel_li {
+                    if fill_slider(ui, egui::Slider::new(&mut op, 0.0..=100.0).suffix("%").max_decimals(0)).on_hover_text("The whole layer's opacity. Hold Alt to set every picked layer").changed() {
+                        for i in self.edit_targets(ui) {
                             self.stack.layers[i].opacity = op;
                             self.modified = true;
                         }
@@ -8761,15 +8837,22 @@ impl GifKitApp {
                                 let now = ui.input(|i| i.time);
                                 let id = self.stack.layers[i].id;
                                 self.snapshot(&format!("style{id}"), now);
-                                self.stack.layers[i].style = st;
+                                // with Alt, every picked layer that can take it
+                                for t in self.edit_targets(ui) {
+                                    if crate::stack::Layer::can_style(&self.stack.layers[t].kind) {
+                                        self.stack.layers[t].style = st.clone();
+                                    }
+                                }
                                 self.modified = true;
                             }
                         }
                     });
                     combo(ui, "layer-blend", &mut mode, &items).on_hover_text("How the layer meets what's under it: Multiply darkens, Screen lightens, Overlay adds contrast, Color and Luminosity take one part of it");
                 });
-                if let Some(i) = sel_li.filter(|i| self.stack.layers[*i].blend != mode) {
-                    self.stack.layers[i].blend = mode;
+                if sel_li.is_some_and(|i| self.stack.layers[i].blend != mode) {
+                    for i in self.edit_targets(ui) {
+                        self.stack.layers[i].blend = mode;
+                    }
                     self.modified = true;
                 }
             });
@@ -8786,6 +8869,10 @@ impl GifKitApp {
         let n = self.stack.layers.len();
         let row_h = 30.0;
         let mut select: Option<(Kind, u64)> = None;
+        // a row clicked with Ctrl (add or take away) or Shift (a run)
+        let mut pick_mod: Option<(u64, bool, bool)> = None;
+        let mut group_many = false;
+        let mut delete_many = false;
         let mut toggle: Option<usize> = None;
         let mut lock: Option<usize> = None;
         let mut remove: Option<usize> = None;
@@ -8828,11 +8915,19 @@ impl GifKitApp {
                 let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click_and_drag());
                 rows.push((li, r, gid, false));
                 let selected = self.sel.get(kind_key(kind)) == Some(&id) && self.tool == kind_tool(kind);
+                // picked with others: a softer highlight than the active one
+                let picked = !selected && self.multi.len() > 1 && self.multi.contains(&id);
                 let dragging_me = self.layer_drag == Some(id);
                 let painter = ui.painter().clone();
                 // selection in the scheme's selection colours, as Qt item views draw it
                 if selected {
                     painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 3.0, pal.highlight);
+                    if self.multi.len() > 1 {
+                        // the active one of several, as Blender marks it
+                        painter.rect_stroke(r.shrink2(vec2(2.0, 1.0)), 3.0, Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Inside);
+                    }
+                } else if picked {
+                    painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 3.0, mix(pal.view, pal.highlight, 0.5));
                 } else if resp.hovered() {
                     painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 3.0, mix(pal.view, pal.highlight, 0.18));
                 }
@@ -9011,6 +9106,8 @@ impl GifKitApp {
                 }
                 if resp.clicked() && !eye.clicked() {
                     select = Some((kind, id));
+                    let m = ui.input(|i| i.modifiers);
+                    pick_mod = Some((id, m.command, m.shift));
                 }
                 if resp.drag_started() {
                     self.layer_drag = Some(id);
@@ -9232,14 +9329,22 @@ impl GifKitApp {
             }
             let grouped = sel_layer.is_some_and(|li| self.stack.layers[li].group.is_some());
             let gk = self.keymap.text(crate::keys::Action::GroupLayer);
-            if icon_tool(ui, if grouped { "object-ungroup" } else { "folder-new" }, &if grouped { "Take the selected layer out of its group".to_string() } else { format!("Put the selected layer in a new group ({gk})") }, sel_layer.is_some()).clicked() {
-                menu_act = sel_layer.map(LayerAct::Group);
+            let several = self.multi.len() > 1;
+            let tip = if several { format!("Put the {} picked layers in a group ({gk})", self.multi.len()) } else if grouped { "Take the selected layer out of its group".to_string() } else { format!("Put the selected layer in a new group ({gk})") };
+            if icon_tool(ui, if grouped && !several { "object-ungroup" } else { "folder-new" }, &tip, sel_layer.is_some()).clicked() {
+                if several {
+                    group_many = true;
+                } else {
+                    menu_act = sel_layer.map(LayerAct::Group);
+                }
             }
             if icon_tool(ui, "edit-rename", &format!("Rename the selected {what}"), sel_layer.is_some() || sel_edit.is_some()).clicked() {
                 menu_act = sel_layer.map(LayerAct::Rename).or(sel_edit.map(LayerAct::RenameEdit));
             }
-            if icon_tool(ui, "edit-delete", &format!("Delete the selected {what}"), sel_layer.is_some() || sel_edit.is_some()).clicked() {
+            let del_tip = if self.multi.len() > 1 { format!("Delete the {} picked layers", self.multi.len()) } else { format!("Delete the selected {what}") };
+            if icon_tool(ui, "edit-delete", &del_tip, sel_layer.is_some() || sel_edit.is_some()).clicked() {
                 match (sel_layer, sel_edit) {
+                    (Some(_), _) if self.multi.len() > 1 => delete_many = true,
                     (Some(li), _) => menu_act = Some(LayerAct::Delete(li)),
                     (None, Some(t)) => edit_remove = Some(t),
                     _ => {}
@@ -9257,9 +9362,46 @@ impl GifKitApp {
         if rest.height() > 0.0 {
             ui.allocate_rect(rest, Sense::hover());
         }
+        if group_many {
+            self.group_picked(now);
+        }
+        if delete_many {
+            self.delete_picked(now);
+        }
+        let before = self.multi.clone();
+        let active_before = self.sel_layer_index();
         if let Some((k, id)) = select {
             self.tool = kind_tool(k);
             self.select(k, id);
+        }
+        if let Some((id, ctrl, shift)) = pick_mod {
+            if ctrl {
+                let mut m = before;
+                if m.contains(&id) && m.len() > 1 {
+                    // taken away: the last picked is active again
+                    m.retain(|x| *x != id);
+                    if let Some(&last) = m.last() {
+                        if let Some(li) = self.stack.index_of(last) {
+                            let k = self.stack.layers[li].kind();
+                            self.tool = kind_tool(k);
+                            self.select(k, last);
+                        }
+                    }
+                } else if !m.contains(&id) {
+                    m.push(id);
+                }
+                self.multi = m;
+            } else if shift {
+                // every layer from the active one to this one
+                if let (Some(a), Some(b)) = (active_before, self.stack.index_of(id)) {
+                    let (lo, hi) = (a.min(b), a.max(b));
+                    let mut m: Vec<u64> = self.stack.layers[lo..=hi].iter().map(|l| l.id).filter(|x| *x != id).collect();
+                    m.push(id);
+                    self.multi = m;
+                }
+            } else {
+                self.multi = vec![id];
+            }
         }
         if let Some(li) = toggle {
             self.stack.layers[li].visible = !self.stack.layers[li].visible;
@@ -9267,6 +9409,20 @@ impl GifKitApp {
         }
         if let Some(li) = lock {
             self.stack.layers[li].locked = !self.stack.layers[li].locked;
+            self.modified = true;
+        }
+        // several picked and one of them dragged: they all go
+        if let Some((from, pos, g)) = drop_to.filter(|(from, _, _)| self.multi.len() > 1 && self.multi.contains(&self.stack.layers[*from].id)) {
+            drop_to = None;
+            self.layer_drag = None;
+            self.snapshot(&format!("reorder{now}"), now);
+            let ids = self.multi.clone();
+            let _ = from;
+            let at = self.stack.move_block(&ids, pos);
+            for l in &mut self.stack.layers[at..at + ids.len()] {
+                l.group = g;
+            }
+            self.stack.tidy_groups();
             self.modified = true;
         }
         if let Some((from, pos, g)) = drop_to {
@@ -10862,7 +11018,9 @@ impl GifKitApp {
         let rect = if self.show_rulers && self.base.is_some() { Rect::from_min_max(rect.min + vec2(RULER, RULER), rect.max) } else { rect };
         self.views[vi].shown = None;
         self.source_view_inner(ui, ctx, rect, shown, vi, show_label);
-        self.guides_ui(ui, full, rect, vi);
+        // the original file and the crop view show the source's pixels
+        let source = shown == ViewSource::Original || self.tool == Tool::Crop;
+        self.guides_ui(ui, full, rect, vi, source);
         if self.before_after && shown == ViewSource::Edit && self.stack.layers.iter().any(|l| matches!(l.kind(), Kind::Adjust | Kind::Effects)) {
             let painter = ui.painter_at(rect);
             let g = painter.layout_no_wrap("Before · adjustments and effects hidden".into(), theme::medium(12.5), Color32::WHITE);

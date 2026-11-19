@@ -2462,7 +2462,7 @@ impl GifKitApp {
             ui.separator();
             let mut c = cur.unwrap_or([61, 174, 233]);
             ui.horizontal(|ui| {
-                if egui::color_picker::color_edit_button_srgb(ui, &mut c).changed() {
+                if colour_btn(ui, &mut c).changed() {
                     pick = Some(Some(c));
                 }
                 ui.label("Other colour");

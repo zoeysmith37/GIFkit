@@ -6,75 +6,88 @@ use super::*;
 pub(super) const TOPICS: &[(&str, &str)] = &[
     (
         "Getting Started",
-        "Open a GIF or a video with Ctrl+O or drop it on the window. Videos open through ffmpeg.
+        "Right then. Open a GIF or a video with Ctrl+O, or just drop it on the window. Videos come in through ffmpeg.
 
-The left rail holds the tools. Pick one and its settings show on the right.
+The tools live down the left rail. Pick one and its settings turn up on the right.
 
-Nothing you do changes the frames until you export. Every edit is a layer or a frame edit you can change or undo later.
+Nothing touches your frames until you export. Every edit is a layer or a frame edit, so you can change your mind as often as you like.
 
 ## The views
-- The preview shows the result as it will look
-- Split view (C) puts the original beside it
-- The compressed view shows the exported file and its size
+- The preview shows the result as it'll look
+- Split view (C) puts the original next to it
+- The compressed view shows the exported file and how big it is
 
 ## Saving
-- Export (Ctrl+E) writes the GIF or other format
+- Export (Ctrl+E) writes your GIF, or whichever format you fancy
 - Save (Ctrl+S) keeps a .gifkit project with every layer still editable
-- Copy Result (Ctrl+Shift+C) puts the finished file on the clipboard to paste into a chat",
+- Copy Result (Ctrl+Shift+C) pops the finished file on the clipboard, ready for a chat",
     ),
     (
         "Layers",
         "Adjust, Effects, Text, Shapes, Emoji, Markup, Censor, Image, Watermark and AI shield each add a layer.
 
-Layers stack like in an image editor. Higher ones draw on top. Hide or lock them from the timeline.
+They stack like in any image editor. Higher ones draw on top. Hide or lock them from the Layers panel or the timeline.
 
-With no layer of a tool's kind selected, changing a setting adds one. With one selected, you edit that one.
+With no layer of a tool's kind picked, changing a setting adds one. With one picked, you're editing that one.
+
+## Picking several
+- Ctrl+click a layer to add it to the pick. Shift+click picks a whole run
+- The last one you clicked is the active one, with the brighter highlight
+- Settings show the active layer. Changes go to it alone
+- Hold Alt while changing opacity, blend, lock or style to do the lot at once
+- Drag any picked layer and the rest come along too
 
 ## Groups
-- Ctrl+G puts the selected layer in a new group, a folder in the Layers panel
-- Drag layers into a group, or out of it
-- A group's eye and lock hide or lock all of its layers
-- Drag a group's row to move all of its layers
+@demo groups
+- Ctrl+G tucks the picked layers into a group, a folder in the Layers panel
+- Drag layers into a group, or back out again
+- A group's eye and lock look after all its layers in one go
+- Drag a group's row to shift the whole lot
 - Ctrl+Shift+G ungroups and keeps the layers
 
+## Layer styles
+@demo styles
+- The fx button beside Blend adds a stroke, drop shadow or outer glow
+- Each one has its own switch. They work on text, shapes and emoji
+
 ## The Layers panel
-- Opacity and Blend sit at the top, for the selected layer
+- Opacity and Blend sit at the top, for the active layer
 - Ctrl+] and Ctrl+[ move a layer up or down. Add Shift for the top or bottom
 - Clip shows a layer only where the layer under it has drawn
-- The fx button beside Blend adds a stroke, drop shadow or outer glow
-- Layer styles work on text, shapes and emoji
-- Arrow keys nudge the selected layer 1 px, with the pointer on the picture
+- Arrow keys nudge the picked layer 1 px, with the pointer over the picture
 - Shift with an arrow moves it 10 px
 - Mask shows it only inside shapes you draw
-- Masking the GIF hides it outside the mask. Layers on top stay
+- Masking the GIF hides it outside the mask. Layers on top stay put
 - In the Mask tool, Draw lets you draw a shape by hand. Esc stops
 
 ## Colours
-Any colour button opens a picker. Under its number boxes are your recent colours, and below them the main colours of the frame on screen.
+Any colour button opens a picker. Under the number boxes sit your recent colours, and below those the main colours in the frame on screen. Handy.
 
 ## Text
-- Drag text on the preview to place it
+- Drag text on the preview to put it where you want it
 - Typing makes it appear letter by letter or word by word
-- Fonts include the ones on your system
+- Fonts include the ones on your computer
 
 ## Shapes and Markup
 - Drag on the preview to draw a shape. Lines and arrows go from start to end
 - Shift keeps a line straight, in Shapes and in Markup
 
 ## Effects
-- Blur, glitch, distortions, styles, frames and more. Colour work lives in Adjust
+- Blur, glitch, wobbles, styles, frames and more. Colour work lives in Adjust
 - Older projects keep their colour settings under Older colour settings
-- Transparency removes a colour. From Corner picks the background for you
-- Soft edge and Remove colour spill clean up a green screen
+- Transparency knocks out a colour. From Corner picks the background for you
+- Soft edge and Remove colour spill tidy up a green screen
 
 ## Animation
-Moves a layer over time with ready-made motions like slide, hop and spin. Keyframes on the timeline (K) give finer control.",
+Moves a layer over time with ready-made motions like slide, hop and spin. Keyframes on the timeline (K) give you finer control.",
     ),
     (
         "Adjustments",
-        "The Adjust tool (A) makes adjustment layers, as in Photoshop. They change the colours of everything under them and never touch the frames.
+        "The Adjust tool (A) makes adjustment layers, just like Photoshop. They change the colours of everything underneath and never lay a finger on the frames.
 
-Add one from the Add Adjustment menu, Edit > Adjustments, the command palette or a shortcut. A layer holds a list of them that runs top to bottom.
+Add one from the Add Adjustment menu, Edit > Adjustments, the command palette or a shortcut. A layer holds a list of them, run top to bottom.
+
+@demo curves
 
 ## Shortcuts
 - Ctrl+L Levels and Ctrl+M Curves
@@ -84,14 +97,14 @@ Add one from the Add Adjustment menu, Edit > Adjustments, the command palette or
 
 ## Curves and Levels
 - Both draw over the frame's histogram
-- Curves: drag a point, click the line to add one, drag it off to remove it
-- Levels: drag the black, grey and white handles, or use Auto
+- Curves: drag a point, click the line for another, drag it off to bin it
+- Levels: drag the black, grey and white handles, or let Auto have a go
 - The eyedroppers set the black, grey or white point. Click them on the Original view
 - Color Balance starts on All Tones, one shift for the whole picture
 - Pick Shadows, Midtones or Highlights in Color Balance for finer control
 
 ## Your presets
-The bookmark on each adjustment's card saves its settings by name. They're there for that adjustment in every project.
+The bookmark on each adjustment's card saves its settings by name. They're there for that adjustment in every project after.
 
 ## Every adjustment
 - Levels, Curves, Exposure, Brightness/Contrast, Vibrance and Hue/Saturation
@@ -99,28 +112,30 @@ The bookmark on each adjustment's card saves its settings by name. They're there
 - Invert, Posterize, Threshold and Gradient Map
 - Looks are ready-made grades. Color Lookup loads .cube files from video editors
 
-## Comparing
-Hold \\ to see the frame without its adjustment and effects layers. Let go to see them again.",
+## Before and after
+Hold \\ to see the frame without its adjustment and effects layers. Let go and they're back.",
     ),
     (
         "Blend Modes",
-        "Every layer has a blend mode in the Layers panel, beside its opacity. It decides how the layer meets what's under it.
+        "Every layer has a blend mode in the Layers panel, next to its opacity. It decides how the layer gets on with what's underneath.
 
 ## Which to use
-- Multiply darkens. White in the layer disappears
-- Screen lightens. Black in the layer disappears
-- Overlay and Soft Light add contrast
+- Multiply darkens. White in the layer vanishes
+- Screen lightens. Black in the layer vanishes
+- Overlay and Soft Light add a bit of punch
 - Color takes only the layer's colour. Luminosity takes only its light
 - Difference shows what's changed between two layers
 
 ## With adjustments
-Curves in Luminosity adds contrast without making colours stronger. Hue/Saturation in Color tints without changing light.",
+Curves in Luminosity adds contrast without making colours garish. Hue/Saturation in Color tints without touching the light.",
     ),
     (
         "Shortcuts and Palette",
-        "Press Ctrl+K for the command palette. Type part of any tool, adjustment, command or recent file and press Enter.
+        "Press Ctrl+K for the command palette. Type a bit of any tool, adjustment, command or recent file and hit Enter. Bob's your uncle.
 
-Each entry shows its shortcut, so you learn them as you go.
+@demo palette
+
+Each entry shows its shortcut, so you'll pick them up as you go.
 
 ## Tools
 - T Text, U Shapes, B Markup and E Emoji
@@ -128,44 +143,47 @@ Each entry shows its shortcut, so you learn them as you go.
 - Space plays. The arrow keys step a frame
 
 ## Your own keys
-Settings > Keyboard Shortcuts changes any of them.",
+Settings > Keyboard Shortcuts lets you change any of them.",
     ),
     (
         "Rulers and Guides",
-        "View > Rulers (Ctrl+Shift+R) shows rulers along the top and left of the preview, in pixels. They are off until you turn them on.
+        "View > Rulers (Ctrl+Shift+R) puts rulers along the top and left of each view, in that view's own pixels. They're off until you want them.
+
+@demo guides
 
 ## Guides
 - Drag from a ruler onto the picture to make a guide
-- Drag a guide back onto its ruler to remove it
+- Drag a guide back onto its ruler to get rid of it
 - Layers snap to guides as you move them
+- Guides belong to the view they're made in: the original or the result
+- A guide pulls towards the frame's edges and middle. Hold Ctrl to place it freely
+- View > Show Guides (Ctrl+;) hides them. View > Clear Guides clears the lot
 - Guides are saved with the project
-- A guide pulls toward the frame's edges and middle. Hold Ctrl to place it freely
-- View > Show Guides (Ctrl+;) hides them, and View > Clear Guides removes them all
 
 ## Grid
-View > Grid (Ctrl+') lays a grid over the picture. Grid Size sets its spacing. Snap to Grid makes things you move or resize line up with it.
+View > Grid (Ctrl+') lays a grid over the picture. Grid Size sets the spacing. Snap to Grid lines up whatever you move or resize.
 
 ## Smart guides
-While you move or resize a layer, lines show where it lines up with the frame and other layers. It snaps there too. Pink numbers show the gap to the nearest layer on each side.
+While you move or resize a layer, pink lines show where it lines up with the frame and other layers, and it snaps there. Pink numbers give the gap to the nearest layer on each side.
 - View > Smart Guides turns them off
-- Hold Ctrl while dragging to move freely without snapping",
+- Hold Ctrl while dragging to move freely, no snapping",
     ),
     (
         "Timeline",
-        "The timeline sits under the preview. The GIF has its own row and each layer gets one too.
+        "The timeline sits under the preview. The GIF gets its own row and so does each layer.
 
 ## Clips
-- Drag a clip to move it and its edges to trim it
+- Drag a clip to move it, and its edges to trim it
 - Trimmed frames are kept. Pull the edge back out to get them back
 - S splits at the playhead and Delete removes a clip
-- Those two keys work with the pointer on the timeline
+- Those two keys work with the pointer over the timeline
 - Right-click a GIF clip for Clip Speed and transitions
 
 ## Speed
-- The Speed tool changes the speed of parts of the GIF
+- The Speed tool speeds up or slows down parts of the GIF
 - Click the GIF track to add a point. Drag it up for faster
-- Double-click a point to set it back to 100%. Right-click for exact values
-- Clip Speed sets one clip's speed the same way
+- Double-click a point to put it back to 100%. Right-click for exact values
+- Clip Speed does one clip the same way
 
 ## Selecting
 - Drag a box on empty space to select clips and keyframes
@@ -173,18 +191,18 @@ While you move or resize a layer, lines show where it lines up with the frame an
 
 ## Playing
 - Space plays and the arrow keys step a frame
-- I and O set in and out points. Export can save just that part
-- Trim to Last Clip cuts the empty end off
+- I and O set in and out points. Export can save just that bit
+- Trim to Last Clip chops off the empty end
 - Shift+O shows onion skin: frames before in red, the next in green
 
 ## Moving layers
-- K adds a keyframe. Auto key adds one when you change a value
+- K adds a keyframe. Auto key adds one whenever you change a value
 - Ease Custom opens a curve to shape the timing. Back overshoots
 - Draw Path: drag on the preview and the layer follows the line
-- Once a layer has keyframes, dragging it on the preview keys it at the playhead
+- With keyframes, dragging a layer on the preview keys it at the playhead
 - Track: click something (or box it) and the layer follows it
 - Pick it on more frames where it changes. Then press Track again or Enter
-- The selected layer's path shows as dots, one a frame",
+- The picked layer's path shows as dots, one a frame",
     ),
     (
         "Frame Edits",
@@ -192,7 +210,7 @@ While you move or resize a layer, lines show where it lines up with the frame an
 
 ## Loops
 - Reverse holds Boomerang and the Seamless Loop tools
-- Find Loop Point looks for the two frames that match best
+- Find Loop Point hunts for the two frames that match best
 - Blend the Seam fades the end into the start
 
 ## Crop
@@ -202,26 +220,27 @@ Drag on the preview to set the crop. Preview picks whether you see it with your 
 - Speed changes the delay of every frame
 - Change Frame Rate makes more or fewer frames for the same length
 - Layers and keyframes stay in time when the frame rate changes
-- Frames skips frames you don't want and adds images as new frames
+- Frames skips the frames you don't want and adds images as new ones
 
 ## In-betweens
 Frames > In-Betweens adds new frames between each pair for smoother motion.
 - Follow motion moves things along instead of fading them
-- Method AI uses RIFE, a network made for in-betweens. Sharp even on hard moves
-- Method Tracker uses GIFkit's own tracking. Unsure sets what it does where it can't follow
+- Method AI uses RIFE, a network made for in-betweens. Sharp even on tricky moves
+- Method Tracker uses GIFkit's own tracking. Unsure sets what it does when lost
 - Burned-in text and logos stay put. A cut holds the nearer frame
-- The length stays the same unless frames would get under 2 cs",
+- The length stays the same unless frames would drop under 2 cs",
     ),
     (
         "Export and Size",
-        "Pick the format in Export. GIF, WebP, AVIF, APNG, MP4, WebM, single frames and sprite sheets are there.
+        "Pick the format in Export. GIF, WebP, AVIF, APNG, MP4, WebM, single frames and sprite sheets are all there.
 
 ## Hitting a size
 - Set a limit in Optimize and press Find Settings
-- Quality drops first. The frames shrink only if they must
-- Keep frame size stops it from shrinking them
-- Platforms sets the limit for Discord, Slack, Twitch and others. Emoji sizes shrink the frames too
-- Near matches merges frames that barely change. Good for screen recordings
+- Quality goes first. The frames only shrink if they really must
+- Keep frame size stops it shrinking them at all
+- Platforms sets the limit for Discord, Slack, Twitch and others
+- Emoji sizes shrink the frames too
+- Near matches merges frames that barely change. Grand for screen recordings
 
 ## Cutting the end
 Cut empty end frames drops blank frames at the end when exporting.",
@@ -231,20 +250,20 @@ Cut empty end frames drops blank frames at the end when exporting.",
         "A preset keeps frame edits, layers and compression to use again on another file. Make one in the Presets tool.
 
 ## Batch
-File > Batch puts the same edits on many files at once.
-- Edits can be this file's edits, a saved preset or none
+File > Batch puts the same edits on loads of files at once.
+- Edits can be this file's edits, a saved preset or none at all
 - For picks a platform limit to fit every file under
 - Files are saved next to the originals unless you choose a folder
-- Nothing gets overwritten. Names get a number when taken",
+- Nothing gets overwritten. Names get a number when they're taken",
     ),
     (
         "Memory and Speed",
-        "GIFkit keeps frames packed in memory and unpacks what it needs.
+        "GIFkit keeps frames packed up in memory and unpacks what it needs, when it needs it.
 
 ## Memory Use
 Settings > Memory Use picks how much it keeps ready.
-- Low saves memory. Scrubbing and undo do more work
-- High keeps more ready and gives more steps to undo
+- Low saves memory. Scrubbing and undo do a bit more work
+- High keeps more ready and gives you more steps of undo
 - The status bar shows how much memory is in use
 
 ## Preview
@@ -252,9 +271,80 @@ Settings > Memory Use picks how much it keeps ready.
 - Hardware Acceleration runs effects on the graphics card
 
 ## Autosave
-Unsaved work is kept every minute. After a crash GIFkit offers it back.",
+Unsaved work is tucked away every minute. If it all goes pear-shaped, GIFkit offers it back next time.",
     ),
 ];
+
+/// Little recordings of GIFkit doing things, shown in the topics with
+/// "@demo name".
+const DEMOS: &[(&str, &[u8])] = &[
+    ("guides", include_bytes!("../assets/handbook/guides.gif")),
+    ("groups", include_bytes!("../assets/handbook/groups.gif")),
+    ("styles", include_bytes!("../assets/handbook/styles.gif")),
+    ("curves", include_bytes!("../assets/handbook/curves.gif")),
+    ("palette", include_bytes!("../assets/handbook/palette.gif")),
+];
+
+/// A demo playing: its frames read one at a time into a single picture,
+/// so a long recording never sits in memory whole.
+struct Player {
+    frames: image::Frames<'static>,
+    tex: Option<egui::TextureHandle>,
+    size: Vec2,
+    next: f64,
+}
+
+thread_local! {
+    static PLAYERS: std::cell::RefCell<std::collections::HashMap<&'static str, Player>> = Default::default();
+}
+
+fn open_demo(bytes: &'static [u8]) -> Option<image::Frames<'static>> {
+    use image::AnimationDecoder;
+    let d = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+    Some(d.into_frames())
+}
+
+/// Shows demo `name`, playing and looping, as wide as fits.
+fn demo(ui: &mut egui::Ui, name: &str) {
+    let Some(&(key, bytes)) = DEMOS.iter().find(|d| d.0 == name) else { return };
+    let now = ui.input(|i| i.time);
+    let ctx = ui.ctx().clone();
+    let shown = PLAYERS.with(|ps| {
+        let mut ps = ps.borrow_mut();
+        if !ps.contains_key(key) {
+            let frames = open_demo(bytes)?;
+            ps.insert(key, Player { frames, tex: None, size: Vec2::ZERO, next: 0.0 });
+        }
+        let pl = ps.get_mut(key)?;
+        if now >= pl.next || pl.tex.is_none() {
+            let f = match pl.frames.next() {
+                Some(Ok(f)) => f,
+                // the end: round again
+                _ => {
+                    pl.frames = open_demo(bytes)?;
+                    pl.frames.next()?.ok()?
+                }
+            };
+            let (n, d) = f.delay().numer_denom_ms();
+            let ms = (n as f64 / d.max(1) as f64).max(20.0);
+            let img = f.into_buffer();
+            let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+            pl.size = vec2(img.width() as f32, img.height() as f32);
+            match &mut pl.tex {
+                Some(t) => t.set(ci, egui::TextureOptions::LINEAR),
+                None => pl.tex = Some(ctx.load_texture(format!("demo-{key}"), ci, egui::TextureOptions::LINEAR)),
+            }
+            pl.next = now + ms / 1000.0;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64((pl.next - now).max(0.01)));
+        Some((pl.tex.clone()?, pl.size))
+    });
+    if let Some((tex, size)) = shown {
+        let w = ui.available_width().min(size.x);
+        let r = ui.add(egui::Image::new((tex.id(), vec2(w, w * size.y / size.x))).corner_radius(4.0));
+        ui.painter().rect_stroke(r.rect, 4.0, Stroke::new(1.0, p().border), egui::StrokeKind::Outside);
+    }
+}
 
 /// Draw one topic's text.
 fn body(ui: &mut egui::Ui, text: &str) {
@@ -262,7 +352,11 @@ fn body(ui: &mut egui::Ui, text: &str) {
     ui.spacing_mut().item_spacing.y = 6.0;
     for block in text.split("\n\n") {
         for line in block.lines() {
-            if let Some(h) = line.strip_prefix("## ") {
+            if let Some(name) = line.strip_prefix("@demo ") {
+                ui.add_space(2.0);
+                demo(ui, name.trim());
+                ui.add_space(2.0);
+            } else if let Some(h) = line.strip_prefix("## ") {
                 ui.add_space(4.0);
                 ui.label(RichText::new(h).font(theme::medium(14.0)).color(pal.fg));
             } else if let Some(item) = line.strip_prefix("- ") {
@@ -321,13 +415,13 @@ impl GifKitApp {
 /// What's new in this version: a headline, a line about it, and the
 /// Handbook topic that explains it.
 const WHATS_NEW: &[(&str, &str, &str)] = &[
-    ("Adjustment layers", "Levels, Curves and 15 more, like Photoshop's. Press A or Ctrl+L", "Adjustments"),
-    ("Blend modes", "Multiply, Screen, Overlay and the rest on every layer, in the Layers panel", "Blend Modes"),
+    ("Adjustment layers", "Levels, Curves and fifteen more, like Photoshop's. Press A or Ctrl+L", "Adjustments"),
+    ("Layer groups and styles", "Ctrl+G tucks layers in a folder. The fx button adds stroke, shadow and glow", "Layers"),
+    ("Pick several layers", "Ctrl+click or Shift+click in the Layers panel. Hold Alt to change them all", "Layers"),
+    ("Blend modes", "Multiply, Screen, Overlay and the rest on every layer", "Blend Modes"),
     ("Command palette", "Ctrl+K finds any tool, adjustment or command by name", "Shortcuts and Palette"),
-    ("Layer groups and styles", "Ctrl+G puts layers in a folder. The fx button adds stroke, shadow and glow", "Layers"),
-    ("Rulers, grid and smart guides", "In View. Layers snap to guides, the grid, the centre and each other", "Rulers and Guides"),
+    ("Rulers, grid and smart guides", "All in View. Layers snap to guides, the grid, the middle and each other", "Rulers and Guides"),
     ("Before and after", "Hold \\ to see the frame without its adjustments", "Adjustments"),
-    ("Tool keys", "T Text, U Shapes, B Markup, E Emoji, Q Mask, A Adjust, G Effects", "Shortcuts and Palette"),
 ];
 
 /// Show What's New now? After an update (not on a first run), unless
@@ -416,6 +510,9 @@ mod tests {
             assert!(!text.trim().is_empty(), "{t}");
             for line in text.lines() {
                 assert_eq!(line, line.trim_end(), "{t}: trailing space");
+                if let Some(name) = line.strip_prefix("@demo ") {
+                    assert!(DEMOS.iter().any(|d| d.0 == name.trim()), "{t}: no demo {name}");
+                }
                 // list items stay short: one thought each
                 if let Some(item) = line.strip_prefix("- ") {
                     assert!(item.split_whitespace().count() <= 16, "{t}: {item}");
