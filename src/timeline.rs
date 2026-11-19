@@ -87,6 +87,19 @@ pub enum Ease {
     Custom,
 }
 
+/// The easing new keyframes start with (an index into `Ease::ALL`).
+static NEW_EASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The easing new keyframes get.
+pub fn new_ease() -> Ease {
+    Ease::ALL.get(NEW_EASE.load(std::sync::atomic::Ordering::Relaxed)).copied().unwrap_or_default()
+}
+
+pub fn set_new_ease(e: Ease) {
+    let i = Ease::ALL.iter().position(|x| *x == e).unwrap_or(0);
+    NEW_EASE.store(i, std::sync::atomic::Ordering::Relaxed);
+}
+
 impl Ease {
     pub const ALL: [Ease; 6] = [Ease::Smooth, Ease::Linear, Ease::In, Ease::Out, Ease::Hold, Ease::Custom];
 
@@ -341,7 +354,7 @@ impl Timing {
             return i;
         }
         let m = self.motion(frame);
-        let k = Key { frame, x: m.dx, y: m.dy, scale_x: m.sx * 100.0, scale_y: m.sy * 100.0, angle: m.angle, opacity: m.opacity * 100.0, ease: Ease::Smooth, curve: CURVE_SMOOTH };
+        let k = Key { frame, x: m.dx, y: m.dy, scale_x: m.sx * 100.0, scale_y: m.sy * 100.0, angle: m.angle, opacity: m.opacity * 100.0, ease: new_ease(), curve: CURVE_SMOOTH };
         self.keys.push(k);
         self.sort_keys();
         self.key_at(frame).unwrap_or(0)

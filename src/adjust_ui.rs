@@ -501,10 +501,11 @@ fn adjust_card(ui: &mut egui::Ui, item: &mut AdjustItem, k: usize, n: usize, lid
                 user_presets(ui, item, egui::Id::unique(("adj-presets", lid, k)));
             });
         });
-        if open {
+        // slides open and shut like the panel's groups
+        fold_body(ui, open_id.with("body"), open, |ui| {
             ui.add_space(4.0);
             ui.add_enabled_ui(item.on, |ui| adjust_editor(ui, &mut item.adj, egui::Id::unique(("adj", lid, k)), hist));
-        }
+        });
     });
     ui.add_space(6.0);
     ui.data_mut(|d| d.insert_temp(open_id, open));

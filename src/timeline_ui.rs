@@ -538,7 +538,9 @@ impl GifKitApp {
         if self.tl_track.is_some_and(|t| !tracks.contains(&t)) {
             self.tl_track = None;
         }
-        let idle = !self.busy();
+        // editing waits while it plays: the buttons stay grey rather than
+        // flickering on at every keyframe the playhead passes
+        let idle = !self.busy() && !self.playing;
         let sel_layer = self.tl_track.filter(|t| *t != GIF);
 
         // ---- toolbar: groups that don't fit go into a menu at the end
@@ -568,7 +570,7 @@ impl GifKitApp {
                 (TbAct::Delete, "edit-delete", "Delete", format!("Delete the selection{}", k(A::TlDelete)), idle && (self.tl_clip.is_some() || self.tl_key.is_some() || !self.tl_keys.is_empty() || !self.tl_sel.is_empty()) && !locked_sel, None),
             ],
             vec![
-                (TbAct::Copy, "edit-copy", "Copy", "Copy (Ctrl+C)".into(), any_clips || self.tl_key.is_some(), None),
+                (TbAct::Copy, "edit-copy", "Copy", "Copy (Ctrl+C)".into(), idle && (any_clips || self.tl_key.is_some()), None),
                 (TbAct::Paste, "edit-paste", "Paste", "Paste at the playhead (Ctrl+V)".into(), idle && self.tl_board.is_some() && (gif_board || (sel_layer.is_some() && !locked_sel)), None),
                 (TbAct::Duplicate, "edit-duplicate", "Duplicate", format!("Duplicate the selection{}", k(A::TlDuplicate)), idle && any_clips && !locked_sel, None),
             ],
@@ -739,7 +741,7 @@ impl GifKitApp {
             (Some((li, k)), _) => self.stack.layers[li].timing.keys[k],
             (None, Some(li)) => {
                 let m = self.stack.layers[li].timing.motion(self.cur);
-                Key { frame: self.cur, x: m.dx, y: m.dy, scale_x: m.sx * 100.0, scale_y: m.sy * 100.0, angle: m.angle, opacity: m.opacity * 100.0, ease: Ease::Smooth, curve: crate::timeline::CURVE_SMOOTH }
+                Key { frame: self.cur, x: m.dx, y: m.dy, scale_x: m.sx * 100.0, scale_y: m.sy * 100.0, angle: m.angle, opacity: m.opacity * 100.0, ease: crate::timeline::new_ease(), curve: crate::timeline::CURVE_SMOOTH }
             }
             _ => Key::default(),
         };
@@ -766,7 +768,7 @@ impl GifKitApp {
         let text_w = |t: &str| ui.painter().layout_no_wrap(t.into(), egui::TextStyle::Body.resolve(ui.style()), pal.fg).size().x;
         let gap = 6.0;
         // (group, width): 0 auto key, 1 position, 2 scale, 3 angle, 4 opacity, 5 ease
-        let widths = [
+        let full = [
             CHIP_H * 3.0 + gap * 3.0 + 18.0,
             text_w("Position:") + gap * 2.0 + 108.0 * 2.0,
             text_w("Scale:") + gap * 2.0 + 88.0 * 2.0,
@@ -775,6 +777,10 @@ impl GifKitApp {
             96.0,
         ];
         let avail = ui.available_width();
+        // narrow: the names go inside the fields instead of beside them, so
+        // more fits on a line
+        let compact = full.iter().sum::<f32>() + 14.0 * 5.0 > avail;
+        let widths = if compact { [full[0], 92.0 * 2.0 + gap, 84.0 * 2.0 + gap, 96.0, 108.0, 96.0] } else { full };
         let mut lines: Vec<Vec<usize>> = vec![Vec::new()];
         let mut used = 0.0;
         for (g, w) in widths.iter().enumerate() {
@@ -787,8 +793,16 @@ impl GifKitApp {
             lines.last_mut().unwrap().push(g);
         }
         let pos_on = editable && placed.is_some();
+        // while playing the values follow the playhead: greyed out, so they
+        // don't flicker on and off at every keyframe
+        let playing = self.playing;
         for line in lines {
-            ui.horizontal(|ui| {
+            // the fields on a line share out the room left over, so a short
+            // line doesn't leave a gap at its end
+            let used: f32 = line.iter().map(|g| widths[*g]).sum::<f32>() + 14.0 * line.len().saturating_sub(1) as f32;
+            let fixed: f32 = line.iter().filter(|g| **g == 0 || **g == 5).map(|g| widths[*g]).sum();
+            let fac = ((avail - fixed - 2.0) / (used - fixed).max(1.0)).clamp(1.0, 1.8);
+            ui.add_enabled_ui(!playing, |ui| ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = gap;
                 for (k, g) in line.into_iter().enumerate() {
                     if k > 0 {
@@ -876,28 +890,42 @@ impl GifKitApp {
                         // effects, watermarks and the AI shield cover the whole frame: they only fade
                         1 => {
                             ui.add_enabled_ui(pos_on, |ui| {
-                                ui.label("Position:").on_hover_text("Left and bottom edges in pixels");
-                                field(ui, "X  ", &mut px, " px", 1.0, 108.0);
-                                field(ui, "Y  ", &mut py, " px", 1.0, 108.0);
+                                if !compact {
+                                    ui.label("Position:").on_hover_text("Left and bottom edges in pixels");
+                                }
+                                let w = if compact { 92.0 } else { 108.0 } * fac;
+                                field(ui, "X  ", &mut px, " px", 1.0, w);
+                                field(ui, "Y  ", &mut py, " px", 1.0, w);
                             });
                         }
                         2 => {
                             ui.add_enabled_ui(pos_on, |ui| {
-                                ui.label("Scale:").on_hover_text("Size as placed, in %");
-                                field(ui, "X  ", &mut key.scale_x, "%", 5.0, 88.0);
-                                field(ui, "Y  ", &mut key.scale_y, "%", 5.0, 88.0);
+                                if !compact {
+                                    ui.label("Scale:").on_hover_text("Size as placed, in %");
+                                }
+                                let w = if compact { 84.0 } else { 88.0 } * fac;
+                                field(ui, if compact { "W  " } else { "X  " }, &mut key.scale_x, "%", 5.0, w);
+                                field(ui, if compact { "H  " } else { "Y  " }, &mut key.scale_y, "%", 5.0, w);
                             });
                         }
                         3 => {
                             ui.add_enabled_ui(pos_on, |ui| {
-                                ui.label("Angle:");
-                                field(ui, "", &mut key.angle, "°", 5.0, 70.0);
+                                if compact {
+                                    field(ui, "Angle  ", &mut key.angle, "°", 5.0, 96.0 * fac);
+                                } else {
+                                    ui.label("Angle:");
+                                    field(ui, "", &mut key.angle, "°", 5.0, 70.0 * fac);
+                                }
                             });
                         }
                         4 => {
                             ui.add_enabled_ui(editable, |ui| {
-                                ui.label("Opacity:");
-                                spin(ui, vec2(80.0, CHIP_H), &mut key.opacity, 5.0, |d| d.range(0.0..=100.0).max_decimals(0).suffix("%"));
+                                if compact {
+                                    spin(ui, vec2(108.0 * fac, CHIP_H), &mut key.opacity, 5.0, |d| d.range(0.0..=100.0).max_decimals(0).prefix("Opacity  ").suffix("%"));
+                                } else {
+                                    ui.label("Opacity:");
+                                    spin(ui, vec2(80.0 * fac, CHIP_H), &mut key.opacity, 5.0, |d| d.range(0.0..=100.0).max_decimals(0).suffix("%"));
+                                }
                             });
                         }
                         _ => {
@@ -908,6 +936,16 @@ impl GifKitApp {
                                     .show_ui(ui, |ui| {
                                         for e in Ease::ALL {
                                             ui.selectable_value(&mut key.ease, e, e.label());
+                                        }
+                                        // what new keyframes start as
+                                        ui.separator();
+                                        ui.label(RichText::new("New keyframes start as").size(11.5).color(p().fg_muted));
+                                        let cur = crate::timeline::new_ease();
+                                        for e in Ease::ALL.into_iter().filter(|e| *e != Ease::Custom) {
+                                            if ui.add(egui::Button::selectable(cur == e, format!("New: {}", e.label()))).clicked() {
+                                                crate::timeline::set_new_ease(e);
+                                                theme::set_setting("new_ease", e.label());
+                                            }
                                         }
                                     })
                                     .response
@@ -922,7 +960,7 @@ impl GifKitApp {
                         }
                     }
                 }
-            });
+            }));
         }
         // back from where it is to how far it moved
         if let Some(b) = placed {
@@ -945,6 +983,27 @@ impl GifKitApp {
                 t.keys[k] = Key { frame: self.cur, ..key };
                 self.tl_key = Some(k);
                 self.modified = true;
+                // Alt: whatever changed goes to every selected keyframe too
+                if ctx.input(|i| i.modifiers.alt) {
+                    let me = self.stack.layers[li].id;
+                    for &(lid, f) in &self.tl_keys {
+                        if (lid, f) == (me, self.cur) {
+                            continue;
+                        }
+                        let Some(oi) = self.stack.index_of(lid) else { continue };
+                        let t = &mut self.stack.layers[oi].timing;
+                        let Some(ki) = t.key_at(f) else { continue };
+                        let o = &mut t.keys[ki];
+                        if key.x != before.x { o.x = key.x; }
+                        if key.y != before.y { o.y = key.y; }
+                        if key.scale_x != before.scale_x { o.scale_x = key.scale_x; }
+                        if key.scale_y != before.scale_y { o.scale_y = key.scale_y; }
+                        if key.angle != before.angle { o.angle = key.angle; }
+                        if key.opacity != before.opacity { o.opacity = key.opacity; }
+                        if key.ease != before.ease { o.ease = key.ease; }
+                        if key.curve != before.curve { o.curve = key.curve; }
+                    }
+                }
             }
         }
         ui.add_space(2.0);
@@ -1065,6 +1124,9 @@ impl GifKitApp {
         }
         // markers: a flag on the ruler with its name
         let markers = self.stack.markers.clone();
+        // where each marker's name ends on screen, so the name is part of
+        // what a click or double-click hits
+        let mut label_end: Vec<f32> = vec![0.0; markers.len()];
         for (mi, m) in markers.iter().enumerate() {
             let x = fx(m.frame as f32);
             if x < lanes.min.x - 4.0 || x > area.max.x {
@@ -1081,6 +1143,7 @@ impl GifKitApp {
                 let g = if g.rows.len() > 1 { ui.fonts_mut(|f| f.layout_no_wrap("…".into(), egui::FontId::proportional(10.5), pal.fg)) } else { g };
                 // on a backing so the frame numbers don't run through it
                 painter.rect_filled(Rect::from_min_size(pos2(x + 9.0, y - 1.0), g.size() + vec2(4.0, 1.0)), 2.0, pal.window);
+                label_end[mi] = x + 11.0 + g.size().x + 2.0;
                 painter.galley(pos2(x + 11.0, y - 1.0), g, MARK);
             }
         }
@@ -1472,7 +1535,15 @@ impl GifKitApp {
             }
         }
         // a marker on the ruler under `x`
-        let marker_at = |me: &Self, x: f32| me.stack.markers.iter().position(|m| (fx(m.frame as f32) + 4.0 - x).abs() < 7.0);
+        let marker_at = |me: &Self, x: f32| {
+            me.stack.markers.iter().position(|m| (fx(m.frame as f32) + 4.0 - x).abs() < 7.0).or_else(|| {
+                // or its name beside it
+                me.stack.markers.iter().enumerate().position(|(mi, m)| {
+                    let x0 = fx(m.frame as f32);
+                    x >= x0 && x <= label_end.get(mi).copied().unwrap_or(x0)
+                })
+            })
+        };
         if resp.double_clicked() {
             if let Some(p) = hovered_pos.filter(|p| p.y < tracks_top && p.x >= lanes.min.x) {
                 if let Some(mi) = marker_at(self, p.x) {
@@ -2392,6 +2463,11 @@ impl GifKitApp {
                     let te = ui.add(egui::TextEdit::singleline(&mut text).desired_width(150.0).font(egui::FontId::proportional(12.0)));
                     if !te.has_focus() && !te.lost_focus() {
                         te.request_focus();
+                        // all of it picked, so typing replaces "Marker 3"
+                        if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), te.id) {
+                            st.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(text.chars().count()))));
+                            st.store(ui.ctx(), te.id);
+                        }
                     }
                     if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                         done = Some(false);
@@ -3082,9 +3158,13 @@ impl GifKitApp {
         }
         self.snapshot(&format!("tl-marker{now}"), now);
         let label = format!("Marker {}", self.stack.markers.len() + 1);
-        self.stack.markers.push(Marker { frame: self.cur, label });
+        self.stack.markers.push(Marker { frame: self.cur, label: label.clone() });
         self.stack.markers.sort_by_key(|m| m.frame);
         self.modified = true;
+        // straight into naming it
+        if let Some(mi) = self.stack.markers.iter().position(|m| m.frame == self.cur) {
+            self.tl_marker_edit = Some((mi, label));
+        }
     }
 
     /// The nearest snap target to `pos` (a frame boundary), within `thr` frames.

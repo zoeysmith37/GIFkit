@@ -14,8 +14,9 @@ Nothing touches your frames until you export. Every edit is a layer or a frame e
 
 ## Panels
 - Number fields: drag across them to change, or click and type
+- Sliders aren't fenced in: type past the end and the slider stretches to fit
 - Shift while dragging is finer. Ctrl lands on round numbers
-- A blue dot in a field means it's been changed. Right-click to reset it
+- A blue dot in a field means it's been changed. Right-click any number to reset it
 - More opens the rest of a section, and stays open till you close it
 - Effects you haven't switched on stay folded out of the way
 
@@ -41,12 +42,14 @@ With no layer of a tool's kind picked, changing a setting adds one. With one pic
 - Ctrl+click a layer to add it to the pick. Shift+click picks a whole run
 - The last one you clicked is the active one, with the brighter highlight
 - Settings show the active layer. Changes go to it alone
-- Hold Alt while changing opacity, blend, lock or style to do the lot at once
+- Hold Alt while changing a setting to change it on every picked layer of that kind
 - Drag any picked layer and the rest come along too
 
 ## Groups
 @demo groups
 - Ctrl+G tucks the picked layers into a group, a folder in the Layers panel
+- Click a group's row for its own Opacity and Blend at the top of the panel
+- Pass Through blends its layers one by one. Any other mode puts the group together first
 - Drag layers into a group, or back out again
 - A group's eye and lock look after all its layers in one go
 - Drag a group's row to shift the whole lot
@@ -54,7 +57,8 @@ With no layer of a tool's kind picked, changing a setting adds one. With one pic
 
 ## Layer styles
 @demo styles
-- The fx button beside Blend adds a stroke, drop shadow or outer glow
+- The fx button beside Blend opens Layer Style: stroke, drop shadow and outer glow
+- Right-click a layer for Layer Style too. The window follows whichever layer you pick
 - Each one has its own switch. They work on text, shapes and emoji
 
 ## The Layers panel
@@ -69,6 +73,9 @@ With no layer of a tool's kind picked, changing a setting adds one. With one pic
 
 ## Colours
 Any colour button opens a picker. Under the number boxes sit your recent colours, and below those the main colours in the frame on screen. Handy.
+
+## Image layers
+- Replace Image swaps the picture and keeps the rest: place, size, motion and effects
 
 ## Text
 - Drag text on the preview to put it where you want it
@@ -199,11 +206,15 @@ While you move or resize a layer, pink lines show where it lines up with the fra
 ## Playing
 - Space plays and the arrow keys step a frame
 - I and O set in and out points. Export can save just that bit
+- New markers ask for a name straight away. Click a marker's name to change it
 - Trim to Last Clip chops off the empty end
 - Shift+O shows onion skin: frames before in red, the next in green
 
 ## Moving layers
 - K adds a keyframe. Auto key adds one whenever you change a value
+- The easing list also sets what new keyframes start as
+- Hold Alt while changing a keyframe to change every selected one
+- The keyframe controls grey out while playing
 - Ease Custom opens a curve to shape the timing. Back overshoots
 - Draw Path: drag on the preview and the layer follows the line
 - With keyframes, dragging a layer on the preview keys it at the playhead
@@ -228,6 +239,7 @@ Drag on the preview to set the crop. Preview picks whether you see it with your 
 - Change Frame Rate makes more or fewer frames for the same length
 - Layers and keyframes stay in time when the frame rate changes
 - Frames skips the frames you don't want and adds images as new ones
+- Repeated Frames finds frames that copy the one before and merges them
 
 ## In-betweens
 Frames > In-Betweens adds new frames between each pair for smoother motion.

@@ -1156,6 +1156,14 @@ pub struct GifKitApp {
     grid_snap: bool,
     /// the Layer Style window is open (on the picked layer)
     style_open: bool,
+    /// the Frames tool's repeated-frame finder: how alike, and whether the
+    /// merged frames' time is kept
+    dupe_level: usize,
+    dupe_keep_time: bool,
+    /// an image layer waiting for its new picture to load
+    replace_image: Option<u64>,
+    /// Alt held this frame (for edits that go to every picked layer)
+    alt_down: bool,
     /// a group's row picked: the panel's opacity and blend are the group's
     sel_group: Option<u64>,
     /// layers picked together in the Layers panel (ids); the active one,
@@ -1763,6 +1771,36 @@ fn group_ex<R>(ui: &mut egui::Ui, title: &str, default_open: bool, badge: Option
     child.add_space(8.0);
     let top = child.cursor().top();
     let r = body(&mut child);
+    let h = child.cursor().top() - top;
+    ui.ctx().data_mut(|d| d.insert_temp(h_id, h));
+    ui.allocate_exact_size(vec2(w, shown), Sense::hover());
+    ui.ctx().request_repaint();
+    Some(r)
+}
+
+/// A fold's contents sliding open and shut: drawn whole, clipped to the
+/// part showing while it moves. Nothing when it's shut.
+fn fold_body<R>(ui: &mut egui::Ui, id: egui::Id, open: bool, add: impl FnOnce(&mut egui::Ui) -> R) -> Option<R> {
+    let t = theme::openness(ui.ctx(), id.with("anim"), open);
+    if t <= 0.0 {
+        return None;
+    }
+    let h_id = id.with("height");
+    if t >= 1.0 {
+        let top = ui.cursor().top();
+        let r = add(ui);
+        let h = ui.cursor().top() - top;
+        ui.ctx().data_mut(|d| d.insert_temp(h_id, h));
+        return Some(r);
+    }
+    let full: f32 = ui.ctx().data(|d| d.get_temp(h_id)).unwrap_or(160.0);
+    let shown = (full * t).max(0.0);
+    let w = ui.available_width();
+    let at = ui.cursor().min;
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(at, vec2(w, full.max(1.0) + 2000.0))).layout(*ui.layout()));
+    child.set_clip_rect(Rect::from_min_size(at, vec2(w, shown)).intersect(ui.clip_rect()));
+    let top = child.cursor().top();
+    let r = add(&mut child);
     let h = child.cursor().top() - top;
     ui.ctx().data_mut(|d| d.insert_temp(h_id, h));
     ui.allocate_exact_size(vec2(w, shown), Sense::hover());
@@ -3657,6 +3695,16 @@ impl GifKitApp {
             multi: Vec::new(),
             style_open: false,
             sel_group: None,
+            replace_image: None,
+            alt_down: {
+                // the easing new keyframes start with, as last chosen
+                if let Some(e) = theme::get_setting("new_ease").and_then(|v| crate::timeline::Ease::ALL.into_iter().find(|e| e.label() == v)) {
+                    crate::timeline::set_new_ease(e);
+                }
+                false
+            },
+            dupe_level: 1,
+            dupe_keep_time: true,
             group_drag: None,
             group_rename_done: None,
             picture_colours_key: None,
@@ -4017,9 +4065,31 @@ impl GifKitApp {
                 }
             }
             JobOutput::Overlay(Ok(src)) => {
-                self.add_overlay(src);
-                self.tool = Tool::AddImage;
-                self.info("Overlay added. Drag it into place");
+                match self.replace_image.take().and_then(|id| self.stack.index_of(id)) {
+                    // a new picture for an image layer: everything else stays
+                    Some(li) => {
+                        let now = ctx.input(|i| i.time);
+                        self.snapshot(&format!("replace{now}"), now);
+                        if let LayerKind::Overlay(o) = &mut self.stack.layers[li].kind {
+                            let (nw, nh) = src.native_size();
+                            // the same width and middle; the height follows the new picture's shape
+                            for pl in &mut o.placements {
+                                let cy = pl.y as f32 + pl.h as f32 / 2.0;
+                                let h = (pl.w as f32 * nh as f32 / nw.max(1) as f32).round().max(1.0);
+                                pl.h = h as u32;
+                                pl.y = (cy - h / 2.0).round() as i32;
+                            }
+                            o.src = Arc::new(src);
+                        }
+                        self.modified = true;
+                        self.info("Image replaced. Its place, motion and effects are kept");
+                    }
+                    None => {
+                        self.add_overlay(src);
+                        self.tool = Tool::AddImage;
+                        self.info("Overlay added. Drag it into place");
+                    }
+                }
             }
             JobOutput::Anim(Err(e)) | JobOutput::Baked(Err(e)) | JobOutput::Loaded(Err(e)) | JobOutput::Overlay(Err(e)) | JobOutput::Fit(Err(e)) | JobOutput::ProjectLoaded(Err(e)) | JobOutput::ProjectSaved(Err(e)) => self.error(format!("{label} failed: {e:#}")),
             JobOutput::ProjectLoaded(Ok((pr, path))) => self.apply_project(pr, path),
@@ -6969,6 +7039,7 @@ impl eframe::App for GifKitApp {
         let ctx = ui.ctx().clone();
         // groups stay whole however the layers were moved
         self.stack.tidy_groups();
+        self.alt_down = ctx.input(|i| i.modifiers.alt);
         self.sync_multi();
         // GIFKIT_STALL: frames that took long to make, and where the time went
         if std::env::var_os("GIFKIT_STALL").is_some() {
@@ -13840,6 +13911,33 @@ impl GifKitApp {
         }
         match sel {
             Some(i) => {
+                // Alt: the settings that changed go to every picked layer of
+                // the same kind too (only those, so each keeps its own text,
+                // place and the rest)
+                let alt = self.alt_down;
+                if alt && self.multi.len() > 1 {
+                    if let (Some(old), Some(new)) = (Self::kind_json(&self.stack.layers[i].kind), Self::kind_json(&kind)) {
+                        if let (Some(o), Some(nw)) = (old.as_object(), new.as_object()) {
+                            let diff: Vec<(String, serde_json::Value)> = nw.iter().filter(|(k, v)| o.get(*k) != Some(*v)).map(|(k, v)| (k.clone(), v.clone())).collect();
+                            for oi in self.picked() {
+                                if oi == i || std::mem::discriminant(&self.stack.layers[oi].kind) != std::mem::discriminant(&kind) || self.stack.layers[oi].locked {
+                                    continue;
+                                }
+                                if let Some(mut j) = Self::kind_json(&self.stack.layers[oi].kind) {
+                                    if let Some(m) = j.as_object_mut() {
+                                        for (k, v) in &diff {
+                                            m.insert(k.clone(), v.clone());
+                                        }
+                                    }
+                                    let mut l = self.stack.layers[oi].kind.clone();
+                                    if Self::kind_from_json(&mut l, j) {
+                                        self.stack.layers[oi].kind = l;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 self.stack.layers[i].kind = kind;
                 self.modified = true;
             }
@@ -13848,6 +13946,33 @@ impl GifKitApp {
             }
         }
     }
+
+    /// A layer's settings as JSON, for copying changed fields between layers.
+    fn kind_json(k: &LayerKind) -> Option<serde_json::Value> {
+    match k {
+        LayerKind::Text(a) => serde_json::to_value(a).ok(),
+        LayerKind::Shape(s) => serde_json::to_value(&**s).ok(),
+        LayerKind::Emoji(e) => serde_json::to_value(&**e).ok(),
+        LayerKind::Censor(c) => serde_json::to_value(c).ok(),
+        LayerKind::Effects(fx) => serde_json::to_value(&**fx).ok(),
+        LayerKind::Shield(s) => serde_json::to_value(s).ok(),
+        _ => None,
+    }
+}
+
+/// Settings back from JSON into a layer of the same kind. False if they
+    /// didn't fit.
+    fn kind_from_json(k: &mut LayerKind, j: serde_json::Value) -> bool {
+    match k {
+        LayerKind::Text(a) => serde_json::from_value(j).map(|v| *a = v).is_ok(),
+        LayerKind::Shape(s) => serde_json::from_value(j).map(|v| **s = v).is_ok(),
+        LayerKind::Emoji(e) => serde_json::from_value(j).map(|v| **e = v).is_ok(),
+        LayerKind::Censor(c) => serde_json::from_value(j).map(|v| *c = v).is_ok(),
+        LayerKind::Effects(fx) => serde_json::from_value(j).map(|v| **fx = v).is_ok(),
+        LayerKind::Shield(s) => serde_json::from_value(j).map(|v| *s = v).is_ok(),
+        _ => false,
+    }
+}
 
     /// Default placement of a new text layer.
     fn place_text(&self, a: &mut Annotation) {
@@ -13994,7 +14119,7 @@ impl GifKitApp {
                     let v = if i == 0 { &mut a.stretch } else { &mut a.stretch_y };
                     let mut pct = *v * 100.0;
                     let tip = if i == 0 { "Squash or stretch the text sideways" } else { "Squash or stretch the text up and down" };
-                    if spin(ui, size, &mut pct, 1.0, |d| d.range(5.0..=2000.0).speed(0.5).max_decimals(0).prefix(if i == 0 { "X  " } else { "Y  " }).suffix("%")).on_hover_text(tip).changed() {
+                    if spin(ui, size, &mut pct, 1.0, |d| d.range(1.0..=5000.0).speed(0.5).max_decimals(0).prefix(if i == 0 { "X  " } else { "Y  " }).suffix("%")).on_hover_text(tip).changed() {
                         *v = pct / 100.0;
                     }
                 })
@@ -14120,6 +14245,7 @@ impl GifKitApp {
         let (aw, ah) = self.dims();
         let src_idx = self.plan.get(self.cur).map(|f| f.src).unwrap_or(0);
         let mut scope = self.place_scope;
+        let mut replace_pick = false;
         // with no image layer the settings show greyed out with stand-in values
         let mut dummy: Option<OverlayLayer> = None;
         let o: &mut OverlayLayer = match sel.map(|i| &mut self.stack.layers[i].kind) {
@@ -14138,6 +14264,12 @@ impl GifKitApp {
         ui.add_enabled_ui(real, |ui| {
             group(ui, "Image", |ui| {
                 form_row(ui, "Source", |ui| cell(ui, vec2(ui.available_width(), CHIP_H), |ui| hint(ui, &if real { format!("{}×{} · {} frame{}", native.0, native.1, nframes, if nframes == 1 { "" } else { "s" }) } else { "None".into() })));
+                form_row(ui, "", |ui| {
+                    let b = egui::Button::image_and_text(crate::icons::image(ui.ctx(), "document-open", 16.0, p().fg), "Replace Image…");
+                    if wide_button(ui, b).on_hover_text("Pick another picture or animation for this layer. Its place, size, motion, effects and the rest are kept").clicked() {
+                        replace_pick = true;
+                    }
+                });
                 slider_row(ui, "Opacity", Spin::new(&mut o.opacity, 0.0..=100.0).suffix("%").max_decimals(0));
             });
             if o.placements.is_empty() {
@@ -14203,6 +14335,14 @@ impl GifKitApp {
         .on_disabled_hover_text("Add an image layer first");
         drop(dummy);
         self.place_scope = scope;
+        if replace_pick {
+            if let Some(li) = sel {
+                if let Some(path) = rfd::FileDialog::new().add_filter("Images", &["png", "gif", "jpg", "jpeg", "webp", "bmp"]).pick_file() {
+                    self.replace_image = Some(self.stack.layers[li].id);
+                    self.load_overlay(path, ctx);
+                }
+            }
+        }
     }
 
     fn ui_watermark(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
@@ -14974,6 +15114,48 @@ impl GifKitApp {
             }
             self.timing_rev += 1;
         }
+        // frames that repeat the one before, found and merged after import
+        let mut merge_now = false;
+        group(ui, "Repeated Frames", |ui| {
+            let levels: Vec<(usize, &str)> = crate::io::MERGE_LEVELS.iter().enumerate().skip(1).map(|(i, l)| (i, l.0)).collect();
+            form_row(ui, "Find", |ui| combo(ui, "dupe-level", &mut self.dupe_level, &levels)).on_hover_text("How alike a frame must be to the one before to count as a repeat");
+            form_row(ui, "", |ui| check(ui, &mut self.dupe_keep_time, "Keep their time")).on_hover_text("On: the frame that stays shows for as long as the ones merged into it, so the timing is the same. Off: they're just skipped");
+            form_row(ui, "", |ui| {
+                merge_now = wide_button(ui, egui::Button::new("Merge Repeated Frames")).on_hover_text("Skips frames that repeat the one before. Undo brings them back").clicked();
+            });
+        });
+        if merge_now {
+            self.snapshot(&format!("dupes{now}"), now);
+            let limit = crate::io::MERGE_LEVELS.get(self.dupe_level).map(|l| l.1).unwrap_or(0.0002);
+            let keep_time = self.dupe_keep_time;
+            let a = self.base.as_mut().unwrap();
+            let mut kept: Option<usize> = None;
+            let mut merged = 0usize;
+            for i in 0..a.frames.len() {
+                if !a.frames[i].enabled {
+                    continue;
+                }
+                let same = kept.is_some_and(|k| {
+                    let (x, y) = (a.frames[k].image.get(), a.frames[i].image.get());
+                    x.dimensions() == y.dimensions() && crate::io::changed_share(x.as_raw(), y.as_raw(), limit) <= limit
+                });
+                match (same, kept) {
+                    (true, Some(k)) => {
+                        if keep_time {
+                            let d = a.frames[i].delay_cs;
+                            a.frames[k].delay_cs = a.frames[k].delay_cs.saturating_add(d);
+                        }
+                        a.frames[i].enabled = false;
+                        merged += 1;
+                    }
+                    _ => kept = Some(i),
+                }
+            }
+            self.timing_rev += 1;
+            self.version += 1;
+            self.modified = true;
+            self.info(if merged == 0 { "No repeated frames found".to_string() } else { format!("{merged} repeated frame{} merged", if merged == 1 { "" } else { "s" }) });
+        }
         group(ui, "Timing", |ui| {
             let mut set_all = false;
             form_row(ui, "Delay", |ui| {
@@ -15011,7 +15193,7 @@ impl GifKitApp {
             form_row(ui, "Add", |ui| {
                 even_grid(ui, 2, 0.0, |ui, i, size| {
                     if i == 0 {
-                        spin(ui, size, &mut self.fr_crossfade, 1.0, |d| d.range(1..=30).suffix(" each")).on_hover_text("New frames between each pair");
+                        spin(ui, size, &mut self.fr_crossfade, 1.0, |d| d.range(1..=120).suffix(" each")).on_hover_text("New frames between each pair");
                     } else {
                         cell(ui, size, |ui| check(ui, &mut self.fr_crossfade_wrap, "Loop")).on_hover_text("Also blend the last frame into the first");
                     }
