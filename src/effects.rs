@@ -180,8 +180,6 @@ pub struct EffectSettings {
     pub adjust: Vec<crate::adjust::AdjustItem>,
     /// made in the Adjust panel (shows there, named after its adjustments)
     pub adjust_layer: bool,
-    /// how the adjustments meet what's under them
-    pub adjust_mode: crate::adjust::Blend,
 }
 
 impl Default for EffectSettings {
@@ -309,7 +307,6 @@ impl Default for EffectSettings {
             counter_size: 7.0,
             adjust: Vec::new(),
             adjust_layer: false,
-            adjust_mode: crate::adjust::Blend::Normal,
         }
     }
 }
@@ -923,7 +920,7 @@ pub fn apply_frame(src: &RgbaImage, idx: usize, n: usize, elapsed_s: f32, clip_s
     let mut img = src.clone();
     let d = EffectSettings::default();
 
-    crate::adjust::apply(&mut img, &s.adjust, s.adjust_mode);
+    crate::adjust::apply(&mut img, &s.adjust, crate::adjust::Blend::Normal);
     if s.hue != d.hue || s.saturation != d.saturation || s.lightness != d.lightness {
         modulate(&mut img, s.hue, s.saturation, s.lightness);
     }

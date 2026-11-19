@@ -155,6 +155,15 @@ pub enum Blend {
 }
 
 impl Blend {
+    pub fn is_normal(&self) -> bool {
+        *self == Blend::Normal
+    }
+
+    /// For the shader: its place in `ALL`.
+    pub fn code(self) -> u32 {
+        Blend::ALL.iter().position(|b| *b == self).unwrap_or(0) as u32
+    }
+
     pub const ALL: [Blend; 16] = [
         Blend::Normal, Blend::Darken, Blend::Multiply, Blend::ColorBurn, Blend::Lighten, Blend::Screen, Blend::ColorDodge, Blend::Overlay, Blend::SoftLight, Blend::HardLight, Blend::Difference, Blend::Exclusion, Blend::Hue, Blend::Saturation, Blend::Color, Blend::Luminosity,
     ];

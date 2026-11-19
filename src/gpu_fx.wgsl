@@ -63,6 +63,94 @@ fn out8(c: vec4<f32>) -> vec4<f32> {
     return clamp(rnd4(c), vec4<f32>(0.0), vec4<f32>(255.0)) / 255.0;
 }
 
+// ---- blend modes (adjust::Blend::apply), colours 0..1
+
+fn bl_lum(c: vec3<f32>) -> f32 {
+    return 0.3 * c.r + 0.59 * c.g + 0.11 * c.b;
+}
+
+fn bl_set_lum(c0: vec3<f32>, l: f32) -> vec3<f32> {
+    let c = c0 + vec3<f32>(l - bl_lum(c0));
+    let ll = bl_lum(c);
+    let mn = min(c.r, min(c.g, c.b));
+    let mx = max(c.r, max(c.g, c.b));
+    var o = c;
+    if (mn < 0.0) {
+        o = vec3<f32>(ll) + (o - vec3<f32>(ll)) * ll / max(ll - mn, 1e-6);
+    }
+    if (mx > 1.0) {
+        o = vec3<f32>(ll) + (o - vec3<f32>(ll)) * (1.0 - ll) / max(mx - ll, 1e-6);
+    }
+    return clamp(o, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+fn bl_sat(c: vec3<f32>) -> f32 {
+    return max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b));
+}
+
+fn bl_set_sat(c: vec3<f32>, s: f32) -> vec3<f32> {
+    let mx = max(c.r, max(c.g, c.b));
+    let mn = min(c.r, min(c.g, c.b));
+    if (mx - mn <= 1e-9) {
+        return vec3<f32>(0.0);
+    }
+    return (c - vec3<f32>(mn)) * s / (mx - mn);
+}
+
+fn bl_hard(cb: f32, cs: f32) -> f32 {
+    if (cs <= 0.5) {
+        return cb * 2.0 * cs;
+    }
+    let t = 2.0 * cs - 1.0;
+    return cb + t - cb * t;
+}
+
+fn bl_one(mode: i32, cb: f32, cs: f32) -> f32 {
+    switch mode {
+        case 1: { return min(cb, cs); }
+        case 2: { return cb * cs; }
+        case 3: {
+            if (cb >= 1.0) { return 1.0; }
+            if (cs <= 0.0) { return 0.0; }
+            return 1.0 - min((1.0 - cb) / cs, 1.0);
+        }
+        case 4: { return max(cb, cs); }
+        case 5: { return cb + cs - cb * cs; }
+        case 6: {
+            if (cb <= 0.0) { return 0.0; }
+            if (cs >= 1.0) { return 1.0; }
+            return min(cb / (1.0 - cs), 1.0);
+        }
+        case 7: { return bl_hard(cs, cb); }
+        case 8: {
+            if (cs <= 0.5) {
+                return cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb);
+            }
+            var d = sqrt(cb);
+            if (cb <= 0.25) {
+                d = ((16.0 * cb - 12.0) * cb + 4.0) * cb;
+            }
+            return cb + (2.0 * cs - 1.0) * (d - cb);
+        }
+        case 9: { return bl_hard(cb, cs); }
+        case 10: { return abs(cb - cs); }
+        case 11: { return cb + cs - 2.0 * cb * cs; }
+        default: { return cs; }
+    }
+}
+
+fn blend_mode(mode: i32, b: vec3<f32>, s: vec3<f32>) -> vec3<f32> {
+    switch mode {
+        case 12: { return bl_set_lum(bl_set_sat(s, bl_sat(b)), bl_lum(b)); }
+        case 13: { return bl_set_lum(bl_set_sat(b, bl_sat(s)), bl_lum(b)); }
+        case 14: { return bl_set_lum(s, bl_lum(b)); }
+        case 15: { return bl_set_lum(b, bl_lum(s)); }
+        default: {
+            return clamp(vec3<f32>(bl_one(mode, b.r, s.r), bl_one(mode, b.g, s.g), bl_one(mode, b.b, s.b)), vec3<f32>(0.0), vec3<f32>(1.0));
+        }
+    }
+}
+
 fn luma(c: vec4<f32>) -> f32 {
     return 0.299 * c.r + 0.587 * c.g + 0.114 * c.b;
 }
@@ -1198,6 +1286,33 @@ fn fs_fx(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             let hi = c01 + (c11 - c01) * t.y;
             let c = lo + (hi - lo) * t.z;
             return vec4<f32>(c8v(c), q.a) / 255.0;
+        }
+        // 60 layer t0 over frame t1 in blend mode a.x (adjust::Blend::ALL),
+        // both premultiplied; a.y = 1: t0 is a whole-frame layer's result
+        // (stack::blend_onto and blend_full)
+        case 60: {
+            let l = textureLoad(t0, ip, 0);
+            let b = textureLoad(t1, ip, 0);
+            let mode = i32(a.x);
+            if (a.y > 0.5) {
+                if (l.a <= 0.0 || b.a <= 0.0) {
+                    return l;
+                }
+                let m = blend_mode(mode, b.rgb / b.a, l.rgb / l.a);
+                return vec4<f32>(m * l.a, l.a);
+            }
+            if (l.a <= 0.0) {
+                return b;
+            }
+            if (b.a <= 0.0) {
+                return l;
+            }
+            let s = l.rgb / l.a;
+            let d = b.rgb / b.a;
+            let m = blend_mode(mode, d, s);
+            let ao = l.a + b.a * (1.0 - l.a);
+            let co = l.a * (1.0 - b.a) * s + l.a * b.a * m + (1.0 - l.a) * b.a * d;
+            return vec4<f32>(co, ao);
         }
         // 53 clear to transparent
         case 53: {

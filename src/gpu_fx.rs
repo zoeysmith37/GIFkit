@@ -206,7 +206,7 @@ pub fn effects_ok(s: &EffectSettings) -> bool {
 /// effects::apply_frame as passes.
 pub fn effects<'a>(p: &mut Plan<'a, '_>, s: &EffectSettings, idx: usize, n: usize, elapsed_s: f32, clip_s: f32, fonts: &[FontEntry]) {
     let d = EffectSettings::default();
-    if let Some(lut) = crate::adjust::lut(&s.adjust, s.adjust_mode) {
+    if let Some(lut) = crate::adjust::lut(&s.adjust, crate::adjust::Blend::Normal) {
         // 59: the adjustments' lookup table, read between its points
         p.owned.push((*lut).clone());
         let k = p.owned.len() - 1;

@@ -426,6 +426,8 @@ pub struct Layer {
     pub mask: Option<crate::shapes::LayerMask>,
     /// mirrored left to right, top to bottom, in its own box
     pub flip: [bool; 2],
+    /// how it meets what's under it (Photoshop's blend modes)
+    pub blend: crate::adjust::Blend,
 }
 
 impl Layer {
@@ -554,6 +556,9 @@ pub fn layer_signature(l: &Layer) -> u64 {
     }
     if l.clip {
         "clip".hash(&mut h);
+    }
+    if l.blend != crate::adjust::Blend::Normal {
+        l.blend.hash(&mut h);
     }
     if let Some(m) = &l.mask {
         format!("{m:?}").hash(&mut h);
@@ -812,7 +817,7 @@ impl Stack {
     pub fn push(&mut self, kind: LayerKind) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
-        self.layers.push(Layer { id, visible: true, kind, label: None, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2] });
+        self.layers.push(Layer { id, visible: true, kind, label: None, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2], blend: Default::default() });
         id
     }
 
@@ -1260,11 +1265,11 @@ impl Stack {
         let n = plan.len();
         let lm = if self.layer_shows(li, i, n) { self.mask_coverage(li, i, plan, fonts, prep, img.dimensions()) } else { None };
         if lm.is_none() && clip.is_none() {
-            self.draw_layer(img, li, i, plan, times, fonts, prep);
+            self.draw_layer_blended(img, li, i, plan, times, fonts, prep);
             return;
         }
         let before = img.clone();
-        self.draw_layer(img, li, i, plan, times, fonts, prep);
+        self.draw_layer_blended(img, li, i, plan, times, fonts, prep);
         if img.dimensions() != before.dimensions() {
             return;
         }
@@ -1280,6 +1285,32 @@ impl Stack {
             _ => return,
         };
         mask_blend(img, &before, &m);
+    }
+
+    /// `draw_layer` in the layer's blend mode: drawn on its own and laid
+    /// over what's under it, or (an effect) its result blended with the
+    /// frame before it.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_layer_blended(&self, img: &mut RgbaImage, li: usize, i: usize, plan: &[PlanFrame], times: &[f32], fonts: &[FontEntry], prep: &Prepared) {
+        let mode = self.layers[li].blend;
+        if mode == crate::adjust::Blend::Normal || !self.layer_shows(li, i, plan.len()) {
+            self.draw_layer(img, li, i, plan, times, fonts, prep);
+            return;
+        }
+        if Self::coverage_kind(&self.layers[li].kind) {
+            let (w, h) = img.dimensions();
+            let mut alone = RgbaImage::new(w, h);
+            self.draw_layer(&mut alone, li, i, plan, times, fonts, prep);
+            if alone.dimensions() == img.dimensions() {
+                blend_onto(img, &alone, mode);
+            }
+        } else {
+            let before = img.clone();
+            self.draw_layer(img, li, i, plan, times, fonts, prep);
+            if img.dimensions() == before.dimensions() {
+                blend_full(img, &before, mode);
+            }
+        }
     }
 
     /// Does layer `li` show at plan frame `i`?
@@ -2007,6 +2038,12 @@ impl Stack {
                 draws.push(GpuOp::ClipBegin);
                 open_lmask = Some((slot, lm.invert));
             }
+            // a blend mode: the frame kept, the layer drawn (on clear, unless
+            // it works on the whole frame), then the two blended
+            let blended = l.blend != crate::adjust::Blend::Normal && anim_clip.is_none();
+            if blended {
+                draws.push(GpuOp::BlendBegin { clear: Self::coverage_kind(&l.kind) });
+            }
             match &l.kind {
                 LayerKind::Effects(fx) => {
                     // as render_frame: from the layer's first frame to its last
@@ -2129,8 +2166,60 @@ impl Stack {
                     }
                 }
             }
+            if blended {
+                draws.push(GpuOp::BlendEnd { mode: l.blend.code(), full: !Self::coverage_kind(&l.kind) });
+            }
         }
         close(&mut draws, &mut open_clip, &mut mask_from, &mut masked, &mut open_lmask);
         Some(GpuFrame { size: (ow, oh), geo, ops: draws, owned })
     }
+}
+
+/// `alone` (one layer, straight alpha) laid over `under` in blend `mode`, as
+/// W3C compositing (and the shader's op 60) does it.
+pub fn blend_onto(under: &mut RgbaImage, alone: &RgbaImage, mode: crate::adjust::Blend) {
+    use rayon::prelude::*;
+    let w = under.width() as usize * 4;
+    under.as_mut().par_chunks_mut(w.max(4)).zip(alone.as_raw().par_chunks(w.max(4))).for_each(|(row, top)| {
+        for (d, s) in row.chunks_exact_mut(4).zip(top.chunks_exact(4)) {
+            if s[3] == 0 {
+                continue;
+            }
+            let sa = s[3] as f32 / 255.0;
+            let sc = [s[0] as f32 / 255.0, s[1] as f32 / 255.0, s[2] as f32 / 255.0];
+            if d[3] == 0 {
+                d.copy_from_slice(s);
+                continue;
+            }
+            let ba = d[3] as f32 / 255.0;
+            let bc = [d[0] as f32 / 255.0, d[1] as f32 / 255.0, d[2] as f32 / 255.0];
+            let m = mode.apply(bc, sc);
+            let ao = sa + ba * (1.0 - sa);
+            for k in 0..3 {
+                let co = sa * (1.0 - ba) * sc[k] + sa * ba * m[k] + (1.0 - sa) * ba * bc[k];
+                d[k] = (co / ao * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+            d[3] = (ao * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    });
+}
+
+/// A whole-frame layer's result `after`, blended with the frame `before` it
+/// in `mode` (where both show).
+pub fn blend_full(after: &mut RgbaImage, before: &RgbaImage, mode: crate::adjust::Blend) {
+    use rayon::prelude::*;
+    let w = after.width() as usize * 4;
+    after.as_mut().par_chunks_mut(w.max(4)).zip(before.as_raw().par_chunks(w.max(4))).for_each(|(row, under)| {
+        for (a, b) in row.chunks_exact_mut(4).zip(under.chunks_exact(4)) {
+            if a[3] == 0 || b[3] == 0 {
+                continue;
+            }
+            let s = [a[0] as f32 / 255.0, a[1] as f32 / 255.0, a[2] as f32 / 255.0];
+            let d = [b[0] as f32 / 255.0, b[1] as f32 / 255.0, b[2] as f32 / 255.0];
+            let m = mode.apply(d, s);
+            for k in 0..3 {
+                a[k] = (m[k] * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    });
 }

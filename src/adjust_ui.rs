@@ -353,18 +353,17 @@ impl GifKitApp {
         if pick.is_some() {
             ui.ctx().request_repaint();
         }
-        // how the whole layer meets what's under it
+        // how the whole layer meets what's under it (the Layers panel has it too)
         if let Some(li) = sel {
-            if let LayerKind::Effects(fx) = &mut self.stack.layers[li].kind {
-                let items: Vec<(adjust::Blend, &str)> = adjust::Blend::ALL.iter().map(|b| (*b, b.label())).collect();
-                let before = fx.adjust_mode;
-                form_row(ui, "Blend", |ui| combo(ui, "adj-blend", &mut fx.adjust_mode, &items))
-                    .on_hover_text("Luminosity: tones change but colours don't shift. Color: colours change, tones stay. Opacity is in the Layers panel");
-                if fx.adjust_mode != before {
-                    self.modified = true;
-                }
-                ui.add_space(4.0);
+            let items: Vec<(adjust::Blend, &str)> = adjust::Blend::ALL.iter().map(|b| (*b, b.label())).collect();
+            let mut mode = self.stack.layers[li].blend;
+            form_row(ui, "Blend", |ui| combo(ui, "adj-blend", &mut mode, &items))
+                .on_hover_text("Luminosity: tones change but colours don't shift. Color: colours change, tones stay. Opacity is in the Layers panel");
+            if mode != self.stack.layers[li].blend {
+                self.stack.layers[li].blend = mode;
+                self.modified = true;
             }
+            ui.add_space(4.0);
         }
         let hist = self.adjust_histogram();
         let Some(li) = sel else {
@@ -644,7 +643,8 @@ fn adjust_editor(ui: &mut egui::Ui, adj: &mut Adjust, id: egui::Id, hist: Option
                 if cur.is_none() {
                     items.push((usize::MAX, "Custom colour"));
                 }
-                if combo(ui, &format!("{id:?}-pf"), &mut v, &items).changed() && v != usize::MAX {
+                combo(ui, &format!("{id:?}-pf"), &mut v, &items);
+                if v != usize::MAX && Some(v) != cur {
                     f.color = adjust::FILTERS[v].1;
                 }
             });

@@ -1028,6 +1028,15 @@ fn gpu_matches_cpu() {
         let kinds: Vec<LayerKind> = ls.into_iter().map(|l| l.0).collect();
         cases.push((Box::leak(format!("{nm}^{}", clips.iter().map(|c| if *c { '1' } else { '0' }).collect::<String>()).into_boxed_str()), Transform::default(), kinds, vec![]));
     }
+    // blend modes: "@Mode" on the end sets every layer's
+    for b in crate::adjust::Blend::ALL.iter().skip(1) {
+        cases.push((Box::leak(format!("blend layers@{}", b.label()).into_boxed_str()), Transform::default(), layers(), vec![]));
+    }
+    for b in [crate::adjust::Blend::Multiply, crate::adjust::Blend::Overlay, crate::adjust::Blend::Luminosity, crate::adjust::Blend::Difference] {
+        let grey = LayerKind::Effects(Box::new(crate::effects::EffectSettings { adjust: crate::adjust::sample_list().into_iter().take(2).collect(), adjust_layer: true, ..Default::default() }));
+        cases.push((Box::leak(format!("blend adjust@{}", b.label()).into_boxed_str()), Transform::default(), vec![grey], vec![]));
+        cases.push((Box::leak(format!("blend fx blur@{}", b.label()).into_boxed_str()), Transform::default(), vec![LayerKind::Effects(Box::new(crate::effects::EffectSettings { blur: true, blur_sigma: 3.0, ..Default::default() }))], vec![]));
+    }
     let only = std::env::var("GPU_ONLY").ok();
     for (ci, (name, tr, ls, keys)) in cases.into_iter().enumerate() {
         if let Some(o) = &only {
@@ -1045,6 +1054,9 @@ fn gpu_matches_cpu() {
                 l.timing.keys = keys.clone();
             }
             l.clip = clips.get(k).copied().unwrap_or(false);
+            if let Some((_, m)) = name.split_once('@') {
+                l.blend = crate::adjust::Blend::ALL.iter().copied().find(|b| b.label() == m).unwrap_or_default();
+            }
         }
         st.layout_text(160, 120, &fonts);
         let plan = st.plan(&base);

@@ -26,6 +26,8 @@ mod timeline_ui;
 mod batch_ui;
 #[path = "adjust_ui.rs"]
 mod adjust_ui;
+#[path = "palette_ui.rs"]
+mod palette_ui;
 #[path = "smoke.rs"]
 mod smoke;
 #[path = "handbook.rs"]
@@ -143,7 +145,7 @@ impl Tool {
             Tool::Reverse => "Reverse, boomerang and loop",
             Tool::Speed => "Playback speed",
             Tool::Optimize => "Compression",
-            Tool::Effects => "Colour, filters and distortions",
+            Tool::Effects => "Filters, distortions and styles",
             Tool::Text => "Text layers",
             Tool::Censor => "Pixelate or blur part of the frame",
             Tool::AddImage => "Image overlays",
@@ -1099,6 +1101,11 @@ pub struct GifKitApp {
     tl_zone_loop: bool,
     /// show only this layer in the live view
     tl_solo: Option<u64>,
+    /// the command palette (Ctrl+K), and a command it ran for the next frame
+    palette: palette_ui::Palette,
+    palette_fire: Option<crate::keys::Action>,
+    /// `\` held: the edit without its adjustment and effects layers
+    before_after: bool,
     /// track heights, and the track whose bottom edge is being dragged
     tl_gif_h: f32,
     tl_row_h: f32,
@@ -3197,6 +3204,9 @@ impl GifKitApp {
             tl_out: None,
             tl_zone_loop: true,
             tl_solo: None,
+            palette: Default::default(),
+            palette_fire: None,
+            before_after: false,
             tl_gif_h: theme::get_setting("tl_gif_h").and_then(|v| v.parse().ok()).unwrap_or(40.0),
             tl_row_h: theme::get_setting("tl_row_h").and_then(|v| v.parse().ok()).unwrap_or(28.0),
             tl_row_drag: None,
@@ -5098,7 +5108,22 @@ impl GifKitApp {
         }
         let typing = ctx.egui_wants_keyboard_input();
         let km = self.keymap.clone();
-        let hit = |a: A| ctx.input(|i| km.pressed(i, a));
+        let fire = self.palette_fire.take();
+        let hit = |a: A| fire == Some(a) || ctx.input(|i| km.pressed(i, a));
+        if hit(A::Palette) || (ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::P))) {
+            let open = !self.palette.open;
+            self.palette = palette_ui::Palette { open, fresh: open, ..Default::default() };
+        }
+        // while the palette is up, keys are for it
+        if self.palette.open {
+            return;
+        }
+        // held: the frame without its adjustment and effects layers
+        let ba = !typing && ctx.input(|i| i.key_down(egui::Key::Backslash));
+        if ba != self.before_after {
+            self.before_after = ba;
+            ctx.request_repaint();
+        }
         let (undo, redo, play, left, right, fit, one, zin, zout, cmp) = (hit(A::Undo), hit(A::Redo), hit(A::PlayPause), hit(A::PrevFrame), hit(A::NextFrame), hit(A::Fit), hit(A::ActualSize), hit(A::ZoomIn), hit(A::ZoomOut), hit(A::SplitView));
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.export_open = false;
@@ -5138,6 +5163,30 @@ impl GifKitApp {
             self.cmp_go = self.cmp_key();
         }
         if !typing && self.base.is_some() && !self.busy() {
+            for (a, t) in [(A::ToolText, Tool::Text), (A::ToolShapes, Tool::Shapes), (A::ToolMarkup, Tool::Markup), (A::ToolEmoji, Tool::Emoji), (A::ToolMask, Tool::Mask), (A::ToolAdjust, Tool::Adjust), (A::ToolEffects, Tool::Effects)] {
+                if hit(a) {
+                    self.open_tool(t);
+                }
+            }
+            if let Some(li) = self.sel_layer_index() {
+                let n = self.stack.layers.len();
+                let now = ctx.input(|i| i.time);
+                // the list shows the top layer first: up is a higher index
+                let to = if hit(A::LayerUp) {
+                    Some((li + 1).min(n - 1))
+                } else if hit(A::LayerDown) {
+                    Some(li.saturating_sub(1))
+                } else if hit(A::LayerTop) {
+                    Some(n - 1)
+                } else if hit(A::LayerBottom) {
+                    Some(0)
+                } else {
+                    None
+                };
+                if let Some(to) = to.filter(|t| *t != li) {
+                    self.apply_layer_act(ctx, LayerAct::Move(li, to), now);
+                }
+            }
             for (a, q) in [(A::AdjLevels, Quick::Kind(0)), (A::AdjCurves, Quick::Kind(1)), (A::AdjHueSat, Quick::Kind(5)), (A::AdjBalance, Quick::Kind(6)), (A::AdjBlackWhite, Quick::Kind(7)), (A::AdjInvert, Quick::Kind(11)), (A::AdjDesaturate, Quick::Desaturate), (A::AutoTone, Quick::AutoTone), (A::AutoContrast, Quick::AutoContrast), (A::AutoColor, Quick::AutoColor)] {
                 if hit(a) {
                     self.quick_adjust(q);
@@ -5444,7 +5493,7 @@ impl GifKitApp {
 
     fn composite_key(&self) -> u64 {
         let proxy = self.ready_proxy().map(|(s, _)| s.to_bits() as u64).unwrap_or(0);
-        hash_parts(&[self.stack.signature(), self.version, self.timing_rev, self.pixelated as u64, self.plan.len() as u64, self.stack.plan_signature(), proxy, self.tl_solo.unwrap_or(u64::MAX)])
+        hash_parts(&[self.stack.signature(), self.version, self.timing_rev, self.pixelated as u64, self.plan.len() as u64, self.stack.plan_signature(), proxy, self.tl_solo.unwrap_or(u64::MAX), self.before_after as u64])
     }
 
     /// How much smaller preview frames are than the source (1 = full size).
@@ -5560,6 +5609,13 @@ impl GifKitApp {
         if let Some(id) = self.tl_solo {
             for l in &mut st.layers {
                 l.visible = l.id == id;
+            }
+        }
+        if self.before_after {
+            for l in &mut st.layers {
+                if matches!(l.kind(), Kind::Adjust | Kind::Effects) {
+                    l.visible = false;
+                }
             }
         }
         Some((st, a))
@@ -6040,6 +6096,7 @@ impl GifKitApp {
                 l.clip = src.clip;
                 l.mask = src.mask.clone();
                 l.flip = src.flip;
+                l.blend = src.blend;
                 last = Some((l.kind(), id));
             }
         }
@@ -6730,6 +6787,7 @@ impl eframe::App for GifKitApp {
         self.track_live_edits(&ctx, now);
         mark("edits");
         self.shortcuts_window(&ctx);
+        self.palette_window(&ctx);
         self.video_import_window(&ctx);
         eyedropper(&ctx);
         clear_group_command(&ctx);
@@ -7077,6 +7135,9 @@ impl GifKitApp {
                 ui.set_min_width(250.0);
                 if menu_item(ui, "help-contents", "GIFkit &Handbook", &self.keymap.text(crate::keys::Action::Handbook), true) {
                     self.handbook_open = true;
+                }
+                if menu_item(ui, "edit-find", "&Command Palette…", &self.keymap.text(crate::keys::Action::Palette), true) {
+                    self.palette = palette_ui::Palette { open: true, fresh: true, ..Default::default() };
                 }
                 if menu_item(ui, "", "GIFkit &Readme", "", true) {
                     open_external(&format!("{REPO_URL}#readme"));
@@ -8064,6 +8125,20 @@ impl GifKitApp {
                 });
             });
         });
+        // the blend mode, under it as Photoshop has them together
+        ui.add_space(2.0);
+        ui.add_enabled_ui(sel_li.is_some_and(|i| !self.stack.layers[i].locked), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Blend:").color(if sel_li.is_some() { pal.fg } else { pal.fg_muted }));
+                let mut mode = sel_li.map(|i| self.stack.layers[i].blend).unwrap_or_default();
+                let items: Vec<(crate::adjust::Blend, &str)> = crate::adjust::Blend::ALL.iter().map(|b| (*b, b.label())).collect();
+                combo(ui, "layer-blend", &mut mode, &items).on_hover_text("How the layer meets what's under it: Multiply darkens, Screen lightens, Overlay adds contrast, Color and Luminosity take one part of it");
+                if let Some(i) = sel_li.filter(|i| self.stack.layers[*i].blend != mode) {
+                    self.stack.layers[i].blend = mode;
+                    self.modified = true;
+                }
+            });
+        });
         ui.add_space(4.0);
         let find = self.layer_find.trim().to_lowercase();
         // the list, with a row of buttons under it
@@ -8717,6 +8792,7 @@ impl GifKitApp {
                     l.clip = src.clip;
                     l.mask = src.mask.clone();
                     l.flip = src.flip;
+                    l.blend = src.blend;
                     self.stack.layers.insert(li + 1, l);
                 }
                 self.select(src.kind(), id);
@@ -9404,7 +9480,7 @@ impl GifKitApp {
                     LayerKind::Markup(m) => ProjLayer::Markup { markup: m.clone() },
                     LayerKind::Emoji(e) => ProjLayer::Emoji { emoji: (**e).clone() },
                 };
-                ProjLayerEntry { visible: l.visible, label: l.label.clone(), layer, timing: l.timing.clone(), locked: l.locked, color: l.color, opacity: l.opacity, clip: l.clip, mask: l.mask.clone(), flip: l.flip }
+                ProjLayerEntry { visible: l.visible, label: l.label.clone(), layer, timing: l.timing.clone(), locked: l.locked, color: l.color, opacity: l.opacity, clip: l.clip, mask: l.mask.clone(), flip: l.flip, blend: l.blend }
             })
             .collect();
         let file = ProjectFile {
@@ -9575,6 +9651,7 @@ impl GifKitApp {
                 l.clip = e.clip;
                 l.mask = e.mask.clone();
                 l.flip = e.flip;
+                l.blend = e.blend;
             }
         }
         self.stack.markers = file.markers;
@@ -10024,7 +10101,17 @@ impl GifKitApp {
     /// coordinates are known: live edit & compressed (output space) and the
     /// original file (source space, when its size matches the frames).
     fn source_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, rect: Rect, src: ViewSource, vi: usize, show_label: bool) {
-        self.source_view_inner(ui, ctx, rect, src, vi, show_label);
+        // `\` held: the compressed view shows the live edit without its
+        // adjustments, so before and after are the same picture to compare
+        let shown = if self.before_after && src == ViewSource::Compressed { ViewSource::Edit } else { src };
+        self.source_view_inner(ui, ctx, rect, shown, vi, show_label);
+        if self.before_after && shown == ViewSource::Edit && self.stack.layers.iter().any(|l| matches!(l.kind(), Kind::Adjust | Kind::Effects)) {
+            let painter = ui.painter_at(rect);
+            let g = painter.layout_no_wrap("Before · adjustments and effects hidden".into(), theme::medium(12.5), Color32::WHITE);
+            let bg = Rect::from_center_size(pos2(rect.center().x, rect.bottom() - 24.0), g.size() + vec2(20.0, 10.0));
+            painter.rect_filled(bg, 12.0, p().highlight.gamma_multiply(0.92));
+            painter.galley(bg.min + vec2(10.0, 5.0), g, Color32::WHITE);
+        }
         self.view_picker(ui, rect, src, vi);
     }
 

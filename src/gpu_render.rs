@@ -111,6 +111,11 @@ pub enum GpuOp<'a> {
     ClipEnd { slot: usize, invert: bool },
     /// mask `slot` kept only where mask `by` is (or isn't)
     MaskMul { slot: usize, by: usize, invert: bool },
+    /// a layer with a blend mode starts: the frame is kept (and, for one
+    /// that draws, cleared to draw the layer alone)
+    BlendBegin { clear: bool },
+    /// and ends: the layer blended over the kept frame (`adjust::Blend::ALL[mode]`)
+    BlendEnd { mode: u32, full: bool },
     /// the frame kept only where mask `slot` is (or isn't), see-through past it
     KeepIn { slot: usize, invert: bool },
 }
@@ -142,7 +147,7 @@ impl GpuFrame<'_> {
         self.ops.iter().all(|op| match op {
             GpuOp::Draw(d) => draw_ok(d),
             GpuOp::Mask { draws, .. } => draws.iter().all(draw_ok),
-            GpuOp::ClipBegin | GpuOp::ClipEnd { .. } | GpuOp::Under { .. } | GpuOp::MaskMul { .. } | GpuOp::KeepIn { .. } => true,
+            GpuOp::ClipBegin | GpuOp::ClipEnd { .. } | GpuOp::Under { .. } | GpuOp::MaskMul { .. } | GpuOp::KeepIn { .. } | GpuOp::BlendBegin { .. } | GpuOp::BlendEnd { .. } => true,
             GpuOp::AnimClip { passes, .. } => passes.iter().all(|p| ok(p.size.0, p.size.1) && p.ins.iter().all(|i| !matches!(i, Some(GpuIn::Img(i)) if !img_ok(i)))),
             GpuOp::Effect { passes, .. } => passes.iter().all(|p| ok(p.size.0, p.size.1) && p.ins.iter().all(|i| !matches!(i, Some(GpuIn::Img(i)) if !img_ok(i)))),
         })
@@ -789,6 +794,7 @@ impl GpuRenderer {
         // clipping: bases' coverage, and the frame as it was before each clipped layer
         let mut masks: HashMap<usize, (wgpu::TextureView, (u32, u32))> = HashMap::new();
         let mut kept: Vec<(wgpu::TextureView, (u32, u32))> = Vec::new();
+        let mut blend_kept: Vec<(wgpu::TextureView, (u32, u32))> = Vec::new();
         let mut unders: HashMap<usize, (wgpu::TextureView, (u32, u32))> = HashMap::new();
         for op in &f.ops {
             match op {
@@ -848,6 +854,25 @@ impl GpuRenderer {
                         // as the CPU: only when nothing changed the frame's size
                         if bs == cur_size && *ms == cur_size {
                             (cur_tex, cur_view) = self.fx_raw(&mut enc, 52.0, [&cur_view, &bv, mv], cur_size, &[[if *invert { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0]]);
+                        }
+                    }
+                }
+                GpuOp::BlendBegin { clear } => {
+                    self.draw_quads(&mut enc, &cur_view, &quads);
+                    quads.clear();
+                    let (_, v) = self.fx_raw(&mut enc, 0.0, [&cur_view, &self.blank, &self.blank], cur_size, &[]);
+                    blend_kept.push((v, cur_size));
+                    if *clear {
+                        (cur_tex, cur_view) = self.fx_raw(&mut enc, 53.0, [&self.blank, &self.blank, &self.blank], cur_size, &[]);
+                    }
+                }
+                GpuOp::BlendEnd { mode, full } => {
+                    self.draw_quads(&mut enc, &cur_view, &quads);
+                    quads.clear();
+                    if let Some((bv, bs)) = blend_kept.pop() {
+                        // as the CPU: only when the layer kept the frame's size
+                        if bs == cur_size {
+                            (cur_tex, cur_view) = self.fx_raw(&mut enc, 60.0, [&cur_view, &bv, &self.blank], cur_size, &[[*mode as f32, if *full { 1.0 } else { 0.0 }, 0.0, 0.0]]);
                         }
                     }
                 }

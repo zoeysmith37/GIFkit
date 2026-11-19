@@ -1050,11 +1050,11 @@ fn project_round_trip() {
     let overlay: Vec<image::RgbaImage> = (0..3).map(|i| image::RgbaImage::from_pixel(8, 6, image::Rgba([i * 80, 10, 200, 255]))).collect();
     let wm = Arc::new(image::RgbaImage::from_pixel(5, 5, image::Rgba([1, 2, 3, 128])));
     let layers = vec![
-        ProjLayerEntry { flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: Some("Caption".into()), timing: Default::default(), layer: ProjLayer::Text { text: crate::text::Annotation { text: "hi".into(), stretch: 0.7, ..Default::default() }, font: Some(("builtin".into(), "Sans Bold".into())) } },
-        ProjLayerEntry { flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: false, label: None, timing: Default::default(), layer: ProjLayer::Image { id: 1, name: "ov.png".into(), path: None, delays: vec![5, 5, 5], placements: vec![Default::default(); base.len()], opacity: 80.0 } },
-        ProjLayerEntry { flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: Default::default(), layer: ProjLayer::Watermark { id: 2, watermark: Default::default(), has_image: true } },
-        ProjLayerEntry { flip: [true, false], mask: Some(crate::shapes::LayerMask { shapes: vec![crate::shapes::MaskShape { kind: crate::shapes::ShapeKind::Star, feather: 3.0, cx: 5.0, cy: 6.0, w: 7.0, h: 8.0, ..Default::default() }, crate::shapes::MaskShape { subtract: true, w: 2.0, h: 2.0, ..Default::default() }], invert: true, ..Default::default() }), clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: crate::timeline::Timing { clips: Some(vec![crate::timeline::Clip { start: 2, end: Some(5) }]), keys: vec![crate::timeline::Key { frame: 3, x: 10.0, ..Default::default() }] }, layer: ProjLayer::Emoji { emoji: crate::shapes::EmojiSettings { emoji: "1f525".into(), w: 20, h: 20, ..Default::default() } } },
-        ProjLayerEntry { flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: Default::default(), layer: ProjLayer::Markup { markup: crate::shapes::MarkupSettings { strokes: vec![crate::shapes::PenStroke { points: vec![[1.0, 2.0], [3.0, 4.0]], ..Default::default() }] } } },
+        ProjLayerEntry { blend: Default::default(), flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: Some("Caption".into()), timing: Default::default(), layer: ProjLayer::Text { text: crate::text::Annotation { text: "hi".into(), stretch: 0.7, ..Default::default() }, font: Some(("builtin".into(), "Sans Bold".into())) } },
+        ProjLayerEntry { blend: Default::default(), flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: false, label: None, timing: Default::default(), layer: ProjLayer::Image { id: 1, name: "ov.png".into(), path: None, delays: vec![5, 5, 5], placements: vec![Default::default(); base.len()], opacity: 80.0 } },
+        ProjLayerEntry { blend: Default::default(), flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: Default::default(), layer: ProjLayer::Watermark { id: 2, watermark: Default::default(), has_image: true } },
+        ProjLayerEntry { blend: Default::default(), flip: [true, false], mask: Some(crate::shapes::LayerMask { shapes: vec![crate::shapes::MaskShape { kind: crate::shapes::ShapeKind::Star, feather: 3.0, cx: 5.0, cy: 6.0, w: 7.0, h: 8.0, ..Default::default() }, crate::shapes::MaskShape { subtract: true, w: 2.0, h: 2.0, ..Default::default() }], invert: true, ..Default::default() }), clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: crate::timeline::Timing { clips: Some(vec![crate::timeline::Clip { start: 2, end: Some(5) }]), keys: vec![crate::timeline::Key { frame: 3, x: 10.0, ..Default::default() }] }, layer: ProjLayer::Emoji { emoji: crate::shapes::EmojiSettings { emoji: "1f525".into(), w: 20, h: 20, ..Default::default() } } },
+        ProjLayerEntry { blend: Default::default(), flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: Default::default(), layer: ProjLayer::Markup { markup: crate::shapes::MarkupSettings { strokes: vec![crate::shapes::PenStroke { points: vec![[1.0, 2.0], [3.0, 4.0]], ..Default::default() }] } } },
     ];
     let mut transform = crate::stack::Transform::default();
     transform.reverse = true;
@@ -1894,6 +1894,47 @@ fn make_old_colour_project() {
     let fx = crate::effects::EffectSettings { grayscale: true, brightness: 10.0, contrast: 25.0, vignette: true, ..Default::default() };
     let mut file = ProjectFile::default();
     file.frames = vec![Default::default()];
-    file.layers = vec![ProjLayerEntry { visible: true, label: None, layer: ProjLayer::Effects { fx }, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2] }];
+    file.layers = vec![ProjLayerEntry { visible: true, label: None, layer: ProjLayer::Effects { fx }, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2], blend: Default::default() }];
     save(std::path::Path::new(&out), file, &base, None, &std::collections::HashMap::new(), &std::collections::HashMap::new(), None).unwrap();
+}
+
+/// Blend modes on ordinary layers: Multiply over white is the layer's own
+/// colour, over black stays black; Screen the other way round. Saved with
+/// the project.
+#[test]
+fn layer_blend_modes() {
+    use crate::adjust::Blend;
+    use crate::stack::{blend_onto, LayerKind, Stack};
+    let red = image::RgbaImage::from_pixel(4, 4, image::Rgba([200, 40, 40, 255]));
+    for (bg, mode, want) in [(255u8, Blend::Multiply, [200, 40, 40]), (0, Blend::Multiply, [0, 0, 0]), (0, Blend::Screen, [200, 40, 40]), (255, Blend::Screen, [255, 255, 255])] {
+        let mut under = image::RgbaImage::from_pixel(4, 4, image::Rgba([bg, bg, bg, 255]));
+        blend_onto(&mut under, &red, mode);
+        assert_eq!(under.get_pixel(1, 1).0[..3], want, "{mode:?} over {bg}");
+    }
+    // a shape layer in Multiply, through the whole renderer
+    let base = Animation { frames: vec![Frame::new(image::RgbaImage::from_pixel(40, 30, image::Rgba([255, 255, 255, 255])), 10)], loop_count: None };
+    let mut st = Stack::default();
+    let id = st.push(LayerKind::Shape(Box::new(crate::shapes::ShapeSettings { x: 5, y: 5, w: 20, h: 15, fill: [30, 140, 220], stroke_w: 0.0, ..Default::default() })));
+    let plan = st.plan(&base);
+    let times = crate::stack::plan_times(&plan);
+    let fonts = crate::text::builtin_fonts();
+    let prep = st.prepare(&base, &fonts);
+    let normal = st.render_frame(&base, &plan, &times, 0, &fonts, &prep);
+    let li = st.index_of(id).unwrap();
+    st.layers[li].blend = Blend::Multiply;
+    let multiplied = st.render_frame(&base, &plan, &times, 0, &fonts, &prep);
+    assert_eq!(normal.get_pixel(15, 12), multiplied.get_pixel(15, 12), "over white, Multiply is the shape's colour");
+    st.layers[li].blend = Blend::Difference;
+    let diff = st.render_frame(&base, &plan, &times, 0, &fonts, &prep);
+    let p = diff.get_pixel(15, 12);
+    assert_eq!(p.0[..3], [225, 115, 35], "white minus the shape");
+    assert_eq!(*diff.get_pixel(35, 25), image::Rgba([255, 255, 255, 255]), "outside the shape nothing changes");
+    // saved and loaded
+    let e = crate::project::ProjLayerEntry { visible: true, label: None, layer: crate::project::ProjLayer::Effects { fx: Default::default() }, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2], blend: Blend::Overlay };
+    let json = serde_json::to_string(&e).unwrap();
+    assert!(json.contains("Overlay"));
+    let back: crate::project::ProjLayerEntry = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.blend, Blend::Overlay);
+    let plain = serde_json::to_string(&crate::project::ProjLayerEntry { blend: Blend::Normal, ..back }).unwrap();
+    assert!(!plain.contains("blend"), "normal isn't written, so older versions read it");
 }

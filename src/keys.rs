@@ -51,10 +51,22 @@ pub enum Action {
     AutoTone,
     AutoContrast,
     AutoColor,
+    Palette,
+    ToolText,
+    ToolShapes,
+    ToolMarkup,
+    ToolEmoji,
+    ToolMask,
+    ToolAdjust,
+    ToolEffects,
+    LayerUp,
+    LayerDown,
+    LayerTop,
+    LayerBottom,
 }
 
 impl Action {
-    pub const ALL: [Action; 45] = [
+    pub const ALL: [Action; 57] = [
         Action::New,
         Action::Open,
         Action::Save,
@@ -100,10 +112,22 @@ impl Action {
         Action::AutoTone,
         Action::AutoContrast,
         Action::AutoColor,
+        Action::Palette,
+        Action::ToolText,
+        Action::ToolShapes,
+        Action::ToolMarkup,
+        Action::ToolEmoji,
+        Action::ToolMask,
+        Action::ToolAdjust,
+        Action::ToolEffects,
+        Action::LayerUp,
+        Action::LayerDown,
+        Action::LayerTop,
+        Action::LayerBottom,
     ];
 
     /// The groups the shortcuts dialog shows, in order.
-    pub const GROUPS: [&'static str; 6] = ["File", "Edit", "Playback", "View", "Timeline", "Help"];
+    pub const GROUPS: [&'static str; 9] = ["File", "Edit", "Layers", "Tools", "Adjustments", "Playback", "View", "Timeline", "Help"];
 
     /// Which of `GROUPS` this belongs to.
     pub fn group(self) -> &'static str {
@@ -114,6 +138,9 @@ impl Action {
             PlayPause | PrevFrame | NextFrame => "Playback",
             ZoomIn | ZoomOut | Fit | ActualSize | SplitView | FullScreen | OnionSkin | Compress => "View",
             AdjLevels | AdjCurves | AdjHueSat | AdjBalance | AdjBlackWhite | AdjInvert | AdjDesaturate | AutoTone | AutoContrast | AutoColor => "Adjustments",
+            ToolText | ToolShapes | ToolMarkup | ToolEmoji | ToolMask | ToolAdjust | ToolEffects => "Tools",
+            LayerUp | LayerDown | LayerTop | LayerBottom => "Layers",
+            Palette => "Help",
             TlSplit | TlKey | TlRazor | TlDelete | TlIn | TlOut | TlMarker | TlPrevEdit | TlNextEdit | TlDuplicate | TlNudgeLeft | TlNudgeRight => "Timeline",
             Handbook => "Help",
         }
@@ -166,6 +193,18 @@ impl Action {
             Action::AutoTone => "Auto Tone",
             Action::AutoContrast => "Auto Contrast",
             Action::AutoColor => "Auto Color",
+            Action::Palette => "Command palette",
+            Action::ToolText => "Text tool",
+            Action::ToolShapes => "Shapes tool",
+            Action::ToolMarkup => "Markup (brush) tool",
+            Action::ToolEmoji => "Emoji tool",
+            Action::ToolMask => "Mask tool",
+            Action::ToolAdjust => "Adjust tool",
+            Action::ToolEffects => "Effects tool",
+            Action::LayerUp => "Move layer up",
+            Action::LayerDown => "Move layer down",
+            Action::LayerTop => "Move layer to the top",
+            Action::LayerBottom => "Move layer to the bottom",
         }
     }
 
@@ -217,6 +256,18 @@ impl Action {
             Action::AutoTone => "auto_tone",
             Action::AutoContrast => "auto_contrast",
             Action::AutoColor => "auto_color",
+            Action::Palette => "palette",
+            Action::ToolText => "tool_text",
+            Action::ToolShapes => "tool_shapes",
+            Action::ToolMarkup => "tool_markup",
+            Action::ToolEmoji => "tool_emoji",
+            Action::ToolMask => "tool_mask",
+            Action::ToolAdjust => "tool_adjust",
+            Action::ToolEffects => "tool_effects",
+            Action::LayerUp => "layer_up",
+            Action::LayerDown => "layer_down",
+            Action::LayerTop => "layer_top",
+            Action::LayerBottom => "layer_bottom",
         }
     }
 
@@ -271,6 +322,18 @@ impl Action {
             Action::AutoTone => cs(Key::L),
             Action::AutoContrast => Some(Binding { ctrl: true, shift: true, alt: true, key: Key::L }),
             Action::AutoColor => cs(Key::B),
+            Action::Palette => c(Key::K),
+            Action::ToolText => k(Key::T),
+            Action::ToolShapes => k(Key::U),
+            Action::ToolMarkup => k(Key::B),
+            Action::ToolEmoji => k(Key::E),
+            Action::ToolMask => k(Key::Q),
+            Action::ToolAdjust => k(Key::A),
+            Action::ToolEffects => k(Key::G),
+            Action::LayerUp => c(Key::CloseBracket),
+            Action::LayerDown => c(Key::OpenBracket),
+            Action::LayerTop => cs(Key::CloseBracket),
+            Action::LayerBottom => cs(Key::OpenBracket),
         }
     }
 
