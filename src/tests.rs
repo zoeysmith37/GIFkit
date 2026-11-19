@@ -1962,3 +1962,18 @@ fn exact_posterize_and_threshold() {
     items.iter_mut().skip(1).for_each(|i| i.on = false);
     assert!(exact_tail(&items).is_empty());
 }
+
+#[test]
+fn guides_snap_and_save() {
+    use crate::project::ProjectFile;
+    use crate::stack::Guide;
+    // the nearest line wins, and nothing past the threshold
+    assert_eq!(crate::app::guides_snap_for_test(&[10.0, 50.0, 90.0], &[0.0, 52.0, 200.0], 6.0), Some((2.0, 52.0)));
+    assert_eq!(crate::app::guides_snap_for_test(&[10.0], &[30.0], 6.0), None);
+    let f = ProjectFile { guides: vec![Guide { vertical: true, at: 12.0 }, Guide { vertical: false, at: 40.0 }], ..Default::default() };
+    let back: ProjectFile = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+    assert_eq!(back.guides, f.guides);
+    // older projects have none
+    let none: ProjectFile = serde_json::from_str("{}").unwrap();
+    assert!(none.guides.is_empty());
+}

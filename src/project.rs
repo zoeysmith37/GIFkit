@@ -167,6 +167,9 @@ pub struct ProjectFile {
     /// the GIF track's colour on the timeline
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gif_color: Option<[u8; 3]>,
+    /// guide lines from the rulers
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub guides: Vec<crate::stack::Guide>,
     /// full-colour pictures (video frames) stored as nearly lossless WebP
     /// instead of PNG: a fraction of the size
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

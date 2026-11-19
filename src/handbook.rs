@@ -105,14 +105,15 @@ Settings > Keyboard Shortcuts changes any of them.",
     ),
     (
         "Rulers and Guides",
-        "View > Rulers shows rulers along the top and left of the preview. They are off until you turn them on.
+        "View > Rulers (Ctrl+Shift+R) shows rulers along the top and left of the preview, in pixels. They are off until you turn them on.
 
 ## Guides
 - Drag from a ruler onto the picture to make a guide
 - Drag a guide back onto its ruler to remove it
 - Layers snap to guides as you move them
 - Guides are saved with the project
-- View > Show Guides hides them, and View > Clear Guides removes them all
+- A guide pulls toward the frame's edges and middle. Hold Ctrl to place it freely
+- View > Show Guides (Ctrl+;) hides them, and View > Clear Guides removes them all
 
 ## Smart guides
 While you move a layer, lines show where it lines up with the frame and other layers. It snaps there too.

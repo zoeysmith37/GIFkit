@@ -581,6 +581,15 @@ pub struct Stack {
     pub speed_env: Vec<crate::timeline::SpeedPoint>,
     /// the GIF track's bar colour on the timeline (None: the accent)
     pub gif_color: Option<[u8; 3]>,
+    /// guide lines dragged out of the rulers, in output pixels
+    pub guides: Vec<Guide>,
+}
+
+/// A guide line: an upright one at x = `at`, or a level one at y = `at`.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Guide {
+    pub vertical: bool,
+    pub at: f32,
 }
 
 /// Size of a preview frame `s` times the source size.

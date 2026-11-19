@@ -33,6 +33,7 @@ pub(super) enum MenuCmd {
     ToolNames,
     Ffmpeg,
     WhatsNew,
+    ClearGuides,
 }
 
 pub(super) struct PalEntry {
@@ -105,6 +106,9 @@ fn action_icon(a: A) -> &'static str {
         A::DeleteObject => "edit-delete",
         A::OnionSkin => "view-visible",
         A::Compress => "view-refresh",
+        A::Rulers => "measure",
+        A::Guides => "guides",
+        A::SmartGuides => "snap-guideline",
         A::LayerUp | A::LayerTop => "go-up",
         A::LayerDown | A::LayerBottom => "go-down",
         A::AdjLevels => "view-object-histogram-linear",
@@ -187,6 +191,7 @@ impl GifKitApp {
             (MenuCmd::Statusbar, "", on_off(self.show_statusbar, "Statusbar"), "Setting", "toggle status bar"),
             (MenuCmd::ToolNames, "", on_off(!self.sidebar_compact, "Tool Names"), "Setting", "toggle sidebar compact labels"),
             (MenuCmd::Ffmpeg, "", "Configure ffmpeg…".to_string(), "Setting", "video mp4 webm avif"),
+            (MenuCmd::ClearGuides, "edit-clear", "Clear Guides".to_string(), "View", "remove guides lines"),
             (MenuCmd::WhatsNew, "tools-wizard", "What's New…".to_string(), "Help", "changes update release notes"),
         ] {
             v.push(PalEntry { icon, title, kind, keys: if matches!(cmd, MenuCmd::CopyResult) { "Ctrl+Shift+C".into() } else { String::new() }, also: also.into(), cmd: PalCmd::Menu(cmd) });
@@ -253,6 +258,7 @@ impl GifKitApp {
                     self.ff_open = true;
                 }
                 MenuCmd::WhatsNew => self.whats_new_open = true,
+                MenuCmd::ClearGuides if has => self.clear_guides(ctx),
                 _ => self.info("Open an animation first"),
             },
             _ => self.info("Open an animation first"),

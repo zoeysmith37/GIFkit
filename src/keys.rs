@@ -63,10 +63,13 @@ pub enum Action {
     LayerDown,
     LayerTop,
     LayerBottom,
+    Rulers,
+    Guides,
+    SmartGuides,
 }
 
 impl Action {
-    pub const ALL: [Action; 57] = [
+    pub const ALL: [Action; 60] = [
         Action::New,
         Action::Open,
         Action::Save,
@@ -124,6 +127,9 @@ impl Action {
         Action::LayerDown,
         Action::LayerTop,
         Action::LayerBottom,
+        Action::Rulers,
+        Action::Guides,
+        Action::SmartGuides,
     ];
 
     /// The groups the shortcuts dialog shows, in order.
@@ -136,7 +142,7 @@ impl Action {
             New | Open | Save | SaveAs | Export | Quit => "File",
             Undo | Redo | History | Duplicate | DeleteObject => "Edit",
             PlayPause | PrevFrame | NextFrame => "Playback",
-            ZoomIn | ZoomOut | Fit | ActualSize | SplitView | FullScreen | OnionSkin | Compress => "View",
+            ZoomIn | ZoomOut | Fit | ActualSize | SplitView | FullScreen | OnionSkin | Compress | Rulers | Guides | SmartGuides => "View",
             AdjLevels | AdjCurves | AdjHueSat | AdjBalance | AdjBlackWhite | AdjInvert | AdjDesaturate | AutoTone | AutoContrast | AutoColor => "Adjustments",
             ToolText | ToolShapes | ToolMarkup | ToolEmoji | ToolMask | ToolAdjust | ToolEffects => "Tools",
             LayerUp | LayerDown | LayerTop | LayerBottom => "Layers",
@@ -194,6 +200,9 @@ impl Action {
             Action::AutoContrast => "Auto Contrast",
             Action::AutoColor => "Auto Color",
             Action::Palette => "Command palette",
+            Action::Rulers => "Show rulers",
+            Action::Guides => "Show guides",
+            Action::SmartGuides => "Smart guides",
             Action::ToolText => "Text tool",
             Action::ToolShapes => "Shapes tool",
             Action::ToolMarkup => "Markup (brush) tool",
@@ -257,6 +266,9 @@ impl Action {
             Action::AutoContrast => "auto_contrast",
             Action::AutoColor => "auto_color",
             Action::Palette => "palette",
+            Action::Rulers => "rulers",
+            Action::Guides => "guides",
+            Action::SmartGuides => "smart_guides",
             Action::ToolText => "tool_text",
             Action::ToolShapes => "tool_shapes",
             Action::ToolMarkup => "tool_markup",
@@ -334,6 +346,9 @@ impl Action {
             Action::LayerDown => c(Key::OpenBracket),
             Action::LayerTop => cs(Key::CloseBracket),
             Action::LayerBottom => cs(Key::OpenBracket),
+            Action::Rulers => cs(Key::R),
+            Action::Guides => c(Key::Semicolon),
+            Action::SmartGuides => None,
         }
     }
 

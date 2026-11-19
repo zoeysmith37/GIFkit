@@ -28,6 +28,8 @@ mod batch_ui;
 mod adjust_ui;
 #[path = "palette_ui.rs"]
 mod palette_ui;
+#[path = "guides_ui.rs"]
+mod guides_ui;
 #[path = "smoke.rs"]
 mod smoke;
 #[path = "handbook.rs"]
@@ -777,11 +779,13 @@ struct ViewState {
     zoom: Option<f32>,
     pan: Vec2,
     fit: f32,
+    /// where the picture was last drawn, and its size: for the rulers
+    shown: Option<(Mapper, Vec2)>,
 }
 
 impl Default for ViewState {
     fn default() -> Self {
-        Self { zoom: None, pan: Vec2::ZERO, fit: 1.0 }
+        Self { zoom: None, pan: Vec2::ZERO, fit: 1.0, shown: None }
     }
 }
 
@@ -810,6 +814,16 @@ impl Mapper {
         Rect::from_min_max(self.to_screen(pos2(x, y)), self.to_screen(pos2(x + w, y + h)))
     }
 }
+
+#[derive(Clone, Copy)]
+struct GuideDrag {
+    vi: usize,
+    vertical: bool,
+    /// the guide's index; None while a new one is still over its ruler
+    idx: Option<usize>,
+}
+
+const RULER: f32 = 20.0;
 
 struct Status {
     text: String,
@@ -1108,6 +1122,15 @@ pub struct GifKitApp {
     palette_fire: Option<crate::keys::Action>,
     /// `\` held: the edit without its adjustment and effects layers
     before_after: bool,
+    /// rulers along the views (off unless asked for)
+    show_rulers: bool,
+    show_guides: bool,
+    /// moved things snap to the frame, guides and other layers
+    smart_guides: bool,
+    /// a guide being dragged: which, or a new one out of a ruler
+    guide_drag: Option<GuideDrag>,
+    /// smart guide lines lit by the drag this frame
+    snap_lines: Vec<(bool, f32)>,
     /// track heights, and the track whose bottom edge is being dragged
     tl_gif_h: f32,
     tl_row_h: f32,
@@ -3382,6 +3405,11 @@ impl GifKitApp {
             palette: Default::default(),
             palette_fire: None,
             before_after: false,
+            show_rulers: theme::get_setting("rulers").as_deref() == Some("1"),
+            show_guides: theme::get_setting("show_guides").as_deref() != Some("0"),
+            smart_guides: theme::get_setting("smart_guides").as_deref() != Some("0"),
+            guide_drag: None,
+            snap_lines: Vec::new(),
             tl_gif_h: theme::get_setting("tl_gif_h").and_then(|v| v.parse().ok()).unwrap_or(40.0),
             tl_row_h: theme::get_setting("tl_row_h").and_then(|v| v.parse().ok()).unwrap_or(28.0),
             tl_row_drag: None,
@@ -5337,6 +5365,11 @@ impl GifKitApp {
         if hit(A::Compress) && self.base.is_some() {
             self.cmp_go = self.cmp_key();
         }
+        for a in [A::Rulers, A::Guides, A::SmartGuides] {
+            if hit(a) {
+                self.toggle_view_aid(a);
+            }
+        }
         if !typing && self.base.is_some() && !self.busy() {
             for (a, t) in [(A::ToolText, Tool::Text), (A::ToolShapes, Tool::Shapes), (A::ToolMarkup, Tool::Markup), (A::ToolEmoji, Tool::Emoji), (A::ToolMask, Tool::Mask), (A::ToolAdjust, Tool::Adjust), (A::ToolEffects, Tool::Effects)] {
                 if hit(a) {
@@ -7164,6 +7197,19 @@ impl GifKitApp {
                     self.link_views = !self.link_views;
                 }
                 ui.separator();
+                if menu_check(ui, self.show_rulers, "&Rulers", &self.keymap.text(crate::keys::Action::Rulers)) {
+                    self.toggle_view_aid(crate::keys::Action::Rulers);
+                }
+                if menu_check(ui, self.show_guides, "Show &Guides", &self.keymap.text(crate::keys::Action::Guides)) {
+                    self.toggle_view_aid(crate::keys::Action::Guides);
+                }
+                if menu_check(ui, self.smart_guides, "S&mart Guides", &self.keymap.text(crate::keys::Action::SmartGuides)) {
+                    self.toggle_view_aid(crate::keys::Action::SmartGuides);
+                }
+                if menu_item_tip(ui, "edit-clear", "&Clear Guides", "", has && !self.stack.guides.is_empty(), "Drag a guide back onto a ruler to remove just that one") {
+                    self.clear_guides(ctx);
+                }
+                ui.separator();
                 if menu_item(ui, "zoom-in", "Zoom &In", &self.keymap.text(crate::keys::Action::ZoomIn), has) {
                     self.zoom_to(self.cur_scale() * 1.25);
                 }
@@ -7373,6 +7419,31 @@ impl GifKitApp {
         });
         let c = self.backdrop_col;
         theme::set_setting("backdrop_col", &format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]));
+    }
+
+    /// Rulers, guides and smart guides on or off, remembered.
+    fn toggle_view_aid(&mut self, a: crate::keys::Action) {
+        use crate::keys::Action as A;
+        let (flag, key, name) = match a {
+            A::Rulers => (&mut self.show_rulers, "rulers", "Rulers"),
+            A::Guides => (&mut self.show_guides, "show_guides", "Guides"),
+            _ => (&mut self.smart_guides, "smart_guides", "Smart guides"),
+        };
+        *flag = !*flag;
+        let on = *flag;
+        theme::set_setting(key, if on { "1" } else { "0" });
+        self.info(format!("{name} {}", if on { "on" } else { "off" }));
+    }
+
+    fn clear_guides(&mut self, ctx: &egui::Context) {
+        if self.stack.guides.is_empty() {
+            return;
+        }
+        let now = ctx.input(|i| i.time);
+        self.snapshot(&format!("guides{now}"), now);
+        self.stack.guides.clear();
+        self.modified = true;
+        self.info("Guides cleared");
     }
 
     fn set_rail_compact(&mut self, compact: bool) {
@@ -9680,6 +9751,7 @@ impl GifKitApp {
             markers: self.stack.markers.clone(),
             speed_env: self.stack.speed_env.clone(),
             gif_color: self.stack.gif_color,
+            guides: self.stack.guides.clone(),
             compact: self.compact_pics,
             settings: serde_json::to_value(self.proj_settings()).unwrap_or_default(),
             ..Default::default()
@@ -9844,6 +9916,7 @@ impl GifKitApp {
         }
         self.stack.markers = file.markers;
         self.stack.speed_env = file.speed_env;
+        self.stack.guides = file.guides;
         self.stack.gif_color = file.gif_color;
         self.compact_pics = file.compact;
         self.stack.sync_len(n);
@@ -10202,6 +10275,7 @@ impl GifKitApp {
         if tex.is_some() {
             self.view_zoom_overlay(ui, vi, rect);
         }
+        self.views[vi].shown = Some((Mapper { rect: img_rect, scale }, img_size));
         (resp, Mapper { rect: img_rect, scale })
     }
 
@@ -10292,7 +10366,11 @@ impl GifKitApp {
         // `\` held: the compressed view shows the live edit without its
         // adjustments, so before and after are the same picture to compare
         let shown = if self.before_after && src == ViewSource::Compressed { ViewSource::Edit } else { src };
+        let full = rect;
+        let rect = if self.show_rulers && self.base.is_some() { Rect::from_min_max(rect.min + vec2(RULER, RULER), rect.max) } else { rect };
+        self.views[vi].shown = None;
         self.source_view_inner(ui, ctx, rect, shown, vi, show_label);
+        self.guides_ui(ui, full, rect, vi);
         if self.before_after && shown == ViewSource::Edit && self.stack.layers.iter().any(|l| matches!(l.kind(), Kind::Adjust | Kind::Effects)) {
             let painter = ui.painter_at(rect);
             let g = painter.layout_no_wrap("Before · adjustments and effects hidden".into(), theme::medium(12.5), Color32::WHITE);
@@ -11075,6 +11153,21 @@ impl GifKitApp {
                                 let (dxn, dyn_) = (ang.cos(), ang.sin());
                                 let len = ox * dxn + oy * dyn_;
                                 (ox, oy) = (dxn * len, dyn_ * len);
+                            } else if self.smart_guides && space == Space::Output && !ui.input(|i| i.modifiers.command) {
+                                // smart guides: its edges and middle line up with
+                                // the frame, the guides and the other layers
+                                let (x0, x1, y0, y1) = guides_ui::obb_extent(&map_box(&mp, src, readable));
+                                let (xs, ys) = self.snap_targets(li, bounds);
+                                let thr = 6.0 / m.scale;
+                                self.snap_lines.clear();
+                                if let Some((d, t)) = guides_ui::nearest_snap(&[x0 + ox, (x0 + x1) / 2.0 + ox, x1 + ox], &xs, thr) {
+                                    ox += d;
+                                    self.snap_lines.push((true, t));
+                                }
+                                if let Some((d, t)) = guides_ui::nearest_snap(&[y0 + oy, (y0 + y1) / 2.0 + oy, y1 + oy], &ys, thr) {
+                                    oy += d;
+                                    self.snap_lines.push((false, t));
+                                }
                             }
                             let (dx, dy) = mp.inverse().apply_vec(ox, oy);
                             let nb = Obb { cx: src.cx + dx, cy: src.cy + dy, ..src };
@@ -14714,4 +14807,9 @@ enum Quick {
     AutoTone,
     AutoContrast,
     AutoColor,
+}
+
+#[cfg(test)]
+pub(crate) fn guides_snap_for_test(edges: &[f32], targets: &[f32], thr: f32) -> Option<(f32, f32)> {
+    guides_ui::nearest_snap(edges, targets, thr)
 }
