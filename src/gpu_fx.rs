@@ -213,6 +213,11 @@ pub fn effects<'a>(p: &mut Plan<'a, '_>, s: &EffectSettings, idx: usize, n: usiz
         let size = p.size;
         p.raw(59, 0.0, [Some(GpuIn::Cur), Some(GpuIn::Owned(k)), None], None, size, false, &[[crate::adjust::N as f32, crate::adjust::TILES as f32, 0.0, 0.0]]);
     }
+    // 61: Posterize and Threshold at the end, exact
+    for e in crate::adjust::exact_tail(&s.adjust) {
+        let [kind, v] = e.code();
+        p.op(61, &[[kind, v, 0.0, 0.0]]);
+    }
     if s.hue != d.hue || s.saturation != d.saturation || s.lightness != d.lightness {
         p.modulate(s.hue, s.saturation, s.lightness);
     }

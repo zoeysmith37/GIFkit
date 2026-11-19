@@ -343,12 +343,26 @@ pub struct Vibrance {
 #[serde(default)]
 pub struct ColorBalance {
     pub tones: [[f32; 3]; 3],
+    /// Added to all three tones, for when one shift is all you want.
+    #[serde(skip_serializing_if = "is_zero3")]
+    pub master: [f32; 3],
     pub preserve: bool,
+}
+
+fn is_zero3(v: &[f32; 3]) -> bool {
+    *v == [0.0; 3]
+}
+
+impl ColorBalance {
+    /// Each tone with the master shift added.
+    pub fn total(&self) -> [[f32; 3]; 3] {
+        self.tones.map(|t| std::array::from_fn(|i| t[i] + self.master[i]))
+    }
 }
 
 impl Default for ColorBalance {
     fn default() -> Self {
-        ColorBalance { tones: [[0.0; 3]; 3], preserve: true }
+        ColorBalance { tones: [[0.0; 3]; 3], master: [0.0; 3], preserve: true }
     }
 }
 
@@ -1137,7 +1151,7 @@ fn compile(items: &[AdjustItem]) -> Vec<Stage> {
             }
             Adjust::Exposure(e) if *e == Exposure::default() => continue,
             Adjust::Vibrance(v) if v.vibrance == 0.0 && v.saturation == 0.0 => continue,
-            Adjust::ColorBalance(b) if b.tones == [[0.0; 3]; 3] => continue,
+            Adjust::ColorBalance(b) if b.total() == [[0.0; 3]; 3] => continue,
             Adjust::ChannelMixer(m) if *m == ChannelMixer::default() => continue,
             Adjust::SelectiveColor(sc) if sc.ranges == [[0.0; 4]; 9] => continue,
             Adjust::PhotoFilter(pf) if pf.density <= 0.0 => continue,
@@ -1151,7 +1165,7 @@ fn compile(items: &[AdjustItem]) -> Vec<Stage> {
             Adjust::Look(l) if matches!(l.look, Look::Gotham | Look::Nashville) => Stage::Cube(legacy_cube(l.look), (l.amount / 100.0).clamp(0.0, 1.0)),
             Adjust::Exposure(e) => Stage::Exposure(2f32.powf(e.exposure.clamp(-20.0, 20.0)), e.offset, e.gamma.clamp(0.01, 9.99)),
             Adjust::Vibrance(v) => Stage::Vibrance(v.vibrance.clamp(-100.0, 100.0) / 100.0, v.saturation.clamp(-100.0, 100.0) / 100.0),
-            Adjust::ColorBalance(b) => Stage::Balance(std::array::from_fn(|ch| Balance::new(b.tones, b.preserve, ch)), b.preserve),
+            Adjust::ColorBalance(b) => Stage::Balance(std::array::from_fn(|ch| Balance::new(b.total(), b.preserve, ch)), b.preserve),
             Adjust::BlackWhite(b) => Stage::BlackWhite(b.weights, b.tint.then(|| b.tint_color.map(|v| v as f32 / 255.0))),
             Adjust::PhotoFilter(p) => Stage::Matrix(photo_filter_matrix(p.color.map(|v| v as f32 / 255.0), p.density / 100.0), p.preserve),
             Adjust::ChannelMixer(m) => Stage::Mixer(m.rows.map(|r| r.map(|v| v / 100.0)), m.mono),
@@ -1270,6 +1284,8 @@ pub fn map_one(item: &AdjustItem, c: [f32; 3]) -> [f32; 3] {
 /// last few lists asked for, as building one takes a few milliseconds.
 pub fn lut(items: &[AdjustItem], mode: Blend) -> Option<Arc<RgbaImage>> {
     static CACHE: Mutex<Vec<(u64, Arc<RgbaImage>)>> = Mutex::new(Vec::new());
+    // hard steps at the end run exactly after the table (exact_tail)
+    let items = &items[..table_len(items)];
     let stages = compile(items);
     if stages.is_empty() {
         return None;
@@ -1347,19 +1363,89 @@ fn c8(v: f32) -> u8 {
 
 /// `items` on every pixel of `img`.
 pub fn apply(img: &mut RgbaImage, items: &[AdjustItem], mode: Blend) {
-    let Some(lut) = lut(items, mode) else { return };
+    let lut = lut(items, mode);
+    let tail = exact_tail(items);
+    if lut.is_none() && tail.is_empty() {
+        return;
+    }
     let w = img.width() as usize;
     img.as_mut().par_chunks_mut(w.max(1) * 4).for_each(|row| {
         for px in row.chunks_exact_mut(4) {
             if px[3] == 0 {
                 continue;
             }
-            let c = lookup(&lut, [px[0] as f32, px[1] as f32, px[2] as f32]);
+            let mut c = [px[0] as f32, px[1] as f32, px[2] as f32];
+            if let Some(lut) = &lut {
+                c = lookup(lut, c).map(|v| c8(v) as f32);
+            }
+            for e in &tail {
+                c = e.run(c);
+            }
             px[0] = c8(c[0]);
             px[1] = c8(c[1]);
             px[2] = c8(c[2]);
         }
     });
+}
+
+/// A hard-stepped adjustment at the end of a list, run on whole levels
+/// after the lookup table so its steps stay sharp (in the table they would
+/// soften over a grid cell).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Exact {
+    Posterize(f32),
+    Threshold(f32),
+}
+
+impl Exact {
+    /// On 0..255 levels, as the shader's op 61.
+    pub fn run(self, c: [f32; 3]) -> [f32; 3] {
+        match self {
+            Exact::Posterize(n) => c.map(|x| {
+                let bin = (x * n / 256.0).floor().min(n - 1.0);
+                (bin * 255.0 / (n - 1.0)).floor()
+            }),
+            Exact::Threshold(level) => {
+                let l = 0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2];
+                [if l >= level - 0.5 { 255.0 } else { 0.0 }; 3]
+            }
+        }
+    }
+
+    /// For the shader: which, and its number.
+    pub fn code(self) -> [f32; 2] {
+        match self {
+            Exact::Posterize(n) => [0.0, n],
+            Exact::Threshold(l) => [1.0, l],
+        }
+    }
+}
+
+/// How many of `items` go in the table: all but the Posterize and
+/// Threshold at the end (switched off ones in between don't count).
+fn table_len(items: &[AdjustItem]) -> usize {
+    let mut n = items.len();
+    while n > 0 {
+        match &items[n - 1] {
+            AdjustItem { on: false, .. } => n -= 1,
+            AdjustItem { adj: Adjust::Posterize(_) | Adjust::Threshold(_), .. } => n -= 1,
+            _ => break,
+        }
+    }
+    n
+}
+
+/// The Posterize and Threshold at the end of `items`, in order.
+pub fn exact_tail(items: &[AdjustItem]) -> Vec<Exact> {
+    items[table_len(items)..]
+        .iter()
+        .filter(|i| i.on)
+        .filter_map(|i| match &i.adj {
+            Adjust::Posterize(p) => Some(Exact::Posterize(p.levels.clamp(2, 255) as f32)),
+            Adjust::Threshold(t) => Some(Exact::Threshold(t.level.clamp(1.0, 255.0))),
+            _ => None,
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------- analysis
@@ -1530,7 +1616,7 @@ pub fn sample_list() -> Vec<AdjustItem> {
         Adjust::Curves(c),
         Adjust::Exposure(Exposure { exposure: 0.6, offset: 0.02, gamma: 1.1 }),
         Adjust::Vibrance(Vibrance { vibrance: 40.0, saturation: -10.0 }),
-        Adjust::ColorBalance(ColorBalance { tones: [[10.0, 0.0, -20.0], [-15.0, 5.0, 25.0], [0.0, -10.0, 10.0]], preserve: true }),
+        Adjust::ColorBalance(ColorBalance { tones: [[10.0, 0.0, -20.0], [-15.0, 5.0, 25.0], [0.0, -10.0, 10.0]], master: [5.0, 0.0, -5.0], preserve: true }),
         Adjust::BlackWhite(BlackWhite { tint: true, ..Default::default() }),
         Adjust::PhotoFilter(PhotoFilter::default()),
         Adjust::ChannelMixer(ChannelMixer { rows: [[80.0, 30.0, -10.0, 0.0], [0.0, 100.0, 0.0, 5.0], [20.0, 0.0, 90.0, 0.0]], mono: false }),
@@ -1606,11 +1692,11 @@ fn bc_table(b: &BrightContrast) -> Vec<f32> {
         // GIFkit's older Effects sliders, the classic straight lines
         let c = b.contrast.clamp(-100.0, 100.0) * 2.55;
         let cf = (259.0 * (c + 255.0)) / (255.0 * (259.0 - c));
-        let br = b.brightness * 2.55;
+        let br = b.brightness.clamp(-200.0, 200.0) * 2.55;
         return (0..n).map(|k| (((k as f32 / (n - 1) as f32 * 255.0 - 128.0) * cf + 128.0 + br) / 255.0).clamp(0.0, 1.0)).collect();
     }
     let step = |k: usize, n: usize| k as f32 / (n - 1) as f32;
-    let br = b.brightness.clamp(-150.0, 150.0);
+    let br = b.brightness.clamp(-300.0, 300.0);
     let bright: Vec<f32> = if br == 0.0 {
         (0..n).map(|k| step(k, n)).collect()
     } else if br > 0.0 {
@@ -1634,7 +1720,7 @@ fn bc_table(b: &BrightContrast) -> Vec<f32> {
             })
             .collect()
     };
-    let ct = b.contrast.clamp(-50.0, 100.0);
+    let ct = b.contrast.clamp(-100.0, 300.0);
     bright.into_iter().map(|v| modern_contrast(v, ct).clamp(0.0, 1.0)).collect()
 }
 

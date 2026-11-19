@@ -1314,6 +1314,25 @@ fn fs_fx(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             let co = l.a * (1.0 - b.a) * s + l.a * b.a * m + (1.0 - l.a) * b.a * d;
             return vec4<f32>(co, ao);
         }
+        // 61 a.x 0: posterize to a.y steps; 1: threshold at level a.y
+        // (adjust::Exact::run)
+        case 61: {
+            let q = ld(t0, ip);
+            if (q.a <= 0.0) {
+                return q / 255.0;
+            }
+            if (a.x < 0.5) {
+                let n = a.y;
+                let bin = min(floor(q.rgb * n / 256.0), vec3<f32>(n - 1.0));
+                return vec4<f32>(floor(bin * 255.0 / (n - 1.0)), q.a) / 255.0;
+            }
+            let l = 0.3 * q.r + 0.59 * q.g + 0.11 * q.b;
+            var v = 0.0;
+            if (l >= a.y - 0.5) {
+                v = 255.0;
+            }
+            return vec4<f32>(v, v, v, q.a) / 255.0;
+        }
         // 53 clear to transparent
         case 53: {
             return vec4<f32>(0.0);

@@ -963,6 +963,8 @@ pub struct GifKitApp {
     batch: batch_ui::BatchState,
     smoke: Option<smoke::Smoke>,
     handbook_open: bool,
+    /// What's new, shown once after an update
+    whats_new_open: bool,
     handbook_topic: usize,
     preset_problems: Vec<String>,
     preset_name: String,
@@ -1952,18 +1954,14 @@ fn colour_edit(ui: &mut egui::Ui, c: &mut [u8; 4], alpha: bool) -> egui::Respons
     ui.painter().rect_stroke(sw, 2.0, Stroke::new(1.0, mix(pal.fg, pal.button, 0.6)), egui::StrokeKind::Inside);
     let mut pick = false;
     egui::Popup::from_toggle_button_response(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-        ui.spacing_mut().interact_size.x = 44.0;
-        ui.spacing_mut().slider_width = 240.0;
-        ui.set_width(240.0);
-        let mut col = Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
-        if egui::color_picker::color_picker_color32(ui, &mut col, if alpha { egui::color_picker::Alpha::OnlyBlend } else { egui::color_picker::Alpha::Opaque }) {
-            *c = col.to_srgba_unmultiplied();
+        ui.set_width(PICK_W);
+        if colour_picker_body(ui, resp.id, c, alpha) {
             resp.mark_changed();
         }
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             let mut hex = format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
-            let te = ui.add(egui::TextEdit::singleline(&mut hex).desired_width(84.0).font(egui::TextStyle::Monospace));
+            let te = ui.add_sized(vec2(84.0, CHIP_H), egui::TextEdit::singleline(&mut hex).font(egui::TextStyle::Monospace));
             if te.changed() {
                 if let Some(v) = parse_hex(&hex) {
                     c[0] = v[0];
@@ -1987,6 +1985,176 @@ fn colour_edit(ui: &mut egui::Ui, c: &mut [u8; 4], alpha: bool) -> egui::Respons
         ui.ctx().request_repaint();
     }
     resp
+}
+
+const PICK_W: f32 = 248.0;
+
+fn hsv_of(c: [u8; 4]) -> [f32; 3] {
+    let [r, g, b] = [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0];
+    let mx = r.max(g).max(b);
+    let mn = r.min(g).min(b);
+    let d = mx - mn;
+    let h = if d <= 0.0 {
+        0.0
+    } else if mx == r {
+        ((g - b) / d).rem_euclid(6.0) / 6.0
+    } else if mx == g {
+        ((b - r) / d + 2.0) / 6.0
+    } else {
+        ((r - g) / d + 4.0) / 6.0
+    };
+    [h, if mx <= 0.0 { 0.0 } else { d / mx }, mx]
+}
+
+fn rgb_of(h: f32, s: f32, v: f32) -> [u8; 3] {
+    let h6 = h.rem_euclid(1.0) * 6.0;
+    let f = |n: f32| {
+        let k = (n + h6).rem_euclid(6.0);
+        v - v * s * k.min(4.0 - k).clamp(0.0, 1.0)
+    };
+    [f(5.0), f(3.0), f(1.0)].map(|x| (x * 255.0).round().clamp(0.0, 255.0) as u8)
+}
+
+/// A colour picker of fixed size: a saturation/value square, a hue strip,
+/// an optional alpha strip and a row of R G B (A) boxes of fixed width.
+fn colour_picker_body(ui: &mut egui::Ui, id: egui::Id, c: &mut [u8; 4], alpha: bool) -> bool {
+    let pal = *p();
+    let mut changed = false;
+    // hue and saturation are kept so greys and blacks don't lose them
+    let key = id.with("hsv");
+    let mut hsv = hsv_of(*c);
+    if let Some((was, kept)) = ui.ctx().data(|d| d.get_temp::<([u8; 4], [f32; 3])>(key)) {
+        if was[..3] == c[..3] {
+            hsv = kept;
+        } else if hsv[1] <= 0.0 || hsv[2] <= 0.0 {
+            hsv[0] = kept[0];
+            if hsv[2] <= 0.0 {
+                hsv[1] = kept[1];
+            }
+        }
+    }
+    let line = Stroke::new(1.0, mix(pal.fg, pal.button, 0.6));
+    let set = |c: &mut [u8; 4], hsv: [f32; 3]| {
+        let rgb = rgb_of(hsv[0], hsv[1], hsv[2]);
+        c[0] = rgb[0];
+        c[1] = rgb[1];
+        c[2] = rgb[2];
+    };
+
+    // saturation / value square
+    let (sq, r) = ui.allocate_exact_size(vec2(PICK_W, 180.0), egui::Sense::click_and_drag());
+    if let Some(pos) = r.interact_pointer_pos() {
+        hsv[1] = ((pos.x - sq.left()) / sq.width()).clamp(0.0, 1.0);
+        hsv[2] = 1.0 - ((pos.y - sq.top()) / sq.height()).clamp(0.0, 1.0);
+        set(c, hsv);
+        changed = true;
+    }
+    let mut mesh = egui::Mesh::default();
+    const N: usize = 16;
+    for j in 0..=N {
+        for i in 0..=N {
+            let (s, v) = (i as f32 / N as f32, 1.0 - j as f32 / N as f32);
+            let [r, g, b] = rgb_of(hsv[0], s, v);
+            mesh.colored_vertex(pos2(sq.left() + s * sq.width(), sq.top() + (1.0 - v) * sq.height()), Color32::from_rgb(r, g, b));
+        }
+    }
+    for j in 0..N as u32 {
+        for i in 0..N as u32 {
+            let a = j * (N as u32 + 1) + i;
+            let b = a + N as u32 + 1;
+            mesh.add_triangle(a, a + 1, b);
+            mesh.add_triangle(a + 1, b + 1, b);
+        }
+    }
+    ui.painter().add(mesh);
+    ui.painter().rect_stroke(sq, 2.0, line, egui::StrokeKind::Outside);
+    let dot = pos2(sq.left() + hsv[1] * sq.width(), sq.top() + (1.0 - hsv[2]) * sq.height());
+    let ring = if hsv[2] > 0.6 && hsv[1] < 0.5 { Color32::BLACK } else { Color32::WHITE };
+    ui.painter().circle_stroke(dot, 6.0, Stroke::new(2.0, ring));
+
+    // strips: hue, then alpha
+    let strip = |ui: &mut egui::Ui, value: f32, paint: &dyn Fn(&egui::Painter, Rect)| -> Option<f32> {
+        ui.add_space(6.0);
+        let (rr, r) = ui.allocate_exact_size(vec2(PICK_W, 16.0), egui::Sense::click_and_drag());
+        paint(ui.painter(), rr);
+        ui.painter().rect_stroke(rr, 2.0, line, egui::StrokeKind::Outside);
+        let x = rr.left() + value * rr.width();
+        let knob = Rect::from_center_size(pos2(x, rr.center().y), vec2(6.0, rr.height() + 4.0));
+        ui.painter().rect(knob, 2.0, Color32::WHITE, Stroke::new(1.0, Color32::BLACK), egui::StrokeKind::Middle);
+        r.interact_pointer_pos().map(|pos| ((pos.x - rr.left()) / rr.width()).clamp(0.0, 1.0))
+    };
+    let hue_paint = |pt: &egui::Painter, rr: Rect| {
+        let mut m = egui::Mesh::default();
+        const S: u32 = 36;
+        for i in 0..=S {
+            let t = i as f32 / S as f32;
+            let [r, g, b] = rgb_of(t, 1.0, 1.0);
+            let col = Color32::from_rgb(r, g, b);
+            let x = rr.left() + t * rr.width();
+            m.colored_vertex(pos2(x, rr.top()), col);
+            m.colored_vertex(pos2(x, rr.bottom()), col);
+            if i > 0 {
+                let a = 2 * i - 2;
+                m.add_triangle(a, a + 1, a + 2);
+                m.add_triangle(a + 1, a + 3, a + 2);
+            }
+        }
+        pt.add(m);
+    };
+    if let Some(h) = strip(ui, hsv[0], &hue_paint) {
+        hsv[0] = h.min(0.9999);
+        set(c, hsv);
+        changed = true;
+    }
+    if alpha {
+        let rgb = [c[0], c[1], c[2]];
+        let alpha_paint = move |pt: &egui::Painter, rr: Rect| {
+            let cell = rr.height() / 2.0;
+            let mut x = rr.left();
+            let mut k = 0;
+            while x < rr.right() {
+                for row in 0..2 {
+                    let r = Rect::from_min_max(pos2(x, rr.top() + row as f32 * cell), pos2((x + cell).min(rr.right()), rr.top() + (row + 1) as f32 * cell));
+                    pt.rect_filled(r, 0.0, if (k + row) % 2 == 0 { Color32::WHITE } else { Color32::from_gray(190) });
+                }
+                x += cell;
+                k += 1;
+            }
+            let mut m = egui::Mesh::default();
+            let (a0, a1) = (Color32::from_rgba_unmultiplied(rgb[0], rgb[1], rgb[2], 0), Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+            m.colored_vertex(rr.left_top(), a0);
+            m.colored_vertex(rr.left_bottom(), a0);
+            m.colored_vertex(rr.right_top(), a1);
+            m.colored_vertex(rr.right_bottom(), a1);
+            m.add_triangle(0, 1, 2);
+            m.add_triangle(1, 3, 2);
+            pt.add(m);
+        };
+        if let Some(a) = strip(ui, c[3] as f32 / 255.0, &alpha_paint) {
+            c[3] = (a * 255.0).round() as u8;
+            changed = true;
+        }
+    }
+
+    // number boxes, all the same width so the popup never changes size
+    ui.add_space(8.0);
+    let n = if alpha { 4 } else { 3 };
+    let gap = ui.spacing().item_spacing.x;
+    let w = ((PICK_W - gap * (n as f32 - 1.0)) / n as f32).floor();
+    let before = *c;
+    ui.horizontal(|ui| {
+        for (i, name) in ["R", "G", "B", "A"].iter().take(n).enumerate() {
+            ui.add_sized(vec2(w, CHIP_H), egui::DragValue::new(&mut c[i]).range(0..=255).prefix(format!("{name} ")));
+        }
+    });
+    if c[..3] != before[..3] {
+        hsv = hsv_of(*c);
+        changed = true;
+    } else if c[3] != before[3] {
+        changed = true;
+    }
+    ui.ctx().data_mut(|d| d.insert_temp(key, (*c, hsv)));
+    changed
 }
 
 /// Runs the eyedropper while one is active: takes a picture of the window,
@@ -2431,7 +2599,13 @@ fn fill_slider(ui: &mut egui::Ui, s: egui::Slider<'_>) -> egui::Response {
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
     child.set_clip_rect(rect.expand2(vec2(0.0, 4.0)).intersect(ui.clip_rect()));
     child.spacing_mut().interact_size.x = bw;
-    child.spacing_mut().slider_width = (w - bw - gap - 2.0).max(40.0);
+    // the handle hangs over the rail's ends by its radius: room for it, so
+    // it isn't cut off at the lowest and highest values
+    let knob = (h / 2.5).ceil() + 1.0;
+    child.add_space(knob);
+    let gap = gap.max(knob + 3.0);
+    child.spacing_mut().item_spacing.x = gap;
+    child.spacing_mut().slider_width = (w - bw - gap - 2.0 - knob).max(40.0);
     let r = slider(&mut child, s);
     // ran over: the box takes it, from now on
     let over = child.min_rect().width() - w;
@@ -3118,6 +3292,7 @@ impl GifKitApp {
             batch: Default::default(),
             smoke: smoke::Smoke::from_env(),
             handbook_open: std::env::var_os("GIFKIT_HANDBOOK").is_some(),
+            whats_new_open: handbook::whats_new_due(),
             handbook_topic: std::env::var("GIFKIT_HANDBOOK").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             preset_problems: Vec::new(),
             preset_name: std::env::var("GIFKIT_PRESET_NAME").unwrap_or_default(),
@@ -6780,6 +6955,7 @@ impl eframe::App for GifKitApp {
         self.restore_window(&ctx);
         self.batch_window(&ctx);
         self.handbook_window(&ctx);
+        self.whats_new_window(&ctx);
         self.tl_paste_window(&ctx);
         self.ffmpeg_window(&ctx);
         mark("canvas");
@@ -7122,6 +7298,10 @@ impl GifKitApp {
                         self.info("Applies after a restart");
                     }
                 }
+                let wn = theme::get_setting("whats_new").as_deref() != Some("0");
+                if menu_check(ui, wn, "Show &What's New After Updates", "") {
+                    theme::set_setting("whats_new", if wn { "0" } else { "1" });
+                }
                 let auto = update_check_on();
                 if menu_check(ui, auto, "Check for &Updates at Startup", "") {
                     theme::set_setting("update_check", if auto { "0" } else { "1" });
@@ -7135,6 +7315,9 @@ impl GifKitApp {
                 ui.set_min_width(250.0);
                 if menu_item(ui, "help-contents", "GIFkit &Handbook", &self.keymap.text(crate::keys::Action::Handbook), true) {
                     self.handbook_open = true;
+                }
+                if menu_item(ui, "tools-wizard", "What's &New…", "", true) {
+                    self.whats_new_open = true;
                 }
                 if menu_item(ui, "edit-find", "&Command Palette…", &self.keymap.text(crate::keys::Action::Palette), true) {
                     self.palette = palette_ui::Palette { open: true, fresh: true, ..Default::default() };
@@ -7542,7 +7725,7 @@ impl GifKitApp {
         let mut capture = self.key_capture;
         let km = self.keymap.clone();
         let mut filter = std::mem::take(&mut self.keys_filter);
-        dialog(ctx, "shortcuts", "Keyboard Shortcuts", vec2(900.0, 680.0), true, &mut open, |ui| {
+        dialog(ctx, "shortcuts", "Keyboard Shortcuts", vec2(1120.0, 740.0), true, &mut open, |ui| {
             // the next key press goes to the action waiting for one
             if let Some(a) = capture {
                 let press = ui.input(|i| {
@@ -7588,15 +7771,20 @@ impl GifKitApp {
             let fixed: Vec<(&str, &str)> = FIXED.iter().copied().filter(|(k, w)| q.is_empty() || k.to_lowercase().contains(&q) || w.to_lowercase().contains(&q)).collect();
             // each group a card; cards go into columns, each to the shortest
             let groups: Vec<(&str, Vec<Action>)> = Action::GROUPS.iter().map(|g| (*g, Action::ALL.iter().copied().filter(|a| a.group() == *g && hit(*a)).collect::<Vec<_>>())).filter(|(_, v)| !v.is_empty()).collect();
-            let cols = ((ui.available_width() / 380.0).floor() as usize).clamp(1, 3);
+            let cols = ((ui.available_width() / 340.0).floor() as usize).clamp(1, 4);
             let mut col_of = vec![Vec::new(); cols];
             let mut heights = vec![0usize; cols];
-            for (k, (g, v)) in groups.iter().enumerate() {
-                // two columns: the short groups on the left, Edit and the
-                // long Timeline group on the right; otherwise the shortest
-                let c = if cols == 2 { usize::from(matches!(*g, "Edit" | "Timeline")) } else { (0..cols).min_by_key(|c| heights[*c]).unwrap_or(0) };
+            // the longest cards first, each to the shortest column, so the
+            // columns come out even; then each column in the usual order
+            let mut by_len: Vec<usize> = (0..groups.len()).collect();
+            by_len.sort_by_key(|k| std::cmp::Reverse(groups[*k].1.len()));
+            for k in by_len {
+                let c = (0..cols).min_by_key(|c| heights[*c]).unwrap_or(0);
                 col_of[c].push(k);
-                heights[c] += v.len() + 2;
+                heights[c] += groups[k].1.len() + 2;
+            }
+            for c in &mut col_of {
+                c.sort();
             }
             let card = |ui: &mut egui::Ui, title: &str, body: &mut dyn FnMut(&mut egui::Ui)| {
                 egui::Frame::new()

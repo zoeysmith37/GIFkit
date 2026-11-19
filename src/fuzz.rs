@@ -894,6 +894,8 @@ fn gpu_matches_cpu() {
         ("fx modulate".into(), fx(&|e| (e.hue, e.saturation, e.lightness) = (140.0, 150.0, 90.0))),
         ("adjust all".into(), fx(&|e| e.adjust = crate::adjust::sample_list())),
         ("adjust curves".into(), fx(&|e| e.adjust = vec![crate::adjust::sample_list().remove(1)])),
+        ("adjust posterize".into(), fx(&|e| e.adjust = vec![crate::adjust::sample_list().remove(1), crate::adjust::AdjustItem::new(crate::adjust::Adjust::Posterize(crate::adjust::Posterize { levels: 5 }))])),
+        ("adjust threshold".into(), fx(&|e| e.adjust = vec![crate::adjust::AdjustItem::new(crate::adjust::Adjust::Threshold(crate::adjust::Threshold { level: 100.0 }))])),
         ("fx bright contrast".into(), fx(&|e| (e.brightness, e.contrast) = (20.0, 30.0))),
         ("fx rc white".into(), fx(&|e| (e.rc_white, e.rc_fuzz) = (true, 30.0))),
         ("fx rc custom edges".into(), fx(&|e| (e.rc_custom, e.rc_color, e.rc_fuzz, e.rc_edge_px) = (true, [128, 60, 90], 25.0, 3))),

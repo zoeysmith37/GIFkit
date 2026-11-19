@@ -181,6 +181,15 @@ fn level_bar(ui: &mut egui::Ui, id: egui::Id, vals: &mut [f32], fills: &[Color32
             painter.rect_filled(Rect::from_min_max(pos2(x0, bar.top()), pos2(x0 + bar.width() / n as f32 + 0.5, bar.bottom())), 0.0, Color32::from_gray(v));
         }
         painter.rect_stroke(bar, 0.0, Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
+    } else {
+        // a groove for the handles, lit between the outer two
+        let groove = Rect::from_min_max(pos2(bar.left(), bar.bottom() - 4.0), bar.right_bottom());
+        painter.rect(groove, 2.0, mix(pal.window, pal.fg, 0.12), Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
+        if vals.len() > 1 {
+            let (lo, hi) = vals.iter().fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
+            let lit = Rect::from_min_max(pos2(bar.left() + lo / 255.0 * w, groove.top()), pos2(bar.left() + hi / 255.0 * w, groove.bottom()));
+            painter.rect_filled(lit, 2.0, mix(pal.highlight, pal.window, 0.35));
+        }
     }
     let x_of = |v: f32| bar.left() + v / 255.0 * w;
     let drag_id = id.with("drag");
@@ -267,6 +276,11 @@ fn gradient_editor(ui: &mut egui::Ui, g: &mut adjust::GradientMap, id: egui::Id)
     if resp.drag_stopped() {
         ui.data_mut(|d| d.remove::<usize>(drag_id));
     }
+    if resp.hovered() {
+        let on_stop = ui.input(|i| i.pointer.hover_pos()).and_then(|pp| hit(pp, &g.stops)).is_some();
+        ui.ctx().set_cursor_icon(if on_stop { egui::CursorIcon::ResizeHorizontal } else { egui::CursorIcon::Copy });
+    }
+    resp.on_hover_text("Click the bar to add a stop. Drag a stop to move it.");
     sel = sel.min(g.stops.len().saturating_sub(1));
     for (k, s) in g.stops.iter().enumerate() {
         let x = x_of(s.at);
@@ -287,13 +301,25 @@ fn gradient_editor(ui: &mut egui::Ui, g: &mut adjust::GradientMap, id: egui::Id)
             });
         });
     }
-    if g.stops.len() > 2 {
-        form_row(ui, "", |ui| {
-            if ui.button("Remove stop").clicked() {
+    form_row(ui, "", |ui| {
+        ui.horizontal(|ui| {
+            if ui.button("Add Stop").on_hover_text("Adds a stop in the widest gap. You can also click the bar.").clicked() {
+                let mut at: Vec<f32> = g.stops.iter().map(|s| s.at).collect();
+                at.extend([0.0, 1.0]);
+                at.sort_by(f32::total_cmp);
+                let (a, b) = at.windows(2).map(|w| (w[0], w[1])).max_by(|x, y| (x.1 - x.0).total_cmp(&(y.1 - y.0))).unwrap_or((0.0, 1.0));
+                let t = (a + b) / 2.0;
+                let c = adjust::map_one(&AdjustItem::new(Adjust::GradientMap(adjust::GradientMap { stops: g.stops.clone(), reverse: false })), [t, t, t]);
+                g.stops.push(Stop { at: t, color: c.map(|v| (v * 255.0).round() as u8) });
+                sel = g.stops.len() - 1;
+                ui.data_mut(|d| d.insert_temp(sel_id, sel));
+            }
+            if ui.add_enabled(g.stops.len() > 2, egui::Button::new("Remove Stop")).clicked() {
                 g.stops.remove(sel);
+                ui.data_mut(|d| d.insert_temp(sel_id, sel.saturating_sub(1)));
             }
         });
-    }
+    });
 }
 
 /// Slider row helper: label, value, range.
@@ -607,10 +633,10 @@ fn adjust_editor(ui: &mut egui::Ui, adj: &mut Adjust, id: egui::Id, hist: Option
         }
         Adjust::ColorBalance(b) => {
             let tid = id.with("tone");
-            let mut tone: usize = ui.data(|d| d.get_temp(tid)).unwrap_or(1);
-            form_row(ui, "Tones", |ui| combo(ui, &format!("{id:?}-tone"), &mut tone, &[(0, "Shadows"), (1, "Midtones"), (2, "Highlights")]));
+            let mut tone: usize = ui.data(|d| d.get_temp(tid)).unwrap_or(3);
+            form_row(ui, "Tones", |ui| combo(ui, &format!("{id:?}-tone"), &mut tone, &[(3, "All Tones"), (0, "Shadows"), (1, "Midtones"), (2, "Highlights")]));
             ui.data_mut(|d| d.insert_temp(tid, tone));
-            let t = &mut b.tones[tone];
+            let t = if tone == 3 { &mut b.master } else { &mut b.tones[tone] };
             for (i, (lo, hi)) in [("Cyan", "Red"), ("Magenta", "Green"), ("Yellow", "Blue")].iter().enumerate() {
                 form_row(ui, hi, |ui| fill_slider(ui, egui::Slider::new(&mut t[i], -100.0..=100.0).max_decimals(0))).on_hover_text(format!("Left toward {lo}, right toward {hi}"));
             }
@@ -727,7 +753,7 @@ fn adjust_editor(ui: &mut egui::Ui, adj: &mut Adjust, id: egui::Id, hist: Option
             slide(ui, "Amount", &mut l.amount, 0.0..=100.0, "%", 0);
         }
         Adjust::BrightContrast(b) => {
-            let (br, cr) = if b.legacy { (-100.0..=100.0, -100.0..=100.0) } else { (-150.0..=150.0, -50.0..=100.0) };
+            let (br, cr) = if b.legacy { (-200.0..=200.0, -100.0..=100.0) } else { (-300.0..=300.0, -100.0..=300.0) };
             slide(ui, "Brightness", &mut b.brightness, br, "", 0);
             slide(ui, "Contrast", &mut b.contrast, cr, "", 0);
             form_row(ui, "", |ui| check(ui, &mut b.legacy, "Use legacy").on_hover_text("The old straight-line version: it can clip the brightest and darkest tones. Older GIFkit Effects layers used it"));

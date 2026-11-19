@@ -24,9 +24,15 @@ Nothing you do changes the frames until you export. Every edit is a layer or a f
     ),
     (
         "Layers",
-        "Effects, Text, Shapes, Emoji, Markup, Censor, Image, Watermark and AI shield each add a layer.
+        "Adjust, Effects, Text, Shapes, Emoji, Markup, Censor, Image, Watermark and AI shield each add a layer.
 
 Layers stack like in an image editor. Higher ones draw on top. Hide or lock them from the timeline.
+
+## The Layers panel
+- Opacity and Blend sit at the top, for the selected layer
+- Ctrl+] and Ctrl+[ move a layer up or down. Add Shift for the top or bottom
+- Clip shows a layer only where the layer under it has drawn
+- Mask shows it only inside shapes you draw
 
 ## Text
 - Drag text on the preview to place it
@@ -34,12 +40,84 @@ Layers stack like in an image editor. Higher ones draw on top. Hide or lock them
 - Fonts include the ones on your system
 
 ## Effects
-- Colour, blur, glitch, distortions and more
+- Blur, glitch, distortions, styles, frames and more. Colour work lives in Adjust
+- Older projects keep their colour settings under Older colour settings
 - Transparency removes a colour. From Corner picks the background for you
 - Soft edge and Remove colour spill clean up a green screen
 
 ## Animation
 Moves a layer over time with ready-made motions like slide, hop and spin. Keyframes on the timeline (K) give finer control.",
+    ),
+    (
+        "Adjustments",
+        "The Adjust tool (A) makes adjustment layers, as in Photoshop. They change the colours of everything under them and never touch the frames.
+
+Add one from the Add Adjustment menu, Edit > Adjustments, the command palette or a shortcut. A layer holds a list of them that runs top to bottom.
+
+## Shortcuts
+- Ctrl+L Levels and Ctrl+M Curves
+- Ctrl+U Hue/Saturation and Ctrl+B Color Balance
+- Ctrl+I Invert and Ctrl+Shift+U Desaturate
+- Ctrl+Shift+L Auto Tone and Ctrl+Shift+B Auto Color
+
+## Curves and Levels
+- Both draw over the frame's histogram
+- Curves: drag a point, click the line to add one, drag it off to remove it
+- Levels: drag the black, grey and white handles, or use Auto
+- The eyedroppers set the black, grey or white point. Click them on the Original view
+
+## Every adjustment
+- Levels, Curves, Exposure, Brightness/Contrast, Vibrance and Hue/Saturation
+- Color Balance, Black & White, Photo Filter, Channel Mixer and Selective Color
+- Invert, Posterize, Threshold and Gradient Map
+- Looks are ready-made grades. Color Lookup loads .cube files from video editors
+
+## Comparing
+Hold \\ to see the frame without its adjustment and effects layers. Let go to see them again.",
+    ),
+    (
+        "Blend Modes",
+        "Every layer has a blend mode in the Layers panel, beside its opacity. It decides how the layer meets what's under it.
+
+## Which to use
+- Multiply darkens. White in the layer disappears
+- Screen lightens. Black in the layer disappears
+- Overlay and Soft Light add contrast
+- Color takes only the layer's colour. Luminosity takes only its light
+- Difference shows what's changed between two layers
+
+## With adjustments
+Curves in Luminosity adds contrast without making colours stronger. Hue/Saturation in Color tints without changing light.",
+    ),
+    (
+        "Shortcuts and Palette",
+        "Press Ctrl+K for the command palette. Type part of any tool, adjustment, command or recent file and press Enter.
+
+Each entry shows its shortcut, so you learn them as you go.
+
+## Tools
+- T Text, U Shapes, B Markup and E Emoji
+- Q Mask, A Adjust and G Effects
+- Space plays. The arrow keys step a frame
+
+## Your own keys
+Settings > Keyboard Shortcuts changes any of them.",
+    ),
+    (
+        "Rulers and Guides",
+        "View > Rulers shows rulers along the top and left of the preview. They are off until you turn them on.
+
+## Guides
+- Drag from a ruler onto the picture to make a guide
+- Drag a guide back onto its ruler to remove it
+- Layers snap to guides as you move them
+- Guides are saved with the project
+- View > Show Guides hides them, and View > Clear Guides removes them all
+
+## Smart guides
+While you move a layer, lines show where it lines up with the frame and other layers. It snaps there too.
+- View > Smart Guides turns them off
+- Hold Ctrl while dragging to move freely without snapping",
     ),
     (
         "Timeline",
@@ -204,9 +282,96 @@ impl GifKitApp {
     }
 }
 
+/// What's new in this version: a headline, a line about it, and the
+/// Handbook topic that explains it.
+const WHATS_NEW: &[(&str, &str, &str)] = &[
+    ("Adjustment layers", "Levels, Curves and 15 more, like Photoshop's. Press A or Ctrl+L", "Adjustments"),
+    ("Blend modes", "Multiply, Screen, Overlay and the rest on every layer, in the Layers panel", "Blend Modes"),
+    ("Command palette", "Ctrl+K finds any tool, adjustment or command by name", "Shortcuts and Palette"),
+    ("Rulers and smart guides", "Turn on rulers in View. Layers snap to guides, the centre and each other", "Rulers and Guides"),
+    ("Before and after", "Hold \\ to see the frame without its adjustments", "Adjustments"),
+    ("Tool keys", "T Text, U Shapes, B Markup, E Emoji, Q Mask, A Adjust, G Effects", "Shortcuts and Palette"),
+];
+
+/// Show What's New now? After an update (not on a first run), unless
+/// turned off in Settings. Remembers the version so it shows once.
+pub(super) fn whats_new_due() -> bool {
+    let now = crate::update::current();
+    let seen = theme::get_setting("seen_version");
+    theme::set_setting("seen_version", &now);
+    if theme::get_setting("whats_new").as_deref() == Some("0") || std::env::var_os("GIFKIT_NO_WHATS_NEW").is_some() {
+        return false;
+    }
+    match seen {
+        Some(s) => crate::update::newer(&now, &s),
+        // a copy from before this setting existed has used GIFkit before
+        None => theme::get_setting("recent").is_some_and(|r| r.len() > 2),
+    }
+}
+
+impl GifKitApp {
+    pub(super) fn whats_new_window(&mut self, ctx: &egui::Context) {
+        if !self.whats_new_open {
+            return;
+        }
+        let pal = *p();
+        let mut open = true;
+        let mut go: Option<&str> = None;
+        let was = theme::get_setting("whats_new").as_deref() != Some("0");
+        let mut show_again = was;
+        let title = format!("What's New in GIFkit {}", crate::update::current());
+        dialog(ctx, "whats-new", &title, vec2(520.0, 470.0), false, &mut open, |ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            for (head, line, topic) in WHATS_NEW {
+                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 52.0), Sense::click());
+                if resp.hovered() {
+                    ui.painter().rect_filled(r, 4.0, mix(pal.window, pal.highlight, 0.12));
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                ui.painter().circle_filled(r.left_center() + vec2(12.0, 0.0), 4.0, pal.highlight);
+                ui.painter().text(r.left_top() + vec2(26.0, 8.0), egui::Align2::LEFT_TOP, *head, theme::medium(14.0), pal.fg);
+                ui.painter().text(r.left_top() + vec2(26.0, 29.0), egui::Align2::LEFT_TOP, *line, egui::FontId::proportional(12.5), pal.fg_muted);
+                if resp.on_hover_text("Read about it in the Handbook").clicked() {
+                    go = Some(topic);
+                }
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                check(ui, &mut show_again, "Show this after updates");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::new("Close").min_size(vec2(84.0, CHIP_H))).clicked() {
+                        self.whats_new_open = false;
+                    }
+                    if ui.add(egui::Button::new("Open Handbook").min_size(vec2(0.0, CHIP_H))).clicked() {
+                        go = Some(WHATS_NEW[0].2);
+                    }
+                });
+            });
+        });
+        if show_again != was {
+            theme::set_setting("whats_new", if show_again { "1" } else { "0" });
+        }
+        if let Some(t) = go {
+            self.handbook_topic = TOPICS.iter().position(|x| x.0 == t).unwrap_or(0);
+            self.handbook_open = true;
+            self.whats_new_open = false;
+        }
+        if !open {
+            self.whats_new_open = false;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whats_new_points_at_real_topics() {
+        for (head, _, topic) in WHATS_NEW {
+            assert!(TOPICS.iter().any(|t| t.0 == *topic), "{head}: no topic {topic}");
+        }
+    }
 
     #[test]
     fn handbook_text_is_tidy() {

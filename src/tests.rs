@@ -1938,3 +1938,27 @@ fn layer_blend_modes() {
     let plain = serde_json::to_string(&crate::project::ProjLayerEntry { blend: Blend::Normal, ..back }).unwrap();
     assert!(!plain.contains("blend"), "normal isn't written, so older versions read it");
 }
+
+/// Posterize and Threshold at the end of a list are exact: only their steps,
+/// no in-between colours from the table.
+#[test]
+fn exact_posterize_and_threshold() {
+    use crate::adjust::*;
+    let ramp = image::RgbaImage::from_fn(256, 4, |x, y| image::Rgba([x as u8, (x as u8).wrapping_add(y as u8 * 50), 255 - x as u8, 255]));
+    let mut a = ramp.clone();
+    let mut items = vec![AdjustItem::new(Adjust::Curves(Curves { ch: [vec![[0.0, 10.0], [255.0, 245.0]], identity_curve(), identity_curve(), identity_curve()] })), AdjustItem::new(Adjust::Posterize(Posterize { levels: 4 }))];
+    apply(&mut a, &items, Blend::Normal);
+    let mut seen = std::collections::BTreeSet::new();
+    for p in a.pixels() {
+        seen.extend(p.0[..3].iter().copied());
+    }
+    assert_eq!(seen.into_iter().collect::<Vec<_>>(), vec![0, 85, 170, 255], "four steps exactly");
+    // Threshold after it: only black and white
+    items.push(AdjustItem::new(Adjust::Threshold(Threshold { level: 128.0 })));
+    let mut b = ramp.clone();
+    apply(&mut b, &items, Blend::Normal);
+    assert!(b.pixels().all(|p| p.0[..3] == [0, 0, 0] || p.0[..3] == [255, 255, 255]));
+    // switched off at the end: the table alone
+    items.iter_mut().skip(1).for_each(|i| i.on = false);
+    assert!(exact_tail(&items).is_empty());
+}
