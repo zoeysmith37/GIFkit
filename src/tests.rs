@@ -1050,11 +1050,11 @@ fn project_round_trip() {
     let overlay: Vec<image::RgbaImage> = (0..3).map(|i| image::RgbaImage::from_pixel(8, 6, image::Rgba([i * 80, 10, 200, 255]))).collect();
     let wm = Arc::new(image::RgbaImage::from_pixel(5, 5, image::Rgba([1, 2, 3, 128])));
     let layers = vec![
-        ProjLayerEntry { blend: Default::default(), flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: Some("Caption".into()), timing: Default::default(), layer: ProjLayer::Text { text: crate::text::Annotation { text: "hi".into(), stretch: 0.7, ..Default::default() }, font: Some(("builtin".into(), "Sans Bold".into())) } },
-        ProjLayerEntry { blend: Default::default(), flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: false, label: None, timing: Default::default(), layer: ProjLayer::Image { id: 1, name: "ov.png".into(), path: None, delays: vec![5, 5, 5], placements: vec![Default::default(); base.len()], opacity: 80.0 } },
-        ProjLayerEntry { blend: Default::default(), flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: Default::default(), layer: ProjLayer::Watermark { id: 2, watermark: Default::default(), has_image: true } },
-        ProjLayerEntry { blend: Default::default(), flip: [true, false], mask: Some(crate::shapes::LayerMask { shapes: vec![crate::shapes::MaskShape { kind: crate::shapes::ShapeKind::Star, feather: 3.0, cx: 5.0, cy: 6.0, w: 7.0, h: 8.0, ..Default::default() }, crate::shapes::MaskShape { subtract: true, w: 2.0, h: 2.0, ..Default::default() }], invert: true, ..Default::default() }), clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: crate::timeline::Timing { clips: Some(vec![crate::timeline::Clip { start: 2, end: Some(5) }]), keys: vec![crate::timeline::Key { frame: 3, x: 10.0, ..Default::default() }] }, layer: ProjLayer::Emoji { emoji: crate::shapes::EmojiSettings { emoji: "1f525".into(), w: 20, h: 20, ..Default::default() } } },
-        ProjLayerEntry { blend: Default::default(), flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: Default::default(), layer: ProjLayer::Markup { markup: crate::shapes::MarkupSettings { strokes: vec![crate::shapes::PenStroke { points: vec![[1.0, 2.0], [3.0, 4.0]], ..Default::default() }] } } },
+        ProjLayerEntry { style: Default::default(), blend: Default::default(), flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: Some("Caption".into()), timing: Default::default(), layer: ProjLayer::Text { text: crate::text::Annotation { text: "hi".into(), stretch: 0.7, ..Default::default() }, font: Some(("builtin".into(), "Sans Bold".into())) } },
+        ProjLayerEntry { style: Default::default(), blend: Default::default(), flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: false, label: None, timing: Default::default(), layer: ProjLayer::Image { id: 1, name: "ov.png".into(), path: None, delays: vec![5, 5, 5], placements: vec![Default::default(); base.len()], opacity: 80.0 } },
+        ProjLayerEntry { style: Default::default(), blend: Default::default(), flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: Default::default(), layer: ProjLayer::Watermark { id: 2, watermark: Default::default(), has_image: true } },
+        ProjLayerEntry { style: Default::default(), blend: Default::default(), flip: [true, false], mask: Some(crate::shapes::LayerMask { shapes: vec![crate::shapes::MaskShape { kind: crate::shapes::ShapeKind::Star, feather: 3.0, cx: 5.0, cy: 6.0, w: 7.0, h: 8.0, ..Default::default() }, crate::shapes::MaskShape { subtract: true, w: 2.0, h: 2.0, ..Default::default() }], invert: true, ..Default::default() }), clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: crate::timeline::Timing { clips: Some(vec![crate::timeline::Clip { start: 2, end: Some(5) }]), keys: vec![crate::timeline::Key { frame: 3, x: 10.0, ..Default::default() }] }, layer: ProjLayer::Emoji { emoji: crate::shapes::EmojiSettings { emoji: "1f525".into(), w: 20, h: 20, ..Default::default() } } },
+        ProjLayerEntry { style: Default::default(), blend: Default::default(), flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: Default::default(), layer: ProjLayer::Markup { markup: crate::shapes::MarkupSettings { strokes: vec![crate::shapes::PenStroke { points: vec![[1.0, 2.0], [3.0, 4.0]], ..Default::default() }] } } },
     ];
     let mut transform = crate::stack::Transform::default();
     transform.reverse = true;
@@ -1894,7 +1894,7 @@ fn make_old_colour_project() {
     let fx = crate::effects::EffectSettings { grayscale: true, brightness: 10.0, contrast: 25.0, vignette: true, ..Default::default() };
     let mut file = ProjectFile::default();
     file.frames = vec![Default::default()];
-    file.layers = vec![ProjLayerEntry { visible: true, label: None, layer: ProjLayer::Effects { fx }, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2], blend: Default::default() }];
+    file.layers = vec![ProjLayerEntry { style: Default::default(), visible: true, label: None, layer: ProjLayer::Effects { fx }, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2], blend: Default::default() }];
     save(std::path::Path::new(&out), file, &base, None, &std::collections::HashMap::new(), &std::collections::HashMap::new(), None).unwrap();
 }
 
@@ -1930,7 +1930,7 @@ fn layer_blend_modes() {
     assert_eq!(p.0[..3], [225, 115, 35], "white minus the shape");
     assert_eq!(*diff.get_pixel(35, 25), image::Rgba([255, 255, 255, 255]), "outside the shape nothing changes");
     // saved and loaded
-    let e = crate::project::ProjLayerEntry { visible: true, label: None, layer: crate::project::ProjLayer::Effects { fx: Default::default() }, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2], blend: Blend::Overlay };
+    let e = crate::project::ProjLayerEntry { visible: true, label: None, layer: crate::project::ProjLayer::Effects { fx: Default::default() }, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2], blend: Blend::Overlay, style: Default::default() };
     let json = serde_json::to_string(&e).unwrap();
     assert!(json.contains("Overlay"));
     let back: crate::project::ProjLayerEntry = serde_json::from_str(&json).unwrap();
@@ -1976,4 +1976,50 @@ fn guides_snap_and_save() {
     // older projects have none
     let none: ProjectFile = serde_json::from_str("{}").unwrap();
     assert!(none.guides.is_empty());
+}
+
+/// Layer styles: a stroke round a shape, a shadow cast away from the
+/// light, both through the whole renderer and saved with the project.
+#[test]
+fn layer_styles() {
+    use crate::layerstyle::LayerStyle;
+    use crate::stack::{LayerKind, Stack};
+    let base = Animation { frames: vec![Frame::new(image::RgbaImage::from_pixel(60, 50, image::Rgba([255, 255, 255, 255])), 10)], loop_count: None };
+    let mut st = Stack::default();
+    let id = st.push(LayerKind::Shape(Box::new(crate::shapes::ShapeSettings { x: 20, y: 15, w: 20, h: 20, fill: [30, 140, 220], stroke_w: 0.0, ..Default::default() })));
+    let li = st.index_of(id).unwrap();
+    let plan = st.plan(&base);
+    let times = crate::stack::plan_times(&plan);
+    let fonts = crate::text::builtin_fonts();
+    let plain = st.render_frame(&base, &plan, &times, 0, &fonts, &st.prepare(&base, &fonts));
+    let mut style = LayerStyle::default();
+    style.stroke.on = true;
+    style.stroke.color = [255, 0, 0];
+    style.stroke.size = 3.0;
+    st.layers[li].style = style.clone();
+    let stroked = st.render_frame(&base, &plan, &times, 0, &fonts, &st.prepare(&base, &fonts));
+    assert_eq!(stroked.get_pixel(30, 25), plain.get_pixel(30, 25), "the shape itself is unchanged");
+    assert_eq!(stroked.get_pixel(18, 25).0[..3], [255, 0, 0], "a red stroke just outside");
+    assert_eq!(stroked.get_pixel(10, 25).0[..3], [255, 255, 255], "nothing further out");
+    // a shadow with the light from the upper left falls down and right
+    style.stroke.on = false;
+    style.shadow = crate::layerstyle::Shadow { on: true, color: [0, 0, 0], opacity: 100.0, angle: 135.0, distance: 6.0, size: 0.0 };
+    st.layers[li].style = style.clone();
+    let shadowed = st.render_frame(&base, &plan, &times, 0, &fonts, &st.prepare(&base, &fonts));
+    assert!(shadowed.get_pixel(43, 38).0[0] < 40, "shadow below right: {:?}", shadowed.get_pixel(43, 38));
+    assert_eq!(shadowed.get_pixel(17, 12).0[..3], [255, 255, 255], "none above left");
+    // a glow lights up all round
+    style.shadow.on = false;
+    style.glow = crate::layerstyle::Glow { on: true, color: [255, 200, 0], opacity: 100.0, size: 6.0, spread: 50.0 };
+    st.layers[li].style = style.clone();
+    let glowing = st.render_frame(&base, &plan, &times, 0, &fonts, &st.prepare(&base, &fonts));
+    for (x, y) in [(18, 25), (42, 25), (30, 13), (30, 37)] {
+        assert!(glowing.get_pixel(x, y).0[2] < 200, "glow at {x},{y}: {:?}", glowing.get_pixel(x, y));
+    }
+    // saved, and left out when there's none
+    let e = crate::project::ProjLayerEntry { visible: true, label: None, layer: crate::project::ProjLayer::Effects { fx: Default::default() }, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2], blend: Default::default(), style: style.clone() };
+    let back: crate::project::ProjLayerEntry = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+    assert_eq!(back.style, style);
+    let none = serde_json::to_string(&crate::project::ProjLayerEntry { style: LayerStyle::default(), ..back }).unwrap();
+    assert!(!none.contains("style"));
 }

@@ -66,10 +66,11 @@ pub enum Action {
     Rulers,
     Guides,
     SmartGuides,
+    Grid,
 }
 
 impl Action {
-    pub const ALL: [Action; 60] = [
+    pub const ALL: [Action; 61] = [
         Action::New,
         Action::Open,
         Action::Save,
@@ -130,6 +131,7 @@ impl Action {
         Action::Rulers,
         Action::Guides,
         Action::SmartGuides,
+        Action::Grid,
     ];
 
     /// The groups the shortcuts dialog shows, in order.
@@ -142,7 +144,7 @@ impl Action {
             New | Open | Save | SaveAs | Export | Quit => "File",
             Undo | Redo | History | Duplicate | DeleteObject => "Edit",
             PlayPause | PrevFrame | NextFrame => "Playback",
-            ZoomIn | ZoomOut | Fit | ActualSize | SplitView | FullScreen | OnionSkin | Compress | Rulers | Guides | SmartGuides => "View",
+            ZoomIn | ZoomOut | Fit | ActualSize | SplitView | FullScreen | OnionSkin | Compress | Rulers | Guides | SmartGuides | Grid => "View",
             AdjLevels | AdjCurves | AdjHueSat | AdjBalance | AdjBlackWhite | AdjInvert | AdjDesaturate | AutoTone | AutoContrast | AutoColor => "Adjustments",
             ToolText | ToolShapes | ToolMarkup | ToolEmoji | ToolMask | ToolAdjust | ToolEffects => "Tools",
             LayerUp | LayerDown | LayerTop | LayerBottom => "Layers",
@@ -203,6 +205,7 @@ impl Action {
             Action::Rulers => "Show rulers",
             Action::Guides => "Show guides",
             Action::SmartGuides => "Smart guides",
+            Action::Grid => "Show grid",
             Action::ToolText => "Text tool",
             Action::ToolShapes => "Shapes tool",
             Action::ToolMarkup => "Markup (brush) tool",
@@ -269,6 +272,7 @@ impl Action {
             Action::Rulers => "rulers",
             Action::Guides => "guides",
             Action::SmartGuides => "smart_guides",
+            Action::Grid => "grid",
             Action::ToolText => "tool_text",
             Action::ToolShapes => "tool_shapes",
             Action::ToolMarkup => "tool_markup",
@@ -349,6 +353,7 @@ impl Action {
             Action::Rulers => cs(Key::R),
             Action::Guides => c(Key::Semicolon),
             Action::SmartGuides => None,
+            Action::Grid => c(Key::Quote),
         }
     }
 

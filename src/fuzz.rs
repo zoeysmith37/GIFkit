@@ -1516,9 +1516,9 @@ fn layer_masks() {
         let out = g.read(&tex);
         // (the colour of a nearly see-through pixel is stored premultiplied on
         // the card, coarse: only its alpha is held to)
-        let bad = out.pixels().zip(cpu.pixels()).filter(|(a, b)| ((a[3] as i32 - b[3] as i32).abs() > 2 || (b[3] >= 64 && (0..3).any(|c| (a[c] as i32 - b[c] as i32).abs() > 4)))).count();
+        let bad = out.pixels().zip(cpu.pixels()).filter(|(a, b)| (a[3] as i32 - b[3] as i32).abs() > 2 || (b[3] >= 64 && (0..3).any(|c| (a[c] as i32 - b[c] as i32).abs() > 4))).count();
         println!("GIF mask: {bad} pixels off");
-        for (i, (a, b)) in out.pixels().zip(cpu.pixels()).enumerate().filter(|(_, (a, b))| ((a[3] as i32 - b[3] as i32).abs() > 2 || (b[3] >= 64 && (0..3).any(|c| (a[c] as i32 - b[c] as i32).abs() > 4)))).take(5) {
+        for (i, (a, b)) in out.pixels().zip(cpu.pixels()).enumerate().filter(|(_, (a, b))| (a[3] as i32 - b[3] as i32).abs() > 2 || (b[3] >= 64 && (0..3).any(|c| (a[c] as i32 - b[c] as i32).abs() > 4))).take(5) {
             println!("  at {} {}: card {:?} cpu {:?}", i % 160, i / 160, a.0, b.0);
         }
         if let Ok(dir) = std::env::var("GPU_OUT") {

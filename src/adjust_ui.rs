@@ -356,7 +356,6 @@ impl GifKitApp {
         if sel.is_some() {
             ui.add_space(GROUP_GAP);
         }
-        hint(ui, if sel.is_some() { "Editing the selected adjustment layer. Adjustments run top to bottom" } else { "Pick an adjustment to make a layer for it" });
         ui.add_space(6.0);
         let mut pick: Option<usize> = None;
         // Photoshop's adjustment menu
@@ -496,6 +495,8 @@ fn adjust_card(ui: &mut egui::Ui, item: &mut AdjustItem, k: usize, n: usize, lid
                 if k > 0 && small_icon(ui, "go-up", "Move up (runs earlier)") {
                     act = Some(CardAct::Up(k));
                 }
+
+                user_presets(ui, item, egui::Id::unique(("adj-presets", lid, k)));
             });
         });
         if open {
@@ -506,6 +507,89 @@ fn adjust_card(ui: &mut egui::Ui, item: &mut AdjustItem, k: usize, n: usize, lid
     ui.add_space(6.0);
     ui.data_mut(|d| d.insert_temp(open_id, open));
     act
+}
+
+/// Settings you saved for this kind of adjustment, kept beside the
+/// settings file so every project can use them.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct UserPreset {
+    name: String,
+    adj: Adjust,
+}
+
+fn user_presets_path() -> Option<std::path::PathBuf> {
+    Some(theme::config_path()?.parent()?.join("adjustment-presets.json"))
+}
+
+fn load_user_presets() -> Vec<UserPreset> {
+    user_presets_path().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+fn save_user_presets(v: &[UserPreset]) {
+    if let (Some(p), Ok(t)) = (user_presets_path(), serde_json::to_string_pretty(v)) {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(p, t);
+    }
+}
+
+/// The card's preset button: save these settings by name, or load ones
+/// saved before for this kind of adjustment.
+fn user_presets(ui: &mut egui::Ui, item: &mut AdjustItem, id: egui::Id) {
+    let pal = *p();
+    let r = ui.add(egui::Button::new("").frame_when_inactive(false).min_size(vec2(22.0, 22.0)));
+    crate::icons::paint(ui.painter(), "bookmarks", r.rect.center(), 16.0, if r.hovered() { pal.fg } else { pal.fg_muted });
+    let r = r.on_hover_text("Your presets for this adjustment");
+    let name_id = id.with("name");
+    egui::Popup::menu(&r).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+        ui.set_width(240.0);
+        let mut all = load_user_presets();
+        let kind = item.adj.index();
+        let mut changed = false;
+        let mut del = None;
+        let mut any = false;
+        for (i, pr) in all.iter().enumerate().filter(|(_, pr)| pr.adj.index() == kind) {
+            any = true;
+            ui.horizontal(|ui| {
+                let w = ui.available_width() - 26.0;
+                if ui.add_sized(vec2(w, CHIP_H), egui::Button::new(&pr.name).frame_when_inactive(false)).on_hover_text("Use these settings").clicked() {
+                    item.adj = pr.adj.clone();
+                    ui.close();
+                }
+                if small_icon(ui, "edit-delete", "Delete this preset") {
+                    del = Some(i);
+                }
+            });
+        }
+        if !any {
+            ui.label(RichText::new("None saved yet").color(pal.fg_muted));
+        }
+        if let Some(i) = del {
+            all.remove(i);
+            changed = true;
+        }
+        ui.separator();
+        let mut name: String = ui.data(|d| d.get_temp(name_id)).unwrap_or_default();
+        let mut save = false;
+        ui.horizontal(|ui| {
+            let te = ui.add_sized(vec2(150.0, CHIP_H), egui::TextEdit::singleline(&mut name).hint_text("Preset name"));
+            save = te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            save |= ui.add_enabled(!name.trim().is_empty(), egui::Button::new("Save").min_size(vec2(0.0, CHIP_H))).clicked();
+        });
+        if save && !name.trim().is_empty() {
+            let n = name.trim().to_string();
+            // the same name for the same kind replaces it
+            all.retain(|pr| !(pr.adj.index() == kind && pr.name == n));
+            all.push(UserPreset { name: n, adj: item.adj.clone() });
+            changed = true;
+            name.clear();
+        }
+        ui.data_mut(|d| d.insert_temp(name_id, name));
+        if changed {
+            save_user_presets(&all);
+        }
+    });
 }
 
 fn adjust_editor(ui: &mut egui::Ui, adj: &mut Adjust, id: egui::Id, hist: Option<&Histogram>) {
@@ -802,7 +886,7 @@ fn adjust_editor(ui: &mut egui::Ui, adj: &mut Adjust, id: egui::Id, hist: Option
         Adjust::Cube(c) => {
             form_row(ui, "File", |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button("Load .cube…").clicked() {
+                    if ui.button("Load .cube…").on_hover_text("The table is saved inside the project").clicked() {
                         if let Some(path) = rfd::FileDialog::new().add_filter("3D LUT", &["cube", "CUBE"]).pick_file() {
                             match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| adjust::parse_cube(&t)) {
                                 Ok(lut) => {
@@ -826,7 +910,6 @@ fn adjust_editor(ui: &mut egui::Ui, adj: &mut Adjust, id: egui::Id, hist: Option
                 form_row(ui, "", |ui| ui.label(RichText::new(&e).size(12.0).color(p().negative)));
             }
             slide(ui, "Amount", &mut c.amount, 0.0..=100.0, "%", 0);
-            form_row(ui, "", |ui| hint(ui, "Saved inside the project"));
         }
     }
 }
@@ -843,7 +926,7 @@ fn levels_droppers(ui: &mut egui::Ui, l: &mut adjust::Levels, id: egui::Id) {
     let pal = *p();
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
-        for (k, (tip, fill)) in [("Set the black point: click something that should be black", Color32::BLACK), ("Set the grey point: click something that should be neutral grey", Color32::from_gray(128)), ("Set the white point: click something that should be white", Color32::WHITE)].iter().enumerate() {
+        for (k, (tip, fill)) in [("Set the black point: click something in the Original view that should be black", Color32::BLACK), ("Set the grey point: click something in the Original view that should be neutral grey", Color32::from_gray(128)), ("Set the white point: click something in the Original view that should be white", Color32::WHITE)].iter().enumerate() {
             let did = id.with(("dropper", k));
             let r = ui.add(egui::Button::new("").min_size(vec2(30.0, 24.0))).on_hover_text(*tip);
             crate::icons::paint(ui.painter(), "color-picker", r.rect.center() - vec2(3.0, 0.0), 16.0, pal.fg);
@@ -860,7 +943,6 @@ fn levels_droppers(ui: &mut egui::Ui, l: &mut adjust::Levels, id: egui::Id) {
                 set_point(l, k, px);
             }
         }
-        hint(ui, "  Pick from the Original view");
     });
 }
 

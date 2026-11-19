@@ -2,6 +2,7 @@
 
 mod refps;
 mod adjust;
+mod layerstyle;
 mod anim;
 mod app;
 mod booth;

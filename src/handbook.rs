@@ -28,16 +28,28 @@ Nothing you do changes the frames until you export. Every edit is a layer or a f
 
 Layers stack like in an image editor. Higher ones draw on top. Hide or lock them from the timeline.
 
+With no layer of a tool's kind selected, changing a setting adds one. With one selected, you edit that one.
+
 ## The Layers panel
 - Opacity and Blend sit at the top, for the selected layer
 - Ctrl+] and Ctrl+[ move a layer up or down. Add Shift for the top or bottom
 - Clip shows a layer only where the layer under it has drawn
-- Mask shows it only inside shapes you draw
+- The fx button beside Blend opens Layer Style: Stroke, Drop Shadow and Outer Glow for text, shapes and emoji. Each has its own switch
+- With the pointer on the picture, the arrow keys nudge the selected layer 1 px. Shift moves it 10
+- Mask shows it only inside shapes you draw. Masking the GIF hides it outside the mask, but not the layers on top
+- In the Mask tool, Draw lets you draw a shape by hand. Esc stops
+
+## Colours
+Any colour button opens a picker. Under its number boxes are your recent colours, and below them the main colours of the frame on screen.
 
 ## Text
 - Drag text on the preview to place it
 - Typing makes it appear letter by letter or word by word
 - Fonts include the ones on your system
+
+## Shapes and Markup
+- Drag on the preview to draw a shape. Lines and arrows go from start to end
+- Shift keeps a line straight, in Shapes and in Markup
 
 ## Effects
 - Blur, glitch, distortions, styles, frames and more. Colour work lives in Adjust
@@ -65,6 +77,10 @@ Add one from the Add Adjustment menu, Edit > Adjustments, the command palette or
 - Curves: drag a point, click the line to add one, drag it off to remove it
 - Levels: drag the black, grey and white handles, or use Auto
 - The eyedroppers set the black, grey or white point. Click them on the Original view
+- Color Balance starts on All Tones, a shift for the whole picture. Pick Shadows, Midtones or Highlights for finer control
+
+## Your presets
+The bookmark on each adjustment's card saves its settings by name. They're there for that adjustment in every project.
 
 ## Every adjustment
 - Levels, Curves, Exposure, Brightness/Contrast, Vibrance and Hue/Saturation
@@ -115,8 +131,11 @@ Settings > Keyboard Shortcuts changes any of them.",
 - A guide pulls toward the frame's edges and middle. Hold Ctrl to place it freely
 - View > Show Guides (Ctrl+;) hides them, and View > Clear Guides removes them all
 
+## Grid
+View > Grid (Ctrl+') lays a grid over the picture. Grid Size sets its spacing. Snap to Grid makes things you move or resize line up with it.
+
 ## Smart guides
-While you move a layer, lines show where it lines up with the frame and other layers. It snaps there too.
+While you move or resize a layer, lines show where it lines up with the frame and other layers. It snaps there too. Pink numbers show the gap to the nearest layer on each side.
 - View > Smart Guides turns them off
 - Hold Ctrl while dragging to move freely without snapping",
     ),
@@ -165,8 +184,12 @@ While you move a layer, lines show where it lines up with the frame and other la
 - Find Loop Point looks for the two frames that match best
 - Blend the Seam fades the end into the start
 
+## Crop
+Drag on the preview to set the crop. Preview picks whether you see it with your edits or as the original.
+
 ## Speed and frames
 - Speed changes the delay of every frame
+- Change Frame Rate makes more or fewer frames for the same length. Layers and keyframes stay in time
 - Frames skips frames you don't want and adds images as new frames
 
 ## In-betweens

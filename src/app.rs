@@ -1131,6 +1131,12 @@ pub struct GifKitApp {
     guide_drag: Option<GuideDrag>,
     /// smart guide lines lit by the drag this frame
     snap_lines: Vec<(bool, f32)>,
+    /// gaps to the nearest layers while one moves: x0, y0, x1, y1
+    snap_gaps: Vec<[f32; 4]>,
+    show_grid: bool,
+    grid_snap: bool,
+    picture_colours_key: Option<(usize, u64, usize)>,
+    grid_size: u32,
     /// track heights, and the track whose bottom edge is being dragged
     tl_gif_h: f32,
     tl_row_h: f32,
@@ -1442,6 +1448,9 @@ fn key_label(key: &str) -> String {
     let word: String = key.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
     match word.as_str() {
         "reorder" => "Reorder layers".into(),
+        "nudge" => "Nudge layer".into(),
+        "style" => "Layer style".into(),
+        "guide" | "guides" => "Guides".into(),
         "del" => "Delete".into(),
         "preset" => "Apply preset".into(),
         "addcensor" => "Add censor".into(),
@@ -1930,6 +1939,39 @@ fn toggle_grid(ui: &mut egui::Ui, min_w: f32, items: &mut [(&mut bool, &str, &st
 
 /// Colour button (KDE KColorButton style: a framed button with a swatch).
 /// Its popup has the colour picker, a hex field and an eyedropper.
+/// The layer style popup: Stroke, Drop Shadow and Outer Glow, each with
+/// its own switch.
+fn layer_style_ui(ui: &mut egui::Ui, st: &mut crate::layerstyle::LayerStyle) {
+    ui.set_width(340.0);
+    let head = |ui: &mut egui::Ui, on: &mut bool, name: &str, tip: &str| {
+        ui.add_space(2.0);
+        check(ui, on, RichText::new(name).strong()).on_hover_text(tip);
+    };
+    head(ui, &mut st.stroke.on, "Stroke", "An outline round the outside");
+    ui.add_enabled_ui(st.stroke.on, |ui| {
+        form_row(ui, "Colour", |ui| colour_btn(ui, &mut st.stroke.color));
+        slider_row(ui, "Size", egui::Slider::new(&mut st.stroke.size, 1.0..=40.0).suffix(" px").max_decimals(0));
+        slider_row(ui, "Opacity", egui::Slider::new(&mut st.stroke.opacity, 0.0..=100.0).suffix("%").max_decimals(0));
+    });
+    ui.separator();
+    head(ui, &mut st.shadow.on, "Drop Shadow", "A soft shadow, cast away from the light");
+    ui.add_enabled_ui(st.shadow.on, |ui| {
+        form_row(ui, "Colour", |ui| colour_btn(ui, &mut st.shadow.color));
+        slider_row(ui, "Opacity", egui::Slider::new(&mut st.shadow.opacity, 0.0..=100.0).suffix("%").max_decimals(0));
+        slider_row(ui, "Angle", egui::Slider::new(&mut st.shadow.angle, -180.0..=180.0).suffix("°").max_decimals(0)).on_hover_text("Where the light comes from. 120° is the upper left");
+        slider_row(ui, "Distance", egui::Slider::new(&mut st.shadow.distance, 0.0..=60.0).suffix(" px").max_decimals(0));
+        slider_row(ui, "Size", egui::Slider::new(&mut st.shadow.size, 0.0..=40.0).suffix(" px").max_decimals(0)).on_hover_text("How soft it is");
+    });
+    ui.separator();
+    head(ui, &mut st.glow.on, "Outer Glow", "A soft light round the outside");
+    ui.add_enabled_ui(st.glow.on, |ui| {
+        form_row(ui, "Colour", |ui| colour_btn(ui, &mut st.glow.color));
+        slider_row(ui, "Opacity", egui::Slider::new(&mut st.glow.opacity, 0.0..=100.0).suffix("%").max_decimals(0));
+        slider_row(ui, "Size", egui::Slider::new(&mut st.glow.size, 1.0..=60.0).suffix(" px").max_decimals(0));
+        slider_row(ui, "Spread", egui::Slider::new(&mut st.glow.spread, 0.0..=100.0).suffix("%").max_decimals(0)).on_hover_text("How much of it is solid before it fades");
+    });
+}
+
 fn colour_btn(ui: &mut egui::Ui, c: &mut [u8; 3]) -> egui::Response {
     let mut rgba = [c[0], c[1], c[2], 255];
     let r = colour_edit(ui, &mut rgba, false);
@@ -1952,6 +1994,59 @@ struct Eyedrop {
 
 static EYEDROP: std::sync::Mutex<Option<Eyedrop>> = std::sync::Mutex::new(None);
 
+/// Colours picked lately, newest first, kept in the settings.
+static RECENT_COLOURS: std::sync::Mutex<Option<Vec<[u8; 3]>>> = std::sync::Mutex::new(None);
+/// The main colours of the frame on screen, for the picker.
+static PICTURE_COLOURS: std::sync::Mutex<Vec<[u8; 3]>> = std::sync::Mutex::new(Vec::new());
+const SWATCHES: usize = 10;
+
+fn recent_colours() -> Vec<[u8; 3]> {
+    let mut g = RECENT_COLOURS.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(|| theme::get_setting("recent_colours").map(|v| v.split(',').filter_map(parse_hex).collect()).unwrap_or_default()).clone()
+}
+
+fn note_recent_colour(c: [u8; 3]) {
+    let mut v = recent_colours();
+    v.retain(|x| *x != c);
+    v.insert(0, c);
+    v.truncate(SWATCHES);
+    theme::set_setting("recent_colours", &v.iter().map(|c| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])).collect::<Vec<_>>().join(","));
+    *RECENT_COLOURS.lock().unwrap_or_else(|e| e.into_inner()) = Some(v);
+}
+
+/// The few colours that cover most of a picture, most first, each a good
+/// way from the others.
+fn main_colours(img: &RgbaImage, n: usize) -> Vec<[u8; 3]> {
+    let total = (img.width() as u64 * img.height() as u64).max(1);
+    let stride = ((total / 40_000) as usize).max(1);
+    let mut bins = vec![(0u32, [0u64; 3]); 4096];
+    for px in img.as_raw().chunks_exact(4).step_by(stride) {
+        if px[3] < 128 {
+            continue;
+        }
+        let k = ((px[0] as usize >> 4) << 8) | ((px[1] as usize >> 4) << 4) | (px[2] as usize >> 4);
+        bins[k].0 += 1;
+        for c in 0..3 {
+            bins[k].1[c] += px[c] as u64;
+        }
+    }
+    let mut order: Vec<usize> = (0..4096).filter(|k| bins[*k].0 > 0).collect();
+    order.sort_by_key(|k| std::cmp::Reverse(bins[*k].0));
+    let mut out: Vec<[u8; 3]> = Vec::new();
+    for k in order {
+        let (cnt, sum) = bins[k];
+        let c = sum.map(|v| (v / cnt as u64) as u8);
+        let far = out.iter().all(|o| (0..3).map(|i| (o[i] as i32 - c[i] as i32).pow(2)).sum::<i32>() > 40 * 40);
+        if far {
+            out.push(c);
+            if out.len() == n {
+                break;
+            }
+        }
+    }
+    out
+}
+
 fn eyedrop_picked_id(id: egui::Id) -> egui::Id {
     id.with("eyedrop-picked")
 }
@@ -1965,6 +2060,7 @@ fn colour_edit(ui: &mut egui::Ui, c: &mut [u8; 4], alpha: bool) -> egui::Respons
         c[1] = px[1];
         c[2] = px[2];
         resp.mark_changed();
+        note_recent_colour(px);
     }
     let sw = resp.rect.shrink2(vec2(6.0, 5.0));
     if c[3] < 255 {
@@ -1976,7 +2072,8 @@ fn colour_edit(ui: &mut egui::Ui, c: &mut [u8; 4], alpha: bool) -> egui::Respons
     ui.painter().rect_filled(sw, 2.0, Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]));
     ui.painter().rect_stroke(sw, 2.0, Stroke::new(1.0, mix(pal.fg, pal.button, 0.6)), egui::StrokeKind::Inside);
     let mut pick = false;
-    egui::Popup::from_toggle_button_response(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+    let pending = resp.id.with("recent");
+    let shown = egui::Popup::from_toggle_button_response(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
         ui.set_width(PICK_W);
         if colour_picker_body(ui, resp.id, c, alpha) {
             resp.mark_changed();
@@ -2000,6 +2097,14 @@ fn colour_edit(ui: &mut egui::Ui, c: &mut [u8; 4], alpha: bool) -> egui::Respons
             }
         });
     });
+    // a colour chosen in the popup counts as recent once it closes
+    if shown.is_some() && resp.changed() {
+        ui.ctx().data_mut(|d| d.insert_temp(pending, [c[0], c[1], c[2]]));
+    } else if shown.is_none() {
+        if let Some(rgb) = ui.ctx().data_mut(|d| d.remove_temp::<[u8; 3]>(pending)) {
+            note_recent_colour(rgb);
+        }
+    }
     if pick {
         let frame = ui.ctx().cumulative_frame_nr();
         if let Ok(mut e) = EYEDROP.lock() {
@@ -2170,6 +2275,32 @@ fn colour_picker_body(ui: &mut egui::Ui, id: egui::Id, c: &mut [u8; 4], alpha: b
             ui.add_sized(vec2(w, CHIP_H), egui::DragValue::new(&mut c[i]).range(0..=255).prefix(format!("{name} ")));
         }
     });
+    // recent picks, then the picture's own colours
+    ui.add_space(6.0);
+    let picture = PICTURE_COLOURS.lock().map(|v| v.clone()).unwrap_or_default();
+    for (row, tip) in [(recent_colours(), "Recent"), (picture, "In the picture")] {
+        let side = ((PICK_W - 2.0 * (SWATCHES as f32 - 1.0)) / SWATCHES as f32).floor();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for i in 0..SWATCHES {
+                let (r, resp) = ui.allocate_exact_size(vec2(side, side), egui::Sense::click());
+                match row.get(i) {
+                    Some(sw) => {
+                        ui.painter().rect_filled(r, 2.0, Color32::from_rgb(sw[0], sw[1], sw[2]));
+                        ui.painter().rect_stroke(r, 2.0, if resp.hovered() { Stroke::new(1.5, pal.highlight) } else { line }, egui::StrokeKind::Inside);
+                        if resp.on_hover_text(format!("{tip} · #{:02x}{:02x}{:02x}", sw[0], sw[1], sw[2])).clicked() {
+                            c[0] = sw[0];
+                            c[1] = sw[1];
+                            c[2] = sw[2];
+                        }
+                    }
+                    None => {
+                        ui.painter().rect_stroke(r, 2.0, Stroke::new(1.0, mix(pal.border, pal.window, 0.4)), egui::StrokeKind::Inside);
+                    }
+                }
+            }
+        });
+    }
     if c[..3] != before[..3] {
         hsv = hsv_of(*c);
         changed = true;
@@ -3410,6 +3541,11 @@ impl GifKitApp {
             smart_guides: theme::get_setting("smart_guides").as_deref() != Some("0"),
             guide_drag: None,
             snap_lines: Vec::new(),
+            snap_gaps: Vec::new(),
+            show_grid: theme::get_setting("grid").as_deref() == Some("1"),
+            picture_colours_key: None,
+            grid_snap: theme::get_setting("grid_snap").as_deref() != Some("0"),
+            grid_size: theme::get_setting("grid_size").and_then(|v| v.parse().ok()).filter(|v| *v > 0).unwrap_or(16),
             tl_gif_h: theme::get_setting("tl_gif_h").and_then(|v| v.parse().ok()).unwrap_or(40.0),
             tl_row_h: theme::get_setting("tl_row_h").and_then(|v| v.parse().ok()).unwrap_or(28.0),
             tl_row_drag: None,
@@ -4451,17 +4587,13 @@ impl GifKitApp {
             ui.add_space(2.0);
             ui.add_enabled_ui(n_unused > 0, |ui| {
                 let label = if n_unused > 0 { format!("Drop the {n_unused} source frames the timeline doesn't use") } else { "Drop unused frames".to_string() };
-                check(ui, &mut self.shrink_drop, label);
-            });
-            ui.indent("shrink-drop", |ui| {
-                hint(ui, if n_unused > 0 { "Frames outside the Cut, kept in case it's lengthened again. Undo brings them back" } else { "The timeline uses every frame" });
+                check(ui, &mut self.shrink_drop, label).on_hover_text(if n_unused > 0 { "Frames outside the Cut, kept in case it's lengthened again. Undo brings them back" } else { "The timeline uses every frame" });
             });
             ui.add_space(8.0);
-            check(ui, &mut self.shrink_compact, "Store full-colour frames compressed");
-            ui.indent("shrink-compact", |ui| {
-                hint(ui, if colourful { "Video frames as nearly lossless WebP: about a tenth of the space" } else { "Video frames as nearly lossless WebP. These frames are mostly few colours: little to gain" });
-                hint(ui, "Takes effect when saved. GIFkit 1.7.1 and older can't open it");
-            });
+            check(ui, &mut self.shrink_compact, "Store full-colour frames compressed").on_hover_text(format!(
+                "{}\nTakes effect when saved. GIFkit 1.7.1 and older can't open it",
+                if colourful { "Video frames as nearly lossless WebP: about a tenth of the space" } else { "Video frames as nearly lossless WebP. These frames are mostly few colours: little to gain" }
+            ));
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -5327,7 +5459,9 @@ impl GifKitApp {
             self.before_after = ba;
             ctx.request_repaint();
         }
-        let (undo, redo, play, left, right, fit, one, zin, zout, cmp) = (hit(A::Undo), hit(A::Redo), hit(A::PlayPause), hit(A::PrevFrame), hit(A::NextFrame), hit(A::Fit), hit(A::ActualSize), hit(A::ZoomIn), hit(A::ZoomOut), hit(A::SplitView));
+        // arrows with the pointer on the picture and a layer picked: nudge it
+        let nudged = !typing && self.nudge_keys(ctx);
+        let (undo, redo, play, left, right, fit, one, zin, zout, cmp) = (hit(A::Undo), hit(A::Redo), hit(A::PlayPause), hit(A::PrevFrame) && !nudged, hit(A::NextFrame) && !nudged, hit(A::Fit), hit(A::ActualSize), hit(A::ZoomIn), hit(A::ZoomOut), hit(A::SplitView));
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.export_open = false;
             self.shortcuts_open = false;
@@ -5365,7 +5499,7 @@ impl GifKitApp {
         if hit(A::Compress) && self.base.is_some() {
             self.cmp_go = self.cmp_key();
         }
-        for a in [A::Rulers, A::Guides, A::SmartGuides] {
+        for a in [A::Rulers, A::Guides, A::SmartGuides, A::Grid] {
             if hit(a) {
                 self.toggle_view_aid(a);
             }
@@ -6305,6 +6439,7 @@ impl GifKitApp {
                 l.mask = src.mask.clone();
                 l.flip = src.flip;
                 l.blend = src.blend;
+                l.style = src.style.clone();
                 last = Some((l.kind(), id));
             }
         }
@@ -7206,6 +7341,23 @@ impl GifKitApp {
                 if menu_check(ui, self.smart_guides, "S&mart Guides", &self.keymap.text(crate::keys::Action::SmartGuides)) {
                     self.toggle_view_aid(crate::keys::Action::SmartGuides);
                 }
+                if menu_check(ui, self.show_grid, "Gr&id", &self.keymap.text(crate::keys::Action::Grid)) {
+                    self.toggle_view_aid(crate::keys::Action::Grid);
+                }
+                sub_menu(ui, "", "Grid Si&ze", |ui| {
+                    for g in [4u32, 8, 10, 16, 20, 25, 32, 50, 64, 100] {
+                        if menu_check(ui, self.grid_size == g, &format!("{g} px"), "") {
+                            self.grid_size = g;
+                            self.show_grid = true;
+                            theme::set_setting("grid_size", &g.to_string());
+                            theme::set_setting("grid", "1");
+                        }
+                    }
+                });
+                if menu_check(ui, self.grid_snap, "Snap to G&rid", "") {
+                    self.grid_snap = !self.grid_snap;
+                    theme::set_setting("grid_snap", if self.grid_snap { "1" } else { "0" });
+                }
                 if menu_item_tip(ui, "edit-clear", "&Clear Guides", "", has && !self.stack.guides.is_empty(), "Drag a guide back onto a ruler to remove just that one") {
                     self.clear_guides(ctx);
                 }
@@ -7421,12 +7573,68 @@ impl GifKitApp {
         theme::set_setting("backdrop_col", &format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]));
     }
 
+    /// Keeps the picker's "in the picture" colours for the frame on screen.
+    fn refresh_picture_colours(&mut self) {
+        let src = self.plan.get(self.cur).map(|f| f.src).unwrap_or(0);
+        let key = (src, self.orig_gen, self.base.as_ref().map(|b| b.len()).unwrap_or(0));
+        if self.picture_colours_key == Some(key) {
+            return;
+        }
+        self.picture_colours_key = Some(key);
+        let v = self.base.as_ref().and_then(|b| b.frames.get(src)).map(|f| main_colours(&f.image.get(), SWATCHES)).unwrap_or_default();
+        if let Ok(mut g) = PICTURE_COLOURS.lock() {
+            *g = v;
+        }
+    }
+
+    /// Arrow keys move the selected layer 1 px (10 with Shift) when the
+    /// pointer is over the picture. True when they did.
+    fn nudge_keys(&mut self, ctx: &egui::Context) -> bool {
+        let over = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| self.views_last.iter().any(|r| r.contains(p)));
+        if !over || self.base.is_none() {
+            return false;
+        }
+        let Some(kind) = self.tool.layer_kind() else { return false };
+        if matches!(kind, Kind::Effects | Kind::Animation | Kind::Adjust | Kind::Markup) {
+            return false;
+        }
+        let Some(li) = self.sel_index(kind) else { return false };
+        let (dx, dy, shift) = ctx.input(|i| {
+            if i.modifiers.command || i.modifiers.alt {
+                return (0.0, 0.0, false);
+            }
+            let k = |key| if i.key_pressed(key) { 1.0 } else { 0.0 };
+            (k(egui::Key::ArrowRight) - k(egui::Key::ArrowLeft), k(egui::Key::ArrowDown) - k(egui::Key::ArrowUp), i.modifiers.shift)
+        });
+        if dx == 0.0 && dy == 0.0 {
+            return false;
+        }
+        if self.stack.layers[li].locked {
+            return true;
+        }
+        let step = if shift { 10.0 } else { 1.0 };
+        let src_idx = self.plan.get(self.cur).map(|f| f.src).unwrap_or(0);
+        let l = &self.stack.layers[li];
+        let Some(b) = l.source_box(src_idx, &self.fonts) else { return false };
+        let b = if l.timing.keys.is_empty() { b } else { l.timing.motion(self.cur).apply(b) };
+        let (bw, bh) = self.dims();
+        let mp = self.stack.layer_maps(bw, bh)[li].m;
+        let (sx, sy) = mp.inverse().apply_vec(dx * step, dy * step);
+        let now = ctx.input(|i| i.time);
+        self.snapshot(&format!("nudge{}", self.stack.layers[li].id), now);
+        self.write_box_or_key(li, Obb { cx: b.cx + sx, cy: b.cy + sy, ..b }, src_idx);
+        self.modified = true;
+        ctx.request_repaint();
+        true
+    }
+
     /// Rulers, guides and smart guides on or off, remembered.
     fn toggle_view_aid(&mut self, a: crate::keys::Action) {
         use crate::keys::Action as A;
         let (flag, key, name) = match a {
             A::Rulers => (&mut self.show_rulers, "rulers", "Rulers"),
             A::Guides => (&mut self.show_guides, "show_guides", "Guides"),
+            A::Grid => (&mut self.show_grid, "grid", "Grid"),
             _ => (&mut self.smart_guides, "smart_guides", "Smart guides"),
         };
         *flag = !*flag;
@@ -8391,7 +8599,28 @@ impl GifKitApp {
                 ui.label(RichText::new("Blend:").color(if sel_li.is_some() { pal.fg } else { pal.fg_muted }));
                 let mut mode = sel_li.map(|i| self.stack.layers[i].blend).unwrap_or_default();
                 let items: Vec<(crate::adjust::Blend, &str)> = crate::adjust::Blend::ALL.iter().map(|b| (*b, b.label())).collect();
-                combo(ui, "layer-blend", &mut mode, &items).on_hover_text("How the layer meets what's under it: Multiply darkens, Screen lightens, Overlay adds contrast, Color and Luminosity take one part of it");
+                let styleable = sel_li.is_some_and(|i| crate::stack::Layer::can_style(&self.stack.layers[i].kind));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // the layer's style: stroke, shadow and glow
+                    let styled = sel_li.is_some_and(|i| !self.stack.layers[i].style.is_none());
+                    let r = ui.add_enabled(styleable, egui::Button::new("").min_size(vec2(30.0, CHIP_H)));
+                    crate::icons::paint(ui.painter(), "tool_imageeffects", r.rect.center(), 16.0, if styled { pal.highlight } else if styleable { pal.fg } else { pal.fg_muted });
+                    let r = r.on_hover_text("Layer style: stroke, drop shadow and outer glow").on_disabled_hover_text("Layer styles are for text, shapes and emoji");
+                    egui::Popup::from_toggle_button_response(&r).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                        if let Some(i) = sel_li {
+                            let mut st = self.stack.layers[i].style.clone();
+                            layer_style_ui(ui, &mut st);
+                            if st != self.stack.layers[i].style {
+                                let now = ui.input(|i| i.time);
+                                let id = self.stack.layers[i].id;
+                                self.snapshot(&format!("style{id}"), now);
+                                self.stack.layers[i].style = st;
+                                self.modified = true;
+                            }
+                        }
+                    });
+                    combo(ui, "layer-blend", &mut mode, &items).on_hover_text("How the layer meets what's under it: Multiply darkens, Screen lightens, Overlay adds contrast, Color and Luminosity take one part of it");
+                });
                 if let Some(i) = sel_li.filter(|i| self.stack.layers[*i].blend != mode) {
                     self.stack.layers[i].blend = mode;
                     self.modified = true;
@@ -9052,6 +9281,8 @@ impl GifKitApp {
                     l.mask = src.mask.clone();
                     l.flip = src.flip;
                     l.blend = src.blend;
+                    l.style = src.style.clone();
+                l.style = src.style.clone();
                     self.stack.layers.insert(li + 1, l);
                 }
                 self.select(src.kind(), id);
@@ -9417,9 +9648,7 @@ impl GifKitApp {
                 ui.add_space(8.0);
                 let folder = self.export_fmt == ExportFormat::Frames && !self.frames_zip;
                 ui.horizontal(|ui| {
-                    if folder {
-                        hint(ui, "You'll pick a folder for the frames");
-                    }
+                    let _ = folder;
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // KDE order: the main action first, then Cancel
                         if ui.add(egui::Button::image_and_text(crate::icons::image(ui.ctx(), "dialog-cancel", 16.0, pal.fg), "Cancel").min_size(vec2(96.0, CHIP_H))).clicked() {
@@ -9739,7 +9968,7 @@ impl GifKitApp {
                     LayerKind::Markup(m) => ProjLayer::Markup { markup: m.clone() },
                     LayerKind::Emoji(e) => ProjLayer::Emoji { emoji: (**e).clone() },
                 };
-                ProjLayerEntry { visible: l.visible, label: l.label.clone(), layer, timing: l.timing.clone(), locked: l.locked, color: l.color, opacity: l.opacity, clip: l.clip, mask: l.mask.clone(), flip: l.flip, blend: l.blend }
+                ProjLayerEntry { visible: l.visible, label: l.label.clone(), layer, timing: l.timing.clone(), locked: l.locked, color: l.color, opacity: l.opacity, clip: l.clip, mask: l.mask.clone(), flip: l.flip, blend: l.blend, style: l.style.clone() }
             })
             .collect();
         let file = ProjectFile {
@@ -9912,6 +10141,7 @@ impl GifKitApp {
                 l.mask = e.mask.clone();
                 l.flip = e.flip;
                 l.blend = e.blend;
+                l.style = e.style.clone();
             }
         }
         self.stack.markers = file.markers;
@@ -10562,6 +10792,7 @@ impl GifKitApp {
 
     fn canvas(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let pal = *p();
+        self.refresh_picture_colours();
         let full = ui.available_rect_before_wrap();
         ui.allocate_rect(full, Sense::hover());
         if !self.compare {
@@ -11153,20 +11384,14 @@ impl GifKitApp {
                                 let (dxn, dyn_) = (ang.cos(), ang.sin());
                                 let len = ox * dxn + oy * dyn_;
                                 (ox, oy) = (dxn * len, dyn_ * len);
-                            } else if self.smart_guides && space == Space::Output && !ui.input(|i| i.modifiers.command) {
-                                // smart guides: its edges and middle line up with
-                                // the frame, the guides and the other layers
+                            } else if space == Space::Output && self.snapping(ui) {
+                                // smart guides and the grid: its edges and middle
+                                // line up with the frame, the guides and the other layers
                                 let (x0, x1, y0, y1) = guides_ui::obb_extent(&map_box(&mp, src, readable));
-                                let (xs, ys) = self.snap_targets(li, bounds);
-                                let thr = 6.0 / m.scale;
-                                self.snap_lines.clear();
-                                if let Some((d, t)) = guides_ui::nearest_snap(&[x0 + ox, (x0 + x1) / 2.0 + ox, x1 + ox], &xs, thr) {
-                                    ox += d;
-                                    self.snap_lines.push((true, t));
-                                }
-                                if let Some((d, t)) = guides_ui::nearest_snap(&[y0 + oy, (y0 + y1) / 2.0 + oy, y1 + oy], &ys, thr) {
-                                    oy += d;
-                                    self.snap_lines.push((false, t));
+                                let (sx, sy, boxes) = self.snap_edges(li, bounds, &[x0 + ox, (x0 + x1) / 2.0 + ox, x1 + ox], &[y0 + oy, (y0 + y1) / 2.0 + oy, y1 + oy], m.scale);
+                                (ox, oy) = (ox + sx, oy + sy);
+                                if self.smart_guides {
+                                    self.note_gaps([x0 + ox, x1 + ox, y0 + oy, y1 + oy], &boxes);
                                 }
                             }
                             let (dx, dy) = mp.inverse().apply_vec(ox, oy);
@@ -11179,6 +11404,14 @@ impl GifKitApp {
                             let ctrl = ui.input(|i| i.modifiers.command);
                             let emoji = matches!(&self.stack.layers[li].kind, LayerKind::Shape(sh) if sh.kind == ShapeKind::Emoji) || kind == Kind::Emoji;
                             let lock = (kind == Kind::Overlay || emoji) != shift;
+                            let mut pi = pi;
+                            if space == Space::Output && out0.angle.abs() < 0.01 && self.snapping(ui) {
+                                // the edge under the pointer lines up like a move does
+                                let ex: &[f32] = if axis == 2 { &[] } else { &[pi.x] };
+                                let ey: &[f32] = if axis == 1 { &[] } else { &[pi.y] };
+                                let (sx, sy, _) = self.snap_edges(li, bounds, ex, ey, m.scale);
+                                pi = pos2(pi.x + sx, pi.y + sy);
+                            }
                             let lp = out0.to_local(pi.x, pi.y);
                             let (mut w, mut h) = ((lp.0 - fixed.0).abs().max(1.0), (lp.1 - fixed.1).abs().max(1.0));
                             let mut axis = axis;
@@ -12041,8 +12274,7 @@ impl GifKitApp {
         self.transform_header(ui, ctx, |t| &mut t.crop_on, |_| {});
         let (w, h) = self.dims();
         group(ui, "Show", |ui| {
-            form_row(ui, "Preview", |ui| seg_row(ui, &mut self.crop_live, &[(true, "With Edits"), (false, "Original")]));
-            form_row(ui, "", |ui| hint(ui, "Drag on the image to set the crop"));
+            form_row(ui, "Preview", |ui| seg_row(ui, &mut self.crop_live, &[(true, "With Edits"), (false, "Original")])).on_hover_text("Drag on the image to set the crop");
         });
         let tr = &mut self.stack.transform;
         let before = tr.crop;
@@ -12249,9 +12481,7 @@ impl GifKitApp {
         let fixed = tr.speed_on && tr.speed_mode != SpeedMode::Percent;
         let mut go = false;
         group(ui, "Change Frame Rate", |ui| {
-            hint(ui, "More or fewer frames, the same length. Layers and keyframes stay in time");
-            ui.add_space(4.0);
-            form_row(ui, "Rate", |ui| fps_picker(ui, "refps", &mut self.refps_fps));
+            form_row(ui, "Rate", |ui| fps_picker(ui, "refps", &mut self.refps_fps)).on_hover_text("More or fewer frames, the same length. Layers and keyframes stay in time");
             form_row(ui, "", |ui| hint(ui, &fps_note(self.refps_fps)));
             form_row(ui, "Frames", |ui| {
                 seg_row(ui, &mut self.refps_blend, &[(false, "Repeat or drop"), (true, "Blend")])
@@ -12586,7 +12816,6 @@ impl GifKitApp {
         ui.add_space(GROUP_GAP);
         let sel = self.sel_index(Kind::Effects);
         ui.horizontal(|ui| {
-            hint(ui, if sel.is_some() { "Editing the selected effects layer" } else { "Changing anything adds an effects layer" });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add(egui::Button::new("Reset").min_size(vec2(84.0, CHIP_H))).on_hover_text("Clear every effect on this layer").clicked() {
                     match sel {
@@ -12681,7 +12910,6 @@ impl GifKitApp {
         ui.add_space(GROUP_GAP);
         let sel = self.sel_index(Kind::Animation);
         ui.horizontal(|ui| {
-            hint(ui, if sel.is_some() { "Editing the selected animation layer" } else { "Changing anything adds an animation layer" });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add(egui::Button::new("Reset").min_size(vec2(84.0, CHIP_H))).on_hover_text("Clear the animation on this layer").clicked() {
                     match sel {
@@ -12980,10 +13208,6 @@ impl GifKitApp {
             _ => self.text_tpl.clone(),
         };
         let before = a.clone();
-        if sel.is_none() {
-            hint(ui, "Changing anything adds a text layer");
-            ui.add_space(6.0);
-        }
         group(ui, "Text", |ui| {
             // a fixed id keeps the focus when the first letter adds the layer
             ui.add(egui::TextEdit::multiline(&mut a.text).id_salt("text_body").desired_rows(2).desired_width(f32::INFINITY));
@@ -13439,9 +13663,6 @@ impl GifKitApp {
             self.pick_mask_owner(pick);
             return;
         }
-        if t == MaskOf::Gif {
-            hint(ui, "The GIF shows only inside the mask. Layers on top aren't masked.");
-        }
         let locked = self.mask_locked(t);
         if locked {
             hint(ui, "The layer is locked");
@@ -13479,10 +13700,6 @@ impl GifKitApp {
                         self.mask_line.clear();
                     }
                 });
-                if self.mask_lasso {
-                    ui.add_space(2.0);
-                    hint(ui, "Drag on the picture to draw the shape. Esc stops.");
-                }
             });
             if !had {
                 return;
@@ -13524,10 +13741,8 @@ impl GifKitApp {
                                     }
                                 });
                             });
-                            hint(ui, "The letters fill the box: size it on the picture");
                         }
                         crate::shapes::MaskForm::Drawn => {
-                            hint(ui, "Drawn by hand. Draw again to add another.");
                         }
                     }
                     slider_row(ui, "Feather", soft_slider(&mut sh.feather, 0.0..=60.0, "").suffix(" px").max_decimals(0));
@@ -13613,14 +13828,8 @@ impl GifKitApp {
                     st.kind = k;
                 }
             });
-            if st.kind.is_linear() {
-                ui.add_space(2.0);
-                hint(ui, "Drag from start to end. Shift keeps it straight.");
-            }
         });
-        if st.kind == ShapeKind::Emoji {
-            hint(ui, "Emoji have their own tool now");
-        } else {
+        if st.kind != ShapeKind::Emoji {
             group(ui, "Style", |ui| {
                 if st.kind == ShapeKind::Line {
                     Self::colour_row(ui, "Line", &mut st.stroke);
@@ -13901,10 +14110,6 @@ impl GifKitApp {
         let sel = self.layer_chooser(ui, Kind::Markup, "Add New Markup Layer", |s| {
             s.add_layer(LayerKind::Markup(MarkupSettings::default()));
         });
-        if sel.is_none() {
-            hint(ui, "Drag on the image to draw");
-            ui.add_space(6.0);
-        }
         group(ui, "Brush", |ui| {
             form_row(ui, "Tool", |ui| seg_row(ui, &mut self.pen_tool, &[(PenTool::Pen, "Pen"), (PenTool::Highlighter, "Highlighter"), (PenTool::Eraser, "Eraser")])).on_hover_text("The eraser removes whole strokes you drag over");
             ui.add_space(4.0);
@@ -13916,7 +14121,6 @@ impl GifKitApp {
             ui.add_enabled_ui(!eraser, |ui| Self::colour_row(ui, "Colour", &mut b.color));
             slider_row(ui, "Size", egui::Slider::new(&mut b.width, 1.0..=80.0).suffix(" px").max_decimals(1).clamping(egui::SliderClamping::Never));
             ui.add_enabled_ui(!eraser, |ui| slider_row(ui, "Opacity", egui::Slider::new(&mut b.opacity, 5.0..=100.0).suffix("%").max_decimals(0)));
-            form_row(ui, "", |ui| hint(ui, "Hold Shift for a straight line"));
         });
         group(ui, "Draw On", |ui| {
             form_row(ui, "Draw on", |ui| seg_row(ui, &mut self.pen_scope, &[(PenScope::All, "All frames"), (PenScope::FromHere, "From here"), (PenScope::ThisFrame, "This frame")])).on_hover_text("Step through frames to draw an animation");
@@ -14244,10 +14448,8 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform, c
     // settings keeps them here, working as before
     if crate::adjust::has_legacy(fx) {
         group_ex(ui, "Older colour settings", true, Some("●".to_string()), |ui| {
-            hint(ui, "Colour work moved to the Adjust tool. These still work as they did");
-            ui.add_space(4.0);
             let b = egui::Button::image_and_text(crate::icons::image(ui.ctx(), "view-object-histogram-linear", 16.0, p().fg), "Move to an Adjustment Layer");
-            if wide_button(ui, b).on_hover_text("The same settings as Hue/Saturation, Brightness/Contrast and so on, which you can then edit with curves, blend modes and the rest").clicked() {
+            if wide_button(ui, b).on_hover_text("Colour work lives in the Adjust tool now. These older settings still work as they did.\nThis moves them to Hue/Saturation, Brightness/Contrast and so on, where curves, blend modes and the rest apply").clicked() {
                 convert = true;
             }
             ui.add_space(4.0);
@@ -14473,7 +14675,6 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform, c
         return convert;
     }
     group_ex(ui, "Transform (Old)", true, on(&[fx.flip_v, fx.flip_h, fx.rot90, fx.rot270, fx.rot_any]), |ui| {
-        hint(ui, "Use the Rotate frame edit instead");
         form_row(ui, "Transform", |ui| {
             toggle_grid(ui, 64.0, &mut [(&mut fx.flip_h, "Flip horizontally", ""), (&mut fx.flip_v, "Flip vertically", ""), (&mut fx.rot90, "Turn 90° clockwise", ""), (&mut fx.rot270, "Turn 90° anticlockwise", "")])
         });

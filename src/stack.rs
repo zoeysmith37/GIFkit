@@ -428,9 +428,16 @@ pub struct Layer {
     pub flip: [bool; 2],
     /// how it meets what's under it (Photoshop's blend modes)
     pub blend: crate::adjust::Blend,
+    /// stroke, drop shadow and outer glow (text, shapes and emoji)
+    pub style: crate::layerstyle::LayerStyle,
 }
 
 impl Layer {
+    /// Can it have a layer style? (text, shapes and emoji)
+    pub fn can_style(k: &LayerKind) -> bool {
+        matches!(k, LayerKind::Text(_) | LayerKind::Shape(_) | LayerKind::Emoji(_))
+    }
+
     /// Can it be mirrored? (things drawn in a box)
     pub fn can_flip(&self) -> bool {
         matches!(self.kind, LayerKind::Text(_) | LayerKind::Shape(_) | LayerKind::Emoji(_) | LayerKind::Overlay(_))
@@ -559,6 +566,9 @@ pub fn layer_signature(l: &Layer) -> u64 {
     }
     if l.blend != crate::adjust::Blend::Normal {
         l.blend.hash(&mut h);
+    }
+    if !l.style.is_none() {
+        format!("{:?}", l.style).hash(&mut h);
     }
     if let Some(m) = &l.mask {
         format!("{m:?}").hash(&mut h);
@@ -826,7 +836,7 @@ impl Stack {
     pub fn push(&mut self, kind: LayerKind) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
-        self.layers.push(Layer { id, visible: true, kind, label: None, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2], blend: Default::default() });
+        self.layers.push(Layer { id, visible: true, kind, label: None, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2], blend: Default::default(), style: Default::default() });
         id
     }
 
@@ -989,6 +999,16 @@ impl Stack {
     }
 
     pub fn prepare(&self, base: &Animation, fonts: &[FontEntry]) -> Prepared {
+        /// A layer's picture with its style under it, moved so the picture
+        /// itself stays put.
+        fn styled(l: &Layer, m: &crate::geo::Affine, (sp, x, y): (RgbaImage, i64, i64)) -> (RgbaImage, i64, i64) {
+            if l.style.is_none() || !Layer::can_style(&l.kind) {
+                return (sp, x, y);
+            }
+            let scale = shapes::map_scale(m);
+            let pad = l.style.pad(scale) as i64;
+            (l.style.apply(&sp, scale), x - pad, y - pad)
+        }
         let maps = self.layer_maps(base.width(), base.height());
         let sprites = self
             .layers
@@ -1009,7 +1029,7 @@ impl Stack {
                     }
                     let x = (o.cx - sp.width() as f32 / 2.0).round() as i64;
                     let y = (o.cy - sp.height() as f32 / 2.0).round() as i64;
-                    Some((sp, x, y))
+                    Some(styled(l, &maps[li].m, (sp, x, y)))
                 }
                 _ => None,
             })
@@ -1036,12 +1056,12 @@ impl Stack {
                     LayerKind::Shape(s) => {
                         let Some(b) = l.source_box(0, fonts) else { return Vec::new() };
                         let o = map_box(m, b, l.readable());
-                        shapes::shape_sprite(s, o, shapes::map_scale(m), l.flip).map(|(img, x, y)| vec![StrokeSprite { img, x, y, from: s.from, to: s.to }]).unwrap_or_default()
+                        shapes::shape_sprite(s, o, shapes::map_scale(m), l.flip).map(|sp| styled(l, m, sp)).map(|(img, x, y)| vec![StrokeSprite { img, x, y, from: s.from, to: s.to }]).unwrap_or_default()
                     }
                     LayerKind::Emoji(e) => {
                         let Some(b) = l.source_box(0, fonts) else { return Vec::new() };
                         let o = map_box(m, b, true);
-                        shapes::emoji_sprite(&e.emoji, o, e.shadow.then_some(&e.shadow_style), l.flip).map(|(img, x, y)| vec![StrokeSprite { img, x, y, from: e.from, to: e.to }]).unwrap_or_default()
+                        shapes::emoji_sprite(&e.emoji, o, e.shadow.then_some(&e.shadow_style), l.flip).map(|sp| styled(l, m, sp)).map(|(img, x, y)| vec![StrokeSprite { img, x, y, from: e.from, to: e.to }]).unwrap_or_default()
                     }
                     LayerKind::Markup(mk) => {
                         let sc = shapes::map_scale(m);
@@ -1081,7 +1101,7 @@ impl Stack {
                             if (o.angle % 360.0).abs() > 0.01 {
                                 sp = crate::ops::rotate_any_image(&sp, o.angle, image::Rgba([0, 0, 0, 0]), true);
                             }
-                            sp
+                            styled(l, &maps[li].m, (sp, 0, 0)).0
                         })
                         .collect()
                 }
