@@ -15,6 +15,24 @@ pub(super) enum PalCmd {
     Shortcuts,
     AutoCompress,
     NewAdjustLayer,
+    Export(ExportFormat),
+    Menu(MenuCmd),
+}
+
+/// Menu items that have no shortcut of their own.
+#[derive(Clone, Copy)]
+pub(super) enum MenuCmd {
+    OpenSequence,
+    CopyResult,
+    Batch,
+    CollapseAll,
+    CollapseFrameEdits,
+    LinkViews,
+    Toolbar,
+    Statusbar,
+    ToolNames,
+    Ffmpeg,
+    WhatsNew,
 }
 
 pub(super) struct PalEntry {
@@ -153,6 +171,26 @@ impl GifKitApp {
             cmd: PalCmd::AutoCompress,
         });
         v.push(PalEntry { icon: "list-add", title: "New Adjustment Layer".into(), kind: "Layer", keys: String::new(), also: "adjust".into(), cmd: PalCmd::NewAdjustLayer });
+        for f in ExportFormat::ALL {
+            let fl = f.label();
+            v.push(PalEntry { icon: "document-export", title: format!("Export as {fl}…"), kind: "Export", keys: String::new(), also: format!("save {} {}", fl.to_lowercase(), f.tip()), cmd: PalCmd::Export(f) });
+        }
+        let on_off = |on: bool, what: &str| format!("{} {what}", if on { "Hide" } else { "Show" });
+        for (cmd, icon, title, kind, also) in [
+            (MenuCmd::OpenSequence, "document-import", "Open Image Sequence…".to_string(), "Command", "png frames folder import"),
+            (MenuCmd::CopyResult, "edit-copy", "Copy Result".to_string(), "Command", "clipboard paste export"),
+            (MenuCmd::Batch, "archive-insert", "Batch…".to_string(), "Command", "many files folder"),
+            (MenuCmd::CollapseAll, "merge", "Collapse All".to_string(), "Layer", "flatten bake merge"),
+            (MenuCmd::CollapseFrameEdits, "dialog-ok-apply", "Collapse Frame Edits".to_string(), "Layer", "bake crop resize rotate"),
+            (MenuCmd::LinkViews, "", format!("{} Both Views", if self.link_views { "Unlink" } else { "Link" }), "View", "split zoom pan sync"),
+            (MenuCmd::Toolbar, "", on_off(self.show_toolbar, "Toolbar"), "Setting", "toggle"),
+            (MenuCmd::Statusbar, "", on_off(self.show_statusbar, "Statusbar"), "Setting", "toggle status bar"),
+            (MenuCmd::ToolNames, "", on_off(!self.sidebar_compact, "Tool Names"), "Setting", "toggle sidebar compact labels"),
+            (MenuCmd::Ffmpeg, "", "Configure ffmpeg…".to_string(), "Setting", "video mp4 webm avif"),
+            (MenuCmd::WhatsNew, "tools-wizard", "What's New…".to_string(), "Help", "changes update release notes"),
+        ] {
+            v.push(PalEntry { icon, title, kind, keys: if matches!(cmd, MenuCmd::CopyResult) { "Ctrl+Shift+C".into() } else { String::new() }, also: also.into(), cmd: PalCmd::Menu(cmd) });
+        }
         for p in self.recent.iter().take(8) {
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             v.push(PalEntry { icon: "document-open-recent", title: name, kind: "Recent", keys: String::new(), also: p.to_string_lossy().into_owned(), cmd: PalCmd::Recent(p.clone()) });
@@ -177,6 +215,46 @@ impl GifKitApp {
                 self.add_layer(LayerKind::Effects(Box::new(EffectSettings { adjust_layer: true, ..Default::default() })));
                 self.tool = Tool::Adjust;
             }
+            PalCmd::Export(f) if has => {
+                if f.needs_ffmpeg() && !self.ffmpeg {
+                    self.ff_open = true;
+                } else {
+                    self.export_fmt = f;
+                    self.export_open = true;
+                }
+            }
+            PalCmd::Menu(m) => match m {
+                MenuCmd::OpenSequence => self.open_sequence_dialog(ctx),
+                MenuCmd::CopyResult if has => self.copy_result(ctx),
+                MenuCmd::Batch => {
+                    self.batch.open = true;
+                    if has {
+                        self.batch.edits = batch_ui::BatchEdits::Current;
+                    }
+                    let (l, pr) = crate::presets::list_with_problems();
+                    self.presets = l;
+                    self.preset_problems = pr;
+                }
+                MenuCmd::CollapseAll if has && !self.stack.is_empty() => self.bake(ctx, false),
+                MenuCmd::CollapseFrameEdits if has && !self.stack.transform.is_identity() => self.bake(ctx, true),
+                MenuCmd::CollapseAll | MenuCmd::CollapseFrameEdits if has => self.info("Nothing to collapse"),
+                MenuCmd::LinkViews => self.link_views = !self.link_views,
+                MenuCmd::Toolbar => {
+                    self.show_toolbar = !self.show_toolbar;
+                    theme::set_setting("show_toolbar", if self.show_toolbar { "1" } else { "0" });
+                }
+                MenuCmd::Statusbar => {
+                    self.show_statusbar = !self.show_statusbar;
+                    theme::set_setting("show_statusbar", if self.show_statusbar { "1" } else { "0" });
+                }
+                MenuCmd::ToolNames => self.set_rail_compact(!self.sidebar_compact),
+                MenuCmd::Ffmpeg => {
+                    self.ff_msg = None;
+                    self.ff_open = true;
+                }
+                MenuCmd::WhatsNew => self.whats_new_open = true,
+                _ => self.info("Open an animation first"),
+            },
             _ => self.info("Open an animation first"),
         }
         ctx.request_repaint();

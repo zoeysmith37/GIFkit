@@ -866,9 +866,8 @@ fn levels_droppers(ui: &mut egui::Ui, l: &mut adjust::Levels, id: egui::Id) {
 
 /// The black (0), grey (1) or white (2) point set from colour `px`.
 fn set_point(l: &mut adjust::Levels, k: usize, px: [u8; 3]) {
-    for ch in 0..3 {
-        let v = px[ch] as f32;
-        let c = &mut l.ch[ch + 1];
+    for (c, v) in l.ch[1..].iter_mut().zip(px) {
+        let v = v as f32;
         match k {
             0 => c.in_black = v.min(c.in_white - 2.0).max(0.0),
             2 => c.in_white = v.max(c.in_black + 2.0).min(255.0),
@@ -879,9 +878,8 @@ fn set_point(l: &mut adjust::Levels, k: usize, px: [u8; 3]) {
         // each channel's middle bent so this colour comes out grey
         let after: [f32; 3] = std::array::from_fn(|ch| adjust::levels(&adjust::LevelsCh { gamma: 1.0, ..l.ch[ch + 1] }, px[ch] as f32 / 255.0));
         let target = (after[0] + after[1] + after[2]) / 3.0;
-        for ch in 0..3 {
-            let c = &mut l.ch[ch + 1];
-            let u = ((px[ch] as f32 - c.in_black) / (c.in_white - c.in_black).max(1.0)).clamp(0.01, 0.99);
+        for (c, v) in l.ch[1..].iter_mut().zip(px) {
+            let u = ((v as f32 - c.in_black) / (c.in_white - c.in_black).max(1.0)).clamp(0.01, 0.99);
             let want = ((target * 255.0 - c.out_black) / (c.out_white - c.out_black).max(1.0)).clamp(0.01, 0.99);
             c.gamma = (u.ln() / want.ln()).clamp(0.1, 9.99);
         }
