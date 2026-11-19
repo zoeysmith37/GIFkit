@@ -175,6 +175,11 @@ pub struct EffectSettings {
     /// the timer's corner (0 bottom left, 1 bottom right, 2 top left, 3 top right) and size (% of the height)
     pub counter_pos: u8,
     pub counter_size: f32,
+
+    /// Photoshop-style adjustments, in order (an Adjust layer's)
+    pub adjust: Vec<crate::adjust::AdjustItem>,
+    /// made in the Adjust panel (shows there, named after its adjustments)
+    pub adjust_layer: bool,
 }
 
 impl Default for EffectSettings {
@@ -300,6 +305,8 @@ impl Default for EffectSettings {
             loop_reverse: false,
             counter_pos: 0,
             counter_size: 7.0,
+            adjust: Vec::new(),
+            adjust_layer: false,
         }
     }
 }
@@ -913,6 +920,7 @@ pub fn apply_frame(src: &RgbaImage, idx: usize, n: usize, elapsed_s: f32, clip_s
     let mut img = src.clone();
     let d = EffectSettings::default();
 
+    crate::adjust::apply(&mut img, &s.adjust);
     if s.hue != d.hue || s.saturation != d.saturation || s.lightness != d.lightness {
         modulate(&mut img, s.hue, s.saturation, s.lightness);
     }

@@ -24,6 +24,8 @@ use std::sync::Arc;
 mod timeline_ui;
 #[path = "batch_ui.rs"]
 mod batch_ui;
+#[path = "adjust_ui.rs"]
+mod adjust_ui;
 #[path = "smoke.rs"]
 mod smoke;
 #[path = "handbook.rs"]
@@ -54,11 +56,14 @@ enum Tool {
     Animation,
     /// a layer's (or the GIF's) mask: its shapes on the picture
     Mask,
+    /// adjustment layers: Levels, Curves and the rest
+    Adjust,
 }
 
 impl Tool {
-    const ALL: [Tool; 20] = [
+    const ALL: [Tool; 21] = [
         Tool::Effects,
+        Tool::Adjust,
         Tool::Animation,
         Tool::Text,
         Tool::Shapes,
@@ -100,6 +105,7 @@ impl Tool {
             Tool::Emoji => "Emoji",
             Tool::Presets => "Presets",
             Tool::Animation => "Animation",
+            Tool::Adjust => "Adjust",
             Tool::Mask => "Mask",
         }
     }
@@ -125,6 +131,7 @@ impl Tool {
             Tool::Emoji => "smiley",
             Tool::Presets => "bookmarks",
             Tool::Animation => "animation-stage",
+            Tool::Adjust => "view-object-histogram-linear",
             Tool::Mask => "layer-mask",
         }
     }
@@ -149,6 +156,7 @@ impl Tool {
             Tool::Markup => "Draw and highlight with a pen",
             Tool::Presets => "Save edits to reuse on other files",
             Tool::Animation => "Intros, outros, looping motion and a timer",
+            Tool::Adjust => "Levels, Curves and other Photoshop-style adjustments",
             Tool::Mask => "Show a layer, or the GIF, only inside shapes",
         }
     }
@@ -166,6 +174,7 @@ impl Tool {
         match self {
             Tool::Effects => Some(Kind::Effects),
             Tool::Animation => Some(Kind::Animation),
+            Tool::Adjust => Some(Kind::Adjust),
             Tool::Text => Some(Kind::Text),
             Tool::Censor => Some(Kind::Censor),
             Tool::AddImage => Some(Kind::Overlay),
@@ -187,6 +196,7 @@ fn kind_tool(k: Kind) -> Tool {
     match k {
         Kind::Effects => Tool::Effects,
         Kind::Animation => Tool::Animation,
+        Kind::Adjust => Tool::Adjust,
         Kind::Text => Tool::Text,
         Kind::Censor => Tool::Censor,
         Kind::Overlay => Tool::AddImage,
@@ -823,6 +833,8 @@ pub struct GifKitApp {
     fx_draft: EffectSettings,
     /// the Animation panel's settings before its layer exists
     anim_draft: EffectSettings,
+    /// the Adjust panel's histogram: of which source frame, at which version
+    adj_hist: Option<((usize, u64), Arc<crate::adjust::Histogram>)>,
     sel: HashMap<&'static str, u64>,
 
     plan: Vec<PlanFrame>,
@@ -1501,6 +1513,7 @@ fn describe_edit(os: &Stack, og: &GifOptions, ns: &Stack, ng: &GifOptions) -> St
                     let name = match l.kind() {
                         Kind::Effects => "Effects".to_string(),
                         Kind::Animation => "Animation".to_string(),
+                        Kind::Adjust => short(l),
                         _ => short(l),
                     };
                     parts.push(if what.is_empty() { format!("Edit {name}") } else { format!("{name}: {what}") });
@@ -1545,6 +1558,7 @@ fn kind_key(k: Kind) -> &'static str {
     match k {
         Kind::Effects => "fx",
         Kind::Animation => "anim",
+        Kind::Adjust => "adjust",
         Kind::Text => "text",
         Kind::Censor => "censor",
         Kind::Overlay => "overlay",
@@ -2996,6 +3010,7 @@ impl GifKitApp {
             stack: Stack::default(),
             fx_draft: EffectSettings::default(),
             anim_draft: EffectSettings { anim: true, ..Default::default() },
+            adj_hist: None,
             sel: HashMap::new(),
             plan: Vec::new(),
             plan_times: Vec::new(),
@@ -10514,7 +10529,7 @@ impl GifKitApp {
             return;
         }
         let Some(kind) = self.tool.layer_kind() else { return };
-        if kind == Kind::Effects || kind == Kind::Animation {
+        if kind == Kind::Effects || kind == Kind::Animation || kind == Kind::Adjust {
             return;
         }
         if kind == Kind::Markup {
@@ -11448,6 +11463,7 @@ impl GifKitApp {
             Tool::Optimize => self.ui_optimize(ui, ctx),
             Tool::Effects => self.ui_effects(ui, ctx),
             Tool::Animation => self.ui_animation(ui),
+            Tool::Adjust => self.ui_adjust(ui, ctx),
             Tool::Text => self.ui_text(ui, ctx),
             Tool::Censor => self.ui_censor(ui, ctx),
             Tool::AddImage => self.ui_add_image(ui, ctx),

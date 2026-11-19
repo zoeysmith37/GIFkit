@@ -198,6 +198,13 @@ fn effects_base(r: &mut Rng) -> crate::effects::EffectSettings {
         let it = item(r, &BoothFx::DISTORT);
         e.warps.push(it);
     }
+    // adjustments, some of them, some switched off
+    let all = crate::adjust::sample_list();
+    for _ in 0..r.below(4) {
+        let mut it = all[r.below(all.len())].clone();
+        it.on = r.chance(0.8);
+        e.adjust.push(it);
+    }
     e.anim = r.chance(0.4);
     e.counter = r.chance(0.4);
     e.counter_pos = r.pick(&[0u8, 1, 2, 3, 9]);
@@ -885,6 +892,8 @@ fn gpu_matches_cpu() {
     };
     let mut fxc: Vec<(String, LayerKind)> = vec![
         ("fx modulate".into(), fx(&|e| (e.hue, e.saturation, e.lightness) = (140.0, 150.0, 90.0))),
+        ("adjust all".into(), fx(&|e| e.adjust = crate::adjust::sample_list())),
+        ("adjust curves".into(), fx(&|e| e.adjust = vec![crate::adjust::sample_list().remove(1)])),
         ("fx bright contrast".into(), fx(&|e| (e.brightness, e.contrast) = (20.0, 30.0))),
         ("fx rc white".into(), fx(&|e| (e.rc_white, e.rc_fuzz) = (true, 30.0))),
         ("fx rc custom edges".into(), fx(&|e| (e.rc_custom, e.rc_color, e.rc_fuzz, e.rc_edge_px) = (true, [128, 60, 90], 25.0, 3))),

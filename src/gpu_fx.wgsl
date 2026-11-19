@@ -1169,6 +1169,36 @@ fn fs_fx(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             }
             return vec4<f32>(0.0, 0.0, 0.0, floor((k * m + 127.0) / 255.0) / 255.0);
         }
+        // 59 the colour through a 3D lookup table t1 (a.x points a side,
+        // slices in a.y tiles a row): adjust::lookup
+        case 59: {
+            let q = ld(t0, ip);
+            if (q.a <= 0.0) {
+                return q / 255.0;
+            }
+            let n = i32(a.x);
+            let tl = i32(a.y);
+            let f = q.rgb * ((a.x - 1.0) / 255.0);
+            let i = min(vec3<i32>(floor(f)), vec3<i32>(n - 2));
+            let t = f - vec3<f32>(i);
+            let c000 = ld(t1, vec2<i32>(i.x + (i.z % tl) * n, i.y + (i.z / tl) * n)).rgb;
+            let c100 = ld(t1, vec2<i32>(i.x + 1 + (i.z % tl) * n, i.y + (i.z / tl) * n)).rgb;
+            let c010 = ld(t1, vec2<i32>(i.x + (i.z % tl) * n, i.y + 1 + (i.z / tl) * n)).rgb;
+            let c110 = ld(t1, vec2<i32>(i.x + 1 + (i.z % tl) * n, i.y + 1 + (i.z / tl) * n)).rgb;
+            let z1 = i.z + 1;
+            let c001 = ld(t1, vec2<i32>(i.x + (z1 % tl) * n, i.y + (z1 / tl) * n)).rgb;
+            let c101 = ld(t1, vec2<i32>(i.x + 1 + (z1 % tl) * n, i.y + (z1 / tl) * n)).rgb;
+            let c011 = ld(t1, vec2<i32>(i.x + (z1 % tl) * n, i.y + 1 + (z1 / tl) * n)).rgb;
+            let c111 = ld(t1, vec2<i32>(i.x + 1 + (z1 % tl) * n, i.y + 1 + (z1 / tl) * n)).rgb;
+            let c00 = c000 + (c100 - c000) * t.x;
+            let c10 = c010 + (c110 - c010) * t.x;
+            let c01 = c001 + (c101 - c001) * t.x;
+            let c11 = c011 + (c111 - c011) * t.x;
+            let lo = c00 + (c10 - c00) * t.y;
+            let hi = c01 + (c11 - c01) * t.y;
+            let c = lo + (hi - lo) * t.z;
+            return vec4<f32>(c8v(c), q.a) / 255.0;
+        }
         // 53 clear to transparent
         case 53: {
             return vec4<f32>(0.0);

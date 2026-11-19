@@ -261,6 +261,7 @@ fn kind_colour(k: Kind) -> Color32 {
     match k {
         Kind::Effects => Color32::from_rgb(155, 89, 182),
         Kind::Animation => Color32::from_rgb(218, 68, 83),
+        Kind::Adjust => Color32::from_rgb(52, 152, 219),
         Kind::Text => Color32::from_rgb(61, 174, 233),
         Kind::Censor => Color32::from_rgb(127, 140, 141),
         Kind::Overlay => Color32::from_rgb(26, 188, 156),

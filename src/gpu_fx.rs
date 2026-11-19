@@ -206,6 +206,13 @@ pub fn effects_ok(s: &EffectSettings) -> bool {
 /// effects::apply_frame as passes.
 pub fn effects<'a>(p: &mut Plan<'a, '_>, s: &EffectSettings, idx: usize, n: usize, elapsed_s: f32, clip_s: f32, fonts: &[FontEntry]) {
     let d = EffectSettings::default();
+    if let Some(lut) = crate::adjust::lut(&s.adjust) {
+        // 59: the adjustments' lookup table, read between its points
+        p.owned.push((*lut).clone());
+        let k = p.owned.len() - 1;
+        let size = p.size;
+        p.raw(59, 0.0, [Some(GpuIn::Cur), Some(GpuIn::Owned(k)), None], None, size, false, &[[crate::adjust::N as f32, crate::adjust::TILES as f32, 0.0, 0.0]]);
+    }
     if s.hue != d.hue || s.saturation != d.saturation || s.lightness != d.lightness {
         p.modulate(s.hue, s.saturation, s.lightness);
     }

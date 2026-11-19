@@ -1763,3 +1763,69 @@ fn change_frame_rate_keeps_everything_in_time() {
     }
     assert_eq!(s.markers[0].frame, 21);
 }
+
+/// Adjustments: known values through the lookup table, no-ops left alone,
+/// and the project round trip (with a .cube inside).
+#[test]
+fn adjustments() {
+    use crate::adjust::*;
+    let grey = |v: u8| image::RgbaImage::from_pixel(4, 4, image::Rgba([v, v, v, 255]));
+    let run = |items: &[AdjustItem], img: &image::RgbaImage| {
+        let mut i = img.clone();
+        apply(&mut i, items);
+        i
+    };
+    let one = |a: Adjust| vec![AdjustItem::new(a)];
+    // every kind at its defaults (Levels, Curves...) changes nothing
+    let photo = image::RgbaImage::from_fn(64, 64, |x, y| image::Rgba([(x * 4) as u8, (y * 4) as u8, ((x * y) % 256) as u8, 255]));
+    for k in [0, 1, 2, 3, 4, 7, 8] {
+        assert_eq!(run(&one(Adjust::make(k)), &photo).as_raw(), photo.as_raw(), "{} at its defaults", KINDS[k]);
+    }
+    // Levels 50..200: 125 is the middle
+    let mut l = Levels::default();
+    (l.ch[0].in_black, l.ch[0].in_white) = (50.0, 200.0);
+    let out = run(&one(Adjust::Levels(l.clone())), &grey(125));
+    assert!((out.get_pixel(0, 0)[0] as i32 - 128).abs() <= 1, "{:?}", out.get_pixel(0, 0));
+    assert_eq!(run(&one(Adjust::Levels(l)), &grey(30)).get_pixel(0, 0)[0], 0);
+    // a Negative curve
+    let mut c = Curves::default();
+    c.ch[0] = vec![[0.0, 255.0], [255.0, 0.0]];
+    let v = run(&one(Adjust::Curves(c)), &grey(100)).get_pixel(0, 0)[0];
+    assert!((v as i32 - 155).abs() <= 1, "{v}");
+    // Threshold
+    let t = one(Adjust::Threshold(Threshold { level: 128.0 }));
+    assert_eq!(run(&t, &grey(200)).get_pixel(0, 0)[0], 255);
+    assert_eq!(run(&t, &grey(60)).get_pixel(0, 0)[0], 0);
+    // Black & White: pure red at Photoshop's 40%
+    let red = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
+    let g = run(&one(Adjust::BlackWhite(BlackWhite::default())), &red);
+    let p = g.get_pixel(0, 0);
+    assert!(p[0] == p[1] && p[1] == p[2] && (p[0] as i32 - 102).abs() <= 1, "{p:?}");
+    // Channel Mixer: red and blue swapped
+    let mx = ChannelMixer { rows: [[0.0, 0.0, 100.0, 0.0], [0.0, 100.0, 0.0, 0.0], [100.0, 0.0, 0.0, 0.0]], mono: false };
+    let px = image::RgbaImage::from_pixel(2, 2, image::Rgba([200, 90, 30, 255]));
+    let q = *run(&one(Adjust::ChannelMixer(mx)), &px).get_pixel(0, 0);
+    assert!((q[0] as i32 - 30).abs() <= 1 && (q[1] as i32 - 90).abs() <= 1 && (q[2] as i32 - 200).abs() <= 1, "{q:?}");
+    // clear pixels stay as they are; switched off does nothing
+    let mut clear = photo.clone();
+    clear.put_pixel(0, 0, image::Rgba([10, 20, 30, 0]));
+    assert_eq!(*run(&sample_list(), &clear).get_pixel(0, 0), image::Rgba([10, 20, 30, 0]));
+    let mut off = sample_list();
+    off.iter_mut().for_each(|i| i.on = false);
+    assert_eq!(run(&off, &photo).as_raw(), photo.as_raw());
+    // the whole list does something, and the same every time (cached)
+    let a = run(&sample_list(), &photo);
+    assert_ne!(a.as_raw(), photo.as_raw());
+    assert_eq!(a.as_raw(), run(&sample_list(), &photo).as_raw());
+    // .cube: parsed, kept in the project, the same after loading
+    let cube = "TITLE \"swap\"\nLUT_3D_SIZE 2\n0 0 0\n0 0 1\n0 1 0\n0 1 1\n1 0 0\n1 0 1\n1 1 0\n1 1 1\n";
+    let lut = parse_cube(cube).unwrap();
+    let items = vec![AdjustItem::new(Adjust::Cube(Cube { name: "swap".into(), lut, amount: 100.0 }))];
+    let q = *run(&items, &px).get_pixel(0, 0);
+    assert!((q[0] as i32 - 30).abs() <= 2 && (q[2] as i32 - 200).abs() <= 2, "cube swaps red and blue: {q:?}");
+    let fx = crate::effects::EffectSettings { adjust: sample_list(), adjust_layer: true, ..Default::default() };
+    let json = serde_json::to_string(&fx).unwrap();
+    let back: crate::effects::EffectSettings = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, fx, "saved and loaded the same");
+    assert!(parse_cube("LUT_3D_SIZE 3\n0 0 0\n").is_err());
+}

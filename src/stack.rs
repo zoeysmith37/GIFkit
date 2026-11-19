@@ -390,6 +390,8 @@ pub enum LayerKind {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Effects,
+    /// an effects layer of adjustments made in the Adjust panel
+    Adjust,
     /// an effects layer made in the Animation panel
     Animation,
     Text,
@@ -447,6 +449,7 @@ impl Layer {
     pub fn kind(&self) -> Kind {
         match self.kind {
             LayerKind::Effects(ref fx) if fx.anim => Kind::Animation,
+            LayerKind::Effects(ref fx) if fx.adjust_layer => Kind::Adjust,
             LayerKind::Effects(_) => Kind::Effects,
             LayerKind::Text(_) => Kind::Text,
             LayerKind::Censor(_) => Kind::Censor,
@@ -461,7 +464,7 @@ impl Layer {
     pub fn active(&self) -> bool {
         self.visible
             && match &self.kind {
-                LayerKind::Effects(fx) => **fx != EffectSettings { anim: fx.anim, ..Default::default() },
+                LayerKind::Effects(fx) => **fx != EffectSettings { anim: fx.anim, adjust_layer: fx.adjust_layer, ..Default::default() },
                 LayerKind::Text(t) => !t.text.is_empty(),
                 LayerKind::Censor(c) => c.w > 0 && c.h > 0,
                 LayerKind::Overlay(_) => true,
@@ -509,6 +512,7 @@ impl Layer {
         }
         match &self.kind {
             LayerKind::Effects(fx) if fx.anim => "Animation".into(),
+            LayerKind::Effects(fx) if fx.adjust_layer => crate::adjust::layer_name(&fx.adjust),
             LayerKind::Effects(_) => "Effects".into(),
             LayerKind::Text(t) => t.text.lines().next().unwrap_or("").to_string(),
             LayerKind::Censor(c) => format!("Censor · {:?}", c.method),
