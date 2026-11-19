@@ -34,7 +34,8 @@ With no layer of a tool's kind selected, changing a setting adds one. With one s
 - Opacity and Blend sit at the top, for the selected layer
 - Ctrl+] and Ctrl+[ move a layer up or down. Add Shift for the top or bottom
 - Clip shows a layer only where the layer under it has drawn
-- The fx button beside Blend opens Layer Style: Stroke, Drop Shadow and Outer Glow for text, shapes and emoji. Each has its own switch
+- The fx button beside Blend adds a stroke, drop shadow or outer glow
+- Layer styles work on text, shapes and emoji
 - With the pointer on the picture, the arrow keys nudge the selected layer 1 px. Shift moves it 10
 - Mask shows it only inside shapes you draw. Masking the GIF hides it outside the mask, but not the layers on top
 - In the Mask tool, Draw lets you draw a shape by hand. Esc stops
