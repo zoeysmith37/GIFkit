@@ -125,6 +125,9 @@ pub struct ProjLayerEntry {
     /// stroke, shadow and glow
     #[serde(default, skip_serializing_if = "crate::layerstyle::LayerStyle::is_none")]
     pub style: crate::layerstyle::LayerStyle,
+    /// the group it's in (an id in ProjectFile::groups)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<u64>,
 }
 
 fn no_flip(f: &[bool; 2]) -> bool {
@@ -173,6 +176,9 @@ pub struct ProjectFile {
     /// guide lines from the rulers
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub guides: Vec<crate::stack::Guide>,
+    /// layer groups
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<crate::stack::Group>,
     /// full-colour pictures (video frames) stored as nearly lossless WebP
     /// instead of PNG: a fraction of the size
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -701,7 +707,7 @@ mod size_tests {
         overlays.insert(5usize, vec![clear.clone(), moved.clone(), clear]);
         let out = std::env::temp_dir().join(format!("pics-{}.gifkit", std::process::id()));
         let mut file = ProjectFile::default();
-        file.layers = vec![ProjLayerEntry { style: Default::default(), visible: true, label: None, layer: ProjLayer::Image { id: 5, name: "x".into(), path: None, delays: vec![5; 3], placements: Vec::new(), opacity: 1.0 }, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2], blend: Default::default() }];
+        file.layers = vec![ProjLayerEntry { group: None, style: Default::default(), visible: true, label: None, layer: ProjLayer::Image { id: 5, name: "x".into(), path: None, delays: vec![5; 3], placements: Vec::new(), opacity: 1.0 }, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2], blend: Default::default() }];
         let big = RgbaImage::from_pixel(600, 300, image::Rgba([10, 200, 30, 255]));
         save(&out, file, &base, Some(&orig), &overlays, &HashMap::new(), Some(&big)).unwrap();
         let t = thumbnail(&out, 128).unwrap();

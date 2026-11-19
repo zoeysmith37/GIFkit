@@ -52,7 +52,7 @@ impl GifKitApp {
         let maps = self.stack.layer_maps(bw, bh);
         let src_idx = self.plan.get(self.cur).map(|f| f.src).unwrap_or(0);
         for (li, l) in self.stack.layers.iter().enumerate() {
-            if li == skip || !l.visible || !l.timing.shows(self.cur, self.plan.len()) {
+            if li == skip || !l.shown() || !l.timing.shows(self.cur, self.plan.len()) {
                 continue;
             }
             let Some(b) = l.source_box(src_idx, &self.fonts) else { continue };

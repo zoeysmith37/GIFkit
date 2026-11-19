@@ -1050,11 +1050,11 @@ fn project_round_trip() {
     let overlay: Vec<image::RgbaImage> = (0..3).map(|i| image::RgbaImage::from_pixel(8, 6, image::Rgba([i * 80, 10, 200, 255]))).collect();
     let wm = Arc::new(image::RgbaImage::from_pixel(5, 5, image::Rgba([1, 2, 3, 128])));
     let layers = vec![
-        ProjLayerEntry { style: Default::default(), blend: Default::default(), flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: Some("Caption".into()), timing: Default::default(), layer: ProjLayer::Text { text: crate::text::Annotation { text: "hi".into(), stretch: 0.7, ..Default::default() }, font: Some(("builtin".into(), "Sans Bold".into())) } },
-        ProjLayerEntry { style: Default::default(), blend: Default::default(), flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: false, label: None, timing: Default::default(), layer: ProjLayer::Image { id: 1, name: "ov.png".into(), path: None, delays: vec![5, 5, 5], placements: vec![Default::default(); base.len()], opacity: 80.0 } },
-        ProjLayerEntry { style: Default::default(), blend: Default::default(), flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: Default::default(), layer: ProjLayer::Watermark { id: 2, watermark: Default::default(), has_image: true } },
-        ProjLayerEntry { style: Default::default(), blend: Default::default(), flip: [true, false], mask: Some(crate::shapes::LayerMask { shapes: vec![crate::shapes::MaskShape { kind: crate::shapes::ShapeKind::Star, feather: 3.0, cx: 5.0, cy: 6.0, w: 7.0, h: 8.0, ..Default::default() }, crate::shapes::MaskShape { subtract: true, w: 2.0, h: 2.0, ..Default::default() }], invert: true, ..Default::default() }), clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: crate::timeline::Timing { clips: Some(vec![crate::timeline::Clip { start: 2, end: Some(5) }]), keys: vec![crate::timeline::Key { frame: 3, x: 10.0, ..Default::default() }] }, layer: ProjLayer::Emoji { emoji: crate::shapes::EmojiSettings { emoji: "1f525".into(), w: 20, h: 20, ..Default::default() } } },
-        ProjLayerEntry { style: Default::default(), blend: Default::default(), flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: Default::default(), layer: ProjLayer::Markup { markup: crate::shapes::MarkupSettings { strokes: vec![crate::shapes::PenStroke { points: vec![[1.0, 2.0], [3.0, 4.0]], ..Default::default() }] } } },
+        ProjLayerEntry { group: None, style: Default::default(), blend: Default::default(), flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: Some("Caption".into()), timing: Default::default(), layer: ProjLayer::Text { text: crate::text::Annotation { text: "hi".into(), stretch: 0.7, ..Default::default() }, font: Some(("builtin".into(), "Sans Bold".into())) } },
+        ProjLayerEntry { group: None, style: Default::default(), blend: Default::default(), flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: false, label: None, timing: Default::default(), layer: ProjLayer::Image { id: 1, name: "ov.png".into(), path: None, delays: vec![5, 5, 5], placements: vec![Default::default(); base.len()], opacity: 80.0 } },
+        ProjLayerEntry { group: None, style: Default::default(), blend: Default::default(), flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: Default::default(), layer: ProjLayer::Watermark { id: 2, watermark: Default::default(), has_image: true } },
+        ProjLayerEntry { group: None, style: Default::default(), blend: Default::default(), flip: [true, false], mask: Some(crate::shapes::LayerMask { shapes: vec![crate::shapes::MaskShape { kind: crate::shapes::ShapeKind::Star, feather: 3.0, cx: 5.0, cy: 6.0, w: 7.0, h: 8.0, ..Default::default() }, crate::shapes::MaskShape { subtract: true, w: 2.0, h: 2.0, ..Default::default() }], invert: true, ..Default::default() }), clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: crate::timeline::Timing { clips: Some(vec![crate::timeline::Clip { start: 2, end: Some(5) }]), keys: vec![crate::timeline::Key { frame: 3, x: 10.0, ..Default::default() }] }, layer: ProjLayer::Emoji { emoji: crate::shapes::EmojiSettings { emoji: "1f525".into(), w: 20, h: 20, ..Default::default() } } },
+        ProjLayerEntry { group: None, style: Default::default(), blend: Default::default(), flip: [false; 2], mask: None, clip: false, opacity: 100.0, color: None, locked: false, visible: true, label: None, timing: Default::default(), layer: ProjLayer::Markup { markup: crate::shapes::MarkupSettings { strokes: vec![crate::shapes::PenStroke { points: vec![[1.0, 2.0], [3.0, 4.0]], ..Default::default() }] } } },
     ];
     let mut transform = crate::stack::Transform::default();
     transform.reverse = true;
@@ -1894,7 +1894,7 @@ fn make_old_colour_project() {
     let fx = crate::effects::EffectSettings { grayscale: true, brightness: 10.0, contrast: 25.0, vignette: true, ..Default::default() };
     let mut file = ProjectFile::default();
     file.frames = vec![Default::default()];
-    file.layers = vec![ProjLayerEntry { style: Default::default(), visible: true, label: None, layer: ProjLayer::Effects { fx }, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2], blend: Default::default() }];
+    file.layers = vec![ProjLayerEntry { group: None, style: Default::default(), visible: true, label: None, layer: ProjLayer::Effects { fx }, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2], blend: Default::default() }];
     save(std::path::Path::new(&out), file, &base, None, &std::collections::HashMap::new(), &std::collections::HashMap::new(), None).unwrap();
 }
 
@@ -1930,7 +1930,7 @@ fn layer_blend_modes() {
     assert_eq!(p.0[..3], [225, 115, 35], "white minus the shape");
     assert_eq!(*diff.get_pixel(35, 25), image::Rgba([255, 255, 255, 255]), "outside the shape nothing changes");
     // saved and loaded
-    let e = crate::project::ProjLayerEntry { visible: true, label: None, layer: crate::project::ProjLayer::Effects { fx: Default::default() }, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2], blend: Blend::Overlay, style: Default::default() };
+    let e = crate::project::ProjLayerEntry { visible: true, label: None, layer: crate::project::ProjLayer::Effects { fx: Default::default() }, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2], blend: Blend::Overlay, style: Default::default(), group: None };
     let json = serde_json::to_string(&e).unwrap();
     assert!(json.contains("Overlay"));
     let back: crate::project::ProjLayerEntry = serde_json::from_str(&json).unwrap();
@@ -2017,9 +2017,60 @@ fn layer_styles() {
         assert!(glowing.get_pixel(x, y).0[2] < 200, "glow at {x},{y}: {:?}", glowing.get_pixel(x, y));
     }
     // saved, and left out when there's none
-    let e = crate::project::ProjLayerEntry { visible: true, label: None, layer: crate::project::ProjLayer::Effects { fx: Default::default() }, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2], blend: Default::default(), style: style.clone() };
+    let e = crate::project::ProjLayerEntry { visible: true, label: None, layer: crate::project::ProjLayer::Effects { fx: Default::default() }, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2], blend: Default::default(), style: style.clone(), group: None };
     let back: crate::project::ProjLayerEntry = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
     assert_eq!(back.style, style);
     let none = serde_json::to_string(&crate::project::ProjLayerEntry { style: LayerStyle::default(), ..back }).unwrap();
     assert!(!none.contains("style"));
+}
+
+/// Layer groups: kept together, hidden as one, moved in and out, saved.
+#[test]
+fn layer_groups() {
+    use crate::stack::{LayerKind, Stack};
+    let base = Animation { frames: vec![Frame::new(image::RgbaImage::from_pixel(40, 30, image::Rgba([255, 255, 255, 255])), 10)], loop_count: None };
+    let mut st = Stack::default();
+    let shape = |x: i32| LayerKind::Shape(Box::new(crate::shapes::ShapeSettings { x, y: 5, w: 8, h: 8, fill: [200, 0, 0], stroke_w: 0.0, ..Default::default() }));
+    for x in [2, 12, 22, 30] {
+        st.push(shape(x));
+    }
+    // layers 1 and 2 in a group
+    let g = st.group_layer(1).unwrap();
+    st.layers[2].group = Some(g);
+    st.tidy_groups();
+    assert_eq!(st.group_range(g), Some(1..3));
+    // a stray far from the rest leaves the group
+    st.layers[3].group = Some(g);
+    let mut moved = st.layers.remove(3);
+    moved.group = Some(g);
+    st.layers.insert(0, moved);
+    st.tidy_groups();
+    assert_eq!(st.layers[0].group, None, "not next to the group: out of it");
+    assert_eq!(st.group_range(g), Some(2..4));
+    // a layer moved between two of its layers joins
+    let l = st.layers.remove(0);
+    st.layers.insert(2, l);
+    st.regroup_after_move(2);
+    assert_eq!(st.group_range(g), Some(1..4));
+    assert_eq!(st.layers[2].group, Some(g));
+    // hiding the group hides its layers in the picture
+    let plan = st.plan(&base);
+    let times = crate::stack::plan_times(&plan);
+    let fonts = crate::text::builtin_fonts();
+    let shown = st.render_frame(&base, &plan, &times, 0, &fonts, &st.prepare(&base, &fonts));
+    st.group_mut(g).unwrap().visible = false;
+    st.tidy_groups();
+    assert!(st.layers[1..4].iter().all(|l| !l.shown() && l.visible), "their own eyes stay open");
+    let hidden = st.render_frame(&base, &plan, &times, 0, &fonts, &st.prepare(&base, &fonts));
+    assert_ne!(shown, hidden);
+    assert_eq!(hidden.get_pixel(5, 8).0[..3], [200, 0, 0], "the ungrouped layer still shows");
+    // saved and back
+    let f = crate::project::ProjectFile { groups: st.groups.clone(), ..Default::default() };
+    let back: crate::project::ProjectFile = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+    assert_eq!(back.groups, st.groups);
+    // ungrouping keeps the layers; an empty group goes
+    st.ungroup(g);
+    assert!(st.groups.is_empty());
+    assert_eq!(st.layers.len(), 4);
+    assert!(st.layers.iter().all(|l| l.shown()));
 }

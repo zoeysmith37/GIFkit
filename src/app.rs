@@ -1135,6 +1135,11 @@ pub struct GifKitApp {
     snap_gaps: Vec<[f32; 4]>,
     show_grid: bool,
     grid_snap: bool,
+    /// a group being renamed in the Layers panel
+    group_renaming: Option<(u64, String)>,
+    /// a group being dragged to a new place
+    group_drag: Option<u64>,
+    group_rename_done: Option<Option<(u64, String)>>,
     picture_colours_key: Option<(usize, u64, usize)>,
     grid_size: u32,
     /// track heights, and the track whose bottom edge is being dragged
@@ -1449,6 +1454,7 @@ fn key_label(key: &str) -> String {
     match word.as_str() {
         "reorder" => "Reorder layers".into(),
         "nudge" => "Nudge layer".into(),
+        "group" => "Group".into(),
         "style" => "Layer style".into(),
         "guide" | "guides" => "Guides".into(),
         "del" => "Delete".into(),
@@ -1759,6 +1765,11 @@ enum LayerAct {
     Clip(usize),
     Move(usize, usize),
     Delete(usize),
+    /// put the layer in a group of its own, or take it out of its group
+    Group(usize),
+    Ungroup(u64),
+    DeleteGroup(u64),
+    RenameGroup(u64),
     CollapseTo(usize),
     CollapseAll,
     CollapseEdits,
@@ -2026,8 +2037,8 @@ fn main_colours(img: &RgbaImage, n: usize) -> Vec<[u8; 3]> {
         }
         let k = ((px[0] as usize >> 4) << 8) | ((px[1] as usize >> 4) << 4) | (px[2] as usize >> 4);
         bins[k].0 += 1;
-        for c in 0..3 {
-            bins[k].1[c] += px[c] as u64;
+        for (sum, v) in bins[k].1.iter_mut().zip(px) {
+            *sum += *v as u64;
         }
     }
     let mut order: Vec<usize> = (0..4096).filter(|k| bins[*k].0 > 0).collect();
@@ -3543,6 +3554,9 @@ impl GifKitApp {
             snap_lines: Vec::new(),
             snap_gaps: Vec::new(),
             show_grid: theme::get_setting("grid").as_deref() == Some("1"),
+            group_renaming: None,
+            group_drag: None,
+            group_rename_done: None,
             picture_colours_key: None,
             grid_snap: theme::get_setting("grid_snap").as_deref() != Some("0"),
             grid_size: theme::get_setting("grid_size").and_then(|v| v.parse().ok()).filter(|v| *v > 0).unwrap_or(16),
@@ -5499,6 +5513,20 @@ impl GifKitApp {
         if hit(A::Compress) && self.base.is_some() {
             self.cmp_go = self.cmp_key();
         }
+        if !typing && self.base.is_some() {
+            let li = self.tool.layer_kind().and_then(|k| self.sel_index(k));
+            let now = ctx.input(|i| i.time);
+            if hit(A::GroupLayer) {
+                if let Some(li) = li.filter(|li| self.stack.layers[*li].group.is_none()) {
+                    self.apply_layer_act(ctx, LayerAct::Group(li), now);
+                }
+            }
+            if hit(A::Ungroup) {
+                if let Some(g) = li.and_then(|li| self.stack.layers[li].group) {
+                    self.apply_layer_act(ctx, LayerAct::Ungroup(g), now);
+                }
+            }
+        }
         for a in [A::Rulers, A::Guides, A::SmartGuides, A::Grid] {
             if hit(a) {
                 self.toggle_view_aid(a);
@@ -6514,7 +6542,7 @@ impl GifKitApp {
         let path = self.path.as_ref().filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("gif")))?;
         let (base, orig) = (self.base.as_ref()?, self.original.as_ref()?);
         let same = base.len() == orig.len() && base.frames.iter().zip(&orig.frames).all(|(a, b)| a.enabled && !a.blank && crate::pixels::Pixels::ptr_eq(&a.image, &b.image) && a.delay_cs == b.delay_cs);
-        let plain = self.stack.layers.iter().all(|l| !l.visible) && self.stack.transform.is_identity() && self.stack.loop_count(base) == orig.loop_count;
+        let plain = self.stack.layers.iter().all(|l| !l.shown()) && self.stack.transform.is_identity() && self.stack.loop_count(base) == orig.loop_count;
         // the in and out points, or see-through frames at the end, change it
         let (range, cut) = self.export_trim();
         let trimmed = range.is_some() || (cut && base.frames.iter().rev().find(|f| f.enabled).is_some_and(|f| f.image.is_fully_transparent()));
@@ -6835,6 +6863,8 @@ impl eframe::App for GifKitApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // groups stay whole however the layers were moved
+        self.stack.tidy_groups();
         // GIFKIT_STALL: frames that took long to make, and where the time went
         if std::env::var_os("GIFKIT_STALL").is_some() {
             thread_local!(static LAST: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) });
@@ -7626,6 +7656,123 @@ impl GifKitApp {
         self.modified = true;
         ctx.request_repaint();
         true
+    }
+
+    /// A group's own row in the Layers panel: its eye, fold, folder, name
+    /// and lock. Clicking picks its top layer. Gives the row's place.
+    fn group_row(&mut self, ui: &mut egui::Ui, g: &crate::stack::Group, top: usize, row_h: f32, menu_act: &mut Option<LayerAct>, select: &mut Option<(Kind, u64)>) -> Rect {
+        let pal = *p();
+        let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click_and_drag());
+        let painter = ui.painter().clone();
+        if resp.hovered() || self.group_drag == Some(g.id) {
+            painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 3.0, mix(pal.view, pal.highlight, 0.18));
+        } else {
+            painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 3.0, mix(pal.view, pal.window, 0.5));
+        }
+        painter.hline(r.x_range().shrink(4.0), r.bottom(), Stroke::new(1.0, mix(pal.view, pal.border, 0.5)));
+        let col = if g.visible { pal.fg } else { pal.fg_muted };
+        let eye_r = Rect::from_center_size(pos2(r.left() + 16.0, r.center().y), vec2(22.0, 22.0));
+        let eye = ui.interact(eye_r, egui::Id::unique(("group-eye", g.id)), Sense::click()).on_hover_text("Show / hide the group");
+        crate::icons::paint(&painter, if g.visible { "view-visible" } else { "view-hidden" }, eye_r.center(), 16.0, col);
+        let fold_r = Rect::from_center_size(pos2(r.left() + 36.0, r.center().y), vec2(16.0, 20.0));
+        let fold = ui.interact(fold_r, egui::Id::unique(("group-fold", g.id)), Sense::click()).on_hover_text(if g.open { "Fold the group" } else { "Show the group's layers" });
+        paint_fold(&painter, fold_r, if fold.hovered() { pal.fg } else { pal.fg_muted }, g.open);
+        crate::icons::paint(&painter, if g.open { "folder-open" } else { "folder" }, pos2(r.left() + 56.0, r.center().y), 16.0, col);
+        let renaming = self.group_renaming.as_ref().is_some_and(|(id, _)| *id == g.id);
+        let name_x = r.left() + 70.0;
+        let name_w = (r.right() - 60.0 - name_x).max(10.0);
+        if renaming {
+            if let Some((_, buf)) = &mut self.group_renaming {
+                let te = ui.put(Rect::from_min_size(pos2(name_x - 4.0, r.top() + 4.0), vec2(name_w + 4.0, r.height() - 8.0)), egui::TextEdit::singleline(buf).font(egui::FontId::proportional(13.0)).margin(vec2(4.0, 2.0)));
+                if self.rename_fresh {
+                    te.request_focus();
+                    self.rename_fresh = false;
+                }
+                let (enter, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+                if esc {
+                    self.group_rename_done = Some(None);
+                } else if te.lost_focus() || enter {
+                    self.group_rename_done = Some(Some((g.id, buf.clone())));
+                }
+            }
+        } else {
+            let mut job = egui::text::LayoutJob::simple_singleline(g.name.clone(), theme::medium(13.0), col);
+            job.wrap = egui::text::TextWrapping { max_width: name_w, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+            let galley = ui.painter().layout_job(job);
+            painter.galley(pos2(name_x, r.center().y - galley.size().y / 2.0), galley, col);
+        }
+        let over = ui.rect_contains_pointer(r);
+        let mut lock_hit = false;
+        if g.locked || over {
+            let lock_r = Rect::from_center_size(pos2(r.right() - 36.0, r.center().y), vec2(20.0, 20.0));
+            let lk = ui.interact(lock_r, egui::Id::unique(("group-lock", g.id)), Sense::click()).on_hover_text(if g.locked { "Unlock the group" } else { "Lock the group" });
+            crate::icons::paint(&painter, if g.locked { "object-locked" } else { "object-unlocked" }, lock_r.center(), 16.0, if g.locked || lk.hovered() { pal.fg } else { pal.fg_muted });
+            lock_hit = lk.hovered();
+            if lk.clicked() {
+                let on = !g.locked;
+                if let Some(gm) = self.stack.group_mut(g.id) {
+                    gm.locked = on;
+                }
+                for l in self.stack.layers.iter_mut().filter(|l| l.group == Some(g.id)) {
+                    l.locked = on;
+                }
+                self.modified = true;
+            }
+        }
+        if over {
+            let del_r = Rect::from_center_size(pos2(r.right() - 14.0, r.center().y), vec2(20.0, 20.0));
+            let del = ui.interact(del_r, egui::Id::unique(("group-ungroup", g.id)), Sense::click()).on_hover_text("Ungroup: keep the layers, lose the folder");
+            crate::icons::paint(&painter, "object-ungroup", del_r.center(), 16.0, if del.hovered() { pal.fg } else { pal.fg_muted });
+            lock_hit |= del.hovered();
+            if del.clicked() {
+                *menu_act = Some(LayerAct::Ungroup(g.id));
+            }
+        }
+        if eye.clicked() {
+            if let Some(gm) = self.stack.group_mut(g.id) {
+                gm.visible = !gm.visible;
+            }
+            self.stack.tidy_groups();
+            self.modified = true;
+        }
+        if fold.clicked() {
+            if let Some(gm) = self.stack.group_mut(g.id) {
+                gm.open = !gm.open;
+            }
+        }
+        let busy = eye.hovered() || fold.hovered() || lock_hit;
+        let resp = resp.on_hover_text("Double-click to rename. Drag to move the whole group");
+        if resp.double_clicked() && !busy {
+            *menu_act = Some(LayerAct::RenameGroup(g.id));
+        } else if resp.clicked() && !busy {
+            let l = &self.stack.layers[top];
+            *select = Some((l.kind(), l.id));
+        }
+        if resp.drag_started() && !busy {
+            self.group_drag = Some(g.id);
+        }
+        let gid = g.id;
+        let visible = g.visible;
+        resp.context_menu(|ui| {
+            ui.set_min_width(230.0);
+            if menu_item(ui, "edit-rename", "&Rename Group", "", true) {
+                *menu_act = Some(LayerAct::RenameGroup(gid));
+            }
+            if menu_item(ui, if visible { "view-hidden" } else { "view-visible" }, if visible { "&Hide Group" } else { "&Show Group" }, "", true) {
+                if let Some(gm) = self.stack.group_mut(gid) {
+                    gm.visible = !gm.visible;
+                }
+                self.stack.tidy_groups();
+            }
+            ui.separator();
+            if menu_item(ui, "object-ungroup", "&Ungroup", &self.keymap.text(crate::keys::Action::Ungroup), true) {
+                *menu_act = Some(LayerAct::Ungroup(gid));
+            }
+            if menu_item(ui, "edit-delete", "&Delete Group and Its Layers", "", true) {
+                *menu_act = Some(LayerAct::DeleteGroup(gid));
+            }
+        });
+        r
     }
 
     /// Rulers, guides and smart guides on or off, remembered.
@@ -8642,7 +8789,8 @@ impl GifKitApp {
         let mut toggle: Option<usize> = None;
         let mut lock: Option<usize> = None;
         let mut remove: Option<usize> = None;
-        let mut drop_to: Option<(usize, usize)> = None;
+        let mut drop_to: Option<(usize, usize, Option<u64>)> = None;
+        let mut group_drop: Option<(u64, usize)> = None;
         let mut to_frames = false;
         let mut rename_done: Option<Option<(usize, String)>> = None;
         let mut edit_rename_done: Option<Option<(Tool, String)>> = None;
@@ -8652,18 +8800,33 @@ impl GifKitApp {
         let frame_edits = !self.stack.transform.is_identity();
         egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            let mut rows: Vec<(usize, Rect)> = Vec::new();
+            // each row: the layer (or a group's top layer), where it is, its
+            // group, and whether it's the group's own row
+            let mut rows: Vec<(usize, Rect, Option<u64>, bool)> = Vec::new();
             for li in (0..n).rev() {
+                let gid = self.stack.layers[li].group.filter(|_| find.is_empty());
+                if let Some(gid) = gid {
+                    // the group's own row above its top layer
+                    if li + 1 == n || self.stack.layers[li + 1].group != Some(gid) {
+                        if let Some(g) = self.stack.group(gid).cloned() {
+                            let r = self.group_row(ui, &g, li, row_h, &mut menu_act, &mut select);
+                            rows.push((li, r, Some(gid), true));
+                        }
+                    }
+                    if !self.stack.group(gid).is_some_and(|g| g.open) {
+                        continue;
+                    }
+                }
                 let (id, name, kind, visible, locked, clipped, mask) = {
                     let l = &self.stack.layers[li];
-                    (l.id, l.name(), l.kind(), l.visible, l.locked, l.clip && li > 0, l.mask.as_ref().map(|m| (m.invert, m.on)))
+                    (l.id, l.name(), l.kind(), l.shown(), l.locked, l.clip && li > 0, l.mask.as_ref().map(|m| (m.invert, m.on)))
                 };
                 let can_flip = self.stack.layers[li].can_flip();
                 if !find.is_empty() && !name.to_lowercase().contains(&find) && !kind_tool(kind).label().to_lowercase().contains(&find) {
                     continue;
                 }
                 let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click_and_drag());
-                rows.push((li, r));
+                rows.push((li, r, gid, false));
                 let selected = self.sel.get(kind_key(kind)) == Some(&id) && self.tool == kind_tool(kind);
                 let dragging_me = self.layer_drag == Some(id);
                 let painter = ui.painter().clone();
@@ -8682,10 +8845,15 @@ impl GifKitApp {
                 if eye.clicked() {
                     toggle = Some(li);
                 }
+                // a group's layers sit indented under it, with a line down
+                let gind = if gid.is_some() { 14.0 } else { 0.0 };
+                if gid.is_some() {
+                    painter.vline(r.left() + 30.0, r.y_range(), Stroke::new(1.0, mix(pal.view, pal.fg_muted, 0.45)));
+                }
                 // clipped layers sit indented under their base, with Photoshop's bent arrow
-                let ind = if clipped { 16.0 } else { 0.0 };
+                let ind = gind + if clipped { 16.0 } else { 0.0 };
                 if clipped {
-                    let (ax, ay) = (r.left() + 34.0, r.center().y);
+                    let (ax, ay) = (r.left() + 34.0 + gind, r.center().y);
                     let st = Stroke::new(1.3, if visible { pal.fg } else { pal.fg_muted });
                     painter.add(egui::Shape::line(vec![pos2(ax, ay - 6.0), pos2(ax, ay + 4.0)], st));
                     painter.add(egui::Shape::line(vec![pos2(ax - 3.0, ay + 1.0), pos2(ax, ay + 4.5), pos2(ax + 3.0, ay + 1.0)], st));
@@ -8768,6 +8936,9 @@ impl GifKitApp {
                     }
                     if menu_check(ui, clipped, "&Clip to Layer Below", "") && li > 0 && !locked {
                         act(LayerAct::Clip(li));
+                    }
+                    if menu_item(ui, if gid.is_some() { "object-ungroup" } else { "folder-new" }, if gid.is_some() { "Remove from &Group" } else { "&Group Layer" }, &self.keymap.text(crate::keys::Action::GroupLayer), true) {
+                        act(LayerAct::Group(li));
                     }
                     ui.separator();
                     if menu_item(ui, if mask.is_some() { "edit-delete" } else { "shapes" }, if mask.is_some() { "Delete &Mask" } else { "Add &Mask" }, "", !locked) {
@@ -8998,27 +9169,47 @@ impl GifKitApp {
                 }
             }
             // drag-to-reorder: insertion line + drop
+            // where a dragged row would go: the stack index to put it at
+            // (0 = bottom), and the group it would land in
+            let landing = |pp: Pos2| -> (usize, f32, Option<u64>) {
+                for (li, rr, g, head) in &rows {
+                    if pp.y < rr.center().y {
+                        // above a group's own row is outside it; above one of its layers, in it
+                        return (li + 1, rr.top(), if *head { None } else { *g });
+                    }
+                }
+                (0, rows.last().map(|r| r.1.bottom()).unwrap_or(pp.y), None)
+            };
             if let Some(did) = self.layer_drag {
                 if let Some(pp) = ui.ctx().pointer_hover_pos().or_else(|| ui.ctx().pointer_interact_pos()) {
                     if let Some(from) = self.stack.index_of(did) {
-                        // rows are top-first; compute stack insertion position
-                        let mut pos = 0usize; // stack index to insert at (0 = bottom)
-                        let mut line_y = rows.last().map(|r| r.1.bottom()).unwrap_or(pp.y);
-                        for (li, rr) in &rows {
-                            if pp.y < rr.center().y {
-                                pos = li + 1;
-                                line_y = rr.top();
-                                break;
-                            }
-                        }
-                        ui.painter().hline(rect.x_range().shrink(4.0), line_y, Stroke::new(2.0, pal.highlight));
+                        let (pos, line_y, g) = landing(pp);
+                        let x0 = if g.is_some() { rect.left() + 30.0 } else { rect.left() + 4.0 };
+                        ui.painter().hline(x0..=rect.right() - 4.0, line_y, Stroke::new(2.0, pal.highlight));
                         if ui.ctx().input(|i| i.pointer.any_released()) {
-                            drop_to = Some((from, pos));
+                            drop_to = Some((from, pos, g));
                         }
                     }
                 }
                 if !ui.ctx().input(|i| i.pointer.any_down()) {
                     self.layer_drag = None;
+                }
+            }
+            if let Some(gid) = self.group_drag {
+                if let Some(pp) = ui.ctx().pointer_hover_pos().or_else(|| ui.ctx().pointer_interact_pos()) {
+                    let (pos, line_y, g) = landing(pp);
+                    // groups don't go inside groups: above the one it landed in
+                    let pos = match g.filter(|g| *g != gid).and_then(|g| self.stack.group_range(g)) {
+                        Some(r) => r.end,
+                        None => pos,
+                    };
+                    ui.painter().hline(rect.x_range().shrink(4.0), line_y, Stroke::new(2.0, pal.highlight));
+                    if ui.ctx().input(|i| i.pointer.any_released()) {
+                        group_drop = Some((gid, pos));
+                    }
+                }
+                if !ui.ctx().input(|i| i.pointer.any_down()) {
+                    self.group_drag = None;
                 }
             }
             if n == 0 {
@@ -9038,6 +9229,11 @@ impl GifKitApp {
             let what = if sel_layer.is_some() { "layer" } else { "edit" };
             if icon_tool(ui, "edit-duplicate", "Duplicate the selected layer", sel_layer.is_some()).clicked() {
                 menu_act = sel_layer.map(LayerAct::Duplicate);
+            }
+            let grouped = sel_layer.is_some_and(|li| self.stack.layers[li].group.is_some());
+            let gk = self.keymap.text(crate::keys::Action::GroupLayer);
+            if icon_tool(ui, if grouped { "object-ungroup" } else { "folder-new" }, &if grouped { "Take the selected layer out of its group".to_string() } else { format!("Put the selected layer in a new group ({gk})") }, sel_layer.is_some()).clicked() {
+                menu_act = sel_layer.map(LayerAct::Group);
             }
             if icon_tool(ui, "edit-rename", &format!("Rename the selected {what}"), sel_layer.is_some() || sel_edit.is_some()).clicked() {
                 menu_act = sel_layer.map(LayerAct::Rename).or(sel_edit.map(LayerAct::RenameEdit));
@@ -9073,14 +9269,43 @@ impl GifKitApp {
             self.stack.layers[li].locked = !self.stack.layers[li].locked;
             self.modified = true;
         }
-        if let Some((from, pos)) = drop_to {
+        if let Some((from, pos, g)) = drop_to {
             self.layer_drag = None;
-            if from < n && pos <= n && pos != from && pos != from + 1 {
+            let moves = pos != from && pos != from + 1;
+            if from < n && pos <= n && (moves || self.stack.layers[from].group != g) {
                 self.snapshot(&format!("reorder{now}"), now);
-                let l = self.stack.layers.remove(from);
+                let mut l = self.stack.layers.remove(from);
+                l.group = g;
                 let pos = if pos > from { pos - 1 } else { pos };
                 self.stack.layers.insert(pos.min(self.stack.layers.len()), l);
+                self.stack.tidy_groups();
+                self.modified = true;
             }
+        }
+        if let Some((gid, pos)) = group_drop {
+            self.group_drag = None;
+            if let Some(r) = self.stack.group_range(gid) {
+                if pos < r.start || pos > r.end {
+                    self.snapshot(&format!("reorder{now}"), now);
+                    let moved: Vec<_> = self.stack.layers.drain(r.clone()).collect();
+                    let at = if pos > r.end { pos - moved.len() } else { pos };
+                    for (k, l) in moved.into_iter().enumerate() {
+                        self.stack.layers.insert(at + k, l);
+                    }
+                    self.stack.tidy_groups();
+                    self.modified = true;
+                }
+            }
+        }
+        if let Some(done) = self.group_rename_done.take() {
+            if let Some((gid, text)) = done {
+                let t = text.trim().to_string();
+                if let (Some(g), false) = (self.stack.group_mut(gid), t.is_empty()) {
+                    g.name = t;
+                    self.modified = true;
+                }
+            }
+            self.group_renaming = None;
         }
         if let Some(done) = rename_done {
             if let Some((li, text)) = done {
@@ -9136,10 +9361,10 @@ impl GifKitApp {
         if li >= self.stack.layers.len() {
             return;
         }
-        let lower = Stack { transform: Transform::default(), layers: self.stack.layers[..=li].iter().filter(|l| l.visible).cloned().collect(), next_id: self.stack.next_id, ..Default::default() };
+        let lower = Stack { transform: Transform::default(), layers: self.stack.layers[..=li].iter().filter(|l| l.shown()).cloned().collect(), next_id: self.stack.next_id, ..Default::default() };
         let mut keep = self.stack.clone();
         // hidden layers in the merged part stay as they are
-        keep.layers = self.stack.layers[..=li].iter().filter(|l| !l.visible).cloned().chain(self.stack.layers[li + 1..].iter().cloned()).collect();
+        keep.layers = self.stack.layers[..=li].iter().filter(|l| !l.shown()).cloned().chain(self.stack.layers[li + 1..].iter().cloned()).collect();
         let fonts = self.fonts.clone();
         let total = base.len();
         self.spawn_in(ctx, "Collapse down", total, false, move |p| {
@@ -9282,7 +9507,7 @@ impl GifKitApp {
                     l.flip = src.flip;
                     l.blend = src.blend;
                     l.style = src.style.clone();
-                l.style = src.style.clone();
+                    l.group = src.group;
                     self.stack.layers.insert(li + 1, l);
                 }
                 self.select(src.kind(), id);
@@ -9301,6 +9526,36 @@ impl GifKitApp {
                     self.snapshot(&format!("reorder{now}"), now);
                     let l = self.stack.layers.remove(from);
                     self.stack.layers.insert(to, l);
+                    self.stack.regroup_after_move(to);
+                }
+            }
+            LayerAct::Group(li) => {
+                self.snapshot(&format!("group{now}"), now);
+                if self.stack.layers[li].group.is_some() {
+                    // already in one: out of it
+                    self.stack.layers[li].group = None;
+                    self.stack.tidy_groups();
+                } else {
+                    self.stack.group_layer(li);
+                    self.info("Grouped. Drag other layers into the group to add them");
+                }
+                self.modified = true;
+            }
+            LayerAct::Ungroup(gid) => {
+                self.snapshot(&format!("group{now}"), now);
+                self.stack.ungroup(gid);
+                self.modified = true;
+            }
+            LayerAct::DeleteGroup(gid) => {
+                self.snapshot(&format!("del{now}"), now);
+                self.stack.layers.retain(|l| l.group != Some(gid));
+                self.stack.tidy_groups();
+                self.modified = true;
+            }
+            LayerAct::RenameGroup(gid) => {
+                if let Some(g) = self.stack.group(gid) {
+                    self.group_renaming = Some((gid, g.name.clone()));
+                    self.rename_fresh = true;
                 }
             }
             LayerAct::Delete(li) => {
@@ -9968,7 +10223,7 @@ impl GifKitApp {
                     LayerKind::Markup(m) => ProjLayer::Markup { markup: m.clone() },
                     LayerKind::Emoji(e) => ProjLayer::Emoji { emoji: (**e).clone() },
                 };
-                ProjLayerEntry { visible: l.visible, label: l.label.clone(), layer, timing: l.timing.clone(), locked: l.locked, color: l.color, opacity: l.opacity, clip: l.clip, mask: l.mask.clone(), flip: l.flip, blend: l.blend, style: l.style.clone() }
+                ProjLayerEntry { visible: l.visible, label: l.label.clone(), layer, timing: l.timing.clone(), locked: l.locked, color: l.color, opacity: l.opacity, clip: l.clip, mask: l.mask.clone(), flip: l.flip, blend: l.blend, style: l.style.clone(), group: l.group }
             })
             .collect();
         let file = ProjectFile {
@@ -9981,6 +10236,7 @@ impl GifKitApp {
             speed_env: self.stack.speed_env.clone(),
             gif_color: self.stack.gif_color,
             guides: self.stack.guides.clone(),
+            groups: self.stack.groups.clone(),
             compact: self.compact_pics,
             settings: serde_json::to_value(self.proj_settings()).unwrap_or_default(),
             ..Default::default()
@@ -10142,11 +10398,17 @@ impl GifKitApp {
                 l.flip = e.flip;
                 l.blend = e.blend;
                 l.style = e.style.clone();
+                l.group = e.group;
             }
         }
         self.stack.markers = file.markers;
         self.stack.speed_env = file.speed_env;
         self.stack.guides = file.guides;
+        self.stack.groups = file.groups;
+        // group ids come from the same counter as layers
+        let top = self.stack.groups.iter().map(|g| g.id + 1).max().unwrap_or(0);
+        self.stack.next_id = self.stack.next_id.max(top);
+        self.stack.tidy_groups();
         self.stack.gif_color = file.gif_color;
         self.compact_pics = file.compact;
         self.stack.sync_len(n);
@@ -11170,7 +11432,7 @@ impl GifKitApp {
         // candidate layers of this kind on this frame: (index, id, source box, displayed box)
         let mut cands: Vec<(usize, u64, Obb, Obb)> = Vec::new();
         for (li, l) in self.stack.layers.iter().enumerate() {
-            if l.kind() != kind || !l.visible {
+            if l.kind() != kind || !l.shown() {
                 continue;
             }
             let applies = match &l.kind {
@@ -11544,7 +11806,7 @@ impl GifKitApp {
         // the selected layer's box on screen, for the little bar under it
         let mut bar: Option<(usize, Vec<Pos2>)> = None;
         for (li, l) in self.stack.layers.iter().enumerate() {
-            if l.kind() != kind || !l.visible {
+            if l.kind() != kind || !l.shown() {
                 continue;
             }
             let Some(b) = l.source_box(src_idx, &self.fonts) else { continue };

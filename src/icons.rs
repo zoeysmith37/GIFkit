@@ -25,7 +25,7 @@ static ICONS: &[(&str, &str, &str)] = icon_set!(
     "view-split-left-right", "view-hidden", "view-visible", "window-close", "zoom-fit-best", "zoom-in", "zoom-original", "zoom-out",
     "snap", "zone-in", "zone-out", "object-locked", "object-unlocked", "edit-copy", "edit-paste", "bookmark-new", "bookmark-remove",
     "keyframe-next", "keyframe-previous", "view-filter", "animation-stage", "overflow-menu", "edit-find", "edit-clear", "mask-alpha", "layer-mask", "draw-freehand-lasso",
-    "view-object-histogram-linear", "draw-bezier-curves", "colors-luma", "color-mode-hue-shift-positive", "color-management", "color-mode-black-white", "colors-chromared", "color-picker-grey", "color-gradient", "color-fill", "tool_imageeffects", "kstars_colors", "photo", "color-mode-invert-image", "measure", "guides", "snap-guideline",
+    "view-object-histogram-linear", "draw-bezier-curves", "colors-luma", "color-mode-hue-shift-positive", "color-management", "color-mode-black-white", "colors-chromared", "color-picker-grey", "color-gradient", "color-fill", "tool_imageeffects", "kstars_colors", "photo", "color-mode-invert-image", "measure", "guides", "snap-guideline", "folder", "folder-open", "folder-new", "object-group", "object-ungroup",
 );
 
 fn hex(c: Color32) -> String {

@@ -30,6 +30,13 @@ Layers stack like in an image editor. Higher ones draw on top. Hide or lock them
 
 With no layer of a tool's kind selected, changing a setting adds one. With one selected, you edit that one.
 
+## Groups
+- Ctrl+G puts the selected layer in a new group, a folder in the Layers panel
+- Drag layers into a group, or out of it
+- A group's eye and lock hide or lock all of its layers
+- Drag a group's row to move all of its layers
+- Ctrl+Shift+G ungroups and keeps the layers
+
 ## The Layers panel
 - Opacity and Blend sit at the top, for the selected layer
 - Ctrl+] and Ctrl+[ move a layer up or down. Add Shift for the top or bottom
@@ -317,7 +324,8 @@ const WHATS_NEW: &[(&str, &str, &str)] = &[
     ("Adjustment layers", "Levels, Curves and 15 more, like Photoshop's. Press A or Ctrl+L", "Adjustments"),
     ("Blend modes", "Multiply, Screen, Overlay and the rest on every layer, in the Layers panel", "Blend Modes"),
     ("Command palette", "Ctrl+K finds any tool, adjustment or command by name", "Shortcuts and Palette"),
-    ("Rulers and smart guides", "Turn on rulers in View. Layers snap to guides, the centre and each other", "Rulers and Guides"),
+    ("Layer groups and styles", "Ctrl+G puts layers in a folder. The fx button adds stroke, shadow and glow", "Layers"),
+    ("Rulers, grid and smart guides", "In View. Layers snap to guides, the grid, the centre and each other", "Rulers and Guides"),
     ("Before and after", "Hold \\ to see the frame without its adjustments", "Adjustments"),
     ("Tool keys", "T Text, U Shapes, B Markup, E Emoji, Q Mask, A Adjust, G Effects", "Shortcuts and Palette"),
 ];

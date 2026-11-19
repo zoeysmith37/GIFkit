@@ -430,6 +430,10 @@ pub struct Layer {
     pub blend: crate::adjust::Blend,
     /// stroke, drop shadow and outer glow (text, shapes and emoji)
     pub style: crate::layerstyle::LayerStyle,
+    /// the group (folder) it's in
+    pub group: Option<u64>,
+    /// its group is hidden (kept by `Stack::tidy_groups`, not saved)
+    pub in_hidden: bool,
 }
 
 impl Layer {
@@ -470,8 +474,13 @@ impl Layer {
             LayerKind::Emoji(_) => Kind::Emoji,
         }
     }
+    /// Shown: its own eye and its group's are both open.
+    pub fn shown(&self) -> bool {
+        self.visible && !self.in_hidden
+    }
+
     pub fn active(&self) -> bool {
-        self.visible
+        self.shown()
             && match &self.kind {
                 LayerKind::Effects(fx) => **fx != EffectSettings { anim: fx.anim, adjust_layer: fx.adjust_layer, ..Default::default() },
                 LayerKind::Text(t) => !t.text.is_empty(),
@@ -593,6 +602,26 @@ pub struct Stack {
     pub gif_color: Option<[u8; 3]>,
     /// guide lines dragged out of the rulers, in output pixels
     pub guides: Vec<Guide>,
+    /// layer groups (folders); their layers sit together in `layers`
+    pub groups: Vec<Group>,
+}
+
+/// A folder of layers, shown, hidden, locked and moved as one.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Group {
+    pub id: u64,
+    pub name: String,
+    pub visible: bool,
+    pub locked: bool,
+    /// its layers listed under it in the Layers panel
+    pub open: bool,
+}
+
+impl Default for Group {
+    fn default() -> Self {
+        Group { id: 0, name: "Group".into(), visible: true, locked: false, open: true }
+    }
 }
 
 /// A guide line: an upright one at x = `at`, or a level one at y = `at`.
@@ -836,7 +865,7 @@ impl Stack {
     pub fn push(&mut self, kind: LayerKind) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
-        self.layers.push(Layer { id, visible: true, kind, label: None, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2], blend: Default::default(), style: Default::default() });
+        self.layers.push(Layer { id, visible: true, kind, label: None, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2], blend: Default::default(), style: Default::default(), group: None, in_hidden: false });
         id
     }
 
@@ -852,6 +881,100 @@ impl Stack {
         self.layers.is_empty() && self.transform.is_identity()
     }
 
+    /// Keeps groups sound: each group's layers together (strays leave it),
+    /// no empty groups, and hidden groups hiding their layers.
+    pub fn tidy_groups(&mut self) {
+        let ids: Vec<u64> = self.groups.iter().map(|g| g.id).collect();
+        for l in &mut self.layers {
+            if l.group.is_some_and(|g| !ids.contains(&g)) {
+                l.group = None;
+            }
+        }
+        for &gid in &ids {
+            // runs of this group's layers; the longest stays (the top one on a tie)
+            let mut runs: Vec<(usize, usize)> = Vec::new();
+            for (i, l) in self.layers.iter().enumerate() {
+                if l.group == Some(gid) {
+                    match runs.last_mut() {
+                        Some(r) if r.1 == i => r.1 = i + 1,
+                        _ => runs.push((i, i + 1)),
+                    }
+                }
+            }
+            if runs.len() > 1 {
+                let keep = *runs.iter().rev().max_by_key(|r| r.1 - r.0).unwrap();
+                for r in runs.iter().filter(|r| **r != keep) {
+                    for l in &mut self.layers[r.0..r.1] {
+                        l.group = None;
+                    }
+                }
+            }
+        }
+        let used: std::collections::HashSet<u64> = self.layers.iter().filter_map(|l| l.group).collect();
+        self.groups.retain(|g| used.contains(&g.id));
+        for l in &mut self.layers {
+            l.in_hidden = l.group.and_then(|g| self.groups.iter().find(|x| x.id == g)).is_some_and(|g| !g.visible);
+        }
+    }
+
+    pub fn group(&self, id: u64) -> Option<&Group> {
+        self.groups.iter().find(|g| g.id == id)
+    }
+
+    pub fn group_mut(&mut self, id: u64) -> Option<&mut Group> {
+        self.groups.iter_mut().find(|g| g.id == id)
+    }
+
+    /// The layers of group `id`, bottom to top, as a range of `layers`.
+    pub fn group_range(&self, id: u64) -> Option<std::ops::Range<usize>> {
+        let a = self.layers.iter().position(|l| l.group == Some(id))?;
+        let b = self.layers.iter().rposition(|l| l.group == Some(id))?;
+        Some(a..b + 1)
+    }
+
+    /// Puts layer `li` in a new group of its own. Gives the group's id.
+    pub fn group_layer(&mut self, li: usize) -> Option<u64> {
+        if li >= self.layers.len() {
+            return None;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        let n = self.groups.len() + 1;
+        self.groups.push(Group { id, name: format!("Group {n}"), ..Default::default() });
+        self.layers[li].group = Some(id);
+        self.tidy_groups();
+        Some(id)
+    }
+
+    /// Takes the group away, keeping its layers where they are.
+    pub fn ungroup(&mut self, id: u64) {
+        for l in &mut self.layers {
+            if l.group == Some(id) {
+                l.group = None;
+            }
+        }
+        self.tidy_groups();
+    }
+
+    /// After layer `li` moved: it joins a group it landed inside, stays in
+    /// its own while still next to it, and leaves it otherwise.
+    pub fn regroup_after_move(&mut self, li: usize) {
+        if li >= self.layers.len() {
+            return;
+        }
+        let below = li.checked_sub(1).and_then(|i| self.layers[i].group);
+        let above = self.layers.get(li + 1).and_then(|l| l.group);
+        let own = self.layers[li].group;
+        self.layers[li].group = if below.is_some() && below == above {
+            below
+        } else if own.is_some() && (own == below || own == above) {
+            own
+        } else {
+            None
+        };
+        self.tidy_groups();
+    }
+
     pub fn count(&self, k: Kind) -> usize {
         self.layers.iter().filter(|l| l.kind() == k).count()
     }
@@ -861,7 +984,7 @@ impl Stack {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         format!("{:?}", self.transform).hash(&mut h);
         for l in &self.layers {
-            (l.id, l.visible, layer_signature(l)).hash(&mut h);
+            (l.id, l.shown(), layer_signature(l)).hash(&mut h);
         }
         h.finish()
     }

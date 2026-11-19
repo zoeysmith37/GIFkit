@@ -110,6 +110,8 @@ fn action_icon(a: A) -> &'static str {
         A::Guides => "guides",
         A::SmartGuides => "snap-guideline",
         A::Grid => "view-grid",
+        A::GroupLayer => "folder-new",
+        A::Ungroup => "object-ungroup",
         A::LayerUp | A::LayerTop => "go-up",
         A::LayerDown | A::LayerBottom => "go-down",
         A::AdjLevels => "view-object-histogram-linear",

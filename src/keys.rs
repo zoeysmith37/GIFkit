@@ -67,10 +67,12 @@ pub enum Action {
     Guides,
     SmartGuides,
     Grid,
+    GroupLayer,
+    Ungroup,
 }
 
 impl Action {
-    pub const ALL: [Action; 61] = [
+    pub const ALL: [Action; 63] = [
         Action::New,
         Action::Open,
         Action::Save,
@@ -132,6 +134,8 @@ impl Action {
         Action::Guides,
         Action::SmartGuides,
         Action::Grid,
+        Action::GroupLayer,
+        Action::Ungroup,
     ];
 
     /// The groups the shortcuts dialog shows, in order.
@@ -147,7 +151,7 @@ impl Action {
             ZoomIn | ZoomOut | Fit | ActualSize | SplitView | FullScreen | OnionSkin | Compress | Rulers | Guides | SmartGuides | Grid => "View",
             AdjLevels | AdjCurves | AdjHueSat | AdjBalance | AdjBlackWhite | AdjInvert | AdjDesaturate | AutoTone | AutoContrast | AutoColor => "Adjustments",
             ToolText | ToolShapes | ToolMarkup | ToolEmoji | ToolMask | ToolAdjust | ToolEffects => "Tools",
-            LayerUp | LayerDown | LayerTop | LayerBottom => "Layers",
+            LayerUp | LayerDown | LayerTop | LayerBottom | GroupLayer | Ungroup => "Layers",
             Palette => "Help",
             TlSplit | TlKey | TlRazor | TlDelete | TlIn | TlOut | TlMarker | TlPrevEdit | TlNextEdit | TlDuplicate | TlNudgeLeft | TlNudgeRight => "Timeline",
             Handbook => "Help",
@@ -206,6 +210,8 @@ impl Action {
             Action::Guides => "Show guides",
             Action::SmartGuides => "Smart guides",
             Action::Grid => "Show grid",
+            Action::GroupLayer => "Group layer",
+            Action::Ungroup => "Ungroup",
             Action::ToolText => "Text tool",
             Action::ToolShapes => "Shapes tool",
             Action::ToolMarkup => "Markup (brush) tool",
@@ -273,6 +279,8 @@ impl Action {
             Action::Guides => "guides",
             Action::SmartGuides => "smart_guides",
             Action::Grid => "grid",
+            Action::GroupLayer => "group",
+            Action::Ungroup => "ungroup",
             Action::ToolText => "tool_text",
             Action::ToolShapes => "tool_shapes",
             Action::ToolMarkup => "tool_markup",
@@ -354,6 +362,8 @@ impl Action {
             Action::Guides => c(Key::Semicolon),
             Action::SmartGuides => None,
             Action::Grid => c(Key::Quote),
+            Action::GroupLayer => c(Key::G),
+            Action::Ungroup => cs(Key::G),
         }
     }
 
@@ -488,5 +498,28 @@ impl Keymap {
     pub fn reset_all(&mut self) {
         self.map = Action::ALL.iter().map(|a| (*a, a.default_binding())).collect();
         self.save();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// No two shortcuts that work in the same place share keys (timeline
+    /// keys only work over the timeline, so they may reuse others').
+    #[test]
+    fn default_keys_dont_clash() {
+        // Ctrl+D and Delete are the same act on the timeline and off it
+        let shared = [(Action::Duplicate, Action::TlDuplicate), (Action::DeleteObject, Action::TlDelete)];
+        for (i, a) in Action::ALL.iter().enumerate() {
+            for b in &Action::ALL[i + 1..] {
+                if a.timeline() != b.timeline() || shared.contains(&(*a, *b)) {
+                    continue;
+                }
+                if let (Some(x), Some(y)) = (a.default_binding(), b.default_binding()) {
+                    assert!(x != y, "{a:?} and {b:?} share {}", x.text());
+                }
+            }
+        }
     }
 }
