@@ -326,7 +326,7 @@ fn gradient_editor(ui: &mut egui::Ui, g: &mut adjust::GradientMap, id: egui::Id)
 
 /// Slider row helper: label, value, range.
 fn slide(ui: &mut egui::Ui, label: &str, v: &mut f32, r: std::ops::RangeInclusive<f32>, suffix: &str, decimals: usize) -> egui::Response {
-    form_row(ui, label, |ui| fill_slider(ui, egui::Slider::new(v, r.clone()).suffix(suffix).max_decimals(decimals)))
+    form_row(ui, label, |ui| fill_slider(ui, Spin::new(v, r.clone()).suffix(suffix).max_decimals(decimals)))
 }
 
 impl GifKitApp {
@@ -724,14 +724,14 @@ fn adjust_editor(ui: &mut egui::Ui, adj: &mut Adjust, id: egui::Id, hist: Option
             ui.data_mut(|d| d.insert_temp(tid, tone));
             let t = if tone == 3 { &mut b.master } else { &mut b.tones[tone] };
             for (i, (lo, hi)) in [("Cyan", "Red"), ("Magenta", "Green"), ("Yellow", "Blue")].iter().enumerate() {
-                form_row(ui, hi, |ui| fill_slider(ui, egui::Slider::new(&mut t[i], -100.0..=100.0).max_decimals(0))).on_hover_text(format!("Left toward {lo}, right toward {hi}"));
+                form_row(ui, hi, |ui| fill_slider(ui, Spin::new(&mut t[i], -100.0..=100.0).max_decimals(0))).on_hover_text(format!("Left toward {lo}, right toward {hi}"));
             }
             form_row(ui, "", |ui| check(ui, &mut b.preserve, "Preserve luminosity"));
         }
         Adjust::BlackWhite(b) => {
             const NAMES: [&str; 6] = ["Reds", "Yellows", "Greens", "Cyans", "Blues", "Magentas"];
             for (i, nm) in NAMES.iter().enumerate() {
-                form_row(ui, nm, |ui| fill_slider(ui, egui::Slider::new(&mut b.weights[i], -200.0..=300.0).suffix("%").max_decimals(0)));
+                form_row(ui, nm, |ui| fill_slider(ui, Spin::new(&mut b.weights[i], -200.0..=300.0).suffix("%").max_decimals(0)));
             }
             form_row(ui, "", |ui| {
                 ui.horizontal(|ui| {
@@ -776,7 +776,7 @@ fn adjust_editor(ui: &mut egui::Ui, adj: &mut Adjust, id: egui::Id, hist: Option
             ui.data_mut(|d| d.insert_temp(oid, o));
             let row = &mut m.rows[o];
             for (i, nm) in ["Red", "Green", "Blue", "Constant"].iter().enumerate() {
-                form_row(ui, nm, |ui| fill_slider(ui, egui::Slider::new(&mut row[i], -200.0..=200.0).suffix("%").max_decimals(0)));
+                form_row(ui, nm, |ui| fill_slider(ui, Spin::new(&mut row[i], -200.0..=200.0).suffix("%").max_decimals(0)));
             }
             let total = row[0] + row[1] + row[2];
             form_row(ui, "", |ui| hint(ui, &format!("Total {total:.0}%{}", if (total - 100.0).abs() > 0.5 { " (100% keeps brightness)" } else { "" })));
@@ -796,7 +796,7 @@ fn adjust_editor(ui: &mut egui::Ui, adj: &mut Adjust, id: egui::Id, hist: Option
             });
             ui.data_mut(|d| d.insert_temp(rid, r));
             for (i, nm) in ["Cyan", "Magenta", "Yellow", "Black"].iter().enumerate() {
-                form_row(ui, nm, |ui| fill_slider(ui, egui::Slider::new(&mut s.ranges[r][i], -100.0..=100.0).suffix("%").max_decimals(0)));
+                form_row(ui, nm, |ui| fill_slider(ui, Spin::new(&mut s.ranges[r][i], -100.0..=100.0).suffix("%").max_decimals(0)));
             }
             form_row(ui, "Method", |ui| seg_row(ui, &mut s.relative, &[(true, "Relative"), (false, "Absolute")]))
                 .on_hover_text("Relative: by how much ink is already there. Absolute: by a set amount");
@@ -848,7 +848,7 @@ fn adjust_editor(ui: &mut egui::Ui, adj: &mut Adjust, id: egui::Id, hist: Option
             let was = h.colorize;
             if h.colorize {
                 let mut hue = h.hue.rem_euclid(360.0);
-                form_row(ui, "Hue", |ui| fill_slider(ui, egui::Slider::new(&mut hue, 0.0..=360.0).suffix("°").max_decimals(0)));
+                form_row(ui, "Hue", |ui| fill_slider(ui, Spin::new(&mut hue, 0.0..=360.0).suffix("°").max_decimals(0)));
                 h.hue = hue;
                 slide(ui, "Saturation", &mut h.saturation, 0.0..=100.0, "", 0);
             } else {
@@ -882,7 +882,7 @@ fn adjust_editor(ui: &mut egui::Ui, adj: &mut Adjust, id: egui::Id, hist: Option
             hint(ui, "Every colour turned to its opposite. Nothing to set");
         }
         Adjust::Posterize(pz) => {
-            form_row(ui, "Levels", |ui| fill_slider(ui, egui::Slider::new(&mut pz.levels, 2..=32).clamping(egui::SliderClamping::Never))).on_hover_text("Steps of each colour. Type more for up to 255");
+            form_row(ui, "Levels", |ui| fill_slider(ui, Spin::new(&mut pz.levels, 2..=32).clamping(egui::SliderClamping::Never))).on_hover_text("Steps of each colour. Type more for up to 255");
             pz.levels = pz.levels.clamp(2, 255);
         }
         Adjust::Cube(c) => {
