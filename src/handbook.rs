@@ -36,8 +36,10 @@ With no layer of a tool's kind selected, changing a setting adds one. With one s
 - Clip shows a layer only where the layer under it has drawn
 - The fx button beside Blend adds a stroke, drop shadow or outer glow
 - Layer styles work on text, shapes and emoji
-- With the pointer on the picture, the arrow keys nudge the selected layer 1 px. Shift moves it 10
-- Mask shows it only inside shapes you draw. Masking the GIF hides it outside the mask, but not the layers on top
+- Arrow keys nudge the selected layer 1 px, with the pointer on the picture
+- Shift with an arrow moves it 10 px
+- Mask shows it only inside shapes you draw
+- Masking the GIF hides it outside the mask. Layers on top stay
 - In the Mask tool, Draw lets you draw a shape by hand. Esc stops
 
 ## Colours
@@ -78,7 +80,8 @@ Add one from the Add Adjustment menu, Edit > Adjustments, the command palette or
 - Curves: drag a point, click the line to add one, drag it off to remove it
 - Levels: drag the black, grey and white handles, or use Auto
 - The eyedroppers set the black, grey or white point. Click them on the Original view
-- Color Balance starts on All Tones, a shift for the whole picture. Pick Shadows, Midtones or Highlights for finer control
+- Color Balance starts on All Tones, one shift for the whole picture
+- Pick Shadows, Midtones or Highlights in Color Balance for finer control
 
 ## Your presets
 The bookmark on each adjustment's card saves its settings by name. They're there for that adjustment in every project.
@@ -190,7 +193,8 @@ Drag on the preview to set the crop. Preview picks whether you see it with your 
 
 ## Speed and frames
 - Speed changes the delay of every frame
-- Change Frame Rate makes more or fewer frames for the same length. Layers and keyframes stay in time
+- Change Frame Rate makes more or fewer frames for the same length
+- Layers and keyframes stay in time when the frame rate changes
 - Frames skips frames you don't want and adds images as new frames
 
 ## In-betweens
