@@ -595,6 +595,9 @@ fn user_presets(ui: &mut egui::Ui, item: &mut AdjustItem, id: egui::Id) {
 }
 
 fn adjust_editor(ui: &mut egui::Ui, adj: &mut Adjust, id: egui::Id, hist: Option<&Histogram>) {
+    // right-click resets any field to this adjustment's default
+    let fresh = Adjust::make(adj.index());
+    let _defaults = super::spin::Defaults::new(&*adj, &fresh);
     match adj {
         Adjust::Levels(l) => {
             let ch = channel_pick(ui, id.with("ch"));

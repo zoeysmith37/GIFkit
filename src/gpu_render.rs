@@ -115,7 +115,8 @@ pub enum GpuOp<'a> {
     /// that draws, cleared to draw the layer alone)
     BlendBegin { clear: bool },
     /// and ends: the layer blended over the kept frame (`adjust::Blend::ALL[mode]`)
-    BlendEnd { mode: u32, full: bool },
+    /// `fade`: how much the layer is faded out (1 - opacity)
+    BlendEnd { mode: u32, full: bool, fade: f32 },
     /// the frame kept only where mask `slot` is (or isn't), see-through past it
     KeepIn { slot: usize, invert: bool },
 }
@@ -866,13 +867,13 @@ impl GpuRenderer {
                         (cur_tex, cur_view) = self.fx_raw(&mut enc, 53.0, [&self.blank, &self.blank, &self.blank], cur_size, &[]);
                     }
                 }
-                GpuOp::BlendEnd { mode, full } => {
+                GpuOp::BlendEnd { mode, full, fade } => {
                     self.draw_quads(&mut enc, &cur_view, &quads);
                     quads.clear();
                     if let Some((bv, bs)) = blend_kept.pop() {
                         // as the CPU: only when the layer kept the frame's size
                         if bs == cur_size {
-                            (cur_tex, cur_view) = self.fx_raw(&mut enc, 60.0, [&cur_view, &bv, &self.blank], cur_size, &[[*mode as f32, if *full { 1.0 } else { 0.0 }, 0.0, 0.0]]);
+                            (cur_tex, cur_view) = self.fx_raw(&mut enc, 60.0, [&cur_view, &bv, &self.blank], cur_size, &[[*mode as f32, if *full { 1.0 } else { 0.0 }, *fade, 0.0]]);
                         }
                     }
                 }

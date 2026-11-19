@@ -1039,6 +1039,15 @@ fn gpu_matches_cpu() {
         cases.push((Box::leak(format!("blend adjust@{}", b.label()).into_boxed_str()), Transform::default(), vec![grey], vec![]));
         cases.push((Box::leak(format!("blend fx blur@{}", b.label()).into_boxed_str()), Transform::default(), vec![LayerKind::Effects(Box::new(crate::effects::EffectSettings { blur: true, blur_sigma: 3.0, ..Default::default() }))], vec![]));
     }
+    // layer groups: "#Mode" puts every layer in one group with that blend,
+    // "~50" gives it that opacity
+    cases.push((Box::leak("group fade~50".to_string().into_boxed_str()), Transform::default(), layers(), vec![]));
+    for (k, nm) in ["text", "shape", "emoji", "overlay"].iter().enumerate() {
+        cases.push((Box::leak(format!("group {nm}#Multiply").into_boxed_str()), Transform::default(), one(k), vec![]));
+    }
+    for b in [crate::adjust::Blend::Multiply, crate::adjust::Blend::Screen, crate::adjust::Blend::Difference] {
+        cases.push((Box::leak(format!("group#{}", b.label()).into_boxed_str()), Transform::default(), layers(), vec![]));
+    }
     let only = std::env::var("GPU_ONLY").ok();
     for (ci, (name, tr, ls, keys)) in cases.into_iter().enumerate() {
         if let Some(o) = &only {
@@ -1060,6 +1069,19 @@ fn gpu_matches_cpu() {
                 l.blend = crate::adjust::Blend::ALL.iter().copied().find(|b| b.label() == m).unwrap_or_default();
             }
         }
+        if name.starts_with("group") {
+            let ids: Vec<u64> = st.layers.iter().map(|l| l.id).collect();
+            if let Some(g) = st.group_layers(&ids).and_then(|g| st.group_mut(g)) {
+                if let Some((_, m)) = name.split_once('#') {
+                    g.pass_through = false;
+                    g.blend = crate::adjust::Blend::ALL.iter().copied().find(|b| b.label() == m).unwrap_or_default();
+                }
+                if let Some((_, o)) = name.split_once('~') {
+                    g.opacity = o.parse().unwrap_or(100.0);
+                }
+            }
+            st.tidy_groups();
+        }
         st.layout_text(160, 120, &fonts);
         let plan = st.plan(&base);
         let times = crate::stack::plan_times(&plan);
@@ -1069,6 +1091,17 @@ fn gpu_matches_cpu() {
             println!("{name:18} not on the GPU");
             continue;
         };
+        if std::env::var_os("GPU_OPS").is_some() {
+            let names: Vec<&str> = job.ops.iter().map(|o| match o {
+                crate::gpu_render::GpuOp::Draw(_) => "Draw",
+                crate::gpu_render::GpuOp::BlendBegin { .. } => "BlendBegin",
+                crate::gpu_render::GpuOp::BlendEnd { .. } => "BlendEnd",
+                crate::gpu_render::GpuOp::Effect { .. } => "Effect",
+                crate::gpu_render::GpuOp::Mask { .. } => "Mask",
+                _ => "other",
+            }).collect();
+            println!("{name}: {names:?}");
+        }
         let tex = gpu.render(&base.frames[0].image.get(), 1, &job, ci as u64 + 1);
         let g = gpu.read(&tex);
         if g.dimensions() != cpu.dimensions() {

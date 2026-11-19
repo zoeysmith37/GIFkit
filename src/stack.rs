@@ -616,11 +616,27 @@ pub struct Group {
     pub locked: bool,
     /// its layers listed under it in the Layers panel
     pub open: bool,
+    /// Pass Through, as Photoshop's default: its layers blend with what's
+    /// under the group one by one, as if there were no group
+    pub pass_through: bool,
+    /// otherwise its layers are put together first, then laid over what's
+    /// under it in this mode
+    pub blend: crate::adjust::Blend,
+    /// %, the whole group's
+    pub opacity: f32,
+}
+
+impl Group {
+    /// Are its layers put together on their own before they meet what's
+    /// under it?
+    pub fn isolated(&self) -> bool {
+        !self.pass_through || self.opacity < 99.95
+    }
 }
 
 impl Default for Group {
     fn default() -> Self {
-        Group { id: 0, name: "Group".into(), visible: true, locked: false, open: true }
+        Group { id: 0, name: "Group".into(), visible: true, locked: false, open: true, pass_through: true, blend: Default::default(), opacity: 100.0 }
     }
 }
 
@@ -935,6 +951,12 @@ impl Stack {
         Some(a..b + 1)
     }
 
+    /// The isolated group layer `li` is in, if any.
+    pub fn isolated_group(&self, li: usize) -> Option<&Group> {
+        let g = self.layers.get(li)?.group?;
+        self.group(g).filter(|g| g.isolated() && g.visible)
+    }
+
     /// Puts layer `li` in a new group of its own. Gives the group's id.
     pub fn group_layer(&mut self, li: usize) -> Option<u64> {
         if li >= self.layers.len() {
@@ -1027,6 +1049,12 @@ impl Stack {
         format!("{:?}", self.transform).hash(&mut h);
         for l in &self.layers {
             (l.id, l.shown(), layer_signature(l)).hash(&mut h);
+        }
+        for g in self.groups.iter().filter(|g| g.isolated()) {
+            (g.id, g.pass_through, g.blend, g.opacity.to_bits()).hash(&mut h);
+            if let Some(r) = self.group_range(g.id) {
+                (r.start, r.end).hash(&mut h);
+            }
         }
         h.finish()
     }
@@ -1357,7 +1385,23 @@ impl Stack {
         // under it (an animation clipped to it moves it over that)
         let mut masks: Vec<Option<image::GrayImage>> = vec![None; self.layers.len()];
         let mut unders: Vec<Option<RgbaImage>> = vec![None; self.layers.len()];
-        for li in 0..self.layers.len() {
+        // an isolated group: its layers go on a clear picture of their own,
+        // which then meets what's under the group in the group's blend
+        let mut open_group: Option<(u64, RgbaImage)> = None;
+        for li in 0..=self.layers.len() {
+            let here = if li < self.layers.len() { self.isolated_group(li).map(|g| g.id) } else { None };
+            if open_group.as_ref().is_some_and(|(g, _)| Some(*g) != here) {
+                if let Some((g, under)) = open_group.take() {
+                    img = self.close_group(g, under, img);
+                }
+            }
+            if li == self.layers.len() {
+                break;
+            }
+            if let (Some(g), None) = (here, &open_group) {
+                let (w, h) = img.dimensions();
+                open_group = Some((g, std::mem::replace(&mut img, RgbaImage::new(w, h))));
+            }
             match base_of[li].filter(|_| self.layers[li].clip) {
                 Some(b) => {
                     let Some(mask) = &masks[b] else {
@@ -1412,6 +1456,24 @@ impl Stack {
             }
         }
         img
+    }
+
+    /// A group's own picture `content` laid over `under` in its blend and
+    /// opacity.
+    fn close_group(&self, gid: u64, mut under: RgbaImage, mut content: RgbaImage) -> RgbaImage {
+        let Some(g) = self.group(gid) else { return under };
+        if under.dimensions() != content.dimensions() {
+            return content;
+        }
+        let k = (g.opacity / 100.0).clamp(0.0, 1.0);
+        if k < 0.999 {
+            for p in content.pixels_mut() {
+                p[3] = (p[3] as f32 * k).round() as u8;
+            }
+        }
+        let mode = if g.pass_through { crate::adjust::Blend::Normal } else { g.blend };
+        blend_onto(&mut under, &content, mode);
+        under
     }
 
     /// Where layer `li`'s mask lets it show at plan frame `i`, at `size`:
@@ -2173,8 +2235,24 @@ impl Stack {
                 masked[b] = true;
             }
         };
+        // an isolated group: its layers drawn on clear, then blended as one
+        let group_end = |g: u64| -> GpuOp<'a> {
+            let gr = self.group(g);
+            let mode = gr.map(|g| if g.pass_through { crate::adjust::Blend::Normal } else { g.blend }).unwrap_or_default();
+            GpuOp::BlendEnd { mode: mode.code(), full: false, fade: 1.0 - gr.map(|g| g.opacity / 100.0).unwrap_or(1.0).clamp(0.0, 1.0) }
+        };
+        let mut open_group: Option<u64> = None;
         for (li, l) in self.layers.iter().enumerate() {
             close(&mut draws, &mut open_clip, &mut mask_from, &mut masked, &mut open_lmask);
+            let here = self.isolated_group(li).map(|g| g.id);
+            if let Some(g) = open_group.filter(|g| Some(*g) != here) {
+                draws.push(group_end(g));
+                open_group = None;
+            }
+            if let (Some(g), None) = (here, open_group) {
+                draws.push(GpuOp::BlendBegin { clear: true });
+                open_group = Some(g);
+            }
             if !l.active() || !l.timing.shows(i, n) {
                 continue;
             }
@@ -2361,10 +2439,13 @@ impl Stack {
                 }
             }
             if blended {
-                draws.push(GpuOp::BlendEnd { mode: l.blend.code(), full: !Self::coverage_kind(&l.kind) });
+                draws.push(GpuOp::BlendEnd { mode: l.blend.code(), full: !Self::coverage_kind(&l.kind), fade: 0.0 });
             }
         }
         close(&mut draws, &mut open_clip, &mut mask_from, &mut masked, &mut open_lmask);
+        if let Some(g) = open_group.take() {
+            draws.push(group_end(g));
+        }
         Some(GpuFrame { size: (ow, oh), geo, ops: draws, owned })
     }
 }

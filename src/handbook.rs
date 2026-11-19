@@ -8,7 +8,7 @@ pub(super) const TOPICS: &[(&str, &str)] = &[
         "Getting Started",
         "Right then. Open a GIF or a video with Ctrl+O, or just drop it on the window. Videos come in through ffmpeg.
 
-The tools live down the left rail. Pick one and its settings turn up on the right. Buttons with a little corner mark hold a few tools: right-click one for the rest.
+The tools live down the left rail. Pick one and its settings turn up on the right. They come in groups: looks, drawing, covering things up, adding pictures, the frame, time and output.
 
 Nothing touches your frames until you export. Every edit is a layer or a frame edit, so you can change your mind as often as you like.
 
@@ -18,8 +18,6 @@ Nothing touches your frames until you export. Every edit is a layer or a frame e
 - A blue dot in a field means it's been changed. Right-click to reset it
 - More opens the rest of a section, and stays open till you close it
 - Effects you haven't switched on stay folded out of the way
-- Shapes, Text and Markup keep their main settings in a bar over the picture
-- View > Tool Options Bar and Settings > Group Related Tools turn those off
 
 ## The views
 - The preview shows the result as it'll look

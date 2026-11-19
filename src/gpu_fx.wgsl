@@ -1291,7 +1291,8 @@ fn fs_fx(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         // both premultiplied; a.y = 1: t0 is a whole-frame layer's result
         // (stack::blend_onto and blend_full)
         case 60: {
-            let l = textureLoad(t0, ip, 0);
+            // a.z: how much it's faded out (a group's opacity)
+            let l = textureLoad(t0, ip, 0) * (1.0 - a.z);
             let b = textureLoad(t1, ip, 0);
             let mode = i32(a.x);
             if (a.y > 0.5) {

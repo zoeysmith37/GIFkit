@@ -2076,6 +2076,22 @@ fn layer_groups() {
     assert_eq!(st.layers[2].id, ids[0]);
     assert_eq!(st.layers[3].id, ids[1]);
     let g = g2;
+    // a group at half opacity, put together first: half as strong
+    st.group_mut(g).unwrap().visible = true;
+    st.tidy_groups();
+    let full = st.render_frame(&base, &plan, &times, 0, &fonts, &st.prepare(&base, &fonts));
+    st.group_mut(g).unwrap().opacity = 50.0;
+    let half = st.render_frame(&base, &plan, &times, 0, &fonts, &st.prepare(&base, &fonts));
+    let top = st.group_range(g).unwrap().end - 1;
+    let x = match &st.layers[top].kind {
+        LayerKind::Shape(sh) => sh.x as u32 + 4,
+        _ => unreachable!(),
+    };
+    let y = 8;
+    assert_eq!(full.get_pixel(x, y).0[..3], [200, 0, 0], "a grouped shape");
+    let hp = half.get_pixel(x, y).0;
+    assert!((hp[1] as i32 - 128).abs() < 4 && hp[0] > 220, "half red over white: {hp:?}");
+    st.group_mut(g).unwrap().opacity = 100.0;
     // ungrouping keeps the layers; an empty group goes
     st.ungroup(g);
     assert!(st.groups.is_empty());

@@ -32,8 +32,6 @@ mod palette_ui;
 mod guides_ui;
 #[path = "spin.rs"]
 mod spin;
-#[path = "options_bar.rs"]
-mod options_bar;
 use spin::Spin;
 #[path = "smoke.rs"]
 mod smoke;
@@ -71,17 +69,14 @@ enum Tool {
 
 /// The rail's groups: a name and its tools, in order. A divider goes
 /// before the ones marked.
-const RAIL_GROUPS: [(&str, &[Tool], bool); 10] = [
-    ("Effects", &[Tool::Effects], false),
-    ("Adjust", &[Tool::Adjust], false),
-    ("Animation", &[Tool::Animation], false),
-    ("Draw", &[Tool::Text, Tool::Shapes, Tool::Emoji, Tool::Markup], false),
-    ("Cover", &[Tool::Mask, Tool::Censor, Tool::Shield], false),
-    ("Add", &[Tool::AddImage, Tool::Watermark], false),
+const RAIL_GROUPS: [(&str, &[Tool], bool); 7] = [
+    ("Look", &[Tool::Effects, Tool::Adjust, Tool::Animation], false),
+    ("Draw", &[Tool::Text, Tool::Shapes, Tool::Emoji, Tool::Markup], true),
+    ("Cover", &[Tool::Mask, Tool::Censor, Tool::Shield], true),
+    ("Add", &[Tool::AddImage, Tool::Watermark], true),
     ("Frame", &[Tool::Resize, Tool::Crop, Tool::Rotate, Tool::Reverse], true),
-    ("Time", &[Tool::Speed, Tool::Cut, Tool::Frames], false),
-    ("Optimize", &[Tool::Optimize], true),
-    ("Presets", &[Tool::Presets], false),
+    ("Time", &[Tool::Speed, Tool::Cut, Tool::Frames], true),
+    ("Output", &[Tool::Optimize, Tool::Presets], true),
 ];
 
 impl Tool {
@@ -984,8 +979,6 @@ pub struct GifKitApp {
     sidebar_compact: bool,
     /// related tools share one rail button with a flyout (Krita's way)
     group_tools: bool,
-    /// the strip over the picture with the drawing tools' main settings
-    options_bar: bool,
     /// the tool each rail group last opened, which its button shows
     rail_pick: [Tool; RAIL_GROUPS.len()],
     layers_collapsed: bool,
@@ -1161,6 +1154,10 @@ pub struct GifKitApp {
     snap_gaps: Vec<[f32; 4]>,
     show_grid: bool,
     grid_snap: bool,
+    /// the Layer Style window is open (on the picked layer)
+    style_open: bool,
+    /// a group's row picked: the panel's opacity and blend are the group's
+    sel_group: Option<u64>,
     /// layers picked together in the Layers panel (ids); the active one,
     /// the one settings show, is `sel`'s
     multi: Vec<u64>,
@@ -2002,7 +1999,7 @@ fn toggle_grid(ui: &mut egui::Ui, min_w: f32, items: &mut [(&mut bool, &str, &st
 /// The layer style popup: Stroke, Drop Shadow and Outer Glow, each with
 /// its own switch.
 fn layer_style_ui(ui: &mut egui::Ui, st: &mut crate::layerstyle::LayerStyle) {
-    ui.set_width(340.0);
+    let _defaults = spin::Defaults::new(&*st, &Default::default());
     // each style a card like an adjustment's: fold, switch, name. It opens
     // when switched on; folding it is remembered
     let head = |ui: &mut egui::Ui, on: &mut bool, name: &str, tip: &str| -> bool {
@@ -2746,6 +2743,8 @@ fn num_fill<'a, N: egui::emath::Numeric>(ui: &mut egui::Ui, v: &'a mut N, step: 
 /// also be dragged or typed as egui allows.
 fn spin<'a, N: egui::emath::Numeric>(ui: &mut egui::Ui, size: Vec2, v: &'a mut N, step: f64, f: impl FnOnce(egui::DragValue<'a>) -> egui::DragValue<'a>) -> egui::Response {
     let pal = *p();
+    let default = spin::default_for(&*v);
+    let vp: *mut N = &mut *v;
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     let enabled = ui.is_enabled();
     // the frame goes under everything, filled in once we know the state
@@ -2794,6 +2793,23 @@ fn spin<'a, N: egui::emath::Numeric>(ui: &mut egui::Ui, size: Vec2, v: &'a mut N
             let y = c.y + dy;
             let t = if up { s * 0.5 } else { -s * 0.5 };
             ui.painter().add(egui::Shape::line(vec![pos2(c.x - s, y + t), pos2(c.x, y - t), pos2(c.x + s, y + t)], Stroke::new(1.2, col)));
+        }
+    }
+    // right-click: back to its default, when it's known
+    if let Some(d) = default.filter(|_| enabled) {
+        let shown = if N::INTEGRAL { format!("{d:.0}") } else { format!("{}", (d * 1000.0).round() / 1000.0) };
+        let mut reset = false;
+        resp.context_menu(|ui| {
+            if ui.button(format!("Reset to {shown}")).clicked() {
+                reset = true;
+                ui.close();
+            }
+        });
+        if reset {
+            // SAFETY: the DragValue that borrowed `v` has been used and
+            // dropped by now, so nothing else holds it
+            unsafe { *vp = N::from_f64(d) };
+            resp.mark_changed();
         }
     }
     if stepped {
@@ -3526,8 +3542,7 @@ impl GifKitApp {
             video_bg: [255, 255, 255],
             view_single: ViewSource::Edit,
             sidebar_compact: theme::get_setting("sidebar_compact").as_deref() != Some("0"),
-            group_tools: theme::get_setting("group_tools").as_deref() != Some("0"),
-            options_bar: theme::get_setting("options_bar").as_deref() != Some("0"),
+            group_tools: theme::get_setting("group_tools").as_deref() == Some("1"),
             rail_pick: RAIL_GROUPS.map(|g| g.1[0]),
             layers_collapsed: false,
             layers_open_h: 380.0,
@@ -3640,6 +3655,8 @@ impl GifKitApp {
             show_grid: theme::get_setting("grid").as_deref() == Some("1"),
             group_renaming: None,
             multi: Vec::new(),
+            style_open: false,
+            sel_group: None,
             group_drag: None,
             group_rename_done: None,
             picture_colours_key: None,
@@ -7241,6 +7258,7 @@ impl eframe::App for GifKitApp {
         self.restore_window(&ctx);
         self.batch_window(&ctx);
         self.handbook_window(&ctx);
+        self.layer_style_window(&ctx);
         self.whats_new_window(&ctx);
         self.tl_paste_window(&ctx);
         self.ffmpeg_window(&ctx);
@@ -7450,10 +7468,6 @@ impl GifKitApp {
                     self.link_views = !self.link_views;
                 }
                 ui.separator();
-                if menu_check(ui, self.options_bar, "&Tool Options Bar", "") {
-                    self.options_bar = !self.options_bar;
-                    theme::set_setting("options_bar", if self.options_bar { "1" } else { "0" });
-                }
                 if menu_check(ui, self.show_rulers, "&Rulers", &self.keymap.text(crate::keys::Action::Rulers)) {
                     self.toggle_view_aid(crate::keys::Action::Rulers);
                 }
@@ -7527,7 +7541,7 @@ impl GifKitApp {
                 if menu_check(ui, !self.sidebar_compact, "Show Tool &Names", "") {
                     self.set_rail_compact(!self.sidebar_compact);
                 }
-                if menu_check(ui, self.group_tools, "&Group Related Tools", "") {
+                if menu_check(ui, self.group_tools, "&Collapse Tool Groups", "") {
                     self.group_tools = !self.group_tools;
                     theme::set_setting("group_tools", if self.group_tools { "1" } else { "0" });
                 }
@@ -7813,13 +7827,67 @@ impl GifKitApp {
         self.modified = true;
     }
 
+    /// Layer Style in a window of its own, for the picked layer. Picking
+    /// another layer while it's open shows that one's.
+    fn layer_style_window(&mut self, ctx: &egui::Context) {
+        if !self.style_open {
+            return;
+        }
+        let li = self.sel_layer_index().filter(|i| crate::stack::Layer::can_style(&self.stack.layers[*i].kind));
+        let mut open = true;
+        let name = li.map(|i| self.stack.layers[i].name()).unwrap_or_default();
+        let mut st = li.map(|i| self.stack.layers[i].style.clone());
+        dialog(ctx, "layer-style", "Layer Style", vec2(460.0, 620.0), true, &mut open, |ui| {
+            let pal = *p();
+            match &mut st {
+                Some(st) => {
+                    ui.horizontal(|ui| {
+                        crate::icons::paint(ui.painter(), "tool_imageeffects", ui.cursor().min + vec2(8.0, 10.0), 16.0, pal.fg_muted);
+                        ui.add_space(22.0);
+                        ui.label(RichText::new(&name).font(theme::medium(15.0)).color(pal.fg));
+                    });
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| layer_style_ui(ui, st));
+                }
+                None => {
+                    ui.add_space(20.0);
+                    ui.vertical_centered(|ui| hint(ui, "Pick a text, shape or emoji layer to style it"));
+                }
+            }
+        });
+        if let (Some(i), Some(st)) = (li, st) {
+            if st != self.stack.layers[i].style {
+                let now = ctx.input(|i| i.time);
+                let id = self.stack.layers[i].id;
+                self.snapshot(&format!("style{id}"), now);
+                // with Alt, every picked layer that can take it
+                let alt = ctx.input(|i| i.modifiers.alt);
+                let mut targets: Vec<usize> = if alt { self.picked() } else { vec![i] };
+                if targets.is_empty() {
+                    targets.push(i);
+                }
+                for t in targets {
+                    if crate::stack::Layer::can_style(&self.stack.layers[t].kind) {
+                        self.stack.layers[t].style = st.clone();
+                    }
+                }
+                self.modified = true;
+            }
+        }
+        if !open {
+            self.style_open = false;
+        }
+    }
+
     /// A group's own row in the Layers panel: its eye, fold, folder, name
     /// and lock. Clicking picks its top layer. Gives the row's place.
-    fn group_row(&mut self, ui: &mut egui::Ui, g: &crate::stack::Group, top: usize, row_h: f32, menu_act: &mut Option<LayerAct>, select: &mut Option<(Kind, u64)>) -> Rect {
+    fn group_row(&mut self, ui: &mut egui::Ui, g: &crate::stack::Group, top: usize, row_h: f32, menu_act: &mut Option<LayerAct>, _select: &mut Option<(Kind, u64)>) -> Rect {
         let pal = *p();
         let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click_and_drag());
         let painter = ui.painter().clone();
-        if resp.hovered() || self.group_drag == Some(g.id) {
+        if self.sel_group == Some(g.id) {
+            painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 3.0, mix(pal.view, pal.highlight, 0.55));
+        } else if resp.hovered() || self.group_drag == Some(g.id) {
             painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 3.0, mix(pal.view, pal.highlight, 0.18));
         } else {
             painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 3.0, mix(pal.view, pal.window, 0.5));
@@ -7900,8 +7968,9 @@ impl GifKitApp {
         if resp.double_clicked() && !busy {
             *menu_act = Some(LayerAct::RenameGroup(g.id));
         } else if resp.clicked() && !busy {
-            let l = &self.stack.layers[top];
-            *select = Some((l.kind(), l.id));
+            // the group itself: its opacity and blend show at the top
+            let _ = top;
+            self.sel_group = Some(g.id);
         }
         if resp.drag_started() && !busy {
             self.group_drag = Some(g.id);
@@ -8482,23 +8551,24 @@ impl GifKitApp {
                 ui.painter().hline(r.x_range().shrink(4.0), r.top() + 1.0, Stroke::new(1.0, pal.border));
                 ui.add_space(6.0);
             };
-            if self.group_tools {
-                for (gi, (_, tools, gap)) in RAIL_GROUPS.iter().enumerate() {
-                    if *gap {
-                        divider(ui);
-                    }
-                    if tools.len() == 1 {
-                        self.rail_row(ui, Some(tools[0]), names);
-                    } else {
-                        self.rail_group_row(ui, gi, names);
+            // the tools in their groups, each set apart: a line between,
+            // and its name over it while the names show
+            for (gi, (gname, tools, gap)) in RAIL_GROUPS.iter().enumerate() {
+                if *gap {
+                    divider(ui);
+                }
+                if names > 0.05 {
+                    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 16.0 * names), Sense::hover());
+                    if names > 0.5 {
+                        ui.painter().text(pos2(r.left() + 8.0, r.center().y), egui::Align2::LEFT_CENTER, gname.to_uppercase(), egui::FontId::proportional(10.0), pal.fg_muted.gamma_multiply((names - 0.5) * 2.0));
                     }
                 }
-            } else {
-                for t in Tool::ALL {
-                    if matches!(t, Tool::Resize | Tool::Frames | Tool::Presets) {
-                        divider(ui);
+                if self.group_tools && tools.len() > 1 {
+                    self.rail_group_row(ui, gi, names);
+                } else {
+                    for &t in tools.iter() {
+                        self.rail_row(ui, Some(t), names);
                     }
-                    self.rail_row(ui, Some(t), names);
                 }
             }
             self.rail_row(ui, None, names);
@@ -8909,6 +8979,53 @@ impl GifKitApp {
         // the selected layer's lock and opacity, as in Photoshop's layer panel
         let sel_li = self.sel_layer_index();
         let mut menu_act: Option<LayerAct> = None;
+        if self.sel_group.is_some_and(|g| self.stack.group(g).is_none()) {
+            self.sel_group = None;
+        }
+        if let Some(g) = self.sel_group.and_then(|g| self.stack.group(g).cloned()) {
+            // a group picked: its lock, opacity and blend, as Photoshop has them
+            let mut gg = g.clone();
+            ui.horizontal(|ui| {
+                let icon = crate::icons::image(ui.ctx(), if gg.locked { "object-locked" } else { "object-unlocked" }, 16.0, pal.fg);
+                if ui.add(sel_btn(egui::Button::image(icon).min_size(vec2(28.0, 26.0)), gg.locked)).on_hover_text(if gg.locked { "Unlock the group" } else { "Lock the group" }).clicked() {
+                    gg.locked = !gg.locked;
+                }
+                crate::icons::paint(ui.painter(), "folder-open", ui.cursor().min + vec2(12.0, 13.0), 16.0, pal.fg_muted);
+                ui.add_space(30.0);
+                ui.label(RichText::new("Opacity:").color(pal.fg));
+                ui.add_enabled_ui(!gg.locked, |ui| {
+                    fill_slider(ui, Spin::new(&mut gg.opacity, 0.0..=100.0).suffix("%").max_decimals(0).default_value(100.0)).on_hover_text("The whole group's opacity. Below 100% its layers are put together first");
+                });
+            });
+            ui.add_space(2.0);
+            ui.add_enabled_ui(!gg.locked, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Blend:").color(pal.fg));
+                    let mut k: usize = if gg.pass_through { 0 } else { crate::adjust::Blend::ALL.iter().position(|b| *b == gg.blend).unwrap_or(0) + 1 };
+                    let mut items: Vec<(usize, &str)> = vec![(0, "Pass Through")];
+                    items.extend(crate::adjust::Blend::ALL.iter().enumerate().map(|(i, b)| (i + 1, b.label())));
+                    combo(ui, "group-blend", &mut k, &items).on_hover_text("Pass Through: its layers blend one by one, as if there were no group. Any other: the group is put together first, then blended as one");
+                    gg.pass_through = k == 0;
+                    if k > 0 {
+                        gg.blend = crate::adjust::Blend::ALL[k - 1];
+                    }
+                });
+            });
+            if gg != g {
+                if gg.locked != g.locked {
+                    for l in self.stack.layers.iter_mut().filter(|l| l.group == Some(g.id)) {
+                        l.locked = gg.locked;
+                    }
+                } else {
+                    let now = ui.input(|i| i.time);
+                    self.snapshot(&format!("group{}", g.id), now);
+                }
+                if let Some(t) = self.stack.group_mut(g.id) {
+                    *t = gg;
+                }
+                self.modified = true;
+            }
+        } else {
         ui.horizontal(|ui| {
             let (locked, mut op) = sel_li.map(|i| (self.stack.layers[i].locked, self.stack.layers[i].opacity)).unwrap_or((false, 100.0));
             ui.add_enabled_ui(sel_li.is_some(), |ui| {
@@ -8954,7 +9071,7 @@ impl GifKitApp {
                 ui.add_space(6.0);
                 ui.label(RichText::new("Opacity:").color(if sel_li.is_some() { pal.fg } else { pal.fg_muted }));
                 ui.add_enabled_ui(!locked, |ui| {
-                    if fill_slider(ui, Spin::new(&mut op, 0.0..=100.0).suffix("%").max_decimals(0)).on_hover_text("The whole layer's opacity. Hold Alt to set every picked layer").changed() {
+                    if fill_slider(ui, Spin::new(&mut op, 0.0..=100.0).suffix("%").max_decimals(0).default_value(100.0)).on_hover_text("The whole layer's opacity. Hold Alt to set every picked layer").changed() {
                         for i in self.edit_targets(ui) {
                             self.stack.layers[i].opacity = op;
                             self.modified = true;
@@ -8976,25 +9093,10 @@ impl GifKitApp {
                     let styled = sel_li.is_some_and(|i| !self.stack.layers[i].style.is_none());
                     let r = ui.add_enabled(styleable, egui::Button::new("").min_size(vec2(30.0, CHIP_H)));
                     crate::icons::paint(ui.painter(), "tool_imageeffects", r.rect.center(), 16.0, if styled { pal.highlight } else if styleable { pal.fg } else { pal.fg_muted });
-                    let r = r.on_hover_text("Layer style: stroke, drop shadow and outer glow").on_disabled_hover_text("Layer styles are for text, shapes and emoji");
-                    egui::Popup::from_toggle_button_response(&r).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-                        if let Some(i) = sel_li {
-                            let mut st = self.stack.layers[i].style.clone();
-                            layer_style_ui(ui, &mut st);
-                            if st != self.stack.layers[i].style {
-                                let now = ui.input(|i| i.time);
-                                let id = self.stack.layers[i].id;
-                                self.snapshot(&format!("style{id}"), now);
-                                // with Alt, every picked layer that can take it
-                                for t in self.edit_targets(ui) {
-                                    if crate::stack::Layer::can_style(&self.stack.layers[t].kind) {
-                                        self.stack.layers[t].style = st.clone();
-                                    }
-                                }
-                                self.modified = true;
-                            }
-                        }
-                    });
+                    let r = r.on_hover_text("Layer Style: stroke, drop shadow and outer glow").on_disabled_hover_text("Layer styles are for text, shapes and emoji");
+                    if r.clicked() {
+                        self.style_open = !self.style_open;
+                    }
                     combo(ui, "layer-blend", &mut mode, &items).on_hover_text("How the layer meets what's under it: Multiply darkens, Screen lightens, Overlay adds contrast, Color and Luminosity take one part of it");
                 });
                 if sel_li.is_some_and(|i| self.stack.layers[i].blend != mode) {
@@ -9005,6 +9107,7 @@ impl GifKitApp {
                 }
             });
         });
+        }
         ui.add_space(4.0);
         let find = self.layer_find.trim().to_lowercase();
         // the list, with a row of buttons under it
@@ -9020,6 +9123,8 @@ impl GifKitApp {
         // a row clicked with Ctrl (add or take away) or Shift (a run)
         let mut pick_mod: Option<(u64, bool, bool)> = None;
         let mut group_many = false;
+        // "Layer Style…" from a row's menu: pick that layer, open the window
+        let mut style_for: Option<(Kind, u64)> = None;
         let mut delete_many = false;
         let mut toggle: Option<usize> = None;
         let mut lock: Option<usize> = None;
@@ -9179,6 +9284,9 @@ impl GifKitApp {
                     }
                     if menu_check(ui, clipped, "&Clip to Layer Below", "") && li > 0 && !locked {
                         act(LayerAct::Clip(li));
+                    }
+                    if menu_item(ui, "tool_imageeffects", "Layer &Style…", "", crate::stack::Layer::can_style(&self.stack.layers[li].kind)) {
+                        style_for = Some((kind, id));
                     }
                     if menu_item(ui, if gid.is_some() { "object-ungroup" } else { "folder-new" }, if gid.is_some() { "Remove from &Group" } else { "&Group Layer" }, &self.keymap.text(crate::keys::Action::GroupLayer), true) {
                         act(LayerAct::Group(li));
@@ -9513,6 +9621,11 @@ impl GifKitApp {
         if group_many {
             self.group_picked(now);
         }
+        if let Some((k, id)) = style_for {
+            self.tool = kind_tool(k);
+            self.select(k, id);
+            self.style_open = true;
+        }
         if delete_many {
             self.delete_picked(now);
         }
@@ -9521,6 +9634,7 @@ impl GifKitApp {
         if let Some((k, id)) = select {
             self.tool = kind_tool(k);
             self.select(k, id);
+            self.sel_group = None;
         }
         if let Some((id, ctrl, shift)) = pick_mod {
             if ctrl {
@@ -9633,6 +9747,7 @@ impl GifKitApp {
         }
         if let Some(t) = edit_toggle {
             let tr = &mut self.stack.transform;
+        let _defaults = spin::Defaults::new(&*tr, &Transform::default());
             match t {
                 Tool::Cut => tr.cut_on = !tr.cut_on,
                 Tool::Speed => tr.speed_on = !tr.speed_on,
@@ -9891,6 +10006,7 @@ impl GifKitApp {
     fn reset_frame_edit(&mut self, t: Tool) {
         let dur = self.base.as_ref().map(|a| a.duration_secs()).unwrap_or(1.0);
         let tr = &mut self.stack.transform;
+        let _defaults = spin::Defaults::new(&*tr, &Transform::default());
         match t {
             Tool::Cut => {
                 tr.cut_on = false;
@@ -11361,13 +11477,9 @@ impl GifKitApp {
     fn canvas(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let pal = *p();
         self.refresh_picture_colours();
-        let mut full = ui.available_rect_before_wrap();
+        let full = ui.available_rect_before_wrap();
         ui.allocate_rect(full, Sense::hover());
-        if self.has_options_bar() {
-            let bar = Rect::from_min_size(full.min, vec2(full.width(), options_bar::BAR_H));
-            full.min.y = bar.bottom();
-            self.options_bar_ui(ui, bar);
-        }
+
         if !self.compare {
             let s = self.view_single;
             self.source_view(ui, ctx, full, s, 0, false);
@@ -12723,6 +12835,7 @@ impl GifKitApp {
         });
         let (bw, bh) = self.dims();
         let tr = &mut self.stack.transform;
+        let _defaults = spin::Defaults::new(&*tr, &Transform::default());
         let (w, h) = if tr.crop_on && tr.crop[2] > 0 { (tr.crop[2], tr.crop[3]) } else { (bw, bh) };
         let before = (tr.rs_w, tr.rs_h, tr.rs_pct.to_bits(), tr.rs_mode, tr.rs_filter);
         // follow the stored settings (undo, presets)
@@ -12850,6 +12963,7 @@ impl GifKitApp {
             form_row(ui, "Preview", |ui| seg_row(ui, &mut self.crop_live, &[(true, "With Edits"), (false, "Original")])).on_hover_text("Drag on the image to set the crop");
         });
         let tr = &mut self.stack.transform;
+        let _defaults = spin::Defaults::new(&*tr, &Transform::default());
         let before = tr.crop;
         group(ui, "Area", |ui| {
             let r = &mut tr.crop;
@@ -12920,6 +13034,7 @@ impl GifKitApp {
             t.rot_any = false;
         });
         let tr = &mut self.stack.transform;
+        let _defaults = spin::Defaults::new(&*tr, &Transform::default());
         let before = format!("{} {} {} {} {} {} {} {:?}", tr.flip_v, tr.flip_h, tr.rot, tr.rot_any, tr.rot_deg, tr.rot_expand, tr.rot_bg_transparent, tr.rot_bg);
         group(ui, "Flip", |ui| {
             form_row(ui, "Flip", |ui| {
@@ -12948,6 +13063,7 @@ impl GifKitApp {
 
     fn ui_reverse(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let tr = &mut self.stack.transform;
+        let _defaults = spin::Defaults::new(&*tr, &Transform::default());
         group(ui, "Playback", |ui| {
             form_row(ui, "Direction", |ui| {
                 check(ui, &mut tr.reverse, "Reverse");
@@ -13001,6 +13117,7 @@ impl GifKitApp {
         });
         let avg_fps = self.base.as_ref().map(|a| a.enabled_count() as f32 / a.duration_secs().max(0.001)).unwrap_or(0.0);
         let tr = &mut self.stack.transform;
+        let _defaults = spin::Defaults::new(&*tr, &Transform::default());
         let before = (tr.speed_mode, tr.speed_val.to_bits());
         group(ui, "Speed", |ui| {
             form_row(ui, "Set as", |ui| combo(ui, "spmode", &mut tr.speed_mode, &[(SpeedMode::Percent, "% of original"), (SpeedMode::DelayAll, "Delay per frame (cs)"), (SpeedMode::Fps, "Frame rate (fps)")]));
@@ -13102,6 +13219,7 @@ impl GifKitApp {
         let (n, dur) = self.base.as_ref().map(|a| (a.len(), a.duration_secs())).unwrap_or((1, 0.0));
         let src = self.plan.get(self.cur).map(|f| f.src + 1).unwrap_or(1);
         let tr = &mut self.stack.transform;
+        let _defaults = spin::Defaults::new(&*tr, &Transform::default());
         let before = format!("{} {} {} {} {}", tr.cut_by_time, tr.cut_start, tr.cut_end, tr.cut_t0, tr.cut_t1);
         group(ui, "Range", |ui| {
             form_row(ui, "Measure in", |ui| seg_row(ui, &mut tr.cut_by_time, &[(false, "Frames"), (true, "Seconds")]));
@@ -13781,6 +13899,8 @@ impl GifKitApp {
             _ => self.text_tpl.clone(),
         };
         let before = a.clone();
+        // right-click resets any field here to its default
+        let _defaults = spin::Defaults::new(&a, &Default::default());
         group(ui, "Text", |ui| {
             // a fixed id keeps the focus when the first letter adds the layer
             ui.add(egui::TextEdit::multiline(&mut a.text).id_salt("text_body").desired_rows(2).desired_width(f32::INFINITY));
@@ -13850,9 +13970,7 @@ impl GifKitApp {
                 a.y = (cy - h1 as f32 / 2.0).round() as i32;
             }
         }
-        let bar = self.has_options_bar();
         group(ui, "Style", |ui| {
-            if !bar {
             form_row(ui, "Size", |ui| {
                 ui.horizontal(|ui| {
                     colour_btn_a(ui, &mut a.color).on_hover_text("Text colour");
@@ -13868,7 +13986,6 @@ impl GifKitApp {
                     }
                 })
             });
-            }
             let d = Annotation::default();
             let extra = (a.stretch - 1.0).abs() > 1e-3 || (a.stretch_y - 1.0).abs() > 1e-3 || a.align != d.align || a.opacity != d.opacity;
             more(ui, "text-style", extra, |ui| {
@@ -13950,6 +14067,8 @@ impl GifKitApp {
             _ => self.censor_tpl.clone(),
         };
         let before = c.clone();
+        // right-click resets any field here to its default
+        let _defaults = spin::Defaults::new(&c, &Default::default());
         if sel.is_none() {
             ui.add_space(6.0);
         }
@@ -14096,6 +14215,8 @@ impl GifKitApp {
             _ => self.wm_tpl.clone(),
         };
         let before = w.clone();
+        // right-click resets any field here to its default
+        let _defaults = spin::Defaults::new(&w, &Default::default());
         let mut browse = false;
         group(ui, "Content", |ui| {
             form_row(ui, "Show", |ui| seg_row(ui, &mut w.use_image, &[(false, "Text"), (true, "Image")]));
@@ -14256,6 +14377,8 @@ impl GifKitApp {
         let Some(mut mk) = self.mask_of(t).cloned().or_else(|| Some(crate::shapes::LayerMask::default())) else { return };
         let had = self.mask_of(t).is_some();
         let before = mk.clone();
+        // right-click resets any field here to its default
+        let _defaults = spin::Defaults::new(&mk, &Default::default());
         let mut sel = self.mask_shape.min(mk.shapes.len().saturating_sub(1));
         let mut add: Option<crate::shapes::MaskShape> = None;
         let mut act: Option<LayerAct> = None;
@@ -14405,9 +14528,9 @@ impl GifKitApp {
             _ => self.shape_tpl.clone(),
         };
         let before = st.clone();
-        // the options bar over the picture holds the shape, fill and outline
-        let bar = self.has_options_bar();
-        if !bar { group(ui, "Shape", |ui| {
+        // right-click resets any field here to its default
+        let _defaults = spin::Defaults::new(&st, &Default::default());
+        group(ui, "Shape", |ui| {
             let kinds: Vec<ShapeKind> = ShapeKind::ALL.iter().copied().filter(|k| *k != ShapeKind::Emoji || st.kind == ShapeKind::Emoji).collect();
             let labels: Vec<&str> = kinds.iter().map(|k| k.label()).collect();
             even_grid(ui, kinds.len(), label_w(ui, &labels), |ui, i, size| {
@@ -14416,10 +14539,9 @@ impl GifKitApp {
                     st.kind = k;
                 }
             });
-        }); }
+        });
         if st.kind != ShapeKind::Emoji {
             group(ui, "Style", |ui| {
-                if !bar {
                 if st.kind == ShapeKind::Line {
                     Self::colour_row(ui, "Line", &mut st.stroke);
                 } else {
@@ -14428,13 +14550,6 @@ impl GifKitApp {
                 }
                 let lined = st.stroke_on || st.kind == ShapeKind::Line;
                 ui.add_enabled_ui(lined, |ui| slider_row(ui, "Width", Spin::new(&mut st.stroke_w, 1.0..=60.0).suffix(" px").max_decimals(1).clamping(egui::SliderClamping::Never)));
-                } else {
-                    // quick colours stay here: the bar has one button each
-                    if st.kind != ShapeKind::Line {
-                        ui.add_enabled_ui(st.fill_on, |ui| form_row(ui, "Fill", |ui| Self::swatches(ui, &mut st.fill)));
-                    }
-                    form_row(ui, if st.kind == ShapeKind::Line { "Line" } else { "Outline" }, |ui| Self::swatches(ui, &mut st.stroke));
-                }
                 match st.kind {
                     ShapeKind::Rounded | ShapeKind::Speech => {
                         slider_row(ui, "Corners", Spin::new(&mut st.corner, 0.0..=50.0).suffix("%").max_decimals(0));
@@ -14670,6 +14785,8 @@ impl GifKitApp {
             _ => self.emoji_tpl.clone(),
         };
         let before = e.clone();
+        // right-click resets any field here to its default
+        let _defaults = spin::Defaults::new(&e, &Default::default());
         group(ui, "Look", |ui| {
             slider_row(ui, "Opacity", Spin::new(&mut e.opacity, 0.0..=100.0).suffix("%").max_decimals(0));
             shadow_rows(ui, &mut e.shadow, &mut e.shadow_style);
@@ -14712,8 +14829,7 @@ impl GifKitApp {
         let sel = self.layer_chooser(ui, Kind::Markup, "Add New Markup Layer", |s| {
             s.add_layer(LayerKind::Markup(MarkupSettings::default()));
         });
-        let bar = self.has_options_bar();
-        if !bar { group(ui, "Brush", |ui| {
+        group(ui, "Brush", |ui| {
             form_row(ui, "Tool", |ui| seg_row(ui, &mut self.pen_tool, &[(PenTool::Pen, "Pen"), (PenTool::Highlighter, "Highlighter"), (PenTool::Eraser, "Eraser")])).on_hover_text("The eraser removes whole strokes you drag over");
             ui.add_space(4.0);
             let eraser = self.pen_tool == PenTool::Eraser;
@@ -14727,7 +14843,7 @@ impl GifKitApp {
         });
         group(ui, "Draw On", |ui| {
             form_row(ui, "Draw on", |ui| seg_row(ui, &mut self.pen_scope, &[(PenScope::All, "All frames"), (PenScope::FromHere, "From here"), (PenScope::ThisFrame, "This frame")])).on_hover_text("Step through frames to draw an animation");
-        }); }
+        });
         let count = sel
             .map(|i| match &self.stack.layers[i].kind {
                 LayerKind::Markup(m) => m.strokes.len(),
@@ -14779,6 +14895,8 @@ impl GifKitApp {
             _ => self.shield_tpl.clone(),
         };
         let before = s.clone();
+        // right-click resets any field here to its default
+        let _defaults = spin::Defaults::new(&s, &Default::default());
         group(ui, "Perturbation", |ui| {
             slider_row(ui, "Strength", soft_slider(&mut s.strength, 0.0..=20.0, "").max_decimals(1)).on_hover_text("4 to 8 is hard to see");
             form_row(ui, "Adds", |ui| {
@@ -15046,6 +15164,7 @@ fn on(b: &[bool]) -> Option<String> {
 /// The Effects panel. True when "Move to an Adjustment Layer" was asked for.
 fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform, corner: Option<[u8; 3]>) -> bool {
     let d = EffectSettings::default();
+    let _defaults = spin::Defaults::new(&*fx, &d);
     let mut convert = false;
     // colour work lives in the Adjust tool now; a layer still using the older
     // settings keeps them here, working as before

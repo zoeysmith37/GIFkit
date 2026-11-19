@@ -7,6 +7,61 @@
 use super::*;
 use egui::emath::Numeric;
 
+/// Settings whose defaults are known while a panel draws them: where the
+/// settings sit in memory, how big they are, and a copy of their defaults'
+/// bytes. A number field inside them finds its own default by where it
+/// sits, so every field of every panel can be reset without each saying so.
+struct Scope {
+    at: usize,
+    len: usize,
+    bytes: Vec<u8>,
+}
+
+thread_local! {
+    static SCOPES: std::cell::RefCell<Vec<Scope>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// While it lives, fields inside `value` reset to their place in `default`.
+pub(super) struct Defaults(());
+
+impl Defaults {
+    pub fn new<T>(value: &T, default: &T) -> Defaults {
+        let len = std::mem::size_of::<T>();
+        // SAFETY: `default` is a live `T`, so its `len` bytes can be read.
+        // Only the bytes are kept; they are never used as a `T` again, only
+        // numbers are read back out of them (see `default_for`)
+        let bytes = unsafe { std::slice::from_raw_parts(default as *const T as *const u8, len) }.to_vec();
+        SCOPES.with(|s| s.borrow_mut().push(Scope { at: value as *const T as usize, len, bytes }));
+        Defaults(())
+    }
+}
+
+impl Drop for Defaults {
+    fn drop(&mut self) {
+        SCOPES.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
+/// The default of the number at `v`, when it sits inside settings whose
+/// defaults are in scope.
+pub(super) fn default_for<N: Numeric>(v: &N) -> Option<f64> {
+    let at = v as *const N as usize;
+    let n = std::mem::size_of::<N>();
+    SCOPES.with(|s| {
+        let s = s.borrow();
+        let sc = s.iter().rev().find(|sc| at >= sc.at && at + n <= sc.at + sc.len)?;
+        let off = at - sc.at;
+        // SAFETY: the number lies inside the settings value, so the same
+        // place in its default (the same type, the same layout) holds a
+        // number of the same type; it's read unaligned from the copy
+        let d: N = unsafe { std::ptr::read_unaligned(sc.bytes[off..off + n].as_ptr() as *const N) };
+        let d = d.to_f64();
+        d.is_finite().then_some(d)
+    })
+}
+
 type Formatter<'a> = Box<dyn 'a + Fn(f64, std::ops::RangeInclusive<usize>) -> String>;
 
 pub(super) struct Spin<'a> {
@@ -16,7 +71,8 @@ pub(super) struct Spin<'a> {
     suffix: String,
     text: String,
     max_decimals: Option<usize>,
-    clamping: egui::SliderClamping,
+    /// None: decided by the range (see `hard`)
+    clamping: Option<egui::SliderClamping>,
     log: bool,
     formatter: Option<Formatter<'a>>,
     default: Option<f64>,
@@ -25,6 +81,7 @@ pub(super) struct Spin<'a> {
 impl<'a> Spin<'a> {
     pub fn new<N: Numeric>(value: &'a mut N, range: std::ops::RangeInclusive<N>) -> Self {
         let r = range.start().to_f64()..=range.end().to_f64();
+        let default = default_for(&*value);
         Spin {
             get: Box::new(move |set| {
                 if let Some(v) = set {
@@ -37,10 +94,10 @@ impl<'a> Spin<'a> {
             suffix: String::new(),
             text: String::new(),
             max_decimals: None,
-            clamping: egui::SliderClamping::Always,
+            clamping: None,
             log: false,
             formatter: None,
-            default: None,
+            default,
         }
     }
     pub fn suffix(mut self, s: impl ToString) -> Self {
@@ -56,7 +113,7 @@ impl<'a> Spin<'a> {
         self
     }
     pub fn clamping(mut self, c: egui::SliderClamping) -> Self {
-        self.clamping = c;
+        self.clamping = Some(c);
         self
     }
     pub fn logarithmic(mut self, on: bool) -> Self {
@@ -128,12 +185,20 @@ impl<'a> Spin<'a> {
         }
     }
 
+    /// Can a typed value go past the range? As Blender's fields: yes, the
+    /// range is only how far dragging goes. A true percentage (0 to 100 %)
+    /// stays inside it, and so does a field asked to clamp.
+    fn hard(&self) -> bool {
+        match self.clamping {
+            Some(egui::SliderClamping::Always) => true,
+            Some(_) => false,
+            None => *self.range.start() == 0.0 && *self.range.end() == 100.0 && self.suffix.trim() == "%",
+        }
+    }
+
     fn tidy(&self, v: f64, typed: bool) -> f64 {
         let (lo, hi) = (self.range.start().min(*self.range.end()), self.range.start().max(*self.range.end()));
-        let v = match self.clamping {
-            egui::SliderClamping::Never if typed => v,
-            _ => v.clamp(lo, hi),
-        };
+        let v = if typed && !self.hard() { v } else { v.clamp(lo, hi) };
         if self.integral { v.round() } else { v }
     }
 }
@@ -150,6 +215,14 @@ impl egui::Widget for Spin<'_> {
         let mut v = (self.get)(None);
         let before = v;
         let enabled = ui.is_enabled();
+        // a value typed past the range stretches it, so dragging and the
+        // fill work around it; back inside (a reset), the range is as it was
+        if !self.hard() && v.is_finite() {
+            let (a, b) = (*self.range.start(), *self.range.end());
+            if a <= b && (v < a || v > b) {
+                self.range = a.min(v)..=b.max(v);
+            }
+        }
 
         // typing a value in
         let typing: Option<String> = ui.data(|d| d.get_temp(typing_id));
