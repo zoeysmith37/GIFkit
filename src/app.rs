@@ -932,6 +932,11 @@ pub struct GifKitApp {
     theme: ThemeChoice,
 
     compare: bool,
+    /// split view as last saved, so a change is remembered once
+    compare_saved: bool,
+    /// the timeline hasn't been shown or hidden by hand: it stays out of
+    /// the way until there's something on it
+    timeline_auto: bool,
     view_left: ViewSource,
     view_right: ViewSource,
     view_single: ViewSource,
@@ -3833,7 +3838,9 @@ impl GifKitApp {
             font_search: String::new(),
             ffmpeg: { let f = io::ffmpeg_available(); if f { crate::gpu::warm_up(); } f },
             theme: theme_choice,
-            compare: true,
+            compare: theme::get_setting("compare").as_deref() == Some("1"),
+            compare_saved: theme::get_setting("compare").as_deref() == Some("1"),
+            timeline_auto: theme::get_setting("show_timeline").is_none(),
             view_left: ViewSource::Original,
             view_right: ViewSource::Compressed,
             cmp: None,
@@ -3867,7 +3874,7 @@ impl GifKitApp {
             fr_thumb: 96.0,
             video_bg: [255, 255, 255],
             view_single: ViewSource::Edit,
-            sidebar_compact: theme::get_setting("sidebar_compact").as_deref() != Some("0"),
+            sidebar_compact: theme::get_setting("sidebar_compact").as_deref() == Some("1"),
             group_tools: theme::get_setting("group_tools").as_deref() == Some("1"),
             rail_pick: RAIL_GROUPS.map(|g| g.1[0]),
             layers_collapsed: false,
@@ -3936,7 +3943,7 @@ impl GifKitApp {
             cmp_full_key: 0,
             shortcuts_open: false,
             win_title: String::new(),
-            show_timeline: theme::get_setting("show_timeline").as_deref() != Some("0"),
+            show_timeline: theme::get_setting("show_timeline").as_deref() == Some("1"),
             tl_zoom: 0.0,
             tl_fit: 1.0,
             tl_zoom_now: 1.0,
@@ -7496,6 +7503,15 @@ impl eframe::App for GifKitApp {
         self.manage_prerender(&ctx, now);
         self.read_ahead(&ctx);
         mark("prerender");
+        if self.compare != self.compare_saved {
+            self.compare_saved = self.compare;
+            theme::set_setting("compare", if self.compare { "1" } else { "0" });
+        }
+        // the timeline comes up the first time there's something to put on it
+        if self.timeline_auto && !self.show_timeline && (!self.stack.layers.is_empty() || !self.stack.markers.is_empty()) {
+            self.show_timeline = true;
+            self.timeline_auto = false;
+        }
         self.manage_compare(&ctx, now);
         mark("compare");
         self.manage_packing(&ctx, now);
@@ -7952,6 +7968,7 @@ impl GifKitApp {
                 if menu_check(ui, self.show_timeline, "Show &Timeline", "") {
                     self.show_timeline = !self.show_timeline;
                     theme::set_setting("show_timeline", if self.show_timeline { "1" } else { "0" });
+                    self.timeline_auto = false;
                 }
                 let full = ctx.input(|i| i.viewport().fullscreen).unwrap_or(false);
                 if menu_check(ui, full, "F&ull Screen Mode", &self.keymap.text(crate::keys::Action::FullScreen)) {
@@ -9374,6 +9391,8 @@ impl GifKitApp {
 
     fn layer_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let pal = *p();
+        // a start button in the empty list: text, shape or image
+        let mut quick_add: Option<usize> = None;
         // the panel takes its height from what it holds: claim all of it up
         // front so it never creeps shorter frame by frame
         let full = ui.available_height();
@@ -10016,13 +10035,53 @@ impl GifKitApp {
                 }
             }
             if n == 0 {
-                ui.add_space(6.0);
+                ui.add_space(8.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("Nothing added yet").color(pal.fg).size(14.0));
+                    ui.label(RichText::new("Start with one of these, or pick any tool from the list").color(pal.fg_muted).size(12.0));
+                });
+                ui.add_space(8.0);
+                let w = ui.available_width() - 16.0;
+                let gap = 6.0;
+                let bw = ((w - gap * 2.0) / 3.0).floor();
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
-                    hint(ui, "No layers yet. Pick a tool to add one.");
+                    ui.spacing_mut().item_spacing.x = gap;
+                    for (i, (icon, label, tip)) in [("draw-text", "Text", "Add words: they can type on, move and fade"), ("draw-rectangle", "Shape", "Add a shape, arrow or speech bubble"), ("insert-image", "Image", "Add a picture or an animation on top")].iter().enumerate() {
+                        let (r, resp) = ui.allocate_exact_size(vec2(bw, 64.0), Sense::click());
+                        let hov = resp.hovered();
+                        ui.painter().rect_filled(r, 6.0, if hov { mix(pal.button, pal.highlight, 0.22) } else { pal.button });
+                        ui.painter().rect_stroke(r, 6.0, Stroke::new(1.0, if hov { pal.highlight } else { pal.border }), egui::StrokeKind::Inside);
+                        crate::icons::paint(ui.painter(), icon, pos2(r.center().x, r.min.y + 24.0), 22.0, pal.fg);
+                        ui.painter().text(pos2(r.center().x, r.max.y - 14.0), egui::Align2::CENTER_CENTER, *label, egui::FontId::proportional(13.0), pal.fg);
+                        if resp.on_hover_text(*tip).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            quick_add = Some(i);
+                        }
+                    }
                 });
             }
         });
+        match quick_add {
+            Some(0) => {
+                self.open_tool(Tool::Text);
+                let mut t = self.text_tpl.clone();
+                self.place_text(&mut t);
+                self.add_layer(LayerKind::Text(t));
+            }
+            Some(1) => {
+                self.open_tool(Tool::Shapes);
+                let (w, h) = self.dims();
+                let sh = self.default_shape(w, h);
+                self.add_layer(LayerKind::Shape(Box::new(sh)));
+            }
+            Some(_) => {
+                self.open_tool(Tool::AddImage);
+                if let Some(path) = rfd::FileDialog::new().add_filter("Images", &["png", "gif", "jpg", "jpeg", "webp", "bmp"]).pick_file() {
+                    self.load_overlay(path, ctx);
+                }
+            }
+            None => {}
+        }
         // buttons for the selected row, as another way in than right-click
         let sel_layer = self.tool.layer_kind().and_then(|k| self.sel_index(k));
         let sel_edit = (self.tool.layer_kind().is_none() && self.edit_rows_shown.contains(&self.tool)).then_some(self.tool);
@@ -10653,11 +10712,20 @@ impl GifKitApp {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 // show or hide the timeline dock
                 let on = self.show_timeline;
-                let b = ui.add(sel_btn(egui::Button::new("").frame_when_inactive(on).min_size(vec2(TOOLBAR_H, TOOLBAR_H)), on)).on_hover_text(if on { "Hide the timeline" } else { "Show the timeline" });
-                crate::icons::paint(ui.painter(), "player-time", b.rect.center(), 16.0, pal.fg);
+                // shut, it says what it is, so it's easy to find
+                let b = if on {
+                    let b = ui.add(sel_btn(egui::Button::new("").frame_when_inactive(on).min_size(vec2(TOOLBAR_H, TOOLBAR_H)), on)).on_hover_text("Hide the timeline");
+                    crate::icons::paint(ui.painter(), "player-time", b.rect.center(), 16.0, pal.fg);
+                    b
+                } else {
+                    let b = ui.add(egui::Button::new(RichText::new("      Timeline").color(pal.fg)).min_size(vec2(TOOLBAR_H, TOOLBAR_H))).on_hover_text("Show the timeline: layers over time, keyframes, markers and clips");
+                    crate::icons::paint(ui.painter(), "player-time", pos2(b.rect.min.x + 16.0, b.rect.center().y), 16.0, pal.fg);
+                    b
+                };
                 if b.clicked() {
                     self.show_timeline = !on;
                     theme::set_setting("show_timeline", if self.show_timeline { "1" } else { "0" });
+                    self.timeline_auto = false;
                 }
                 // in a narrow window the time goes first, then the speed menu
                 let room = ui.available_width() - 90.0;

@@ -22,7 +22,7 @@ Nothing touches your frames until you export. Every edit is a layer or a frame e
 
 ## The views
 - The preview shows the result as it'll look
-- Split view (C) puts the original next to it
+- Split view (C) puts the original next to it. It's off to start with
 - The compressed view shows the exported file and how big it is
 
 ## Saving
@@ -216,6 +216,7 @@ While you move or resize a layer, pink lines show where it lines up with the fra
 - Shift+O shows onion skin: frames before in red, the next in green
 
 ## Moving layers
+- The timeline comes up once you add something. The Timeline button shows or hides it
 - K adds a keyframe. Auto key adds one whenever you change a value
 - The easing list also sets what new keyframes start as
 - Hold Alt while changing a keyframe to change every selected one
