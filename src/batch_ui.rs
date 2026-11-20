@@ -298,6 +298,7 @@ impl GifKitApp {
         let idle = !self.busy();
         let has = self.base.is_some();
         let names: Vec<String> = self.presets.iter().map(|p| p.name.clone()).collect();
+        let mut pick: Option<super::Pick> = None;
         dialog(ctx, "batch", "Batch", vec2(500.0, 470.0), false, &mut open, |ui| {
             ui.set_width(470.0);
             let b = &mut self.batch;
@@ -329,15 +330,7 @@ impl GifKitApp {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if ui.button("Add Files…").clicked() {
-                        let mut d = rfd::FileDialog::new().add_filter("Animations", &["gif", "webp", "png", "apng", "avif", "mp4", "webm", "mov", "mkv"]);
-                        if let Some(dir) = &self.last_dir {
-                            d = d.set_directory(dir);
-                        }
-                        for f in d.pick_files().unwrap_or_default() {
-                            if !b.files.contains(&f) {
-                                b.files.push(f);
-                            }
-                        }
+                        pick = Some(super::Pick::BatchFiles);
                     }
                     if ui.add_enabled(!b.files.is_empty(), egui::Button::new("Clear")).clicked() {
                         b.files.clear();
@@ -382,9 +375,7 @@ impl GifKitApp {
                                 b.out = None;
                             }
                             if ui.button("Choose…").clicked() {
-                                if let Some(d) = rfd::FileDialog::new().pick_folder() {
-                                    b.out = Some(d);
-                                }
+                                pick = Some(super::Pick::BatchFolder);
                             }
                         });
                     });
@@ -398,6 +389,9 @@ impl GifKitApp {
                 });
             });
         });
+        if let Some(k) = pick {
+            self.pick_soon(k);
+        }
         if !open {
             self.batch.open = false;
         }

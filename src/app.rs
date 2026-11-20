@@ -1050,6 +1050,8 @@ pub struct GifKitApp {
     simple_fit_for: Option<(ExportFormat, usize)>,
     /// "More settings…": the full export window, this time open
     export_full: bool,
+    /// a file picker to open after this many more frames
+    pick_after: Option<(Pick, u8)>,
     export_fmt: ExportFormat,
     frames_zip: bool,
     presets: Vec<crate::presets::Preset>,
@@ -3831,10 +3833,25 @@ fn pace_frames() {
 /// Whether any GIFkit window had focus last frame (its dialogs then stay
 /// above the main window).
 static APP_FOCUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-/// The main window has focus: its dialogs are held above it. While a dialog
-/// itself has focus it's on top anyway, and holding it there would keep the
-/// system's file pickers (Save…, Browse…) behind it.
-static MAIN_FOCUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// A file picker is about to open from a dialog: the dialogs let go of the
+/// top so the picker comes up in front, and take it back after.
+static PICKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A system file picker asked for from inside a dialog, opened a couple of
+/// frames later (see `PICKING`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Pick {
+    /// Export's Save…
+    Save,
+    /// File ▸ Open
+    Open,
+    /// ffmpeg's Browse…
+    Ffmpeg,
+    /// Batch's Add Files…
+    BatchFiles,
+    /// Batch's output folder
+    BatchFolder,
+}
 /// A dialog had focus this frame.
 static DIALOG_FOCUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -3844,9 +3861,6 @@ fn track_app_focus(ctx: &egui::Context) {
     use std::sync::atomic::Ordering::Relaxed;
     static AWAY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let main = ctx.input(|i| i.viewport().focused) != Some(false);
-    if MAIN_FOCUSED.swap(main, Relaxed) != main {
-        ctx.request_repaint();
-    }
     let any = main || DIALOG_FOCUSED.swap(false, Relaxed);
     // focus passing between our own windows takes a frame or two: only let
     // go once it's been away for a few
@@ -3910,7 +3924,8 @@ fn dialog_ex(ctx: &egui::Context, id: &str, title: &str, size: Vec2, resizable: 
     }
     // GIFkit's own windows always sit above the main one: kept on top while
     // any GIFkit window has focus, and let go when you switch to another app
-    if on_top || MAIN_FOCUSED.load(std::sync::atomic::Ordering::Relaxed) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if on_top || (APP_FOCUSED.load(Relaxed) && !PICKING.load(Relaxed)) {
         b = b.with_window_level(egui::WindowLevel::AlwaysOnTop);
     } else {
         b = b.with_window_level(egui::WindowLevel::Normal);
@@ -4205,6 +4220,7 @@ impl GifKitApp {
             simple_target: theme::get_setting("simple_target").and_then(|v| v.parse().ok()).filter(|v: &usize| *v < SIMPLE_TARGETS.len()).unwrap_or(0),
             simple_fit_for: None,
             export_full: false,
+            pick_after: None,
             export_fmt: ExportFormat::Gif,
             frames_zip: false,
             presets: Vec::new(),
@@ -5876,16 +5892,7 @@ impl GifKitApp {
             self.ff_job = Some((pr, rx));
         }
         if locate {
-            let mut d = rfd::FileDialog::new().set_title("Where is ffmpeg?");
-            if cfg!(windows) {
-                d = d.add_filter("ffmpeg", &["exe"]);
-            }
-            if let Some(f) = d.pick_file() {
-                match crate::ffmpeg::use_file(&f) {
-                    Ok(()) => self.ffmpeg_ready(ctx),
-                    Err(e) => self.ff_msg = Some((false, e.to_string())),
-                }
-            }
+            self.pick_soon(Pick::Ffmpeg);
         }
         if recheck {
             if crate::ffmpeg::recheck() {
@@ -6037,7 +6044,13 @@ impl GifKitApp {
 
     // ------------------------------------------------------------ file ops
 
-    fn open_dialog(&mut self, ctx: &egui::Context) {
+    /// File ▸ Open: the picker opens a moment later, once any open dialogs
+    /// have let go of the top, so it comes up in front of them.
+    fn open_dialog(&mut self, _ctx: &egui::Context) {
+        self.pick_soon(Pick::Open);
+    }
+
+    fn open_dialog_now(&mut self, ctx: &egui::Context) {
         if let Some(p) = rfd::FileDialog::new()
             .add_filter("Animations, images, videos & projects", &["gif", "png", "apng", "webp", "jpg", "jpeg", "bmp", "avif", "mp4", "m4v", "mov", "webm", "mkv", "avi", "wmv", "flv", "mpg", "mpeg", "ts", "ogv", "3gp", crate::project::EXT])
             .add_filter("GIFkit projects", &[crate::project::EXT])
@@ -7850,6 +7863,7 @@ impl eframe::App for GifKitApp {
         mark("prerender");
         track_app_focus(&ctx);
         pace_frames();
+        self.run_pick(&ctx);
         if self.compare != self.compare_saved {
             self.compare_saved = self.compare;
             theme::set_setting("compare", if self.compare { "1" } else { "0" });
@@ -9562,6 +9576,57 @@ impl GifKitApp {
             }
         });
         scroll_hints(ui, &out, pal.window, "rail");
+    }
+
+    /// Open a file picker from a dialog: the dialogs drop off the top first,
+    /// so it comes up in front of them.
+    fn pick_soon(&mut self, what: Pick) {
+        PICKING.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.pick_after = Some((what, 3));
+    }
+
+    fn run_pick(&mut self, ctx: &egui::Context) {
+        let Some((what, n)) = self.pick_after else { return };
+        if n > 0 {
+            self.pick_after = Some((what, n - 1));
+            ctx.request_repaint();
+            return;
+        }
+        self.pick_after = None;
+        match what {
+            Pick::Save => self.do_export(ctx),
+            Pick::Open => self.open_dialog_now(ctx),
+            Pick::Ffmpeg => {
+                let mut d = rfd::FileDialog::new().set_title("Where is ffmpeg?");
+                if cfg!(windows) {
+                    d = d.add_filter("ffmpeg", &["exe"]);
+                }
+                if let Some(f) = d.pick_file() {
+                    match crate::ffmpeg::use_file(&f) {
+                        Ok(()) => self.ffmpeg_ready(ctx),
+                        Err(e) => self.ff_msg = Some((false, e.to_string())),
+                    }
+                }
+            }
+            Pick::BatchFiles => {
+                let mut d = rfd::FileDialog::new().add_filter("Animations", &["gif", "webp", "png", "apng", "avif", "mp4", "webm", "mov", "mkv"]);
+                if let Some(dir) = &self.last_dir {
+                    d = d.set_directory(dir);
+                }
+                for f in d.pick_files().unwrap_or_default() {
+                    if !self.batch.files.contains(&f) {
+                        self.batch.files.push(f);
+                    }
+                }
+            }
+            Pick::BatchFolder => {
+                if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                    self.batch.out = Some(d);
+                }
+            }
+        }
+        PICKING.store(false, std::sync::atomic::Ordering::Relaxed);
+        ctx.request_repaint();
     }
 
     /// Simple View hides the rulers, guides and grid; Full View gets them back.
@@ -11622,8 +11687,9 @@ impl GifKitApp {
             self.export_open = false;
         }
         if go {
+            // the picker opens once the dialogs have let go of the top
             self.export_open = false;
-            self.do_export(ctx);
+            self.pick_soon(Pick::Save);
         }
     }
 
@@ -11768,8 +11834,9 @@ impl GifKitApp {
             self.export_open = false;
         }
         if go {
+            // the picker opens once the dialogs have let go of the top
             self.export_open = false;
-            self.do_export(ctx);
+            self.pick_soon(Pick::Save);
         }
     }
 
