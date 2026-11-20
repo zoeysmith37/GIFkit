@@ -15,7 +15,6 @@ use image::RgbaImage;
 use std::f32::consts::TAU;
 
 /// Scratch pictures the passes share.
-const T_FLAGS: u8 = 0;
 const T_BLUR: u8 = 1;
 const T_BLOCKS: u8 = 2;
 const T_SMALL: u8 = 3;
@@ -200,7 +199,8 @@ fn kernel_size(sigma: f32) -> u32 {
 
 /// Can the card do every effect this layer has on?
 pub fn effects_ok(s: &EffectSettings) -> bool {
-    !s.error_dither
+    // colour removal works on whole areas (joined regions, fringes): the processor's
+    !s.error_dither && !(s.rc_white || s.rc_black || s.rc_custom)
 }
 
 /// effects::apply_frame as passes.
@@ -223,30 +223,6 @@ pub fn effects<'a>(p: &mut Plan<'a, '_>, s: &EffectSettings, idx: usize, n: usiz
     }
     if s.brightness != 0.0 || s.contrast != 0.0 {
         p.bright_contrast(s.brightness, s.contrast);
-    }
-    if s.rc_white || s.rc_black || s.rc_custom {
-        if s.rc_custom && (s.rc_soft > 0.0 || s.rc_despill) {
-            let c = s.rc_color;
-            let thr = s.rc_fuzz.max(0.0) / 100.0 * 441.67;
-            let soft = s.rc_soft.max(0.0) / 100.0 * 441.67;
-            let ch = if s.rc_despill { crate::effects::key_channel(c).map(|c| c as f32 + 1.0).unwrap_or(0.0) } else { 0.0 };
-            p.op(56, &[[c[0] as f32, c[1] as f32, c[2] as f32, thr], [soft, ch, 0.0, 0.0]]);
-        }
-        let edges = if s.rc_clean_edges { Some(s.rc_edge_px) } else { None };
-        for (on, c) in [(s.rc_white, [255, 255, 255]), (s.rc_black, [0, 0, 0]), (s.rc_custom, s.rc_color)] {
-            if !on {
-                continue;
-            }
-            let thr = s.rc_fuzz.max(0.0) / 100.0 * 441.67;
-            let col = [c[0] as f32, c[1] as f32, c[2] as f32];
-            p.op(13, &[[col[0], col[1], col[2], thr]]);
-            if let Some(px) = edges.filter(|px| *px > 0) {
-                let edge_thr = (thr * 4.0).max(0.30 * 441.67);
-                let size = p.size;
-                p.raw(14, 0.0, [Some(GpuIn::Cur), None, None], Some(T_FLAGS), size, false, &[[px as f32, 0.0, 0.0, 0.0]]);
-                p.raw(15, 0.0, [Some(GpuIn::Cur), Some(GpuIn::Tmp(T_FLAGS)), None], None, size, false, &[[col[0], col[1], col[2], edge_thr], [px as f32, 0.0, 0.0, 0.0]]);
-            }
-        }
     }
     if s.grayscale {
         p.op(8, &[]);

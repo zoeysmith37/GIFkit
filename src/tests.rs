@@ -172,9 +172,38 @@ fn every_effect_runs() {
 fn replace_white_makes_transparent() {
     let mut img = RgbaImage::from_pixel(20, 20, Rgba([255, 255, 254, 255]));
     img.put_pixel(10, 10, Rgba([0, 0, 0, 255]));
-    effects::replace_color(&mut img, [255, 255, 255], 2.0, Some(2));
+    effects::remove_colors(&mut img, &[[255, 255, 255]], 2.0, 3.0, 2, false, false);
     assert_eq!(img.get_pixel(0, 0)[3], 0);
     assert_eq!(img.get_pixel(10, 10)[3], 255);
+}
+
+/// Removing a colour keeps the same colour inside the subject when only
+/// what touches the edge should go, and leaves edge pixels part-seen
+/// with the removed colour taken out (no fringe, no blocks).
+#[test]
+fn remove_colors_nuance() {
+    // white ground, a black ring with white inside it, a grey antialiased pixel
+    let mut img = RgbaImage::from_pixel(30, 30, Rgba([255, 255, 255, 255]));
+    for y in 8..22 {
+        for x in 8..22 {
+            let edge = x == 8 || x == 21 || y == 8 || y == 21;
+            if edge {
+                img.put_pixel(x, y, Rgba([0, 0, 0, 255]));
+            }
+        }
+    }
+    img.put_pixel(7, 15, Rgba([128, 128, 128, 255]));
+    let mut all = img.clone();
+    effects::remove_colors(&mut all, &[[255, 255, 255]], 2.0, 3.0, 2, false, false);
+    assert_eq!(all.get_pixel(15, 15)[3], 0, "inside goes too");
+    let mut out = img.clone();
+    effects::remove_colors(&mut out, &[[255, 255, 255]], 2.0, 3.0, 2, true, false);
+    assert_eq!(out.get_pixel(0, 0)[3], 0);
+    assert_eq!(out.get_pixel(15, 15)[3], 255, "contiguous: the inside stays");
+    assert_eq!(out.get_pixel(8, 15).0, [0, 0, 0, 255], "the ring stays solid");
+    let g = out.get_pixel(7, 15);
+    assert!(g[3] > 30 && g[3] < 230, "grey edge part-seen: {g:?}");
+    assert!(g[0] < 90, "white taken out of it: {g:?}");
 }
 
 #[test]
@@ -1493,7 +1522,7 @@ fn chroma_key_soft_edge_and_spill() {
     let tinted = image::Rgba([150u8, 210, 140, 255]);
     let far = image::Rgba([220u8, 40, 40, 255]);
     let mut img = image::RgbaImage::from_fn(4, 1, |x, _| [green, near, tinted, far][x as usize]);
-    crate::effects::key_color(&mut img, [40, 200, 60], 5.0, 20.0, true);
+    crate::effects::remove_colors(&mut img, &[[40, 200, 60]], 3.0, 20.0, 0, false, true);
     assert_eq!(img.get_pixel(0, 0)[3], 0, "the key colour goes");
     let a = img.get_pixel(1, 0)[3];
     assert!(a > 0 && a < 255, "a near colour fades: {a}");
@@ -2003,7 +2032,7 @@ fn layer_styles() {
     assert_eq!(stroked.get_pixel(10, 25).0[..3], [255, 255, 255], "nothing further out");
     // a shadow with the light from the upper left falls down and right
     style.stroke.on = false;
-    style.shadow = crate::layerstyle::Shadow { on: true, color: [0, 0, 0], opacity: 100.0, angle: 135.0, distance: 6.0, size: 0.0 };
+    style.shadow = crate::layerstyle::Shadow { on: true, color: [0, 0, 0], opacity: 100.0, angle: 135.0, distance: 6.0, size: 0.0, spread: 0.0 };
     st.layers[li].style = style.clone();
     let shadowed = st.render_frame(&base, &plan, &times, 0, &fonts, &st.prepare(&base, &fonts));
     assert!(shadowed.get_pixel(43, 38).0[0] < 40, "shadow below right: {:?}", shadowed.get_pixel(43, 38));
@@ -2016,6 +2045,26 @@ fn layer_styles() {
     for (x, y) in [(18, 25), (42, 25), (30, 13), (30, 37)] {
         assert!(glowing.get_pixel(x, y).0[2] < 200, "glow at {x},{y}: {:?}", glowing.get_pixel(x, y));
     }
+    // inside: a colour overlay covers it, Fill 0 leaves only the effects
+    style.glow.on = false;
+    style.overlay = crate::layerstyle::ColorOverlay { on: true, color: [0, 200, 0], opacity: 100.0, blend: Default::default() };
+    st.layers[li].style = style.clone();
+    let over = st.render_frame(&base, &plan, &times, 0, &fonts, &st.prepare(&base, &fonts));
+    assert_eq!(over.get_pixel(30, 25).0[..3], [0, 200, 0]);
+    style.overlay.on = false;
+    style.stroke = crate::layerstyle::Stroke { on: true, color: [255, 0, 0], size: 3.0, position: crate::layerstyle::StrokePos::Inside, ..Default::default() };
+    style.fill = 0.0;
+    st.layers[li].style = style.clone();
+    let hollow = st.render_frame(&base, &plan, &times, 0, &fonts, &st.prepare(&base, &fonts));
+    assert_eq!(hollow.get_pixel(21, 25).0[..3], [255, 0, 0], "inside stroke at the edge");
+    assert_eq!(hollow.get_pixel(30, 25).0[..3], [255, 255, 255], "Fill 0: the middle shows through");
+    assert_eq!(hollow.get_pixel(18, 25).0[..3], [255, 255, 255], "nothing outside");
+    // bevel: lit side brighter than the shadowed side
+    style = LayerStyle { bevel: crate::layerstyle::Bevel { on: true, size: 4.0, ..Default::default() }, ..Default::default() };
+    st.layers[li].style = style.clone();
+    let bev = st.render_frame(&base, &plan, &times, 0, &fonts, &st.prepare(&base, &fonts));
+    let lum = |p: &image::Rgba<u8>| p.0[0] as u32 + p.0[1] as u32 + p.0[2] as u32;
+    assert!(lum(bev.get_pixel(21, 21)) > lum(bev.get_pixel(38, 33)) + 60, "{:?} vs {:?}", bev.get_pixel(21, 21), bev.get_pixel(38, 33));
     // saved, and left out when there's none
     let e = crate::project::ProjLayerEntry { visible: true, label: None, layer: crate::project::ProjLayer::Effects { fx: Default::default() }, timing: Default::default(), locked: false, color: None, opacity: 100.0, clip: false, mask: None, flip: [false; 2], blend: Default::default(), style: style.clone(), group: None };
     let back: crate::project::ProjLayerEntry = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
@@ -2097,4 +2146,64 @@ fn layer_groups() {
     assert!(st.groups.is_empty());
     assert_eq!(st.layers.len(), 4);
     assert!(st.layers.iter().all(|l| l.shown()));
+}
+
+/// Deleting frames moves keyframes, clips, markers and the cut along with
+/// the frames that stay.
+#[test]
+fn refit_after_deleting_frames() {
+    use crate::stack::{LayerKind, Stack};
+    use crate::timeline::{Clip, Key, Marker};
+    let img = |v: u8| Frame::new(image::RgbaImage::from_pixel(8, 8, image::Rgba([v, v, v, 255])), 10);
+    let old = Animation { frames: (0..10).map(|i| img(i as u8 * 20)).collect(), loop_count: None };
+    let mut st = Stack::default();
+    st.push(LayerKind::Shape(Box::default()));
+    let k = |frame: usize, x: f32| Key { frame, x, ..Key::default() };
+    st.layers[0].timing.keys = vec![k(1, 1.0), k(5, 5.0), k(8, 8.0)];
+    st.layers[0].timing.clips = Some(vec![Clip { start: 4, end: Some(7) }]);
+    st.markers.push(Marker { frame: 6, label: "m".into() });
+    // frames 2, 3 and 5 go
+    let keep: Vec<bool> = (0..10).map(|i| ![2, 3, 5].contains(&i)).collect();
+    let map: Vec<Option<usize>> = {
+        let mut n = 0;
+        keep.iter().map(|&k| k.then(|| { n += 1; n - 1 })).collect()
+    };
+    let mut new = old.clone();
+    new.frames = old.frames.iter().zip(&keep).filter(|(_, k)| **k).map(|(f, _)| f.clone()).collect();
+    st.refit_frames(&old, &new, &map);
+    let keys: Vec<(usize, f32)> = st.layers[0].timing.keys.iter().map(|k| (k.frame, k.x)).collect();
+    // 1 stays, 5 (gone) lands on old 6 = new 3, 8 becomes 5
+    assert_eq!(keys, vec![(1, 1.0), (3, 5.0), (5, 8.0)]);
+    let c = &st.layers[0].timing.clips.as_ref().unwrap()[0];
+    assert_eq!((c.start, c.end), (2, Some(4)), "old 4..=7 is new 2..=4");
+    assert_eq!(st.markers[0].frame, 3);
+}
+
+/// Every layer style on a star, saved to STYLE_OUT for a look.
+#[test]
+#[ignore]
+fn style_gallery() {
+    use crate::layerstyle::*;
+    use crate::stack::{LayerKind, Stack};
+    let out = std::env::var("STYLE_OUT").unwrap_or("/tmp".into());
+    let base = Animation { frames: vec![Frame::new(image::RgbaImage::from_pixel(160, 140, image::Rgba([200, 205, 215, 255])), 10)], loop_count: None };
+    let looks: Vec<(&str, LayerStyle)> = vec![
+        ("bevel", LayerStyle { bevel: Bevel { on: true, size: 8.0, ..Default::default() }, ..Default::default() }),
+        ("emboss", LayerStyle { bevel: Bevel { on: true, size: 8.0, style: BevelStyle::Pillow, ..Default::default() }, ..Default::default() }),
+        ("inner", LayerStyle { inner_shadow: InnerShadow { on: true, ..Default::default() }, inner_glow: InnerGlow { on: true, ..Default::default() }, ..Default::default() }),
+        ("satin", LayerStyle { satin: Satin { on: true, ..Default::default() }, ..Default::default() }),
+        ("grad", LayerStyle { gradient: GradientOverlay { on: true, from: [255, 120, 0], to: [255, 230, 80], ..Default::default() }, stroke: Stroke { on: true, position: StrokePos::Center, size: 4.0, ..Default::default() }, shadow: Shadow { on: true, ..Default::default() }, ..Default::default() }),
+        ("hollow", LayerStyle { fill: 0.0, stroke: Stroke { on: true, color: [255, 255, 255], ..Default::default() }, glow: Glow { on: true, ..Default::default() }, ..Default::default() }),
+    ];
+    let fonts = crate::text::builtin_fonts();
+    for (name, style) in looks {
+        let mut st = Stack::default();
+        let id = st.push(LayerKind::Shape(Box::new(crate::shapes::ShapeSettings { kind: crate::shapes::ShapeKind::Star, x: 30, y: 25, w: 100, h: 90, fill: [60, 140, 230], stroke_w: 0.0, ..Default::default() })));
+        let li = st.index_of(id).unwrap();
+        st.layers[li].style = style;
+        let plan = st.plan(&base);
+        let times = crate::stack::plan_times(&plan);
+        let img = st.render_frame(&base, &plan, &times, 0, &fonts, &st.prepare(&base, &fonts));
+        img.save(format!("{out}/style_{name}.png")).unwrap();
+    }
 }

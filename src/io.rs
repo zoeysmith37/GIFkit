@@ -99,7 +99,13 @@ pub const MERGE_LEVELS: [(&str, f64); 4] = [("Keep every frame", -1.0), ("Merge 
 /// Share of pixels that differ clearly between two RGBA buffers (video
 /// noise under a small step doesn't count). Stops counting past `limit`.
 pub fn changed_share(a: &[u8], b: &[u8], limit: f64) -> f64 {
-    const TOL: i32 = 18;
+    changed_share_tol(a, b, limit, 18)
+}
+
+/// As [`changed_share`], with a pixel counting as changed past `tol` (0..=255).
+pub fn changed_share_tol(a: &[u8], b: &[u8], limit: f64, tol: i32) -> f64 {
+    #[allow(non_snake_case)]
+    let TOL = tol;
     let n = a.len() / 4;
     let stop = (limit * n as f64) as usize + 1;
     let mut changed = 0usize;
@@ -112,6 +118,36 @@ pub fn changed_share(a: &[u8], b: &[u8], limit: f64) -> f64 {
         }
     }
     changed as f64 / n.max(1) as f64
+}
+
+/// Repeated-frame finding at a tolerance of 0..=100 (how different a frame
+/// may be and still count as the one before): the share of pixels that
+/// may change and how far a pixel may change before it counts.
+pub fn repeat_limits(tol: f32) -> (f64, i32) {
+    let t = (tol.clamp(0.0, 100.0) / 100.0) as f64;
+    (0.000_02 * 1500f64.powf(t), (4.0 + t * 44.0).round() as i32)
+}
+
+/// Frames that repeat the frame kept before them, at tolerance `tol`, as
+/// (kept frame, repeat). Skipped frames are passed over.
+pub fn find_repeats(a: &crate::anim::Animation, tol: f32) -> Vec<(usize, usize)> {
+    let (limit, px) = repeat_limits(tol);
+    let mut kept: Option<usize> = None;
+    let mut out = Vec::new();
+    for i in 0..a.frames.len() {
+        if !a.frames[i].enabled {
+            continue;
+        }
+        let same = kept.is_some_and(|k| {
+            let (x, y) = (a.frames[k].image.get(), a.frames[i].image.get());
+            x.dimensions() == y.dimensions() && changed_share_tol(x.as_raw(), y.as_raw(), limit, px) <= limit
+        });
+        match (same, kept) {
+            (true, Some(k)) => out.push((k, i)),
+            _ => kept = Some(i),
+        }
+    }
+    out
 }
 
 /// Common frame rates, fastest first. GIFs show 50, 33.3, 25, 20, 16.7,

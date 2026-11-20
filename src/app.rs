@@ -1156,9 +1156,14 @@ pub struct GifKitApp {
     grid_snap: bool,
     /// the Layer Style window is open (on the picked layer)
     style_open: bool,
+    /// a layer style copied to paste on other layers
+    style_clip: Option<crate::layerstyle::LayerStyle>,
     /// the Frames tool's repeated-frame finder: how alike, and whether the
     /// merged frames' time is kept
-    dupe_level: usize,
+    /// how different a frame may be and still count as a repeat, 0..=100
+    dupe_tol: f32,
+    /// repeats found at (version, timing, tolerance), for the count shown
+    dupe_found: Option<((u64, u64, u32), usize)>,
     dupe_keep_time: bool,
     /// an image layer waiting for its new picture to load
     replace_image: Option<u64>,
@@ -2032,64 +2037,213 @@ fn toggle_grid(ui: &mut egui::Ui, min_w: f32, items: &mut [(&mut bool, &str, &st
     });
 }
 
-/// Colour button (KDE KColorButton style: a framed button with a swatch).
-/// Its popup has the colour picker, a hex field and an eyedropper.
-/// The layer style popup: Stroke, Drop Shadow and Outer Glow, each with
-/// its own switch.
+/// The Layer Style window, laid out as Photoshop's: the effects down the
+/// left, each with its switch, and the picked one's settings on the right.
 fn layer_style_ui(ui: &mut egui::Ui, st: &mut crate::layerstyle::LayerStyle) {
+    use crate::layerstyle as ls;
     let _defaults = spin::Defaults::new(&*st, &Default::default());
-    // each style a card like an adjustment's: fold, switch, name. It opens
-    // when switched on; folding it is remembered
-    let head = |ui: &mut egui::Ui, on: &mut bool, name: &str, tip: &str| -> bool {
-        let pal = *p();
-        let id = egui::Id::unique(("style-open", name));
-        let was = *on;
-        let mut open: bool = ui.ctx().data_mut(|d| *d.get_persisted_mut_or(id, *on));
-        ui.add_space(2.0);
-        ui.horizontal(|ui| {
-            let (fr, fresp) = ui.allocate_exact_size(vec2(16.0, 22.0), Sense::click());
-            crate::icons::paint(ui.painter(), if open { "go-down" } else { "go-next" }, fr.center(), 16.0, if fresp.hovered() { pal.fg } else { pal.fg_muted });
-            if fresp.clicked() {
-                open = !open;
+    let pal = *p();
+    let page_id = egui::Id::unique("layer-style-page");
+    let mut page: usize = ui.ctx().data_mut(|d| *d.get_persisted_mut_or(page_id, 0));
+    let blends: Vec<(crate::adjust::Blend, &str)> = crate::adjust::Blend::ALL.iter().map(|b| (*b, b.label())).collect();
+    let names = ["Blending Options", "Bevel & Emboss", "Stroke", "Inner Shadow", "Inner Glow", "Satin", "Colour Overlay", "Gradient Overlay", "Outer Glow", "Drop Shadow"];
+    let tips = [
+        "The layer's own pixels, under its effects",
+        "Lights the edge so it stands out of the picture or sinks in",
+        "An outline: outside, inside or on the edge",
+        "A shadow inside the edge, as if it were cut out",
+        "Light in from the edge, or out from the middle",
+        "Silky shading inside",
+        "Fills it with one colour",
+        "Fills it with a gradient",
+        "A soft light round the outside",
+        "A soft shadow, cast away from the light",
+    ];
+    let side_w = 168.0;
+    ui.horizontal_top(|ui| {
+        // the list
+        ui.allocate_ui_with_layout(vec2(side_w, ui.available_height()), egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_width(side_w);
+            for (i, name) in names.iter().enumerate() {
+                let on: Option<&mut bool> = match i {
+                    1 => Some(&mut st.bevel.on),
+                    2 => Some(&mut st.stroke.on),
+                    3 => Some(&mut st.inner_shadow.on),
+                    4 => Some(&mut st.inner_glow.on),
+                    5 => Some(&mut st.satin.on),
+                    6 => Some(&mut st.overlay.on),
+                    7 => Some(&mut st.gradient.on),
+                    8 => Some(&mut st.glow.on),
+                    9 => Some(&mut st.shadow.on),
+                    _ => None,
+                };
+                let (r, resp) = ui.allocate_exact_size(vec2(side_w, 26.0), Sense::click());
+                let sel = page == i;
+                if sel {
+                    ui.painter().rect_filled(r, 3.0, mix(pal.view, pal.highlight, 0.45));
+                } else if resp.hovered() {
+                    ui.painter().rect_filled(r, 3.0, mix(pal.view, pal.highlight, 0.15));
+                }
+                let mut x = r.min.x + 6.0;
+                let mut lit = true;
+                if let Some(on) = on {
+                    let cb = Rect::from_min_size(pos2(x, r.center().y - 12.0), vec2(18.0, 18.0));
+                    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(cb));
+                    let was = *on;
+                    child.add(egui::Checkbox::without_text(on));
+                    // switching one on shows its settings, as Photoshop does
+                    if *on && !was {
+                        page = i;
+                    }
+                    lit = *on;
+                    x += 22.0;
+                }
+                let col = if sel || lit { pal.fg } else { pal.fg_muted };
+                ui.painter().text(pos2(x, r.center().y), egui::Align2::LEFT_CENTER, *name, egui::FontId::proportional(13.0), col);
+                if resp.on_hover_text(tips[i]).clicked() {
+                    page = i;
+                }
+                if i == 0 {
+                    ui.add_space(2.0);
+                    ui.separator();
+                    ui.add_space(2.0);
+                }
             }
-            ui.add(egui::Checkbox::without_text(on)).on_hover_text(tip);
-            let name_r = ui.add(egui::Label::new(RichText::new(name).strong().color(if *on { pal.fg } else { pal.fg_muted })).sense(Sense::click())).on_hover_text(tip);
-            if name_r.clicked() {
-                open = !open;
+            ui.add_space(8.0);
+            let any = st.count() > 0 || st.fill < 100.0;
+            if ui.add_enabled(any, egui::Button::new("Clear Style").min_size(vec2(side_w, 26.0))).on_hover_text("Switch every effect off and put Fill back to 100%").clicked() {
+                *st = ls::LayerStyle::default();
             }
         });
-        if *on && !was {
-            open = true;
-        }
-        ui.ctx().data_mut(|d| d.insert_persisted(id, open));
-        open
-    };
-    if head(ui, &mut st.stroke.on, "Stroke", "An outline round the outside") {
-    ui.add_enabled_ui(st.stroke.on, |ui| {
-        form_row(ui, "Colour", |ui| colour_btn(ui, &mut st.stroke.color));
-        slider_row(ui, "Size", Spin::new(&mut st.stroke.size, 1.0..=40.0).default_value(crate::layerstyle::Stroke::default().size as f64).suffix(" px").max_decimals(0));
-        slider_row(ui, "Opacity", Spin::new(&mut st.stroke.opacity, 0.0..=100.0).default_value(crate::layerstyle::Stroke::default().opacity as f64).suffix("%").max_decimals(0));
+        ui.separator();
+        // the settings
+        ui.vertical(|ui| {
+            ui.label(RichText::new(names[page]).font(theme::medium(15.0)).color(pal.fg));
+            ui.add_space(6.0);
+            let reset = |ui: &mut egui::Ui| ui.add_space(6.0);
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                match page {
+                    0 => {
+                        slider_row(ui, "Fill", Spin::new(&mut st.fill, 0.0..=100.0).suffix("%").max_decimals(0).default_value(100.0)).on_hover_text("The layer's own pixels. Effects stay at full strength, so 0% leaves just the stroke, glow and so on");
+                        hint(ui, "The layer's Opacity and Blend are in the Layers panel");
+                    }
+                    1 => {
+                        let b = &mut st.bevel;
+                        let d = ls::Bevel::default();
+                        form_row(ui, "Style", |ui| combo(ui, "bevel-style", &mut b.style, &[(ls::BevelStyle::Inner, "Inner Bevel"), (ls::BevelStyle::Outer, "Outer Bevel"), (ls::BevelStyle::Emboss, "Emboss"), (ls::BevelStyle::Pillow, "Pillow Emboss")]));
+                        slider_row(ui, "Depth", Spin::new(&mut b.depth, 1.0..=1000.0).suffix("%").max_decimals(0).logarithmic(true).default_value(d.depth as f64));
+                        form_row(ui, "Direction", |ui| seg_row(ui, &mut b.up, &[(true, "Up"), (false, "Down")]));
+                        slider_row(ui, "Size", Spin::new(&mut b.size, 0.0..=100.0).suffix(" px").max_decimals(0).default_value(d.size as f64));
+                        slider_row(ui, "Soften", Spin::new(&mut b.soften, 0.0..=16.0).suffix(" px").max_decimals(0).default_value(d.soften as f64));
+                        group(ui, "Shading", |ui| {
+                            slider_row(ui, "Angle", Spin::new(&mut b.angle, -180.0..=180.0).suffix("°").max_decimals(0).default_value(d.angle as f64)).on_hover_text("Where the light comes from. 120° is the upper left");
+                            slider_row(ui, "Altitude", Spin::new(&mut b.altitude, 0.0..=90.0).suffix("°").max_decimals(0).default_value(d.altitude as f64)).on_hover_text("How high the light is. Low lights rake across the edge");
+                            form_row(ui, "Highlight", |ui| {
+                                ui.horizontal(|ui| {
+                                    colour_btn(ui, &mut b.hi_color);
+                                    combo(ui, "bevel-hi-blend", &mut b.hi_blend, &blends);
+                                })
+                            });
+                            slider_row(ui, "Opacity", Spin::new(&mut b.hi_opacity, 0.0..=100.0).suffix("%").max_decimals(0).default_value(d.hi_opacity as f64));
+                            form_row(ui, "Shadow", |ui| {
+                                ui.horizontal(|ui| {
+                                    colour_btn(ui, &mut b.sh_color);
+                                    combo(ui, "bevel-sh-blend", &mut b.sh_blend, &blends);
+                                })
+                            });
+                            slider_row(ui, "Opacity", Spin::new(&mut b.sh_opacity, 0.0..=100.0).suffix("%").max_decimals(0).default_value(d.sh_opacity as f64));
+                        });
+                    }
+                    2 => {
+                        let s = &mut st.stroke;
+                        let d = ls::Stroke::default();
+                        slider_row(ui, "Size", Spin::new(&mut s.size, 1.0..=40.0).suffix(" px").max_decimals(0).default_value(d.size as f64));
+                        form_row(ui, "Position", |ui| seg_row(ui, &mut s.position, &[(ls::StrokePos::Outside, "Outside"), (ls::StrokePos::Inside, "Inside"), (ls::StrokePos::Center, "Centre")]));
+                        form_row(ui, "Blend", |ui| combo(ui, "stroke-blend", &mut s.blend, &blends)).on_hover_text("For the part inside the edge");
+                        slider_row(ui, "Opacity", Spin::new(&mut s.opacity, 0.0..=100.0).suffix("%").max_decimals(0).default_value(d.opacity as f64));
+                        form_row(ui, "Colour", |ui| colour_btn(ui, &mut s.color));
+                    }
+                    3 => {
+                        let s = &mut st.inner_shadow;
+                        let d = ls::InnerShadow::default();
+                        form_row(ui, "Blend", |ui| combo(ui, "ishadow-blend", &mut s.blend, &blends));
+                        form_row(ui, "Colour", |ui| colour_btn(ui, &mut s.color));
+                        slider_row(ui, "Opacity", Spin::new(&mut s.opacity, 0.0..=100.0).suffix("%").max_decimals(0).default_value(d.opacity as f64));
+                        slider_row(ui, "Angle", Spin::new(&mut s.angle, -180.0..=180.0).suffix("°").max_decimals(0).default_value(d.angle as f64));
+                        slider_row(ui, "Distance", Spin::new(&mut s.distance, 0.0..=60.0).suffix(" px").max_decimals(0).default_value(d.distance as f64));
+                        slider_row(ui, "Choke", Spin::new(&mut s.choke, 0.0..=100.0).suffix("%").max_decimals(0).default_value(d.choke as f64)).on_hover_text("How hard its edge is");
+                        slider_row(ui, "Size", Spin::new(&mut s.size, 0.0..=40.0).suffix(" px").max_decimals(0).default_value(d.size as f64));
+                    }
+                    4 => {
+                        let g = &mut st.inner_glow;
+                        let d = ls::InnerGlow::default();
+                        form_row(ui, "Blend", |ui| combo(ui, "iglow-blend", &mut g.blend, &blends));
+                        form_row(ui, "Colour", |ui| colour_btn(ui, &mut g.color));
+                        slider_row(ui, "Opacity", Spin::new(&mut g.opacity, 0.0..=100.0).suffix("%").max_decimals(0).default_value(d.opacity as f64));
+                        form_row(ui, "Source", |ui| seg_row(ui, &mut g.center, &[(false, "Edge"), (true, "Centre")]));
+                        slider_row(ui, "Choke", Spin::new(&mut g.choke, 0.0..=100.0).suffix("%").max_decimals(0).default_value(d.choke as f64));
+                        slider_row(ui, "Size", Spin::new(&mut g.size, 1.0..=60.0).suffix(" px").max_decimals(0).default_value(d.size as f64));
+                    }
+                    5 => {
+                        let s = &mut st.satin;
+                        let d = ls::Satin::default();
+                        form_row(ui, "Blend", |ui| combo(ui, "satin-blend", &mut s.blend, &blends));
+                        form_row(ui, "Colour", |ui| colour_btn(ui, &mut s.color));
+                        slider_row(ui, "Opacity", Spin::new(&mut s.opacity, 0.0..=100.0).suffix("%").max_decimals(0).default_value(d.opacity as f64));
+                        slider_row(ui, "Angle", Spin::new(&mut s.angle, -180.0..=180.0).suffix("°").max_decimals(0).default_value(d.angle as f64));
+                        slider_row(ui, "Distance", Spin::new(&mut s.distance, 0.0..=60.0).suffix(" px").max_decimals(0).default_value(d.distance as f64));
+                        slider_row(ui, "Size", Spin::new(&mut s.size, 0.0..=60.0).suffix(" px").max_decimals(0).default_value(d.size as f64));
+                        form_row(ui, "", |ui| check(ui, &mut s.invert, "Invert"));
+                    }
+                    6 => {
+                        let o = &mut st.overlay;
+                        form_row(ui, "Blend", |ui| combo(ui, "overlay-blend", &mut o.blend, &blends));
+                        form_row(ui, "Colour", |ui| colour_btn(ui, &mut o.color));
+                        slider_row(ui, "Opacity", Spin::new(&mut o.opacity, 0.0..=100.0).suffix("%").max_decimals(0).default_value(100.0));
+                    }
+                    7 => {
+                        let g = &mut st.gradient;
+                        let d = ls::GradientOverlay::default();
+                        form_row(ui, "Blend", |ui| combo(ui, "grad-blend", &mut g.blend, &blends));
+                        slider_row(ui, "Opacity", Spin::new(&mut g.opacity, 0.0..=100.0).suffix("%").max_decimals(0).default_value(d.opacity as f64));
+                        form_row(ui, "Colours", |ui| {
+                            ui.horizontal(|ui| {
+                                colour_btn(ui, &mut g.from);
+                                if icon_tool(ui, "view-refresh", "Swap the two colours", true).clicked() {
+                                    std::mem::swap(&mut g.from, &mut g.to);
+                                }
+                                colour_btn(ui, &mut g.to);
+                            })
+                        });
+                        form_row(ui, "", |ui| check(ui, &mut g.reverse, "Reverse"));
+                        form_row(ui, "Style", |ui| combo(ui, "grad-style", &mut g.style, &[(ls::GradStyle::Linear, "Linear"), (ls::GradStyle::Radial, "Radial"), (ls::GradStyle::Reflected, "Reflected")]));
+                        slider_row(ui, "Angle", Spin::new(&mut g.angle, -180.0..=180.0).suffix("°").max_decimals(0).default_value(d.angle as f64)).on_hover_text("90° runs from the bottom up");
+                        slider_row(ui, "Scale", Spin::new(&mut g.scale, 10.0..=150.0).suffix("%").max_decimals(0).default_value(d.scale as f64));
+                    }
+                    8 => {
+                        let g = &mut st.glow;
+                        let d = ls::Glow::default();
+                        form_row(ui, "Colour", |ui| colour_btn(ui, &mut g.color));
+                        slider_row(ui, "Opacity", Spin::new(&mut g.opacity, 0.0..=100.0).suffix("%").max_decimals(0).default_value(d.opacity as f64));
+                        slider_row(ui, "Spread", Spin::new(&mut g.spread, 0.0..=100.0).suffix("%").max_decimals(0).default_value(d.spread as f64)).on_hover_text("How much of it is solid before it fades");
+                        slider_row(ui, "Size", Spin::new(&mut g.size, 1.0..=60.0).suffix(" px").max_decimals(0).default_value(d.size as f64));
+                    }
+                    _ => {
+                        let s = &mut st.shadow;
+                        let d = ls::Shadow::default();
+                        form_row(ui, "Colour", |ui| colour_btn(ui, &mut s.color));
+                        slider_row(ui, "Opacity", Spin::new(&mut s.opacity, 0.0..=100.0).suffix("%").max_decimals(0).default_value(d.opacity as f64));
+                        slider_row(ui, "Angle", Spin::new(&mut s.angle, -180.0..=180.0).suffix("°").max_decimals(0).default_value(d.angle as f64)).on_hover_text("Where the light comes from. 120° is the upper left");
+                        slider_row(ui, "Distance", Spin::new(&mut s.distance, 0.0..=60.0).suffix(" px").max_decimals(0).default_value(d.distance as f64));
+                        slider_row(ui, "Spread", Spin::new(&mut s.spread, 0.0..=100.0).suffix("%").max_decimals(0).default_value(d.spread as f64)).on_hover_text("How hard its edge is before it softens");
+                        slider_row(ui, "Size", Spin::new(&mut s.size, 0.0..=40.0).suffix(" px").max_decimals(0).default_value(d.size as f64)).on_hover_text("How soft it is");
+                    }
+                }
+                reset(ui);
+            });
+        });
     });
-    }
-    ui.separator();
-    if head(ui, &mut st.shadow.on, "Drop Shadow", "A soft shadow, cast away from the light") {
-    ui.add_enabled_ui(st.shadow.on, |ui| {
-        form_row(ui, "Colour", |ui| colour_btn(ui, &mut st.shadow.color));
-        slider_row(ui, "Opacity", Spin::new(&mut st.shadow.opacity, 0.0..=100.0).default_value(crate::layerstyle::Shadow::default().opacity as f64).suffix("%").max_decimals(0));
-        slider_row(ui, "Angle", Spin::new(&mut st.shadow.angle, -180.0..=180.0).default_value(crate::layerstyle::Shadow::default().angle as f64).suffix("°").max_decimals(0)).on_hover_text("Where the light comes from. 120° is the upper left");
-        slider_row(ui, "Distance", Spin::new(&mut st.shadow.distance, 0.0..=60.0).default_value(crate::layerstyle::Shadow::default().distance as f64).suffix(" px").max_decimals(0));
-        slider_row(ui, "Size", Spin::new(&mut st.shadow.size, 0.0..=40.0).default_value(crate::layerstyle::Shadow::default().size as f64).suffix(" px").max_decimals(0)).on_hover_text("How soft it is");
-    });
-    }
-    ui.separator();
-    if head(ui, &mut st.glow.on, "Outer Glow", "A soft light round the outside") {
-    ui.add_enabled_ui(st.glow.on, |ui| {
-        form_row(ui, "Colour", |ui| colour_btn(ui, &mut st.glow.color));
-        slider_row(ui, "Opacity", Spin::new(&mut st.glow.opacity, 0.0..=100.0).default_value(crate::layerstyle::Glow::default().opacity as f64).suffix("%").max_decimals(0));
-        slider_row(ui, "Size", Spin::new(&mut st.glow.size, 1.0..=60.0).default_value(crate::layerstyle::Glow::default().size as f64).suffix(" px").max_decimals(0));
-        slider_row(ui, "Spread", Spin::new(&mut st.glow.spread, 0.0..=100.0).default_value(crate::layerstyle::Glow::default().spread as f64).suffix("%").max_decimals(0)).on_hover_text("How much of it is solid before it fades");
-    });
-    }
+    ui.ctx().data_mut(|d| d.insert_persisted(page_id, page));
 }
 
 fn colour_btn(ui: &mut egui::Ui, c: &mut [u8; 3]) -> egui::Response {
@@ -2194,6 +2348,9 @@ fn colour_edit(ui: &mut egui::Ui, c: &mut [u8; 4], alpha: bool) -> egui::Respons
     let mut pick = false;
     let pending = resp.id.with("recent");
     let shown = egui::Popup::from_toggle_button_response(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+        ui.set_width(PICK_W + PALETTE_W + 10.0);
+        ui.horizontal_top(|ui| {
+        ui.vertical(|ui| {
         ui.set_width(PICK_W);
         if colour_picker_body(ui, resp.id, c, alpha) {
             resp.mark_changed();
@@ -2216,6 +2373,13 @@ fn colour_edit(ui: &mut egui::Ui, c: &mut [u8; 4], alpha: bool) -> egui::Respons
                 ui.close();
             }
         });
+        });
+        ui.add_space(4.0);
+        // a standard palette down the side, as KDE's colour dialog has
+        if palette_column(ui, c) {
+            resp.mark_changed();
+        }
+        });
     });
     // a colour chosen in the popup counts as recent once it closes
     if shown.is_some() && resp.changed() {
@@ -2235,7 +2399,54 @@ fn colour_edit(ui: &mut egui::Ui, c: &mut [u8; 4], alpha: bool) -> egui::Respons
     resp
 }
 
-const PICK_W: f32 = 248.0;
+const PICK_W: f32 = 300.0;
+const PALETTE_W: f32 = 76.0;
+
+/// Ready-made colours in tints and shades, three to a row: greys, then
+/// round the colour wheel. Gives whether one was picked.
+fn palette_column(ui: &mut egui::Ui, c: &mut [u8; 4]) -> bool {
+    let pal = *p();
+    const ROWS: [[[u8; 3]; 3]; 14] = [
+        [[255, 255, 255], [204, 204, 204], [153, 153, 153]],
+        [[102, 102, 102], [51, 51, 51], [0, 0, 0]],
+        [[255, 179, 179], [237, 21, 21], [139, 0, 0]],
+        [[255, 214, 170], [246, 116, 0], [153, 68, 0]],
+        [[255, 243, 176], [253, 204, 0], [156, 120, 0]],
+        [[221, 245, 170], [126, 211, 33], [64, 116, 8]],
+        [[178, 236, 196], [39, 174, 96], [20, 90, 50]],
+        [[170, 236, 230], [26, 188, 156], [12, 98, 82]],
+        [[180, 226, 248], [61, 174, 233], [24, 92, 140]],
+        [[181, 196, 252], [41, 98, 255], [16, 44, 140]],
+        [[208, 190, 250], [123, 77, 255], [62, 30, 150]],
+        [[232, 186, 246], [155, 89, 182], [88, 36, 112]],
+        [[252, 186, 226], [233, 30, 140], [128, 10, 74]],
+        [[236, 214, 196], [160, 110, 74], [94, 60, 36]],
+    ];
+    let gap = 2.0;
+    let side = ((PALETTE_W - gap * 2.0) / 3.0).floor();
+    let line = Stroke::new(1.0, mix(pal.fg, pal.button, 0.6));
+    let mut picked = false;
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing = vec2(gap, gap);
+        for row in ROWS {
+            ui.horizontal(|ui| {
+                for sw in row {
+                    let (r, resp) = ui.allocate_exact_size(vec2(side, side), Sense::click());
+                    ui.painter().rect_filled(r, 2.0, Color32::from_rgb(sw[0], sw[1], sw[2]));
+                    let same = c[..3] == sw;
+                    ui.painter().rect_stroke(r, 2.0, if same || resp.hovered() { Stroke::new(1.5, pal.highlight) } else { line }, egui::StrokeKind::Inside);
+                    if resp.on_hover_text(format!("#{:02x}{:02x}{:02x}", sw[0], sw[1], sw[2])).clicked() {
+                        c[0] = sw[0];
+                        c[1] = sw[1];
+                        c[2] = sw[2];
+                        picked = true;
+                    }
+                }
+            });
+        }
+    });
+    picked
+}
 
 fn hsv_of(c: [u8; 4]) -> [f32; 3] {
     let [r, g, b] = [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0];
@@ -2290,7 +2501,7 @@ fn colour_picker_body(ui: &mut egui::Ui, id: egui::Id, c: &mut [u8; 4], alpha: b
     };
 
     // saturation / value square
-    let (sq, r) = ui.allocate_exact_size(vec2(PICK_W, 180.0), egui::Sense::click_and_drag());
+    let (sq, r) = ui.allocate_exact_size(vec2(PICK_W, 196.0), egui::Sense::click_and_drag());
     if let Some(pos) = r.interact_pointer_pos() {
         hsv[1] = ((pos.x - sq.left()) / sq.width()).clamp(0.0, 1.0);
         hsv[2] = 1.0 - ((pos.y - sq.top()) / sq.height()).clamp(0.0, 1.0);
@@ -2851,6 +3062,78 @@ fn spin<'a, N: egui::emath::Numeric>(ui: &mut egui::Ui, size: Vec2, v: &'a mut N
         }
     }
     if stepped {
+        resp.mark_changed();
+    }
+    resp
+}
+
+/// The shapes as picture tiles, the picked one lit. Gives a new pick.
+fn shape_tiles(ui: &mut egui::Ui, kinds: &[crate::shapes::ShapeKind], cur: crate::shapes::ShapeKind) -> Option<crate::shapes::ShapeKind> {
+    use crate::shapes::{ShapeKind, ShapeSettings};
+    let pal = *p();
+    let w = ui.available_width();
+    let gap = 4.0;
+    let per = ((w + gap) / (44.0 + gap)).floor().max(1.0) as usize;
+    let tile = ((w + gap) / per as f32 - gap).floor();
+    let h = 40.0;
+    let mut out = None;
+    for row in kinds.chunks(per) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for k in row {
+                let (r, resp) = ui.allocate_exact_size(vec2(tile, h), Sense::click());
+                let on = *k == cur;
+                let bg = if on { mix(pal.button, pal.highlight, 0.45) } else if resp.hovered() { mix(pal.button, pal.highlight, 0.18) } else { pal.button };
+                ui.painter().rect_filled(r, 4.0, bg);
+                ui.painter().rect_stroke(r, 4.0, Stroke::new(1.0, if on { pal.highlight } else { pal.border }), egui::StrokeKind::Inside);
+                // the shape itself, drawn once per colour and kept
+                let col = if on { pal.fg } else { mix(pal.fg_muted, pal.fg, 0.5) };
+                let key = egui::Id::unique(("shape-tile", *k as u8, col.to_array()));
+                let tex: Option<egui::TextureHandle> = ui.ctx().data(|d| d.get_temp(key));
+                let tex = tex.or_else(|| {
+                    let c = [col.r(), col.g(), col.b()];
+                    let line = *k == ShapeKind::Line;
+                    let s = ShapeSettings { kind: *k, fill: c, fill_on: !line, stroke: c, stroke_on: line, stroke_w: 3.0, points: if *k == ShapeKind::Burst { 12 } else { 5 }, corner: 30.0, ..Default::default() };
+                    let (sw, sh) = (44.0, 32.0);
+                    let o = crate::geo::Obb { cx: sw, cy: sh, w: sw * 1.4, h: sh * 1.4, angle: 0.0 };
+                    let (img, _, _) = crate::shapes::shape_sprite(&s, o, 2.0, [false; 2])?;
+                    let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+                    let t = ui.ctx().load_texture(format!("shape-tile-{}", *k as u8), ci, egui::TextureOptions::LINEAR);
+                    ui.ctx().data_mut(|d| d.insert_temp(key, t.clone()));
+                    Some(t)
+                });
+                if let Some(t) = tex {
+                    let ts = t.size_vec2();
+                    let k = ((h - 12.0) / ts.y).min((tile - 12.0) / ts.x);
+                    ui.painter().image(t.id(), Rect::from_center_size(r.center(), ts * k), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                }
+                if resp.on_hover_text(k.label()).clicked() {
+                    out = Some(*k);
+                }
+            }
+        });
+        ui.add_space(gap);
+    }
+    out
+}
+
+/// A dropdown of preset values: shows the one matching `v`, or "Custom".
+fn preset_combo(ui: &mut egui::Ui, id: &str, v: &mut f32, items: &[f32], fmt: impl Fn(f32) -> String) -> egui::Response {
+    let cur = items.iter().position(|x| (*x - *v).abs() < 1e-3);
+    let text = cur.map(|i| fmt(items[i])).unwrap_or_else(|| "Custom".into());
+    let w = ui.available_width();
+    let r = egui::ComboBox::from_id_salt(id).selected_text(text).width(w).show_ui(ui, |ui| {
+        let mut changed = false;
+        for x in items {
+            if ui.selectable_label(cur.is_some_and(|i| items[i] == *x), fmt(*x)).clicked() {
+                *v = *x;
+                changed = true;
+            }
+        }
+        changed
+    });
+    let mut resp = r.response;
+    if r.inner == Some(true) {
         resp.mark_changed();
     }
     resp
@@ -3694,6 +3977,7 @@ impl GifKitApp {
             group_renaming: None,
             multi: Vec::new(),
             style_open: false,
+            style_clip: None,
             sel_group: None,
             replace_image: None,
             alt_down: {
@@ -3703,7 +3987,8 @@ impl GifKitApp {
                 }
                 false
             },
-            dupe_level: 1,
+            dupe_tol: 30.0,
+            dupe_found: None,
             dupe_keep_time: true,
             group_drag: None,
             group_rename_done: None,
@@ -4024,6 +4309,18 @@ impl GifKitApp {
                     self.add_layer(LayerKind::Shape(Box::new(ShapeSettings { stroke: [34, 38, 44], fill: [255, 255, 255], corner: 30.0, ..mk(ShapeKind::Speech, 150, 18, 150, 82, 0.0, [255, 255, 255]) })));
                     self.add_layer(LayerKind::Shape(Box::new(ShapeSettings { stroke_on: false, shadow: true, ..mk(ShapeKind::Arrow, 30, 150, 120, 34, -25.0, [255, 59, 48]) })));
                     self.add_layer(LayerKind::Shape(Box::new(ShapeSettings { points: 5, ..mk(ShapeKind::Star, 20, 20, 70, 70, 10.0, [255, 204, 0]) })));
+                    if let Ok(page) = std::env::var("GIFKIT_STYLE_PAGE") {
+                        // for screenshots: the star styled, its Layer Style open
+                        if let Some(l) = self.stack.layers.last_mut() {
+                            l.style.bevel.on = true;
+                            l.style.stroke.on = true;
+                            l.style.shadow.on = true;
+                            l.style.gradient = crate::layerstyle::GradientOverlay { on: true, from: [255, 120, 0], to: [255, 230, 80], blend: crate::adjust::Blend::Normal, ..Default::default() };
+                        }
+                        self.style_open = true;
+                        let page: usize = page.parse().unwrap_or(0);
+                        ctx.data_mut(|d| d.insert_persisted(egui::Id::unique("layer-style-page"), page));
+                    }
                     self.add_layer(LayerKind::Emoji(Box::new(EmojiSettings { emoji: "1f525".into(), shadow: true, x: 240, y: 150, w: 64, h: 64, angle: -12.0, ..Default::default() })));
                     let pts: Vec<[f32; 2]> = (0..40).map(|i| { let t = i as f32 / 39.0; [170.0 + 120.0 * t, 205.0 + 10.0 * (t * 9.0).sin()] }).collect();
                     let hl: Vec<[f32; 2]> = vec![[30.0, 112.0], [140.0, 112.0]];
@@ -4142,6 +4439,68 @@ impl GifKitApp {
         self.last_coalesce = None;
         self.bump();
         self.after_base_change(size_changed);
+    }
+
+    /// Swap in frames that were taken out or copied (`map[i]`: where old
+    /// frame `i` went, None if gone), with everything on the timeline
+    /// moved along to stay with the frames it was on.
+    fn refit_base(&mut self, new: Animation, map: Vec<Option<usize>>, label: &str) {
+        let Some(old) = self.base.clone() else { return };
+        self.flush_live_edit();
+        let mut st = self.stack.clone();
+        let (starts, ends) = st.refit_frames(&old, &new, &map);
+        let st_at = |f: usize| starts.get(f).copied().unwrap_or_else(|| starts.last().copied().unwrap_or(0));
+        let en_at = |f: usize| ends.get(f).copied().unwrap_or_else(|| ends.last().copied().unwrap_or(0));
+        let (tin, tout) = (self.tl_in.map(st_at), self.tl_out.map(en_at));
+        for k in &mut self.track_anchors {
+            k.frame = st_at(k.frame);
+        }
+        let cur = st_at(self.cur);
+        self.set_base_with_undo(new, Some(st), label);
+        (self.tl_in, self.tl_out) = (tin, tout);
+        self.cur = cur.min(self.plan.len().saturating_sub(1));
+        self.tl_keys.clear();
+        self.tl_key = None;
+        self.timing_rev += 1;
+    }
+
+    /// Take out the source frames where `keep` is false, keeping the
+    /// timeline lined up (a clip split on a gone frame moves to the next).
+    fn drop_base_frames(&mut self, keep: &[bool], label: &str) {
+        self.drop_base_frames_timed(keep, false, label);
+    }
+
+    /// As [`Self::drop_base_frames`]; with `merge_time` a gone frame's time
+    /// goes to the frame kept before it.
+    fn drop_base_frames_timed(&mut self, keep: &[bool], merge_time: bool, label: &str) {
+        let Some(old) = self.base.as_ref() else { return };
+        let mut new = old.clone();
+        let mut map = Vec::with_capacity(old.len());
+        let mut frames = Vec::new();
+        let mut carry_cut = false;
+        for (i, f) in old.frames.iter().enumerate() {
+            if keep.get(i).copied().unwrap_or(true) {
+                let mut f = f.clone();
+                f.cut |= carry_cut;
+                carry_cut = false;
+                map.push(Some(frames.len()));
+                frames.push(f);
+            } else {
+                carry_cut |= f.cut;
+                if merge_time {
+                    if let Some(last) = frames.last_mut() {
+                        last.delay_cs = last.delay_cs.saturating_add(f.delay_cs);
+                    }
+                }
+                map.push(None);
+            }
+        }
+        if frames.is_empty() {
+            self.error("That would leave no frames");
+            return;
+        }
+        new.frames = frames;
+        self.refit_base(new, map, label);
     }
 
     fn push_undo(&mut self, s: Snapshot) {
@@ -7908,7 +8267,7 @@ impl GifKitApp {
         let mut open = true;
         let name = li.map(|i| self.stack.layers[i].name()).unwrap_or_default();
         let mut st = li.map(|i| self.stack.layers[i].style.clone());
-        dialog(ctx, "layer-style", "Layer Style", vec2(460.0, 620.0), true, &mut open, |ui| {
+        dialog(ctx, "layer-style", "Layer Style", vec2(640.0, 560.0), true, &mut open, |ui| {
             let pal = *p();
             match &mut st {
                 Some(st) => {
@@ -7918,11 +8277,11 @@ impl GifKitApp {
                         ui.label(RichText::new(&name).font(theme::medium(15.0)).color(pal.fg));
                     });
                     ui.add_space(6.0);
-                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| layer_style_ui(ui, st));
+                    layer_style_ui(ui, st);
                 }
                 None => {
                     ui.add_space(20.0);
-                    ui.vertical_centered(|ui| hint(ui, "Pick a text, shape or emoji layer to style it"));
+                    ui.vertical_centered(|ui| hint(ui, "Pick a text, shape, emoji or image layer to style it"));
                 }
             }
         });
@@ -9196,6 +9555,8 @@ impl GifKitApp {
         let mut group_many = false;
         // "Layer Style…" from a row's menu: pick that layer, open the window
         let mut style_for: Option<(Kind, u64)> = None;
+        // copy (0), paste (1) or clear (2) a layer's style
+        let mut style_cmd: Option<(u8, usize)> = None;
         let mut delete_many = false;
         let mut toggle: Option<usize> = None;
         let mut lock: Option<usize> = None;
@@ -9359,6 +9720,19 @@ impl GifKitApp {
                     if menu_item(ui, "tool_imageeffects", "Layer &Style…", "", crate::stack::Layer::can_style(&self.stack.layers[li].kind)) {
                         style_for = Some((kind, id));
                     }
+                    let can = crate::stack::Layer::can_style(&self.stack.layers[li].kind);
+                    let has = !self.stack.layers[li].style.is_none();
+                    ui.menu_button("Layer Style", |ui| {
+                        if menu_item(ui, "edit-copy", "&Copy Layer Style", "", can && has) {
+                            style_cmd = Some((0, li));
+                        }
+                        if menu_item(ui, "edit-paste", "&Paste Layer Style", "", can && self.style_clip.is_some() && !locked) {
+                            style_cmd = Some((1, li));
+                        }
+                        if menu_item(ui, "edit-clear", "C&lear Layer Style", "", can && has && !locked) {
+                            style_cmd = Some((2, li));
+                        }
+                    });
                     if menu_item(ui, if gid.is_some() { "object-ungroup" } else { "folder-new" }, if gid.is_some() { "Remove from &Group" } else { "&Group Layer" }, &self.keymap.text(crate::keys::Action::GroupLayer), true) {
                         act(LayerAct::Group(li));
                     }
@@ -9691,6 +10065,26 @@ impl GifKitApp {
         }
         if group_many {
             self.group_picked(now);
+        }
+        if let Some((cmd, li)) = style_cmd {
+            if cmd == 0 {
+                self.style_clip = Some(self.stack.layers[li].style.clone());
+                self.info("Layer style copied");
+            } else {
+                let st = if cmd == 1 { self.style_clip.clone().unwrap_or_default() } else { Default::default() };
+                self.snapshot(&format!("style-paste{now}"), now);
+                // pasting goes on every picked layer that can take it
+                let mut targets = self.picked();
+                if !targets.contains(&li) {
+                    targets = vec![li];
+                }
+                for t in targets {
+                    if crate::stack::Layer::can_style(&self.stack.layers[t].kind) {
+                        self.stack.layers[t].style = st.clone();
+                    }
+                }
+                self.modified = true;
+            }
         }
         if let Some((k, id)) = style_for {
             self.tool = kind_tool(k);
@@ -12812,19 +13206,29 @@ impl GifKitApp {
                 self.playing = false;
                 return;
             }
+            // taking out or copying a frame moves the timeline along with it
+            if act == "delete" || act == "copy" {
+                let Some(old) = self.base.as_ref() else { return };
+                if act == "delete" {
+                    if old.len() > 1 {
+                        let keep: Vec<bool> = (0..old.len()).map(|k| k != i).collect();
+                        self.drop_base_frames(&keep, "Delete frame");
+                    }
+                } else {
+                    let mut new = old.clone();
+                    let f = new.frames[i].clone();
+                    new.frames.insert(i + 1, crate::anim::Frame { cut: false, ..f });
+                    let map = (0..old.len()).map(|k| Some(if k <= i { k } else { k + 1 })).collect();
+                    self.refit_base(new, map, "Copy frame");
+                }
+                return;
+            }
             self.snapshot(&format!("{act}{i}{now}"), now);
             let a = self.base.as_mut().unwrap();
             match act {
                 "toggle" => a.frames[i].enabled = !a.frames[i].enabled,
-                "copy" => {
-                    let f = a.frames[i].clone();
-                    a.frames.insert(i + 1, f);
-                }
                 "left" if i > 0 => a.frames.swap(i, i - 1),
                 "right" if i + 1 < a.len() => a.frames.swap(i, i + 1),
-                "delete" if a.len() > 1 => {
-                    a.frames.remove(i);
-                }
                 _ => {}
             }
             if act == "toggle" {
@@ -12946,13 +13350,7 @@ impl GifKitApp {
                     tr.rs_pct = pct.clamp(0.1, 6400.0);
                 }
                 const PCTS: [f32; 9] = [10.0, 25.0, 33.3, 50.0, 75.0, 100.0, 150.0, 200.0, 400.0];
-                form_row(ui, "", |ui| {
-                    even_grid(ui, PCTS.len(), 60.0, |ui, i, size| {
-                        if ui.add_sized(size, sel_btn(egui::Button::new(format!("{}%", PCTS[i])), tr.rs_pct == PCTS[i])).clicked() {
-                            tr.rs_pct = PCTS[i];
-                        }
-                    })
-                });
+                form_row(ui, "Preset", |ui| preset_combo(ui, "rs-pct", &mut tr.rs_pct, &PCTS, |x| format!("{x}%")));
             } else {
                 tr.rs_pct = 0.0;
                 form_row(ui, "Size", |ui| {
@@ -13195,14 +13593,14 @@ impl GifKitApp {
             match tr.speed_mode {
                 SpeedMode::Percent => {
                     slider_row(ui, "Speed", soft_slider(&mut tr.speed_val, 10.0..=400.0, "").suffix(" %").max_decimals(0));
-                    const PCTS: [f32; 6] = [25.0, 50.0, 100.0, 150.0, 200.0, 300.0];
-                    form_row(ui, "", |ui| {
-                        even_grid(ui, PCTS.len(), 60.0, |ui, i, size| {
-                            if ui.add_sized(size, sel_btn(egui::Button::new(format!("{:.0}%", PCTS[i])), tr.speed_val == PCTS[i])).clicked() {
-                                tr.speed_val = PCTS[i];
-                            }
-                        })
-                    });
+                    const PCTS: [f32; 8] = [25.0, 50.0, 75.0, 100.0, 125.0, 150.0, 200.0, 300.0];
+                    form_row(ui, "Preset", |ui| preset_combo(ui, "speed-pct", &mut tr.speed_val, &PCTS, |x| match x as i32 {
+                        25 => "25% (quarter speed)".into(),
+                        50 => "50% (half speed)".into(),
+                        100 => "100% (as it was)".into(),
+                        200 => "200% (double speed)".into(),
+                        n => format!("{n}%"),
+                    }));
                 }
                 SpeedMode::DelayAll => {
                     form_row(ui, "Delay", |ui| num_fill(ui, &mut tr.speed_val, 1.0, |d| d.range(1.0..=100000.0).speed(0.2).max_decimals(0).suffix(" cs"))).on_hover_text("One delay for every frame in hundredths of a second");
@@ -13567,7 +13965,11 @@ impl GifKitApp {
         });
         if drop_go {
             let n = self.opt_drop_nth;
-            self.run_anim(ctx, "Drop frames", move |a, _| Ok(ops::drop_every_nth(a, n)));
+            if let Some(len) = self.base.as_ref().map(|a| a.len()).filter(|_| n >= 2) {
+                // each dropped frame's time goes to the one before, as before
+                let keep: Vec<bool> = (0..len).map(|i| (i + 1) % n != 0).collect();
+                self.drop_base_frames_timed(&keep, true, "Drop frames");
+            }
         }
     }
 
@@ -14672,13 +15074,9 @@ impl GifKitApp {
         let _defaults = spin::Defaults::new(&st, &Default::default());
         group(ui, "Shape", |ui| {
             let kinds: Vec<ShapeKind> = ShapeKind::ALL.iter().copied().filter(|k| *k != ShapeKind::Emoji || st.kind == ShapeKind::Emoji).collect();
-            let labels: Vec<&str> = kinds.iter().map(|k| k.label()).collect();
-            even_grid(ui, kinds.len(), label_w(ui, &labels), |ui, i, size| {
-                let k = kinds[i];
-                if ui.add_sized(size, sel_btn(egui::Button::new(k.label()).truncate(), st.kind == k)).clicked() {
-                    st.kind = k;
-                }
-            });
+            if let Some(k) = shape_tiles(ui, &kinds, st.kind) {
+                st.kind = k;
+            }
         });
         if st.kind != ShapeKind::Emoji {
             group(ui, "Style", |ui| {
@@ -14810,13 +15208,42 @@ impl GifKitApp {
                     tabs.push((EmojiTab::Group(g as u8), name, crate::emoji::GROUPS[g]));
                 }
                 ui.add_space(2.0);
-                let labels: Vec<&str> = tabs.iter().map(|t| t.1).collect();
-                even_grid(ui, tabs.len(), label_w(ui, &labels), |ui, i, size| {
-                    let (t, label, tip) = tabs[i];
-                    if ui.add_sized(size, sel_btn(egui::Button::new(label).truncate(), self.emoji_tab == t)).on_hover_text(tip).clicked() {
-                        self.emoji_tab = t;
+                // a strip of picture tabs, as emoji pickers have
+                const ICONS: [&str; 9] = ["1f600", "1f44b", "1f43b", "1f354", "2708", "26bd", "1f4a1", "2764", "1f3c1"];
+                let n = tabs.len();
+                let w = ui.available_width();
+                let tw = (w / n as f32).floor();
+                let pal = *p();
+                let (strip, _) = ui.allocate_exact_size(vec2(w, 34.0), Sense::hover());
+                ui.painter().rect_filled(strip, 4.0, pal.view);
+                for (i, (t, _, tip)) in tabs.iter().enumerate() {
+                    let r = Rect::from_min_size(pos2(strip.min.x + i as f32 * tw, strip.min.y), vec2(tw, 34.0));
+                    let resp = ui.interact(r, egui::Id::unique(("emoji-tab", i)), Sense::click()).on_hover_text(*tip);
+                    let on = self.emoji_tab == *t;
+                    if on {
+                        ui.painter().rect_filled(r.shrink(1.0), 4.0, mix(pal.view, pal.highlight, 0.35));
+                        ui.painter().line_segment([pos2(r.min.x + 5.0, r.max.y - 1.5), pos2(r.max.x - 5.0, r.max.y - 1.5)], Stroke::new(2.0, pal.highlight));
+                    } else if resp.hovered() {
+                        ui.painter().rect_filled(r.shrink(1.0), 4.0, mix(pal.view, pal.highlight, 0.15));
                     }
-                });
+                    let c = r.center();
+                    match t {
+                        EmojiTab::Group(g) => {
+                            if let Some(tex) = self.emoji_texture(ctx, ICONS[*g as usize]) {
+                                let sz = 20.0f32.min(tw - 6.0);
+                                let tint = if on || resp.hovered() { Color32::WHITE } else { Color32::from_white_alpha(170) };
+                                ui.painter().image(tex.id(), Rect::from_center_size(c, vec2(sz, sz)), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), tint);
+                            }
+                        }
+                        _ => crate::icons::paint(ui.painter(), "document-open-recent", c, 18.0, if on { pal.fg } else { pal.fg_muted }),
+                    }
+                    if resp.clicked() {
+                        self.emoji_tab = *t;
+                    }
+                }
+                let name = tabs.iter().find(|t| t.0 == self.emoji_tab).map(|t| t.2).unwrap_or("");
+                ui.add_space(2.0);
+                ui.label(RichText::new(name).color(pal.fg_muted).size(12.0));
             }
             ui.add_space(2.0);
             // skin tone
@@ -15117,40 +15544,42 @@ impl GifKitApp {
         // frames that repeat the one before, found and merged after import
         let mut merge_now = false;
         group(ui, "Repeated Frames", |ui| {
-            let levels: Vec<(usize, &str)> = crate::io::MERGE_LEVELS.iter().enumerate().skip(1).map(|(i, l)| (i, l.0)).collect();
-            form_row(ui, "Find", |ui| combo(ui, "dupe-level", &mut self.dupe_level, &levels)).on_hover_text("How alike a frame must be to the one before to count as a repeat");
+            let r = slider_row(ui, "Tolerance", Spin::new(&mut self.dupe_tol, 0.0..=100.0).suffix("%").max_decimals(0).default_value(30.0));
+            r.on_hover_text("How different a frame may be from the one before and still count as a repeat. Low: only exact copies. High: small movements too");
             form_row(ui, "", |ui| check(ui, &mut self.dupe_keep_time, "Keep their time")).on_hover_text("On: the frame that stays shows for as long as the ones merged into it, so the timing is the same. Off: they're just skipped");
+            // a count of what it would find, worked out once the slider settles
+            let key = (self.version, self.timing_rev, self.dupe_tol.to_bits());
+            let settled = !ui.input(|i| i.pointer.any_down());
+            if settled && self.dupe_found.is_none_or(|(k, _)| k != key) {
+                if let Some(a) = &self.base {
+                    self.dupe_found = Some((key, crate::io::find_repeats(a, self.dupe_tol).len()));
+                }
+            }
+            let found = self.dupe_found.filter(|(k, _)| *k == key).map(|(_, n)| n);
+            let label = match found {
+                Some(0) => "No Repeated Frames".to_string(),
+                Some(1) => "Merge 1 Repeated Frame".to_string(),
+                Some(n) => format!("Merge {n} Repeated Frames"),
+                None => "Merge Repeated Frames".to_string(),
+            };
             form_row(ui, "", |ui| {
-                merge_now = wide_button(ui, egui::Button::new("Merge Repeated Frames")).on_hover_text("Skips frames that repeat the one before. Undo brings them back").clicked();
+                merge_now = ui.add_enabled_ui(found != Some(0), |ui| wide_button(ui, egui::Button::new(label.clone()))).inner.on_hover_text("Skips frames that repeat the one before. Undo brings them back").clicked();
             });
         });
         if merge_now {
             self.snapshot(&format!("dupes{now}"), now);
-            let limit = crate::io::MERGE_LEVELS.get(self.dupe_level).map(|l| l.1).unwrap_or(0.0002);
             let keep_time = self.dupe_keep_time;
+            let tol = self.dupe_tol;
             let a = self.base.as_mut().unwrap();
-            let mut kept: Option<usize> = None;
-            let mut merged = 0usize;
-            for i in 0..a.frames.len() {
-                if !a.frames[i].enabled {
-                    continue;
+            let found = crate::io::find_repeats(a, tol);
+            for &(k, i) in &found {
+                if keep_time {
+                    let d = a.frames[i].delay_cs;
+                    a.frames[k].delay_cs = a.frames[k].delay_cs.saturating_add(d);
                 }
-                let same = kept.is_some_and(|k| {
-                    let (x, y) = (a.frames[k].image.get(), a.frames[i].image.get());
-                    x.dimensions() == y.dimensions() && crate::io::changed_share(x.as_raw(), y.as_raw(), limit) <= limit
-                });
-                match (same, kept) {
-                    (true, Some(k)) => {
-                        if keep_time {
-                            let d = a.frames[i].delay_cs;
-                            a.frames[k].delay_cs = a.frames[k].delay_cs.saturating_add(d);
-                        }
-                        a.frames[i].enabled = false;
-                        merged += 1;
-                    }
-                    _ => kept = Some(i),
-                }
+                a.frames[i].enabled = false;
             }
+            let merged = found.len();
             self.timing_rev += 1;
             self.version += 1;
             self.modified = true;
@@ -15290,11 +15719,9 @@ impl GifKitApp {
         };
         let b = egui::Button::image_and_text(crate::icons::image(ctx, "edit-delete", 16.0, p().fg), label);
         if ui.add_enabled_ui(skipped > 0, |ui| ui.add_sized(vec2(ui.available_width(), CHIP_H), b)).inner.clicked() {
-            self.run_anim(ctx, "Remove skipped", move |a, _| {
-                let mut a = a.clone();
-                a.frames.retain(|f| f.enabled);
-                Ok(a)
-            });
+            let keep: Vec<bool> = self.base.as_ref().map(|a| a.frames.iter().map(|f| f.enabled).collect()).unwrap_or_default();
+            self.drop_base_frames(&keep, "Remove skipped");
+            self.info("✔ Skipped frames deleted. The timeline moved up to match");
         }
     }
 }
@@ -15500,13 +15927,14 @@ fn effects_ui(ui: &mut egui::Ui, fx: &mut EffectSettings, _tr: &mut Transform, c
         });
         let any = fx.rc_white || fx.rc_black || fx.rc_custom;
         ui.add_enabled_ui(any, |ui| {
-            slider_row(ui, "Fuzz", soft_slider(&mut fx.rc_fuzz, 0.0..=60.0, "").default_value(d.rc_fuzz as f64).suffix(" %").max_decimals(0)).on_hover_text("How close a colour must be to count");
-            ui.add_enabled_ui(fx.rc_custom, |ui| {
-                slider_row(ui, "Soft edge", soft_slider(&mut fx.rc_soft, 0.0..=40.0, "").default_value(d.rc_soft as f64).suffix(" %").max_decimals(0)).on_hover_text("Fades edge colours out for smoother edges");
-                form_row(ui, "Spill", |ui| check(ui, &mut fx.rc_despill, "Remove colour spill")).on_hover_text("Removes leftover tint, like a green screen's glow");
-            });
+            slider_row(ui, "Fuzz", soft_slider(&mut fx.rc_fuzz, 0.0..=60.0, "").default_value(d.rc_fuzz as f64).suffix(" %").max_decimals(1)).on_hover_text("How close a colour must be to go, judged by eye");
+            slider_row(ui, "Soft edge", soft_slider(&mut fx.rc_soft, 0.0..=40.0, "").default_value(d.rc_soft as f64).suffix(" %").max_decimals(1)).on_hover_text("Colours just past the fuzz fade out instead of stopping dead");
+            form_row(ui, "", |ui| check(ui, &mut fx.rc_contiguous, "Only the background")).on_hover_text("Only areas joined to the picture's edge go, so the same colour inside the subject (eyes, outlines, a black shirt) stays");
             opt_row(ui, "Clean edges", &mut fx.rc_clean_edges, |ui| {
-                num_fill(ui, &mut fx.rc_edge_px, 1.0, |d| d.range(1..=50).suffix(" px")).on_hover_text("Removes leftover fringe around cut-out areas");
+                num_fill(ui, &mut fx.rc_edge_px, 1.0, |d| d.range(1..=8).suffix(" px")).on_hover_text("Edge pixels that are part the colour go part see-through, with the colour taken out of them, so no halo is left");
+            });
+            ui.add_enabled_ui(fx.rc_custom, |ui| {
+                form_row(ui, "Spill", |ui| check(ui, &mut fx.rc_despill, "Remove colour spill")).on_hover_text("Removes leftover tint, like a green screen's glow");
             });
         });
     });

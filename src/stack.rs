@@ -437,9 +437,9 @@ pub struct Layer {
 }
 
 impl Layer {
-    /// Can it have a layer style? (text, shapes and emoji)
+    /// Can it have a layer style? (text, shapes, emoji and images)
     pub fn can_style(k: &LayerKind) -> bool {
-        matches!(k, LayerKind::Text(_) | LayerKind::Shape(_) | LayerKind::Emoji(_))
+        matches!(k, LayerKind::Text(_) | LayerKind::Shape(_) | LayerKind::Emoji(_) | LayerKind::Overlay(_))
     }
 
     /// Can it be mirrored? (things drawn in a box)
@@ -1642,7 +1642,12 @@ impl Stack {
             LayerKind::Overlay(o) => {
                 if let Some(b) = l.source_box(src, fonts) {
                     let frame = o.src.frame_at(times[i]);
-                    crate::overlay::draw_in_obb(&mut img, frame, map_box(m, mo.apply(b), true), o.opacity / 100.0, l.flip);
+                    let ob = map_box(m, mo.apply(b), true);
+                    if l.style.is_none() {
+                        crate::overlay::draw_in_obb(&mut img, frame, ob, o.opacity / 100.0, l.flip);
+                    } else if let Some((sp, x, y)) = styled_overlay(frame, ob, l.flip, &l.style, shapes::map_scale(m)) {
+                        draw(&mut img, &sp, x, y, o.opacity / 100.0);
+                    }
                 }
             }
             LayerKind::Watermark(w) => {
@@ -2021,6 +2026,148 @@ impl Stack {
         shots.get(k)
     }
 
+    /// The GIF's frames were taken out or copied: `map[i]` is where old
+    /// source frame `i` went in `new` (None: deleted). Everything counted
+    /// in frames follows the frames that stay: clips, keyframes, markers,
+    /// speed points, frame ranges and the cut. Gives back, for each old
+    /// timeline frame, where it starts and ends up on the new timeline.
+    pub fn refit_frames(&mut self, old: &Animation, new: &Animation, map: &[Option<usize>]) -> (Vec<usize>, Vec<usize>) {
+        let old_plan = self.plan(old);
+        // old frame ranges first become clips, so they stay with their frames
+        for li in 0..self.layers.len() {
+            self.ensure_clips(li, &old_plan);
+        }
+        let n_old = old.len();
+        let n_new = new.len();
+        // a deleted source frame lands on the next one kept (starts) or the
+        // one before (ends)
+        let next: Vec<Option<usize>> = {
+            let mut v = vec![None; n_old + 1];
+            for i in (0..n_old).rev() {
+                v[i] = map[i].or(v[i + 1]);
+            }
+            v
+        };
+        let prev: Vec<Option<usize>> = {
+            let mut v = vec![None; n_old];
+            let mut last = None;
+            for i in 0..n_old {
+                last = map[i].or(last);
+                v[i] = last;
+            }
+            v
+        };
+        let src_start = |s: usize| next.get(s).copied().flatten().or_else(|| prev.get(s).copied().flatten()).unwrap_or(0);
+        let src_end = |s: usize| prev.get(s).copied().flatten().or_else(|| next.get(s).copied().flatten()).unwrap_or(0);
+        // the cut, counted from 1 in source frames
+        {
+            let t = &mut self.transform;
+            if !t.cut_by_time {
+                if t.cut_start > 1 {
+                    t.cut_start = src_start((t.cut_start - 1).min(n_old.saturating_sub(1))) + 1;
+                }
+                if t.cut_end != 0 {
+                    t.cut_end = src_end((t.cut_end - 1).min(n_old.saturating_sub(1))) + 1;
+                }
+            }
+        }
+        // pen strokes and older frame ranges, counted from 1
+        let fix_range = |from: &mut usize, to: &mut usize| {
+            if *from > 1 {
+                *from = src_start((*from - 1).min(n_old.saturating_sub(1))) + 1;
+            }
+            if *to != 0 {
+                *to = src_end((*to - 1).min(n_old.saturating_sub(1))) + 1;
+            }
+        };
+        for l in &mut self.layers {
+            match &mut l.kind {
+                LayerKind::Markup(m) => m.strokes.iter_mut().for_each(|st| fix_range(&mut st.from, &mut st.to)),
+                LayerKind::Overlay(o) if o.placements.len() == n_old => {
+                    let mut pl = vec![None; n_new];
+                    for (i, m) in map.iter().enumerate() {
+                        if let Some(j) = m {
+                            if *j < n_new && pl[*j].is_none() {
+                                pl[*j] = Some(o.placements[i]);
+                            }
+                        }
+                    }
+                    let mut last = o.placements.first().copied();
+                    o.placements = pl.into_iter().map(|p| {
+                        if p.is_some() {
+                            last = p;
+                        }
+                        p.or(last).unwrap()
+                    }).collect();
+                }
+                _ => {}
+            }
+        }
+        // timeline frames: find each old one's source in the new timeline,
+        // the same time round when it shows twice (boomerang)
+        let new_plan = self.plan(new);
+        let mut where_new: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+        for (q, f) in new_plan.iter().enumerate() {
+            where_new.entry(f.src).or_default().push(q);
+        }
+        let mut seen: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut direct: Vec<Option<usize>> = Vec::with_capacity(old_plan.len());
+        for f in &old_plan {
+            let k = seen.entry(f.src).or_insert(0);
+            let at = map.get(f.src).copied().flatten().and_then(|ns| where_new.get(&ns)).map(|v| v[(*k).min(v.len() - 1)]);
+            *k += 1;
+            direct.push(at);
+        }
+        let n_plan_new = new_plan.len();
+        let last_new = n_plan_new.saturating_sub(1);
+        let mut starts = vec![last_new; old_plan.len()];
+        let mut nxt = None;
+        for p in (0..old_plan.len()).rev() {
+            nxt = direct[p].or(nxt);
+            starts[p] = nxt.unwrap_or(last_new);
+        }
+        let mut ends = vec![0; old_plan.len()];
+        let mut prv = None;
+        for p in 0..old_plan.len() {
+            prv = direct[p].or(prv);
+            ends[p] = prv.or(direct[p]).unwrap_or(0);
+        }
+        let n_plan_old = old_plan.len();
+        let st = |f: usize| starts.get(f).copied().unwrap_or(last_new);
+        let en = |f: usize| ends.get(f).copied().unwrap_or(last_new);
+        for l in &mut self.layers {
+            if let Some(cl) = &mut l.timing.clips {
+                let mut out = Vec::new();
+                for c in cl.iter() {
+                    let ns = st(c.start);
+                    let ne = c.end.filter(|&e| e + 1 < n_plan_old).map(en);
+                    if ne.is_some_and(|e| e < ns) || (c.start >= n_plan_old && n_plan_old > 0) {
+                        continue;
+                    }
+                    out.push(crate::timeline::Clip { start: ns, end: ne });
+                }
+                *cl = out;
+            }
+            let mut keys: Vec<crate::timeline::Key> = Vec::new();
+            for k in l.timing.keys.drain(..) {
+                let f = st(k.frame);
+                match keys.last_mut() {
+                    Some(last) if last.frame == f => *last = crate::timeline::Key { frame: f, ..k },
+                    _ => keys.push(crate::timeline::Key { frame: f, ..k }),
+                }
+            }
+            l.timing.keys = keys;
+        }
+        for m in &mut self.markers {
+            m.frame = st(m.frame);
+        }
+        for sp in &mut self.speed_env {
+            sp.frame = st(sp.frame);
+        }
+        self.speed_env.dedup_by_key(|s| s.frame);
+        (starts, ends)
+    }
+
     /// Keep per-frame data in sync with the number of source frames.
     pub fn sync_len(&mut self, n: usize) {
         for l in &mut self.layers {
@@ -2032,6 +2179,24 @@ impl Stack {
             }
         }
     }
+}
+
+/// An image layer's picture for one frame, put in its box `ob` on a
+/// see-through sprite and styled. Gives the sprite and its top-left.
+fn styled_overlay(frame: &RgbaImage, ob: crate::geo::Obb, flip: [bool; 2], style: &crate::layerstyle::LayerStyle, scale: f32) -> Option<(RgbaImage, i64, i64)> {
+    let t = ob.angle.to_radians();
+    let (c, s) = (t.cos().abs(), t.sin().abs());
+    let (hw, hh) = ((ob.w * c + ob.h * s) / 2.0, (ob.w * s + ob.h * c) / 2.0);
+    let (x0, y0) = ((ob.cx - hw).floor() as i64 - 1, (ob.cy - hh).floor() as i64 - 1);
+    let (x1, y1) = ((ob.cx + hw).ceil() as i64 + 1, (ob.cy + hh).ceil() as i64 + 1);
+    let (cw, ch) = ((x1 - x0).max(1) as u32, (y1 - y0).max(1) as u32);
+    if cw as u64 * ch as u64 > 4096 * 4096 {
+        return None;
+    }
+    let mut img = RgbaImage::new(cw, ch);
+    crate::overlay::draw_in_obb(&mut img, frame, crate::geo::Obb { cx: ob.cx - x0 as f32, cy: ob.cy - y0 as f32, ..ob }, 1.0, flip);
+    let pad = style.pad(scale) as i64;
+    Some((style.apply(&img, scale), x0 - pad, y0 - pad))
 }
 
 /// Start time (seconds) of each plan frame.
@@ -2365,13 +2530,21 @@ impl Stack {
                     if let Some(b) = l.source_box(src, fonts) {
                         let frame = o.src.frame_at(times[i]);
                         let ob = map_box(m, mo.apply(b), true);
-                        let (iw, ih) = (frame.width().max(1) as f32, frame.height().max(1) as f32);
-                        let am = Affine::scale(ob.w.round().max(1.0) / iw, ob.h.round().max(1.0) / ih)
-                            .then(Affine::translate(-ob.w.round().max(1.0) / 2.0, -ob.h.round().max(1.0) / 2.0))
-                            .then(Affine::scale(if l.flip[0] { -1.0 } else { 1.0 }, if l.flip[1] { -1.0 } else { 1.0 }))
-                            .then(Affine::rotate(ob.angle))
-                            .then(Affine::translate(ob.cx, ob.cy));
-                        draws.push(GpuOp::Draw(GpuDraw { src: GpuSrc::Img(frame), m: am, opacity: o.opacity / 100.0 * k }));
+                        if !l.style.is_none() {
+                            // styled: drawn here, the same as the processor does
+                            if let Some((sp, x, y)) = styled_overlay(frame, ob, l.flip, &l.style, shapes::map_scale(m)) {
+                                owned.push(sp);
+                                draws.push(GpuOp::Draw(GpuDraw { src: GpuSrc::Owned(owned.len() - 1), m: Affine::translate(x as f32, y as f32), opacity: o.opacity / 100.0 * k }));
+                            }
+                        } else {
+                            let (iw, ih) = (frame.width().max(1) as f32, frame.height().max(1) as f32);
+                            let am = Affine::scale(ob.w.round().max(1.0) / iw, ob.h.round().max(1.0) / ih)
+                                .then(Affine::translate(-ob.w.round().max(1.0) / 2.0, -ob.h.round().max(1.0) / 2.0))
+                                .then(Affine::scale(if l.flip[0] { -1.0 } else { 1.0 }, if l.flip[1] { -1.0 } else { 1.0 }))
+                                .then(Affine::rotate(ob.angle))
+                                .then(Affine::translate(ob.cx, ob.cy));
+                            draws.push(GpuOp::Draw(GpuDraw { src: GpuSrc::Img(frame), m: am, opacity: o.opacity / 100.0 * k }));
+                        }
                     }
                 }
                 LayerKind::Watermark(w) => {

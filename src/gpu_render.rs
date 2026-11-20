@@ -44,6 +44,8 @@ pub enum GpuSrc<'a> {
     #[allow(dead_code)]
     Img(&'a RgbaImage),
     Solid([u8; 4], (f32, f32)),
+    /// one of `GpuFrame::owned` (made for this frame alone)
+    Owned(usize),
 }
 
 /// One thing drawn over the frame: `m` maps its pixels to output pixels.
@@ -143,7 +145,7 @@ impl GpuFrame<'_> {
         }
         let draw_ok = |d: &GpuDraw| match d.src {
             GpuSrc::Img(i) => img_ok(i),
-            GpuSrc::Solid(..) => true,
+            GpuSrc::Solid(..) | GpuSrc::Owned(_) => true,
         };
         self.ops.iter().all(|op| match op {
             GpuOp::Draw(d) => draw_ok(d),
@@ -674,12 +676,16 @@ impl GpuRenderer {
     }
 
     /// The bind group that draws `d` onto a frame of `size`.
-    fn quad(&mut self, d: &GpuDraw, size: (u32, u32), sprite_gen: u64) -> wgpu::BindGroup {
+    fn quad(&mut self, d: &GpuDraw, size: (u32, u32), sprite_gen: u64, owned: &[RgbaImage]) -> wgpu::BindGroup {
         let inv = d.m.inverse();
         let foot = footprint(&inv);
         let (view, sz, col, solid) = match d.src {
             GpuSrc::Img(img) => (self.sprite_view(img, sprite_gen), (img.width() as f32, img.height() as f32), [0.0; 4], 0.0),
             GpuSrc::Solid(c, s) => (self.blank.clone(), s, rgba(c), 1.0),
+            GpuSrc::Owned(k) => match owned.get(k) {
+                Some(img) => (upload(&self.device, &self.queue, img, "gifkit-owned-sprite").create_view(&Default::default()), (img.width() as f32, img.height() as f32), [0.0; 4], 0.0),
+                None => (self.blank.clone(), (1.0, 1.0), [0.0; 4], 1.0),
+            },
         };
         let (ow, oh) = (size.0 as f32, size.1 as f32);
         self.bind(&view, &uniform_block(&[[d.m.a, d.m.b, d.m.c, d.m.d], [d.m.tx, d.m.ty, sz.0, sz.1], [inv.a, inv.b, inv.c, inv.d], [inv.tx, inv.ty, ow, oh], col, [d.opacity, solid, foot.0, foot.1]]))
@@ -800,7 +806,7 @@ impl GpuRenderer {
         for op in &f.ops {
             match op {
                 GpuOp::Draw(d) => {
-                    let q = self.quad(d, cur_size, sprite_gen);
+                    let q = self.quad(d, cur_size, sprite_gen, &f.owned);
                     quads.push(q);
                 }
                 GpuOp::Mask { draws, slot } => {
@@ -809,7 +815,7 @@ impl GpuRenderer {
                     // a clear pass, then the base's draws alone
                     let b = self.bind3([&self.blank, &self.blank, &self.blank], &uniform_block(&[[53.0, 0.0, cur_size.0 as f32, cur_size.1 as f32]]));
                     self.pass(&mut enc, &v, &self.fx, &b);
-                    let qs: Vec<wgpu::BindGroup> = draws.iter().map(|d| self.quad(d, cur_size, sprite_gen)).collect();
+                    let qs: Vec<wgpu::BindGroup> = draws.iter().map(|d| self.quad(d, cur_size, sprite_gen, &f.owned)).collect();
                     self.draw_quads(&mut enc, &v, &qs);
                     masks.insert(*slot, (v, cur_size));
                 }

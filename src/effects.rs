@@ -50,6 +50,9 @@ pub struct EffectSettings {
     pub rc_soft: f32,
     /// take the removed colour's tint out of what's left (green screen spill)
     pub rc_despill: bool,
+    /// only what's joined to the picture's edge goes (the background), not
+    /// the same colour inside the subject
+    pub rc_contiguous: bool,
 
     // Animation flow
     pub reverse: bool,
@@ -212,8 +215,9 @@ impl Default for EffectSettings {
             rc_fuzz: 2.0,
             rc_clean_edges: true,
             rc_edge_px: 2,
-            rc_soft: 0.0,
+            rc_soft: 3.0,
             rc_despill: false,
+            rc_contiguous: false,
             reverse: false,
             set_loop: false,
             loop_count: 0,
@@ -474,10 +478,6 @@ fn flatten_on(img: &mut RgbaImage, c: [u8; 3]) {
     });
 }
 
-fn color_dist(p: &[u8], c: [u8; 3]) -> f32 {
-    (((p[0] as f32 - c[0] as f32).powi(2) + (p[1] as f32 - c[1] as f32).powi(2) + (p[2] as f32 - c[2] as f32).powi(2)) as f32).sqrt()
-}
-
 /// Which channel a key colour is mostly made of (0 red, 1 green, 2 blue),
 /// if one stands out: the one spill shows in.
 pub fn key_channel(c: [u8; 3]) -> Option<usize> {
@@ -486,21 +486,165 @@ pub fn key_channel(c: [u8; 3]) -> Option<usize> {
     (m as i32 - others >= 40).then_some(i)
 }
 
-/// A chroma key: pixels within `fuzz` of `target` go, ones within `soft`
-/// more fade out, and (`despill`) the key's tint is taken out of the rest.
-/// Percentages of the colour range. Runs before the hard-edged removal.
-pub fn key_color(img: &mut RgbaImage, target: [u8; 3], fuzz: f32, soft: f32, despill: bool) {
-    let thr = fuzz.max(0.0) / 100.0 * 441.67;
-    let soft = soft.max(0.0) / 100.0 * 441.67;
-    let ch = if despill { key_channel(target) } else { None };
-    img.par_chunks_mut(4).for_each(|p| {
-        let d = color_dist(p, target);
-        if d <= thr {
+/// sRGB (0..=255) to OKLab, where distances look even to the eye.
+fn oklab(c: [u8; 3]) -> [f32; 3] {
+    static LIN: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    let lin = LIN.get_or_init(|| {
+        let mut t = [0f32; 256];
+        for (i, v) in t.iter_mut().enumerate() {
+            let x = i as f32 / 255.0;
+            *v = if x <= 0.04045 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) };
+        }
+        t
+    });
+    let (r, g, b) = (lin[c[0] as usize], lin[c[1] as usize], lin[c[2] as usize]);
+    let l = (0.412_221_46 * r + 0.536_332_55 * g + 0.051_445_995 * b).cbrt();
+    let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
+    let s = (0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b).cbrt();
+    [0.210_454_26 * l + 0.793_617_8 * m - 0.004_072_047 * s, 1.977_998_5 * l - 2.428_592_2 * m + 0.450_593_7 * s, 0.025_904_037 * l + 0.782_771_77 * m - 0.808_675_77 * s]
+}
+
+/// Remove `targets` colours: pixels within `fuzz`% (by eye, OKLab) go,
+/// a `soft`% band past it fades out, and part-removed pixels have the
+/// removed colour taken back out of them so no fringe is left. With
+/// `edge_px`, pixels that close to a removed area and near the colour
+/// fade by how much of it they hold (no hard blocks). `contiguous`: only
+/// what's joined to the picture's edge goes.
+pub fn remove_colors(img: &mut RgbaImage, targets: &[[u8; 3]], fuzz: f32, soft: f32, edge_px: u32, contiguous: bool, despill: bool) {
+    if targets.is_empty() {
+        return;
+    }
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let thr = fuzz.max(0.0) / 100.0;
+    let soft = soft.max(0.0) / 100.0;
+    let tl: Vec<[f32; 3]> = targets.iter().map(|c| oklab(*c)).collect();
+    // how far each pixel is from the nearest target, and which
+    let near: Vec<(f32, u8)> = img
+        .par_chunks(4)
+        .map(|p| {
+            if p[3] == 0 {
+                return (f32::MAX, 0);
+            }
+            let q = oklab([p[0], p[1], p[2]]);
+            let mut best = (f32::MAX, 0u8);
+            for (k, t) in tl.iter().enumerate() {
+                let d = ((q[0] - t[0]).powi(2) + (q[1] - t[1]).powi(2) + (q[2] - t[2]).powi(2)).sqrt();
+                if d < best.0 {
+                    best = (d, k as u8);
+                }
+            }
+            best
+        })
+        .collect();
+    // what's kept of each: 0 gone, 1 untouched
+    let keep_of = |d: f32| if d <= thr { 0.0 } else if soft > 0.0 && d < thr + soft { (d - thr) / soft } else { 1.0 };
+    let mut keep: Vec<f32> = near.iter().map(|&(d, _)| keep_of(d)).collect();
+    if contiguous {
+        // flood in from the edge through pixels that are at least part removed
+        let mut reached = vec![false; w * h];
+        let mut stack: Vec<usize> = Vec::new();
+        for x in 0..w {
+            stack.push(x);
+            stack.push((h - 1) * w + x);
+        }
+        for y in 0..h {
+            stack.push(y * w);
+            stack.push(y * w + w - 1);
+        }
+        while let Some(i) = stack.pop() {
+            if reached[i] || keep[i] >= 1.0 {
+                continue;
+            }
+            reached[i] = true;
+            let (x, y) = (i % w, i / w);
+            if x > 0 {
+                stack.push(i - 1);
+            }
+            if x + 1 < w {
+                stack.push(i + 1);
+            }
+            if y > 0 {
+                stack.push(i - w);
+            }
+            if y + 1 < h {
+                stack.push(i + w);
+            }
+        }
+        for (k, r) in keep.iter_mut().zip(&reached) {
+            if !r {
+                *k = 1.0;
+            }
+        }
+    }
+    // the fringe: pixels next to a removed area are usually a blend of the
+    // removed colour and what's solid beside them. Each is split into the
+    // two by the solid neighbour most unlike the colour, so an edge goes
+    // part-seen by just as much as it held of the colour
+    let gone: Vec<bool> = keep.iter().map(|k| *k <= 0.0).collect();
+    let close = crate::ops::near_any(&gone, w, h, edge_px.clamp(1, 8) as usize);
+    let raw: Vec<[f32; 3]> = img.pixels().map(|p| [p[0] as f32, p[1] as f32, p[2] as f32]).collect();
+    let r = edge_px.clamp(1, 4) as i64;
+    let unmix: Vec<Option<(f32, usize)>> = (0..w * h)
+        .into_par_iter()
+        .map(|i| {
+            if !close[i] || keep[i] <= 0.0 || near[i].0 == f32::MAX {
+                return None;
+            }
+            let t = targets[near[i].1 as usize].map(|v| v as f32);
+            let (x, y) = ((i % w) as i64, (i / w) as i64);
+            // the solid neighbour furthest from the colour
+            let mut best: Option<(f32, usize)> = None;
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    let (xx, yy) = (x + dx, y + dy);
+                    if xx < 0 || yy < 0 || xx >= w as i64 || yy >= h as i64 {
+                        continue;
+                    }
+                    let j = yy as usize * w + xx as usize;
+                    if keep[j] >= 1.0 && !close[j] || (keep[j] >= 1.0 && j != i && near[j].0 > near[i].0) {
+                        if best.is_none_or(|b| near[j].0 > b.0) && near[j].0 != f32::MAX {
+                            best = Some((near[j].0, j));
+                        }
+                    }
+                }
+            }
+            let (_, j) = best?;
+            let k = raw[j];
+            let (kt, pt) = ([k[0] - t[0], k[1] - t[1], k[2] - t[2]], [raw[i][0] - t[0], raw[i][1] - t[1], raw[i][2] - t[2]]);
+            let len2 = kt[0] * kt[0] + kt[1] * kt[1] + kt[2] * kt[2];
+            if len2 < 1.0 {
+                return None;
+            }
+            let a = ((pt[0] * kt[0] + pt[1] * kt[1] + pt[2] * kt[2]) / len2).clamp(0.0, 1.0);
+            Some((a, near[i].1 as usize))
+        })
+        .collect();
+    if edge_px > 0 {
+        for (k, u) in keep.iter_mut().zip(&unmix) {
+            if let Some((a, _)) = u {
+                *k = k.min(*a);
+            }
+        }
+    }
+    let ch = if despill { targets.last().and_then(|t| key_channel(*t)) } else { None };
+    img.par_chunks_mut(4).zip(keep.par_iter()).zip(near.par_iter()).zip(unmix.par_iter()).for_each(|(((p, &k), &(_, ti)), u)| {
+        let edge = u.is_some();
+        if k >= 1.0 && ch.is_none() {
+            return;
+        }
+        if k <= 0.0 {
             p[3] = 0;
             return;
         }
-        if soft > 0.0 && d < thr + soft {
-            p[3] = c8(p[3] as f32 * ((d - thr) / soft));
+        if k < 1.0 && edge {
+            // take the removed colour back out: p = k·c + (1-k)·t
+            let t = targets[ti as usize];
+            for c in 0..3 {
+                p[c] = c8((p[c] as f32 - (1.0 - k) * t[c] as f32) / k);
+            }
+        }
+        if k < 1.0 {
+            p[3] = c8(p[3] as f32 * k);
         }
         if let (Some(c), true) = (ch, p[3] > 0) {
             let (o1, o2) = match c {
@@ -511,45 +655,6 @@ pub fn key_color(img: &mut RgbaImage, target: [u8; 3], fuzz: f32, soft: f32, des
             p[c] = p[c].min(((o1 as u16 + o2 as u16) / 2) as u8);
         }
     });
-}
-
-/// Make pixels close to `target` transparent. `fuzz` in percent.
-pub fn replace_color(img: &mut RgbaImage, target: [u8; 3], fuzz: f32, clean_edges: Option<u32>) {
-    let thr = fuzz.max(0.0) / 100.0 * 441.67;
-    img.par_chunks_mut(4).for_each(|p| {
-        if color_dist(p, target) <= thr {
-            p[3] = 0;
-        }
-    });
-    if let Some(px) = clean_edges {
-        if px == 0 {
-            return;
-        }
-        let (w, h) = img.dimensions();
-        let edge_thr = (thr * 4.0).max(0.30 * 441.67);
-        let alpha: Vec<u8> = img.pixels().map(|p| p[3]).collect();
-        let src = img.clone();
-        // pixels with a removed one within `px` (two passes, any radius)
-        let clear: Vec<bool> = alpha.iter().map(|a| *a == 0).collect();
-        let near_clear = crate::ops::near_any(&clear, w as usize, h as usize, px as usize);
-        img.par_chunks_mut(4).enumerate().for_each(|(i, p)| {
-            if alpha[i] == 0 {
-                return;
-            }
-            let (x, y) = (i as u32 % w, i as u32 / w);
-            if near_clear[i] {
-                let d = color_dist(&src.get_pixel(x, y).0, target);
-                if d <= edge_thr {
-                    // fade by closeness to the removed colour
-                    let t = (d / edge_thr).clamp(0.0, 1.0);
-                    p[3] = c8(p[3] as f32 * t * t);
-                    if p[3] < 40 {
-                        p[3] = 0;
-                    }
-                }
-            }
-        });
-    }
 }
 
 fn convolve3(img: &RgbaImage, k: [f32; 9], bias: f32, gray: bool) -> RgbaImage {
@@ -929,20 +1034,14 @@ pub fn apply_frame(src: &RgbaImage, idx: usize, n: usize, elapsed_s: f32, clip_s
     }
     // replace colour before colour presets so the target colour matches the source
     if s.rc_white || s.rc_black || s.rc_custom {
-        let edges = if s.rc_clean_edges { Some(s.rc_edge_px) } else { None };
-        if s.rc_custom && (s.rc_soft > 0.0 || s.rc_despill) {
-            // the soft edge and spill only for a chosen colour (a green screen)
-            key_color(&mut img, s.rc_color, s.rc_fuzz, s.rc_soft, s.rc_despill);
+        let mut targets = Vec::new();
+        for (on, c) in [(s.rc_white, [255, 255, 255]), (s.rc_black, [0, 0, 0]), (s.rc_custom, s.rc_color)] {
+            if on {
+                targets.push(c);
+            }
         }
-        if s.rc_white {
-            replace_color(&mut img, [255, 255, 255], s.rc_fuzz, edges);
-        }
-        if s.rc_black {
-            replace_color(&mut img, [0, 0, 0], s.rc_fuzz, edges);
-        }
-        if s.rc_custom {
-            replace_color(&mut img, s.rc_color, s.rc_fuzz, edges);
-        }
+        let edges = if s.rc_clean_edges { s.rc_edge_px } else { 0 };
+        remove_colors(&mut img, &targets, s.rc_fuzz, s.rc_soft, edges, s.rc_contiguous, s.rc_despill && s.rc_custom);
     }
     if s.grayscale {
         grayscale(&mut img);

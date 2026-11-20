@@ -57,8 +57,11 @@ With no layer of a tool's kind picked, changing a setting adds one. With one pic
 
 ## Layer styles
 @demo styles
-- The fx button beside Blend opens Layer Style: stroke, drop shadow and outer glow
-- Right-click a layer for Layer Style too. The window follows whichever layer you pick
+- The fx button beside Blend opens Layer Style, laid out as Photoshop's
+- Bevel and emboss, stroke, inner shadow and glow, satin, colour and gradient overlays, outer glow and drop shadow
+- Blending Options has Fill: the layer's own pixels fade, its effects don't
+- Text, shapes, emoji and image layers can all be styled
+- Right-click a layer for Layer Style, or to copy, paste and clear one
 - Each one has its own switch. They work on text, shapes and emoji
 
 ## The Layers panel
@@ -90,6 +93,8 @@ Any colour button opens a picker. Under the number boxes sit your recent colours
 - Blur, glitch, wobbles, styles, frames and more. Colour work lives in Adjust
 - Older projects keep their colour settings under Older colour settings
 - Transparency knocks out a colour. From Corner picks the background for you
+- Only the background keeps that colour inside the subject, like a black shirt or outlines
+- Clean edges makes edge pixels part see-through and takes the colour out of them, so there's no halo
 - Soft edge and Remove colour spill tidy up a green screen
 
 ## Animation
@@ -240,6 +245,8 @@ Drag on the preview to set the crop. Preview picks whether you see it with your 
 - Layers and keyframes stay in time when the frame rate changes
 - Frames skips the frames you don't want and adds images as new ones
 - Repeated Frames finds frames that copy the one before and merges them
+- Tolerance sets how alike they must be. The button counts what it'll find
+- Deleting frames moves keyframes, clips, markers and in and out points along with them
 
 ## In-betweens
 Frames > In-Betweens adds new frames between each pair for smoother motion.
