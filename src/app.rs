@@ -11553,29 +11553,35 @@ impl GifKitApp {
         }
         let searching = self.job.as_ref().is_some_and(|j| j.label.starts_with("Finding settings"));
         let mut more = false;
-        dialog(ctx, "export-simple", "Export", vec2(700.0, 440.0), false, &mut open, |ui| {
-            ui.set_width(660.0);
+        // the preview as tall as the settings beside it (their height last time)
+        let col_id = egui::Id::unique("simple-export-col");
+        let col_h: f32 = ctx.data_mut(|d| d.get_temp(col_id)).unwrap_or(330.0);
+        let side = col_h.clamp(300.0, 460.0);
+        dialog(ctx, "export-simple", "Export", vec2(side + 420.0, side + 90.0), false, &mut open, |ui| {
+            ui.set_width(side + 380.0);
             ui.horizontal_top(|ui| {
                 // what the saved file will look like
-                let (rect, _) = ui.allocate_exact_size(vec2(300.0, 300.0), Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(vec2(side, side), Sense::hover());
                 self.export_preview(ui, ctx, rect);
-                ui.add_space(12.0);
-                ui.vertical(|ui| {
-                    ui.set_width(ui.available_width());
+                ui.add_space(14.0);
+                let col = ui.vertical(|ui| {
+                    ui.set_width(366.0);
                     ui.label(RichText::new("Save as").font(theme::medium(13.5)).color(pal.fg));
                     ui.add_space(4.0);
                     let w = ((ui.available_width() - 16.0) / 3.0).floor();
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
-                        for (f, desc) in [(ExportFormat::Gif, "Plays everywhere"), (ExportFormat::Mp4, "Smallest, no sound"), (ExportFormat::Webp, "Sharper, newer apps")] {
+                        for (f, desc) in [(ExportFormat::Gif, "Plays anywhere"), (ExportFormat::Mp4, "Smallest file"), (ExportFormat::Webp, "Sharpest")] {
                             let en = !f.needs_ffmpeg() || self.ffmpeg;
                             let on = self.export_fmt == f;
                             let (r, resp) = ui.allocate_exact_size(vec2(w, 52.0), if en { Sense::click() } else { Sense::hover() });
                             ui.painter().rect_filled(r, 5.0, if on { mix(pal.button, pal.highlight, 0.4) } else { pal.button });
                             ui.painter().rect_stroke(r, 5.0, Stroke::new(1.0, if on { pal.highlight } else { pal.border }), egui::StrokeKind::Inside);
                             let col = if en { pal.fg } else { pal.fg_muted };
-                            ui.painter().text(pos2(r.left() + 10.0, r.top() + 17.0), egui::Align2::LEFT_CENTER, f.label(), theme::medium(14.0), col);
-                            ui.painter().text(pos2(r.left() + 10.0, r.top() + 36.0), egui::Align2::LEFT_CENTER, if en { desc } else { "Needs ffmpeg" }, egui::FontId::proportional(11.5), pal.fg_muted);
+                            // kept inside the tile, however narrow it gets
+                            let tp = ui.painter().with_clip_rect(r.shrink(2.0));
+                            tp.text(pos2(r.left() + 10.0, r.top() + 17.0), egui::Align2::LEFT_CENTER, f.label(), theme::medium(14.0), col);
+                            tp.text(pos2(r.left() + 10.0, r.top() + 36.0), egui::Align2::LEFT_CENTER, if en { desc } else { "Needs ffmpeg" }, egui::FontId::proportional(11.5), pal.fg_muted);
                             let resp = if en { resp.on_hover_text(f.tip()) } else { resp.on_hover_text("Needs ffmpeg: Settings ▸ Configure ffmpeg") };
                             if resp.clicked() {
                                 self.export_fmt = f;
@@ -11633,6 +11639,7 @@ impl GifKitApp {
                         });
                     });
                 });
+                ctx.data_mut(|d| d.insert_temp(col_id, col.response.rect.height()));
             });
             ui.add_space(10.0);
             ui.horizontal(|ui| {
