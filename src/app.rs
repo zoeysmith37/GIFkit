@@ -3859,21 +3859,36 @@ static DIALOG_FOCUSED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// focus, for the dialogs' window level.
 fn track_app_focus(ctx: &egui::Context) {
     use std::sync::atomic::Ordering::Relaxed;
-    static AWAY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    use std::sync::Mutex;
+    static AWAY_SINCE: Mutex<Option<f64>> = Mutex::new(None);
+    let now = ctx.input(|i| i.time);
+    // the main window, or any dialog: each dialog's own input says so
     let main = ctx.input(|i| i.viewport().focused) != Some(false);
-    let any = main || DIALOG_FOCUSED.swap(false, Relaxed);
-    // focus passing between our own windows takes a frame or two: only let
-    // go once it's been away for a few
-    let away = if any { 0 } else { AWAY.load(Relaxed).saturating_add(1) };
-    AWAY.store(away, Relaxed);
-    let on = away < 4;
+    // (a pointer over one counts too: some systems are slow to say a new
+    // window has focus)
+    let dialog = DIALOG_FOCUSED.swap(false, Relaxed) || DIALOG_IDS.lock().map(|ids| ids.iter().any(|v| ctx.input_for(*v, |i| i.viewport().focused == Some(true) || i.pointer.has_pointer()))).unwrap_or(false);
+    let any = main || dialog;
+    // focus passing between our own windows (a new dialog still opening, a
+    // big one like Export taking its time) leaves none focused for a moment:
+    // only let go once it's been away for most of a second
+    let Ok(mut since) = AWAY_SINCE.lock() else { return };
+    let on = if any {
+        *since = None;
+        true
+    } else {
+        let t0 = *since.get_or_insert(now);
+        now - t0 < 0.8
+    };
     if APP_FOCUSED.swap(on, Relaxed) != on {
         ctx.request_repaint();
     }
-    if !any && away < 4 {
-        ctx.request_repaint_after(std::time::Duration::from_millis(60));
+    if !any && on {
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 }
+
+/// The dialogs that are windows of their own, for `track_app_focus`.
+static DIALOG_IDS: std::sync::Mutex<Vec<egui::ViewportId>> = std::sync::Mutex::new(Vec::new());
 
 /// `dialog`, optionally kept above other windows.
 #[allow(clippy::too_many_arguments)]
@@ -3911,6 +3926,11 @@ fn dialog_ex(ctx: &egui::Context, id: &str, title: &str, size: Vec2, resizable: 
         return;
     }
     let vid = egui::ViewportId::from_hash_of(("gifkit-dialog", id));
+    if let Ok(mut ids) = DIALOG_IDS.lock() {
+        if !ids.contains(&vid) {
+            ids.push(vid);
+        }
+    }
     let pos_id = egui::Id::unique(("dialog-pos", id));
     let pos = ctx.data_mut(|d| d.get_temp::<Pos2>(pos_id)).or_else(|| {
         let main = ctx.input(|i| i.viewport().outer_rect)?;
