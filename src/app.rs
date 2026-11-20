@@ -3589,6 +3589,13 @@ fn sub_menu(ui: &mut egui::Ui, icon: &str, text: &str, add: impl FnOnce(&mut egu
 
 /// A top-level menu in the menu bar. Alt plus its underlined letter opens it.
 fn top_menu(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+    top_menu_ex(ui, title, true, add);
+}
+
+/// `top_menu`; with `close_on_click` off it stays open while things in it
+/// are clicked (Settings, to try schemes and accents side by side), and shuts
+/// on a click outside it or Esc.
+fn top_menu_ex(ui: &mut egui::Ui, title: &str, close_on_click: bool, add: impl FnOnce(&mut egui::Ui)) {
     let (job, key) = mnemonic(ui, title, p().fg);
     // the popup id egui gives the button's menu, known before the button is added
     let popup = ui.next_auto_id().with("popup");
@@ -3598,7 +3605,11 @@ fn top_menu(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
             ui.ctx().data_mut(|d| d.insert_temp(mnemonics_id(), true));
         }
     }
-    egui::containers::menu::MenuButton::from_button(egui::Button::new(job)).ui(ui, add);
+    let mut b = egui::containers::menu::MenuButton::from_button(egui::Button::new(job));
+    if !close_on_click {
+        b = b.config(egui::containers::menu::MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside));
+    }
+    b.ui(ui, add);
 }
 
 fn mnemonics_id() -> egui::Id {
@@ -3731,7 +3742,8 @@ fn scroll_hints<R>(ui: &egui::Ui, out: &egui::scroll_area::ScrollAreaOutput<R>, 
         return;
     }
     let pal = *p();
-    let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique(("scroll-hints", key)))).with_clip_rect(r);
+    // on the panel's own layer, so windows and menus still cover it
+    let painter = ui.painter().with_clip_rect(r);
     let band = 26.0f32.min(r.height() / 3.0);
     let mut step = 0.0;
     for (top, show) in [(true, above), (false, below)] {
@@ -3793,6 +3805,22 @@ fn row_rename(ui: &mut egui::Ui, r: Rect, buf: &mut String, size: f32) -> egui::
     child.add(egui::TextEdit::singleline(buf).font(font).frame(egui::Frame::NONE).margin(egui::Margin::ZERO).desired_width(inner.width()).min_size(vec2(0.0, text_h)))
 }
 
+/// Without waiting for the screen, frames could come as fast as the card can
+/// draw them: keep to about 120 a second, plenty for any preview.
+fn pace_frames() {
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    const GAP: std::time::Duration = std::time::Duration::from_micros(8_300);
+    let Ok(mut last) = LAST.lock() else { return };
+    if let Some(t) = *last {
+        let since = t.elapsed();
+        if since < GAP {
+            std::thread::sleep(GAP - since);
+        }
+    }
+    *last = Some(std::time::Instant::now());
+}
+
 /// Whether any GIFkit window had focus last frame (its dialogs then stay
 /// above the main window).
 static APP_FOCUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -3821,13 +3849,12 @@ fn track_app_focus(ctx: &egui::Context) {
 
 /// `dialog`, optionally kept above other windows.
 #[allow(clippy::too_many_arguments)]
-/// GIFkit's dialogs as windows of their own on the desktop (Settings), rather
-/// than drawn inside the main window. Off by default: every window of its
-/// own redraws with the main one and waits for the screen, which halves the
-/// frame rate while one is open.
+/// GIFkit's dialogs as windows of their own on the desktop, with the
+/// system's title bars (the default), or drawn inside the main window
+/// (Settings).
 fn separate_dialogs() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| theme::get_setting("separate_dialogs").as_deref() == Some("1"))
+    *ON.get_or_init(|| theme::get_setting("separate_dialogs").as_deref() != Some("0"))
 }
 
 fn dialog_ex(ctx: &egui::Context, id: &str, title: &str, size: Vec2, resizable: bool, on_top: bool, open: &mut bool, mut add: impl FnMut(&mut egui::Ui)) {
@@ -7808,6 +7835,7 @@ impl eframe::App for GifKitApp {
         self.read_ahead(&ctx);
         mark("prerender");
         track_app_focus(&ctx);
+        pace_frames();
         if self.compare != self.compare_saved {
             self.compare_saved = self.compare;
             theme::set_setting("compare", if self.compare { "1" } else { "0" });
@@ -8310,11 +8338,12 @@ impl GifKitApp {
                 }
             });
             }
-            top_menu(ui, "&Settings", |ui| {
+            top_menu_ex(ui, "&Settings", false, |ui| {
                 ui.set_min_width(290.0);
                 if menu_item_tip(ui, "", "Configure &ffmpeg…", "", true, "Where GIFkit finds ffmpeg, for video and AVIF") {
                     self.ff_msg = None;
                     self.ff_open = true;
+                    ui.close();
                 }
                 ui.separator();
                 if menu_check(ui, self.show_toolbar, "Show &Toolbar", "") {
@@ -8402,6 +8431,7 @@ impl GifKitApp {
                     theme::set_setting("sample_preview", if self.sample_preview { "1" } else { "0" });
                 }
                 if menu_item(ui, "document-open", "Open Presets F&older", "", true) {
+                    ui.close();
                     if let Some(dir) = crate::presets::folder() {
                         let _ = std::fs::create_dir_all(&dir);
                         open_in_file_manager(&dir);
@@ -8528,7 +8558,7 @@ impl GifKitApp {
                         self.info("Applies after a restart");
                     }
                 }
-                let sep = theme::get_setting("separate_dialogs").as_deref() == Some("1");
+                let sep = theme::get_setting("separate_dialogs").as_deref() != Some("0");
                 if menu_check(ui, sep, "&Dialogs in Their Own Windows", "") {
                     theme::set_setting("separate_dialogs", if sep { "0" } else { "1" });
                     self.info("Applies after a restart");
@@ -8543,6 +8573,7 @@ impl GifKitApp {
                 }
                 ui.separator();
                 if menu_item(ui, "configure-shortcuts", "&Keyboard Shortcuts", "", true) {
+                    ui.close();
                     self.shortcuts_open = true;
                 }
             });

@@ -137,6 +137,14 @@ fn main() -> eframe::Result {
         // (files, browser pictures) and passes text on to text fields
         clipboard_shortcuts: false,
         renderer,
+        // presenting doesn't wait for the screen: each dialog is a window of
+        // its own, drawn with the main one, and waiting for the screen once per
+        // window cut the frame rate while any was open. The app paces itself
+        // instead (see `pace_frames`).
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            surface: eframe::egui_wgpu::SurfaceConfig { present_mode: eframe::wgpu::PresentMode::AutoNoVsync, desired_maximum_frame_latency: Some(1) },
+            ..Default::default()
+        },
         ..Default::default()
     };
     // the window draws through wgpu (Vulkan, DirectX 12, Metal) so previews can

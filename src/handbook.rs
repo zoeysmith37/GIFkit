@@ -21,7 +21,7 @@ Nothing touches your frames until you export. Every edit is a layer or a frame e
 - Switching changes only what shows. Your work stays as it is
 
 ## Panels
-- Dialogs open inside the main window. Settings can give them windows of their own
+- Dialogs are windows of their own. Settings can put them inside the main window
 - Number fields: drag across them to change, or click and type
 - Sliders aren't fenced in: type past the end and the slider stretches to fit
 - Shift while dragging is finer. Ctrl lands on round numbers
