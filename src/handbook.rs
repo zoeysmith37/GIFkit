@@ -58,7 +58,7 @@ With no layer of a tool's kind picked, changing a setting adds one. With one pic
 ## Layer styles
 @demo styles
 - The fx button beside Blend opens Layer Style, laid out as Photoshop's
-- Bevel and emboss, stroke, inner shadow and glow, satin, colour and gradient overlays, outer glow and drop shadow
+- Effects: bevel, stroke, inner shadow and glow, satin, overlays, outer glow, drop shadow
 - Blending Options has Fill: the layer's own pixels fade, its effects don't
 - Text, shapes, emoji and image layers can all be styled
 - Right-click a layer for Layer Style, or to copy, paste and clear one
@@ -93,8 +93,8 @@ Any colour button opens a picker. Under the number boxes sit your recent colours
 - Blur, glitch, wobbles, styles, frames and more. Colour work lives in Adjust
 - Older projects keep their colour settings under Older colour settings
 - Transparency knocks out a colour. From Corner picks the background for you
-- Only the background keeps that colour inside the subject, like a black shirt or outlines
-- Clean edges makes edge pixels part see-through and takes the colour out of them, so there's no halo
+- Only the background keeps that colour inside the subject, like outlines
+- Clean edges fades edge pixels and takes the colour out of them: no halo
 - Soft edge and Remove colour spill tidy up a green screen
 
 ## Animation
