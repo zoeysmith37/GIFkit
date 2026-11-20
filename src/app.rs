@@ -96,7 +96,7 @@ const SIMPLE_TOOLS: [(Tool, &str); 10] = [
 /// The sections each tool keeps in Simple View, by title (None: all of them).
 fn simple_sections(t: Tool) -> Option<&'static [&'static str]> {
     Some(match t {
-        Tool::Text => &["Text", "Font", "Style", "Placement", "When It Shows"],
+        Tool::Text => &["Text", "Layout", "Font", "Style", "Placement", "When It Shows"],
         Tool::Shapes => &["Shape", "Style", "Placement", "When It Shows"],
         Tool::Emoji => &["Pick", "Placement", "When It Shows"],
         Tool::AddImage => &["Image", "Placement", "When It Shows"],
@@ -2197,7 +2197,6 @@ fn layer_style_ui(ui: &mut egui::Ui, st: &mut crate::layerstyle::LayerStyle) {
                 match page {
                     0 => {
                         slider_row(ui, "Fill", Spin::new(&mut st.fill, 0.0..=100.0).suffix("%").max_decimals(0).default_value(100.0)).on_hover_text("The layer's own pixels. Effects stay at full strength, so 0% leaves just the stroke, glow and so on");
-                        hint(ui, "The layer's Opacity and Blend are in the Layers panel");
                     }
                     1 => {
                         let b = &mut st.bevel;
@@ -3822,8 +3821,40 @@ fn track_app_focus(ctx: &egui::Context) {
 
 /// `dialog`, optionally kept above other windows.
 #[allow(clippy::too_many_arguments)]
+/// GIFkit's dialogs as windows of their own on the desktop (Settings), rather
+/// than drawn inside the main window. Off by default: every window of its
+/// own redraws with the main one and waits for the screen, which halves the
+/// frame rate while one is open.
+fn separate_dialogs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| theme::get_setting("separate_dialogs").as_deref() == Some("1"))
+}
+
 fn dialog_ex(ctx: &egui::Context, id: &str, title: &str, size: Vec2, resizable: bool, on_top: bool, open: &mut bool, mut add: impl FnMut(&mut egui::Ui)) {
     let pal = *p();
+    if !separate_dialogs() {
+        // drawn inside the main window: always above it, and no extra redraw
+        let mut keep = true;
+        let main = ctx.content_rect();
+        let mut w = egui::Window::new(RichText::new(title).font(theme::medium(13.5)).color(pal.fg))
+            .id(egui::Id::unique(("gifkit-dialog", id)))
+            .open(&mut keep)
+            .collapsible(false)
+            .resizable(resizable)
+            .constrain(true)
+            .default_pos(main.center() - size / 2.0 - vec2(0.0, 20.0))
+            .min_width(size.x.min(main.width() - 40.0) - 28.0)
+            .frame(egui::Frame::window(&ctx.global_style()).fill(pal.window).stroke(Stroke::new(1.0, pal.border)).inner_margin(egui::Margin::same(14)));
+        if resizable {
+            w = w.default_size(size);
+        }
+        w.show(ctx, |ui| add(ui));
+        if !keep || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            *open = false;
+        }
+        let _ = on_top;
+        return;
+    }
     let vid = egui::ViewportId::from_hash_of(("gifkit-dialog", id));
     let pos_id = egui::Id::unique(("dialog-pos", id));
     let pos = ctx.data_mut(|d| d.get_temp::<Pos2>(pos_id)).or_else(|| {
@@ -4652,7 +4683,7 @@ impl GifKitApp {
                             o.src = Arc::new(src);
                         }
                         self.modified = true;
-                        self.info("Image replaced. Its place, motion and effects are kept");
+                        self.info("Image replaced");
                     }
                     None => {
                         self.add_overlay(src);
@@ -6544,6 +6575,11 @@ impl GifKitApp {
     // ------------------------------------------------------------ playback
 
     fn advance(&mut self, ctx: &egui::Context) {
+        // the Export window plays its own preview; the main view holds still
+        if self.export_open {
+            self.last_tick = None;
+            return;
+        }
         if !self.playing || self.plan.is_empty() || !self.plan.iter().any(|f| f.enabled) {
             self.last_tick = None;
             // paused: the original waits where the edit is, to start from there
@@ -8374,7 +8410,7 @@ impl GifKitApp {
                 ui.separator();
                 sub_menu(ui, "", "&Colour Scheme", |ui| {
                     // a fixed width: rows sized to what's left would widen it every frame
-                    const W: f32 = 236.0;
+                    const W: f32 = PICK_W;
                     ui.set_width(W);
                     let pal = *p();
                     let pick = theme::scheme_pick();
@@ -8458,14 +8494,31 @@ impl GifKitApp {
                         });
                     }
                     ui.add_space(4.0);
+                    // any colour: the picker opens right here (a popup would shut the menu)
                     let mut c = accent.map(|c| [c[0], c[1], c[2], 255]).unwrap_or([pal.highlight.r(), pal.highlight.g(), pal.highlight.b(), 255]);
-                    ui.horizontal(|ui| {
-                        ui.add_space(8.0);
-                        if colour_edit(ui, &mut c, false).changed() {
-                            theme::set_scheme(ctx, &pick, Some([c[0], c[1], c[2]]));
-                        }
-                        ui.label("Other accent");
-                    });
+                    let open_id = egui::Id::unique("accent-picker-open");
+                    let mut picker = ui.ctx().data_mut(|d| *d.get_temp_mut_or(open_id, false));
+                    let (r, resp) = ui.allocate_exact_size(vec2(W, 30.0), Sense::click());
+                    if resp.hovered() {
+                        ui.painter().rect_filled(r, 4.0, mix(pal.window, pal.highlight, 0.25));
+                    }
+                    let sw = Rect::from_center_size(pos2(r.left() + 20.0, r.center().y), vec2(24.0, 18.0));
+                    ui.painter().rect(sw, 3.0, Color32::from_rgb(c[0], c[1], c[2]), Stroke::new(1.0, mix(pal.fg, pal.window, 0.5)), egui::StrokeKind::Outside);
+                    ui.painter().text(pos2(r.left() + 42.0, r.center().y), egui::Align2::LEFT_CENTER, "Other accent", egui::FontId::proportional(13.0), pal.fg);
+                    crate::icons::paint(ui.painter(), if picker { "go-up" } else { "go-down" }, pos2(r.right() - 14.0, r.center().y), 14.0, pal.fg_muted);
+                    if resp.clicked() {
+                        picker = !picker;
+                        ui.ctx().data_mut(|d| d.insert_temp(open_id, picker));
+                    }
+                    if picker {
+                        ui.add_space(4.0);
+                        ui.scope(|ui| {
+                            ui.set_width(W);
+                            if colour_picker_body(ui, open_id, &mut c, false) {
+                                theme::set_scheme(ctx, &pick, Some([c[0], c[1], c[2]]));
+                            }
+                        });
+                    }
                     ui.add_space(2.0);
                 });
                 if cfg!(all(unix, not(target_os = "macos"))) {
@@ -8474,6 +8527,11 @@ impl GifKitApp {
                         theme::set_setting("wayland", if native { "xwayland" } else { "native" });
                         self.info("Applies after a restart");
                     }
+                }
+                let sep = theme::get_setting("separate_dialogs").as_deref() == Some("1");
+                if menu_check(ui, sep, "&Dialogs in Their Own Windows", "") {
+                    theme::set_setting("separate_dialogs", if sep { "0" } else { "1" });
+                    self.info("Applies after a restart");
                 }
                 let wn = theme::get_setting("whats_new").as_deref() != Some("0");
                 if menu_check(ui, wn, "Show &What's New After Updates", "") {
@@ -8890,7 +8948,7 @@ impl GifKitApp {
     fn open_tool(&mut self, t: Tool) {
         // Simple View's tools only: the rest say where they are
         if self.simple && !t.simple() {
-            self.info(format!("{} is in Full View. View ▸ Simple View switches back", t.label()));
+            self.info(format!("{} is in Full View", t.label()));
             return;
         }
         if t == Tool::Presets && self.tool != Tool::Presets {
@@ -9169,7 +9227,7 @@ impl GifKitApp {
             } else if let Some(s) = &self.status {
                 ui.label(RichText::new(&s.text).size(12.5).color(if s.error { pal.negative } else { pal.fg_muted }));
             } else if self.simple {
-                ui.label(RichText::new("Simple View. The timeline, masks, layer styles and the rest are in Full View.").size(12.5).color(pal.fg_muted));
+                ui.label(RichText::new("Simple View").size(12.5).color(pal.fg_muted)).on_hover_text("The timeline, masks, layer styles and the rest are in Full View");
                 if ui.link(RichText::new("Switch to Full View").size(12.5)).clicked() {
                     full_view = true;
                 }
@@ -9532,7 +9590,7 @@ impl GifKitApp {
         ui.add_space(12.0);
         ui.label(RichText::new(format!("{} is part of Full View", self.tool.label())).color(pal.fg).size(14.0));
         ui.add_space(4.0);
-        hint(ui, "This layer still shows and plays as it was made. Its settings are in Full View.");
+        hint(ui, "It still shows as it was. Edit it in Full View");
         ui.add_space(10.0);
         if wide_button(ui, egui::Button::new("Switch to Full View").stroke(Stroke::new(1.0, pal.highlight))).clicked() {
             self.set_simple(false);
@@ -9591,7 +9649,7 @@ impl GifKitApp {
             ui.add_space(6.0);
             ui.label(RichText::new("How much do you want to see?").font(theme::medium(19.0)).color(pal.fg));
             ui.add_space(2.0);
-            hint(ui, "You can change this any time with the Simple View switch at the top right. Nothing you make is lost either way.");
+            hint(ui, "Change it any time with the switch at the top right");
             ui.add_space(12.0);
             let w = ((ui.available_width() - 12.0) / 2.0).floor();
             ui.horizontal_top(|ui| {
@@ -9618,7 +9676,6 @@ impl GifKitApp {
             });
             ui.add_space(14.0);
             ui.horizontal(|ui| {
-                hint(ui, "Asked once, on first launch");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.add(egui::Button::new("Start").stroke(Stroke::new(1.0, pal.highlight)).min_size(vec2(96.0, CHIP_H))).clicked() {
                         pick = Some(simple);
@@ -10642,16 +10699,9 @@ impl GifKitApp {
                 }
             }
             if n == 0 {
-                // the words only where there's room; the buttons always
-                let roomy = list_h > 150.0;
-                ui.add_space(if roomy { 8.0 } else { 4.0 });
-                if roomy {
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("Nothing added yet").color(pal.fg).size(14.0));
-                        ui.add(egui::Label::new(RichText::new("Start with one of these, or pick any tool from the list").color(pal.fg_muted).size(12.0)).wrap());
-                    });
-                    ui.add_space(8.0);
-                }
+                // always laid out the same: the buttons first, a line under
+                // them that the list cuts off when it's short
+                ui.add_space(8.0);
                 let w = ui.available_width() - 16.0;
                 let gap = 6.0;
                 let bw = ((w - gap * 2.0) / 3.0).floor();
@@ -10670,9 +10720,14 @@ impl GifKitApp {
                         }
                     }
                 });
+                ui.add_space(6.0);
+                ui.vertical_centered(|ui| hint(ui, "Or pick any tool from the list"));
             }
         });
-        scroll_hints(ui, &list_out, pal.view, "layers");
+        // the empty list's start buttons fit; no arrows for its last line
+        if n > 0 {
+            scroll_hints(ui, &list_out, pal.view, "layers");
+        }
         match quick_add {
             Some(0) => {
                 self.open_tool(Tool::Text);
@@ -11621,7 +11676,7 @@ impl GifKitApp {
                         _ if searching => ("view-refresh", "Finding the best quality that fits…".to_string(), pal.fg_muted),
                         Some((n, text)) => match limit {
                             Some(l) if n <= l => ("dialog-ok-apply", format!("{text}, fits {site}"), pal.positive),
-                            Some(_) => ("dialog-warning", format!("{text}, too big for {site}. Try MP4 or Cut it shorter"), pal.neutral),
+                            Some(_) => ("dialog-warning", format!("{text}, too big for {site}"), pal.neutral),
                             None => ("dialog-ok-apply", text, pal.positive),
                         },
                         None if self.preview_format().is_none() => ("help-about", "Size shown after saving".to_string(), pal.fg_muted),
@@ -11677,7 +11732,12 @@ impl GifKitApp {
         let (tex, size) = if fresh {
             let (i, size) = {
                 let c = self.cmp.as_ref().unwrap();
-                (c.frame_for(self.cur, self.play_time(), &self.plan), vec2(c.full.0 as f32, c.full.1 as f32))
+                // its own clock: the file plays on while the main view waits
+                let dur = c.anim.duration_secs().max(0.01) as f64;
+                let t = (ui.input(|i| i.time) % dur) as f32 + c.span.0;
+                let i = if c.sample.is_some() { c.frame_for(self.cur, self.play_time(), &self.plan) } else { c.frame_for(self.cur, t, &self.plan) };
+                ctx.request_repaint_after(std::time::Duration::from_millis(20));
+                (i, vec2(c.full.0 as f32, c.full.1 as f32))
             };
             (self.cmp_texture(ctx, i).map(Tex::from), size)
         } else {
@@ -16008,7 +16068,7 @@ impl GifKitApp {
                 });
             }
             group(ui, "Mask", |ui| {
-                check(ui, &mut mk.invert, "Invert: show outside the shapes").on_hover_text("Cuts holes instead");
+                check(ui, &mut mk.invert, "Invert").on_hover_text("Show outside the shapes instead").on_hover_text("Cuts holes instead");
                 let mut off = !mk.on;
                 if check(ui, &mut off, "Turn the mask off").changed() {
                     mk.on = !off;
@@ -16710,7 +16770,7 @@ impl GifKitApp {
         if ui.add_enabled_ui(skipped > 0, |ui| ui.add_sized(vec2(ui.available_width(), CHIP_H), b)).inner.clicked() {
             let keep: Vec<bool> = self.base.as_ref().map(|a| a.frames.iter().map(|f| f.enabled).collect()).unwrap_or_default();
             self.drop_base_frames(&keep, "Remove skipped");
-            self.info("✔ Skipped frames deleted. The timeline moved up to match");
+            self.info("Skipped frames deleted");
         }
     }
 }

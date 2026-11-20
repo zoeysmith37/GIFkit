@@ -628,6 +628,8 @@ pub fn install(ctx: &egui::Context) {
         s.spacing.interact_size = Vec2::new(72.0, 30.0);
         s.spacing.slider_width = 150.0;
         s.spacing.slider_rail_height = 4.0;
+        // scroll bars take their own room beside the content, never over it
+        s.spacing.scroll = egui::style::ScrollStyle { bar_width: 8.0, bar_inner_margin: 2.0, bar_outer_margin: 0.0, ..egui::style::ScrollStyle::solid() };
         s.spacing.menu_margin = egui::Margin::same(4);
         s.spacing.combo_width = 120.0;
         s.spacing.icon_width = 16.0;

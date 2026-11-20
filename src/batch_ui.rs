@@ -282,9 +282,9 @@ impl GifKitApp {
             Some(side) => {
                 let dims = self.dims();
                 fit_side(&mut self.stack.transform, dims, side);
-                self.info(format!("{}: {lim} and {side} px. Press Find Settings.", pf.name));
+                self.info(format!("{}: {lim}, {side} px", pf.name));
             }
-            None => self.info(format!("{}: {lim}. Press Find Settings.", pf.name)),
+            None => self.info(format!("{}: {lim}", pf.name)),
         }
     }
 

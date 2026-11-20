@@ -17,9 +17,11 @@ Nothing touches your frames until you export. Every edit is a layer or a frame e
 - No timeline: each layer has When It Shows, in seconds, with Fade in and Fade out
 - Export asks where it's going and finds the best quality that fits
 - More settings in Export opens the full window
+- Export holds the main view still while its preview plays
 - Switching changes only what shows. Your work stays as it is
 
 ## Panels
+- Dialogs open inside the main window. Settings can give them windows of their own
 - Number fields: drag across them to change, or click and type
 - Sliders aren't fenced in: type past the end and the slider stretches to fit
 - Shift while dragging is finer. Ctrl lands on round numbers

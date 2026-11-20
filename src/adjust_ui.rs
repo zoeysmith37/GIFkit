@@ -875,7 +875,7 @@ fn adjust_editor(ui: &mut egui::Ui, adj: &mut Adjust, id: egui::Id, hist: Option
             }
         }
         Adjust::Invert(_) => {
-            hint(ui, "Every colour turned to its opposite. Nothing to set");
+            hint(ui, "Nothing to set");
         }
         Adjust::Posterize(pz) => {
             form_row(ui, "Levels", |ui| fill_slider(ui, Spin::new(&mut pz.levels, 2..=32).clamping(egui::SliderClamping::Never))).on_hover_text("Steps of each colour. Type more for up to 255");
