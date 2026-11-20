@@ -380,18 +380,6 @@ impl GifKitApp {
         if pick.is_some() {
             ui.ctx().request_repaint();
         }
-        // how the whole layer meets what's under it (the Layers panel has it too)
-        if let Some(li) = sel {
-            let items: Vec<(adjust::Blend, &str)> = adjust::Blend::ALL.iter().map(|b| (*b, b.label())).collect();
-            let mut mode = self.stack.layers[li].blend;
-            form_row(ui, "Blend", |ui| combo(ui, "adj-blend", &mut mode, &items))
-                .on_hover_text("Luminosity: tones change but colours don't shift. Color: colours change, tones stay. Opacity is in the Layers panel");
-            if mode != self.stack.layers[li].blend {
-                self.stack.layers[li].blend = mode;
-                self.modified = true;
-            }
-            ui.add_space(4.0);
-        }
         let hist = self.adjust_histogram();
         let Some(li) = sel else {
             if let Some(k) = pick {

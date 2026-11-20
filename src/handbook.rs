@@ -73,9 +73,12 @@ With no layer of a tool's kind picked, changing a setting adds one. With one pic
 - Mask shows it only inside shapes you draw
 - Masking the GIF hides it outside the mask. Layers on top stay put
 - In the Mask tool, Draw lets you draw a shape by hand. Esc stops
+- Right-click a layer or group for Colour, a label the timeline shares
 
 ## Colours
 Any colour button opens a picker. Under the number boxes sit your recent colours, and below those the main colours in the frame on screen. Handy.
+
+Settings, Colour Scheme picks GIFkit's own colours: KDE's Breeze Light, Breeze Dark, Breeze Classic or Oxygen, and an accent. Follow System goes back to your desktop's.
 
 ## Image layers
 - Replace Image swaps the picture and keeps the rest: place, size, motion and effects

@@ -176,3 +176,46 @@ pub fn paint(painter: &egui::Painter, name: &str, c: egui::Pos2, size: f32, col:
         painter.image(t.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// Every icon named in the code is one we ship, so none paints as a blank.
+    #[test]
+    fn named_icons_exist() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        let mut missing = Vec::new();
+        for e in std::fs::read_dir(dir).unwrap() {
+            let path = e.unwrap().path();
+            if path.extension().is_none_or(|x| x != "rs") || path.ends_with("icons.rs") || path.ends_with("theme.rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap();
+            for call in ["icons::paint(", "icon_tool(", "menu_item(", "icon_btn(", "icons::image("] {
+                for (at, _) in src.match_indices(call) {
+                    // the first string literal in the call names the icon
+                    let rest = &src[at + call.len()..];
+                    let Some(q) = rest.find('"') else { continue };
+                    if rest[..q].contains(')') || rest[..q].contains(';') {
+                        continue;
+                    }
+                    let name = &rest[q + 1..];
+                    let name = &name[..name.find('"').unwrap_or(0)];
+                    if !name.is_empty() && !super::ICONS.iter().any(|(n, _, _)| *n == name) {
+                        missing.push(format!("{}: {name}", path.file_name().unwrap().to_string_lossy()));
+                    }
+                }
+            }
+            // icon names leading tuples of (icon, label, …)
+            for (at, _) in src.match_indices("(\"") {
+                let rest = &src[at + 2..];
+                let Some(end) = rest.find('"') else { continue };
+                let name = &rest[..end];
+                let tuple = rest[end..].starts_with("\", \"");
+                if tuple && name.contains('-') && name.chars().all(|c| c.is_ascii_lowercase() || c == '-') && !super::ICONS.iter().any(|(n, _, _)| *n == name) {
+                    missing.push(format!("{} (tuple): {name}", path.file_name().unwrap().to_string_lossy()));
+                }
+            }
+        }
+        assert!(missing.is_empty(), "icons that don't exist: {missing:?}");
+    }
+}

@@ -99,9 +99,63 @@ fn palettes() -> &'static (Palette, Palette) {
     }
 }
 
+/// KDE's own colour schemes, in kdeglobals form, for picking by hand on
+/// any system: (key, name, the scheme).
+pub const SCHEMES: [(&str, &str, &str); 4] = [
+    ("breeze-light", "Breeze Light", "[Colors:Window]\nBackgroundNormal=239,240,241\nForegroundNormal=35,38,41\nForegroundInactive=112,125,138\nForegroundNegative=218,68,83\nForegroundNeutral=246,116,0\nForegroundPositive=39,174,96\n[Colors:View]\nBackgroundNormal=255,255,255\nBackgroundAlternate=247,247,247\n[Colors:Button]\nBackgroundNormal=252,252,252\n[Colors:Header]\nBackgroundNormal=222,224,226\n[Colors:Header][Inactive]\nBackgroundNormal=239,240,241\n[Colors:Selection]\nBackgroundNormal=61,174,233\n"),
+    ("breeze-dark", "Breeze Dark", "[Colors:Window]\nBackgroundNormal=32,35,38\nForegroundNormal=252,252,252\nForegroundInactive=161,169,177\nForegroundNegative=218,68,83\nForegroundNeutral=246,116,0\nForegroundPositive=39,174,96\n[Colors:View]\nBackgroundNormal=20,22,24\nBackgroundAlternate=29,31,34\n[Colors:Button]\nBackgroundNormal=41,44,48\n[Colors:Header]\nBackgroundNormal=41,44,48\n[Colors:Header][Inactive]\nBackgroundNormal=32,35,38\n[Colors:Selection]\nBackgroundNormal=61,174,233\n"),
+    ("breeze-classic", "Breeze Classic", "[Colors:Window]\nBackgroundNormal=239,240,241\nForegroundNormal=35,38,41\nForegroundInactive=127,140,141\nForegroundNegative=218,68,83\nForegroundNeutral=246,116,0\nForegroundPositive=39,174,96\n[Colors:View]\nBackgroundNormal=252,252,252\nBackgroundAlternate=239,240,241\n[Colors:Button]\nBackgroundNormal=239,240,241\n[Colors:Header]\nBackgroundNormal=239,240,241\n[Colors:Selection]\nBackgroundNormal=61,174,233\n"),
+    ("oxygen", "Oxygen", "[Colors:Window]\nBackgroundNormal=224,223,222\nForegroundNormal=20,19,18\nForegroundInactive=136,135,134\nForegroundNegative=191,3,3\nForegroundNeutral=176,128,0\nForegroundPositive=0,110,40\n[Colors:View]\nBackgroundNormal=255,255,255\nBackgroundAlternate=248,247,246\n[Colors:Button]\nBackgroundNormal=232,231,230\n[Colors:Header]\nBackgroundNormal=224,223,222\n[Colors:Selection]\nBackgroundNormal=67,172,232\n"),
+];
+
+/// Accent colours to pick from, as Plasma offers: (name, colour).
+pub const ACCENTS: [(&str, [u8; 3]); 9] = [
+    ("Blue", [61, 174, 233]),
+    ("Purple", [155, 89, 182]),
+    ("Pink", [233, 30, 99]),
+    ("Red", [218, 68, 83]),
+    ("Orange", [246, 116, 0]),
+    ("Yellow", [253, 188, 75]),
+    ("Green", [39, 174, 96]),
+    ("Teal", [26, 188, 156]),
+    ("Grey", [127, 140, 141]),
+];
+
+/// The colour scheme picked in GIFkit ("" = follow the system).
+pub fn scheme_pick() -> String {
+    get_setting("ui_scheme").filter(|k| SCHEMES.iter().any(|s| s.0 == k)).unwrap_or_default()
+}
+
+/// The accent picked in GIFkit (None = the scheme's or the system's).
+pub fn accent_pick() -> Option<[u8; 3]> {
+    let c = parse_kde_color(&get_setting("ui_accent")?)?;
+    Some([c.r(), c.g(), c.b()])
+}
+
+/// Use a colour scheme ("" follows the system) and accent; shows at once.
+pub fn set_scheme(ctx: &egui::Context, scheme: &str, accent: Option<[u8; 3]>) {
+    set_setting("ui_scheme", scheme);
+    set_setting("ui_accent", &accent.map(|c| format!("{},{},{}", c[0], c[1], c[2])).unwrap_or_default());
+    DIRTY.store(true, Ordering::Release);
+    ctx.request_repaint();
+}
+
+/// A scheme's own window, view and selection colours, for its menu swatch.
+pub fn scheme_swatch(key: &str) -> Option<[Color32; 3]> {
+    let (_, _, text) = SCHEMES.iter().find(|s| s.0 == key)?;
+    let (p, _) = parse_kdeglobals(text).scheme?;
+    Some([p.window, p.view, p.highlight])
+}
+
 fn build_palettes() -> (Palette, Palette) {
-    let kde = read_kde();
-    let accent = accent_override().unwrap_or(kde.accent);
+    // a scheme picked in GIFkit wins over the desktop's
+    let pick = scheme_pick();
+    let kde = match SCHEMES.iter().find(|s| s.0 == pick) {
+        Some((_, _, text)) => parse_kdeglobals(text),
+        None => read_kde(),
+    };
+    let picked_accent = accent_pick().map(|c| Some(Color32::from_rgb(c[0], c[1], c[2])));
+    let accent = accent_override().or(picked_accent).unwrap_or(kde.accent);
     let scheme = kde.scheme.map(|(pal, dark)| (accent.map(|a| with_accent(pal, a, dark)).unwrap_or(pal), dark));
     SCHEME.store(match scheme { Some((_, true)) => 1, Some((_, false)) => 2, None => 0 }, Ordering::Relaxed);
     let (mut d, mut l) = match accent {

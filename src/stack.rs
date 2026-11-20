@@ -624,6 +624,8 @@ pub struct Group {
     pub blend: crate::adjust::Blend,
     /// %, the whole group's
     pub opacity: f32,
+    /// its label colour in the Layers panel, as Photoshop's
+    pub color: Option<[u8; 3]>,
 }
 
 impl Group {
@@ -636,7 +638,7 @@ impl Group {
 
 impl Default for Group {
     fn default() -> Self {
-        Group { id: 0, name: "Group".into(), visible: true, locked: false, open: true, pass_through: true, blend: Default::default(), opacity: 100.0 }
+        Group { id: 0, name: "Group".into(), visible: true, locked: false, open: true, pass_through: true, blend: Default::default(), opacity: 100.0, color: None }
     }
 }
 

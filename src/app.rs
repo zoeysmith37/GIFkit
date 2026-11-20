@@ -1864,6 +1864,9 @@ enum LayerAct {
     Ungroup(u64),
     DeleteGroup(u64),
     RenameGroup(u64),
+    /// a label colour for the layer (and the others picked with it)
+    Colour(usize, Option<[u8; 3]>),
+    GroupColour(u64, Option<[u8; 3]>),
     CollapseTo(usize),
     CollapseAll,
     CollapseEdits,
@@ -3581,6 +3584,106 @@ fn dialog(ctx: &egui::Context, id: &str, title: &str, size: Vec2, resizable: boo
     dialog_ex(ctx, id, title, size, resizable, false, open, add)
 }
 
+/// Label colours: Breeze's palette, as the timeline and Layers panel use.
+const LABEL_SWATCHES: [[u8; 3]; 12] = [
+    [61, 174, 233],
+    [29, 153, 243],
+    [26, 188, 156],
+    [39, 174, 96],
+    [241, 196, 15],
+    [253, 188, 75],
+    [246, 116, 0],
+    [218, 68, 83],
+    [233, 30, 99],
+    [155, 89, 182],
+    [142, 68, 173],
+    [127, 140, 141],
+];
+
+/// A "Colour" submenu of label colours. Gives the pick: a colour, or None
+/// for no colour.
+fn colour_label_menu(ui: &mut egui::Ui, cur: Option<[u8; 3]>) -> Option<Option<[u8; 3]>> {
+    let mut pick = None;
+    sub_menu(ui, "format-fill-color", "C&olour", |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.set_max_width(6.0 * 28.0);
+            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+            for c in LABEL_SWATCHES {
+                let col = Color32::from_rgb(c[0], c[1], c[2]);
+                let (r, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
+                let on = cur == Some(c);
+                ui.painter().rect(r.shrink(2.0), 3.0, col, Stroke::new(if on || resp.hovered() { 2.0 } else { 1.0 }, if on { p().fg } else { mix(col, Color32::BLACK, 0.3) }), egui::StrokeKind::Inside);
+                if resp.clicked() {
+                    pick = Some(Some(c));
+                    ui.close();
+                }
+            }
+        });
+        ui.separator();
+        let mut c = cur.unwrap_or([61, 174, 233]);
+        ui.horizontal(|ui| {
+            if colour_btn(ui, &mut c).changed() {
+                pick = Some(Some(c));
+            }
+            ui.label("Other colour");
+        });
+        if menu_item(ui, "edit-clear-all", "&No Colour", "", cur.is_some()) {
+            pick = Some(None);
+        }
+    });
+    pick
+}
+
+/// A label colour's mark on a Layers row: the eye's column tinted, as
+/// Photoshop does it.
+fn paint_label(painter: &egui::Painter, r: Rect, c: [u8; 3]) {
+    let pal = *p();
+    let col = Color32::from_rgb(c[0], c[1], c[2]);
+    let cell = Rect::from_min_max(pos2(r.left() + 2.0, r.top() + 1.0), pos2(r.left() + 30.0, r.bottom() - 1.0));
+    painter.rect_filled(cell, egui::CornerRadius { nw: 3, sw: 3, ne: 0, se: 0 }, mix(pal.view, col, 0.55));
+}
+
+/// A name field drawn over a list row, exactly the size of `r`: it never
+/// grows the row or spills over the buttons beside it.
+fn row_rename(ui: &mut egui::Ui, r: Rect, buf: &mut String, size: f32) -> egui::Response {
+    let pal = *p();
+    ui.painter().rect_filled(r, 3.0, pal.view);
+    ui.painter().rect_stroke(r, 3.0, Stroke::new(1.0, pal.highlight), egui::StrokeKind::Inside);
+    let font = egui::FontId::proportional(size);
+    let text_h = ui.fonts_mut(|f| f.row_height(&font));
+    // just the text's height, centred in the row
+    let inner = Rect::from_min_max(pos2(r.left() + 5.0, r.center().y - text_h / 2.0), pos2(r.right() - 4.0, r.center().y + text_h / 2.0));
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    child.set_clip_rect(r.intersect(ui.clip_rect()));
+    child.add(egui::TextEdit::singleline(buf).font(font).frame(egui::Frame::NONE).margin(egui::Margin::ZERO).desired_width(inner.width()).min_size(vec2(0.0, text_h)))
+}
+
+/// Whether any GIFkit window had focus last frame (its dialogs then stay
+/// above the main window).
+static APP_FOCUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// A dialog had focus this frame.
+static DIALOG_FOCUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Called once a frame from the main window: works out whether GIFkit has
+/// focus, for the dialogs' window level.
+fn track_app_focus(ctx: &egui::Context) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static AWAY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let main = ctx.input(|i| i.viewport().focused) != Some(false);
+    let any = main || DIALOG_FOCUSED.swap(false, Relaxed);
+    // focus passing between our own windows takes a frame or two: only let
+    // go once it's been away for a few
+    let away = if any { 0 } else { AWAY.load(Relaxed).saturating_add(1) };
+    AWAY.store(away, Relaxed);
+    let on = away < 4;
+    if APP_FOCUSED.swap(on, Relaxed) != on {
+        ctx.request_repaint();
+    }
+    if !any && away < 4 {
+        ctx.request_repaint_after(std::time::Duration::from_millis(60));
+    }
+}
+
 /// `dialog`, optionally kept above other windows.
 #[allow(clippy::too_many_arguments)]
 fn dialog_ex(ctx: &egui::Context, id: &str, title: &str, size: Vec2, resizable: bool, on_top: bool, open: &mut bool, mut add: impl FnMut(&mut egui::Ui)) {
@@ -3597,13 +3700,20 @@ fn dialog_ex(ctx: &egui::Context, id: &str, title: &str, size: Vec2, resizable: 
     if !resizable {
         b = b.with_maximize_button(false);
     }
-    if on_top {
+    // GIFkit's own windows always sit above the main one: kept on top while
+    // any GIFkit window has focus, and let go when you switch to another app
+    if on_top || APP_FOCUSED.load(std::sync::atomic::Ordering::Relaxed) {
         b = b.with_window_level(egui::WindowLevel::AlwaysOnTop);
+    } else {
+        b = b.with_window_level(egui::WindowLevel::Normal);
     }
     if let Some(pos) = pos {
         b = b.with_position(pos);
     }
     let close = ctx.show_viewport_immediate(vid, b, |ui, class| {
+        if ui.ctx().input(|i| i.viewport().focused) == Some(true) {
+            DIALOG_FOCUSED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         if class == egui::ViewportClass::EmbeddedWindow {
             add(ui);
         } else {
@@ -7503,6 +7613,7 @@ impl eframe::App for GifKitApp {
         self.manage_prerender(&ctx, now);
         self.read_ahead(&ctx);
         mark("prerender");
+        track_app_focus(&ctx);
         if self.compare != self.compare_saved {
             self.compare_saved = self.compare;
             theme::set_setting("compare", if self.compare { "1" } else { "0" });
@@ -8074,12 +8185,71 @@ impl GifKitApp {
                 }
                 ui.separator();
                 sub_menu(ui, "", "&Colour Scheme", |ui| {
-                    ui.set_min_width(160.0);
-                    for (t, l) in [(ThemeChoice::System, "&Follow System"), (ThemeChoice::Dark, "&Dark"), (ThemeChoice::Light, "&Light")] {
-                        if menu_check(ui, self.theme == t, l, "") {
-                            self.theme = t;
+                    ui.set_min_width(220.0);
+                    let pick = theme::scheme_pick();
+                    let accent = theme::accent_pick();
+                    // the system's own: KDE's on Plasma, light or dark elsewhere
+                    let follow = if cfg!(all(unix, not(target_os = "macos"))) { "&Follow System (KDE)" } else { "&Follow System" };
+                    if menu_check(ui, pick.is_empty() && self.theme == ThemeChoice::System, follow, "") {
+                        self.theme = ThemeChoice::System;
+                        theme::set_scheme(ctx, "", accent);
+                    }
+                    if pick.is_empty() {
+                        for (t, l) in [(ThemeChoice::Dark, "    Always &Dark"), (ThemeChoice::Light, "    Always &Light")] {
+                            if menu_check(ui, self.theme == t, l, "") {
+                                self.theme = t;
+                            }
                         }
                     }
+                    ui.separator();
+                    // KDE's own schemes, on any system
+                    for (key, name, _) in theme::SCHEMES {
+                        let on = pick == key;
+                        let r = ui.add(egui::Button::selectable(on, format!("      {name}")).min_size(vec2(ui.available_width(), 26.0)));
+                        if let Some(sw) = theme::scheme_swatch(key) {
+                            for (i, c) in sw.iter().enumerate() {
+                                let cell = Rect::from_center_size(pos2(r.rect.left() + 10.0 + i as f32 * 7.0, r.rect.center().y), vec2(8.0, 14.0));
+                                ui.painter().rect_filled(cell, 1.5, *c);
+                            }
+                            ui.painter().rect_stroke(Rect::from_min_max(pos2(r.rect.left() + 6.0, r.rect.center().y - 7.0), pos2(r.rect.left() + 28.0, r.rect.center().y + 7.0)), 2.0, Stroke::new(1.0, mix(p().fg, p().window, 0.6)), egui::StrokeKind::Outside);
+                        }
+                        if r.clicked() {
+                            self.theme = ThemeChoice::System;
+                            theme::set_scheme(ctx, key, accent);
+                        }
+                    }
+                    ui.separator();
+                    ui.label(RichText::new("Accent").color(p().fg_muted).size(12.0));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.set_max_width(220.0);
+                        ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                        // the scheme's (or the desktop's) own accent
+                        let (r, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
+                        let own = accent.is_none();
+                        ui.painter().circle_stroke(r.center(), 8.0, Stroke::new(if own { 2.5 } else { 1.0 }, p().fg));
+                        ui.painter().line_segment([r.center() + vec2(-5.0, 5.0), r.center() + vec2(5.0, -5.0)], Stroke::new(1.0, p().fg_muted));
+                        if resp.on_hover_text("The scheme's own accent").clicked() {
+                            theme::set_scheme(ctx, &pick, None);
+                        }
+                        for (name, c) in theme::ACCENTS {
+                            let (r, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
+                            let on = accent == Some(c);
+                            ui.painter().circle_filled(r.center(), 8.0, Color32::from_rgb(c[0], c[1], c[2]));
+                            if on || resp.hovered() {
+                                ui.painter().circle_stroke(r.center(), 10.0, Stroke::new(2.0, p().fg));
+                            }
+                            if resp.on_hover_text(name).clicked() {
+                                theme::set_scheme(ctx, &pick, Some(c));
+                            }
+                        }
+                    });
+                    let mut c = accent.map(|c| [c[0], c[1], c[2], 255]).unwrap_or([p().highlight.r(), p().highlight.g(), p().highlight.b(), 255]);
+                    ui.horizontal(|ui| {
+                        if colour_edit(ui, &mut c, false).changed() {
+                            theme::set_scheme(ctx, &pick, Some([c[0], c[1], c[2]]));
+                        }
+                        ui.label("Other accent");
+                    });
                 });
                 if cfg!(all(unix, not(target_os = "macos"))) {
                     let native = theme::get_setting("wayland").as_deref() == Some("native");
@@ -8344,6 +8514,9 @@ impl GifKitApp {
         } else {
             painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 3.0, mix(pal.view, pal.window, 0.5));
         }
+        if let Some(c) = g.color {
+            paint_label(&painter, r, c);
+        }
         painter.hline(r.x_range().shrink(4.0), r.bottom(), Stroke::new(1.0, mix(pal.view, pal.border, 0.5)));
         let col = if g.visible { pal.fg } else { pal.fg_muted };
         let eye_r = Rect::from_center_size(pos2(r.left() + 16.0, r.center().y), vec2(22.0, 22.0));
@@ -8358,7 +8531,7 @@ impl GifKitApp {
         let name_w = (r.right() - 60.0 - name_x).max(10.0);
         if renaming {
             if let Some((_, buf)) = &mut self.group_renaming {
-                let te = ui.put(Rect::from_min_size(pos2(name_x - 4.0, r.top() + 4.0), vec2(name_w + 4.0, r.height() - 8.0)), egui::TextEdit::singleline(buf).font(egui::FontId::proportional(13.0)).margin(vec2(4.0, 2.0)));
+                let te = row_rename(ui, Rect::from_min_size(pos2(name_x - 4.0, r.top() + 3.0), vec2(name_w + 4.0, r.height() - 6.0)), buf, 13.0);
                 if self.rename_fresh {
                     te.request_focus();
                     self.rename_fresh = false;
@@ -8439,6 +8612,10 @@ impl GifKitApp {
                     gm.visible = !gm.visible;
                 }
                 self.stack.tidy_groups();
+            }
+            let cur = self.stack.groups.iter().find(|g| g.id == gid).and_then(|g| g.color);
+            if let Some(c) = colour_label_menu(ui, cur) {
+                *menu_act = Some(LayerAct::GroupColour(gid, c));
             }
             ui.separator();
             if menu_item(ui, "object-ungroup", "&Ungroup", &self.keymap.text(crate::keys::Action::Ungroup), true) {
@@ -9277,7 +9454,7 @@ impl GifKitApp {
                 let name_r = Rect::from_min_size(pos2(name_x - 4.0, r.top() + 2.0), vec2((r.right() - 30.0 - name_x).max(40.0), row_h - 4.0));
                 let mut done: Option<Option<String>> = None;
                 if let Some((_, _, buf)) = &mut self.mask_renaming {
-                    let te = ui.put(name_r, egui::TextEdit::singleline(buf).font(egui::FontId::proportional(12.5)).margin(vec2(4.0, 1.0)));
+                    let te = row_rename(ui, name_r, buf, 12.5);
                     if self.rename_fresh {
                         te.request_focus();
                         self.rename_fresh = false;
@@ -9640,6 +9817,10 @@ impl GifKitApp {
                 } else if resp.hovered() {
                     painter.rect_filled(r.shrink2(vec2(2.0, 1.0)), 3.0, mix(pal.view, pal.highlight, 0.18));
                 }
+                let label = self.stack.layers[li].color.or_else(|| gid.and_then(|g| self.stack.groups.iter().find(|x| x.id == g)).and_then(|g| g.color));
+                if let Some(c) = label {
+                    paint_label(&painter, r, c);
+                }
                 let pal = if selected { theme::Palette { fg: Color32::WHITE, fg_muted: mix(Color32::WHITE, pal.highlight, 0.35), ..pal } } else { pal };
                 painter.hline(r.x_range().shrink(4.0), r.bottom(), Stroke::new(1.0, mix(pal.view, pal.border, 0.5)));
                 // eye
@@ -9705,8 +9886,8 @@ impl GifKitApp {
                 }
                 if renaming {
                     if let Some((_, buf)) = &mut self.renaming {
-                        let name_r = Rect::from_min_size(pos2(r.left() + 48.0, r.top() + 4.0), vec2(name_w + 4.0, r.height() - 8.0));
-                    let te = ui.put(name_r, egui::TextEdit::singleline(buf).font(egui::FontId::proportional(13.0)).margin(vec2(4.0, 2.0)));
+                        let name_r = Rect::from_min_size(pos2(r.left() + 47.0 + ind, r.top() + 3.0), vec2(name_w + 6.0, r.height() - 6.0));
+                    let te = row_rename(ui, name_r, buf, 13.0);
                     if self.rename_fresh {
                         te.request_focus();
                         self.rename_fresh = false;
@@ -9724,6 +9905,7 @@ impl GifKitApp {
                     self.renaming = Some((id, name.clone()));
                     self.rename_fresh = true;
                 }
+                let own_colour = self.stack.layers[li].color;
                 resp.context_menu(|ui| {
                     ui.set_min_width(230.0);
                     let top = li + 1 == n;
@@ -9734,6 +9916,9 @@ impl GifKitApp {
                     }
                     if menu_item(ui, "edit-duplicate", "&Duplicate Layer", "", true) {
                         act(LayerAct::Duplicate(li));
+                    }
+                    if let Some(c) = colour_label_menu(ui, own_colour) {
+                        act(LayerAct::Colour(li, c));
                     }
                     if menu_item(ui, if visible { "view-hidden" } else { "view-visible" }, if visible { "&Hide Layer" } else { "&Show Layer" }, "", true) {
                         act(LayerAct::Toggle(li));
@@ -9746,7 +9931,7 @@ impl GifKitApp {
                     }
                     let can = crate::stack::Layer::can_style(&self.stack.layers[li].kind);
                     let has = !self.stack.layers[li].style.is_none();
-                    ui.menu_button("Layer Style", |ui| {
+                    sub_menu(ui, "edit-paste", "Copy and Paste St&yle", |ui| {
                         if menu_item(ui, "edit-copy", "&Copy Layer Style", "", can && has) {
                             style_cmd = Some((0, li));
                         }
@@ -9913,7 +10098,7 @@ impl GifKitApp {
                     }
                 } else if let Some((_, buf)) = &mut self.edit_renaming {
                     let name_r = Rect::from_min_size(pos2(r.left() + 48.0, r.top() + 3.0), vec2((r.width() - 80.0).max(40.0), r.height() - 6.0));
-                    let te = ui.put(name_r, egui::TextEdit::singleline(buf).font(egui::FontId::proportional(12.5)).margin(vec2(4.0, 1.0)));
+                    let te = row_rename(ui, name_r, buf, 12.5);
                     if self.rename_fresh {
                         te.request_focus();
                         self.rename_fresh = false;
@@ -10047,7 +10232,7 @@ impl GifKitApp {
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
                     ui.spacing_mut().item_spacing.x = gap;
-                    for (i, (icon, label, tip)) in [("draw-text", "Text", "Add words: they can type on, move and fade"), ("draw-rectangle", "Shape", "Add a shape, arrow or speech bubble"), ("insert-image", "Image", "Add a picture or an animation on top")].iter().enumerate() {
+                    for (i, (icon, label, tip)) in [("draw-text", "Text", "Add words: they can type on, move and fade"), ("shapes", "Shape", "Add a shape, arrow or speech bubble"), ("insert-image", "Image", "Add a picture or an animation on top")].iter().enumerate() {
                         let (r, resp) = ui.allocate_exact_size(vec2(bw, 64.0), Sense::click());
                         let hov = resp.hovered();
                         ui.painter().rect_filled(r, 6.0, if hov { mix(pal.button, pal.highlight, 0.22) } else { pal.button });
@@ -10438,6 +10623,24 @@ impl GifKitApp {
             LayerAct::RenameEdit(t) => {
                 self.edit_renaming = Some((t, self.edit_labels.get(&t).cloned().unwrap_or_else(|| t.label().to_string())));
                 self.rename_fresh = true;
+            }
+            LayerAct::Colour(li, c) => {
+                self.snapshot(&format!("label{now}"), now);
+                let mut targets = self.picked();
+                if !targets.contains(&li) {
+                    targets = vec![li];
+                }
+                for t in targets {
+                    self.stack.layers[t].color = c;
+                }
+                self.modified = true;
+            }
+            LayerAct::GroupColour(g, c) => {
+                self.snapshot(&format!("label{now}"), now);
+                if let Some(gm) = self.stack.group_mut(g) {
+                    gm.color = c;
+                }
+                self.modified = true;
             }
             LayerAct::Duplicate(li) => {
                 self.snapshot(&format!("duplicate{now}"), now);

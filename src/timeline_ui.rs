@@ -2490,7 +2490,6 @@ impl GifKitApp {
         }
     }
 
-    /// A track's colour choices: Breeze's palette, the default, or any colour.
     /// How dragging the GIF's end (or Make Longer) adds frames.
     fn tl_extend_menu(&mut self, ui: &mut egui::Ui) {
         sub_menu(ui, "", "When Made L&onger", |ui| {
@@ -2504,49 +2503,10 @@ impl GifKitApp {
         });
     }
 
+    /// A track's colour choices: Breeze's palette, the default, or any colour.
     fn tl_colour_menu(&mut self, ui: &mut egui::Ui, track: u64, now: f64) {
-        const SWATCHES: [[u8; 3]; 12] = [
-            [61, 174, 233],
-            [29, 153, 243],
-            [26, 188, 156],
-            [39, 174, 96],
-            [241, 196, 15],
-            [253, 188, 75],
-            [246, 116, 0],
-            [218, 68, 83],
-            [233, 30, 99],
-            [155, 89, 182],
-            [142, 68, 173],
-            [127, 140, 141],
-        ];
         let cur = if track == GIF { self.stack.gif_color } else { self.stack.index_of(track).and_then(|li| self.stack.layers[li].color) };
-        let mut pick: Option<Option<[u8; 3]>> = None;
-        sub_menu(ui, "format-fill-color", "C&olour", |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.set_max_width(6.0 * 28.0);
-                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
-                for c in SWATCHES {
-                    let col = Color32::from_rgb(c[0], c[1], c[2]);
-                    let (r, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
-                    let on = cur == Some(c);
-                    ui.painter().rect(r.shrink(2.0), 3.0, col, Stroke::new(if on || resp.hovered() { 2.0 } else { 1.0 }, if on { p().fg } else { mix(col, Color32::BLACK, 0.3) }), egui::StrokeKind::Inside);
-                    if resp.clicked() {
-                        pick = Some(Some(c));
-                    }
-                }
-            });
-            ui.separator();
-            let mut c = cur.unwrap_or([61, 174, 233]);
-            ui.horizontal(|ui| {
-                if colour_btn(ui, &mut c).changed() {
-                    pick = Some(Some(c));
-                }
-                ui.label("Other colour");
-            });
-            if menu_item(ui, "edit-clear-all", "&Default Colour", "", cur.is_some()) {
-                pick = Some(None);
-            }
-        });
+        let pick = super::colour_label_menu(ui, cur);
         if let Some(c) = pick {
             self.snapshot(&format!("tl-colour{track}"), now);
             if track == GIF {
