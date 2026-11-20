@@ -3073,9 +3073,12 @@ fn shape_tiles(ui: &mut egui::Ui, kinds: &[crate::shapes::ShapeKind], cur: crate
     let pal = *p();
     let w = ui.available_width();
     let gap = 4.0;
-    let per = ((w + gap) / (44.0 + gap)).floor().max(1.0) as usize;
+    // rows of the same length, as many to a row as fit at a comfortable size
+    let n = kinds.len().max(1);
+    let fits = ((w + gap) / (42.0 + gap)).floor().max(1.0) as usize;
+    let per = (1..=n.min(fits)).rev().find(|k| n % k == 0).unwrap_or(1);
     let tile = ((w + gap) / per as f32 - gap).floor();
-    let h = 40.0;
+    let h = (tile * 0.8).clamp(40.0, 52.0);
     let mut out = None;
     for row in kinds.chunks(per) {
         ui.horizontal(|ui| {
@@ -3094,8 +3097,10 @@ fn shape_tiles(ui: &mut egui::Ui, kinds: &[crate::shapes::ShapeKind], cur: crate
                     let c = [col.r(), col.g(), col.b()];
                     let line = *k == ShapeKind::Line;
                     let s = ShapeSettings { kind: *k, fill: c, fill_on: !line, stroke: c, stroke_on: line, stroke_w: 3.0, points: if *k == ShapeKind::Burst { 12 } else { 5 }, corner: 30.0, ..Default::default() };
-                    let (sw, sh) = (44.0, 32.0);
-                    let o = crate::geo::Obb { cx: sw, cy: sh, w: sw * 1.4, h: sh * 1.4, angle: 0.0 };
+                    // drawn in their natural shape: square, a bit wider for the long ones
+                    let wide = matches!(k, ShapeKind::Rect | ShapeKind::Rounded | ShapeKind::Arrow | ShapeKind::Line | ShapeKind::Speech | ShapeKind::Bubble | ShapeKind::Thought);
+                    let (sw, sh) = if wide { (64.0, 50.0) } else { (56.0, 56.0) };
+                    let o = crate::geo::Obb { cx: sw, cy: sh, w: sw, h: sh, angle: 0.0 };
                     let (img, _, _) = crate::shapes::shape_sprite(&s, o, 2.0, [false; 2])?;
                     let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
                     let t = ui.ctx().load_texture(format!("shape-tile-{}", *k as u8), ci, egui::TextureOptions::LINEAR);
@@ -3104,7 +3109,7 @@ fn shape_tiles(ui: &mut egui::Ui, kinds: &[crate::shapes::ShapeKind], cur: crate
                 });
                 if let Some(t) = tex {
                     let ts = t.size_vec2();
-                    let k = ((h - 12.0) / ts.y).min((tile - 12.0) / ts.x);
+                    let k = ((h - 14.0) / ts.y).min((tile - 14.0) / ts.x);
                     ui.painter().image(t.id(), Rect::from_center_size(r.center(), ts * k), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
                 }
                 if resp.on_hover_text(k.label()).clicked() {
