@@ -253,6 +253,10 @@ fn timing(r: &mut Rng, n: usize) -> crate::timeline::Timing {
         }
         t.sort_keys();
     }
+    if r.chance(0.25) {
+        t.fade_in = r.pick(&[0, 1, 3, 40]);
+        t.fade_out = r.pick(&[0, 2, 5]);
+    }
     t
 }
 

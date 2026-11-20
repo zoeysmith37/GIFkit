@@ -12,6 +12,13 @@ The tools live down the left rail. Pick one and its settings turn up on the righ
 
 Nothing touches your frames until you export. Every edit is a layer or a frame edit, so you can change your mind as often as you like.
 
+## Simple View
+- The Simple View switch at the top right keeps ten everyday tools and hides the rest
+- No timeline: each layer has When It Shows, in seconds, with Fade in and Fade out
+- Export asks where it's going and finds the best quality that fits
+- More settings in Export opens the full window
+- Switching changes only what shows. Your work stays as it is
+
 ## Panels
 - Number fields: drag across them to change, or click and type
 - Sliders aren't fenced in: type past the end and the slider stretches to fit
@@ -78,7 +85,7 @@ With no layer of a tool's kind picked, changing a setting adds one. With one pic
 ## Colours
 Any colour button opens a picker. Under the number boxes sit your recent colours, and below those the main colours in the frame on screen. Handy.
 
-Settings, Colour Scheme picks GIFkit's own colours: KDE's Breeze Light, Breeze Dark, Breeze Classic or Oxygen, and an accent. Follow System goes back to your desktop's.
+Settings, Colour Scheme picks GIFkit's own colours, lightest to darkest: Breeze Light, Breeze Grey, Breeze Dark and Breeze Black (near pure black, kind to OLED screens), and an accent. Follow System goes back to your desktop's.
 
 ## Image layers
 - Replace Image swaps the picture and keeps the rest: place, size, motion and effects

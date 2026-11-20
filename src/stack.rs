@@ -452,10 +452,11 @@ impl Layer {
         self.mask.as_ref().filter(|m| m.on)
     }
 
-    /// Its motion at plan frame `i`, with the layer's own opacity in.
-    pub fn motion(&self, i: usize) -> crate::timeline::Motion {
+    /// Its motion at plan frame `i` of `n`, with the layer's own opacity and
+    /// its fades in.
+    pub fn motion(&self, i: usize, n: usize) -> crate::timeline::Motion {
         let mut m = self.timing.motion(i);
-        m.opacity *= (self.opacity / 100.0).clamp(0.0, 1.0);
+        m.opacity *= (self.opacity / 100.0).clamp(0.0, 1.0) * self.timing.fade_at(i, n);
         m
     }
 
@@ -1485,7 +1486,7 @@ impl Stack {
         let mk = l.active_mask()?;
         let mut cov = RgbaImage::new(size.0, size.1);
         if let Some((sp, x, y)) = prep.lmasks.get(li).and_then(|m| m.as_ref()) {
-            let mo = l.motion(i);
+            let mo = l.motion(i, plan.len());
             let place = mk.linked && mo.moves();
             if place {
                 let (centre, d, lin) = self.mask_place(li, i, plan, fonts, prep, sp, *x, *y);
@@ -1507,7 +1508,7 @@ impl Stack {
     #[allow(clippy::too_many_arguments)]
     fn mask_place(&self, li: usize, i: usize, plan: &[PlanFrame], fonts: &[FontEntry], prep: &Prepared, sp: &RgbaImage, x: i64, y: i64) -> ((f32, f32), (f32, f32), [f32; 4]) {
         let l = &self.layers[li];
-        let mo = l.motion(i);
+        let mo = l.motion(i, plan.len());
         let m = &prep.maps[li].m;
         let src = plan[i].src;
         let ob = l.source_box(src, fonts).map(|b| map_box(m, b, false));
@@ -1574,7 +1575,7 @@ impl Stack {
     /// Does layer `li` show at plan frame `i`?
     fn layer_shows(&self, li: usize, i: usize, n: usize) -> bool {
         let l = &self.layers[li];
-        l.active() && l.timing.shows(i, n) && l.motion(i).opacity > 0.001
+        l.active() && l.timing.shows(i, n) && l.motion(i, n).opacity > 0.001
     }
 
     /// Layers that draw something with a shape, which clipped layers can
@@ -1599,7 +1600,7 @@ impl Stack {
         if !l.active() || !l.timing.shows(i, n) {
             return;
         }
-        let mo = l.motion(i);
+        let mo = l.motion(i, plan.len());
         if mo.opacity <= 0.001 {
             return;
         }
@@ -2423,7 +2424,7 @@ impl Stack {
             if !l.active() || !l.timing.shows(i, n) {
                 continue;
             }
-            let mo = l.motion(i);
+            let mo = l.motion(i, plan.len());
             if mo.opacity <= 0.001 {
                 continue;
             }

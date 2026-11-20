@@ -79,7 +79,54 @@ const RAIL_GROUPS: [(&str, &[Tool], bool); 7] = [
     ("Output", &[Tool::Optimize, Tool::Presets], true),
 ];
 
+/// Simple View's tools, each with a line on what it's for.
+const SIMPLE_TOOLS: [(Tool, &str); 10] = [
+    (Tool::Text, "Words, with a fade"),
+    (Tool::Emoji, "Stickers by category"),
+    (Tool::Shapes, "Arrows and bubbles"),
+    (Tool::AddImage, "Add a picture"),
+    (Tool::Effects, "One-click looks"),
+    (Tool::Adjust, "Brightness and colour"),
+    (Tool::Crop, "Trim the edges"),
+    (Tool::Resize, "Smaller or bigger"),
+    (Tool::Cut, "Keep the good bit"),
+    (Tool::Speed, "Faster, slower, backwards"),
+];
+
+/// The sections each tool keeps in Simple View, by title (None: all of them).
+fn simple_sections(t: Tool) -> Option<&'static [&'static str]> {
+    Some(match t {
+        Tool::Text => &["Text", "Font", "Style", "Placement", "When It Shows"],
+        Tool::Shapes => &["Shape", "Style", "Placement", "When It Shows"],
+        Tool::Emoji => &["Pick", "Placement", "When It Shows"],
+        Tool::AddImage => &["Image", "Placement", "When It Shows"],
+        Tool::Effects => &["Styles", "Blur & Sharpen"],
+        Tool::Crop => &["Area", "Auto-Trim"],
+        Tool::Resize => &["Size"],
+        Tool::Cut => &["Range"],
+        Tool::Speed => &["Speed"],
+        _ => return None,
+    })
+}
+
+/// Simple View's export targets: name, a size limit in MiB (the search
+/// aims a little under the site's own), and what it says beside it.
+const SIMPLE_TARGETS: [(&str, Option<f32>, &str); 4] = [
+    ("Discord", Some(9.5), "under 10 MB"),
+    ("X", Some(14.0), "under 15 MB"),
+    ("A message or email", Some(4.5), "under 5 MB"),
+    ("Keep it as it is", None, "best quality"),
+];
+
+/// Simple View's adjustments, by their place in `adjust::KINDS`.
+const SIMPLE_ADJUST: [usize; 6] = [3, 2, 5, 4, 7, 15];
+
 impl Tool {
+    /// In Simple View's set.
+    fn simple(self) -> bool {
+        SIMPLE_TOOLS.iter().any(|(t, _)| *t == self)
+    }
+
     const ALL: [Tool; 21] = [
         Tool::Effects,
         Tool::Adjust,
@@ -949,6 +996,8 @@ pub struct GifKitApp {
     pack_last: f64,
     cmp_key_seen: u64,
     cmp_key_since: f64,
+    /// when the preview's key last changed, for its longest wait
+    cmp_key_first: f64,
     cmp_gen: u64,
 
     // tool UI state
@@ -995,6 +1044,12 @@ pub struct GifKitApp {
     timeline_open_h: f32,
     layer_drag: Option<u64>,
     export_open: bool,
+    /// Simple View's export: where it's going (`SIMPLE_TARGETS`)
+    simple_target: usize,
+    /// the format and target the last size search was for, this time open
+    simple_fit_for: Option<(ExportFormat, usize)>,
+    /// "More settings…": the full export window, this time open
+    export_full: bool,
     export_fmt: ExportFormat,
     frames_zip: bool,
     presets: Vec<crate::presets::Preset>,
@@ -1083,6 +1138,12 @@ pub struct GifKitApp {
     win_title: String,
     // the timeline dock
     show_timeline: bool,
+    /// Simple View: ten tools, no timeline, the simple export
+    simple: bool,
+    /// the first-launch question: Simple or everything
+    welcome_open: bool,
+    /// Full View's rulers, guides and grid, kept while Simple View hides them
+    view_stash: Option<(bool, bool, bool)>,
     /// pixels per frame (0 fits the whole animation)
     tl_zoom: f32,
     /// pixels per frame that fit the whole animation, and the zoom now (last drawn)
@@ -1701,6 +1762,9 @@ fn group_on<R>(ui: &mut egui::Ui, title: &str, on: bool, add: impl FnMut(&mut eg
 
 /// Collapsible group with a default state and an optional badge (e.g. number of active options).
 fn group_ex<R>(ui: &mut egui::Ui, title: &str, default_open: bool, badge: Option<String>, mut add: impl FnMut(&mut egui::Ui) -> R) -> Option<R> {
+    if simple_hides(title) {
+        return None;
+    }
     // KDE settings pages are flat: a heading with a thin line under it, then the form
     let pal = *p();
     if title.is_empty() {
@@ -2790,6 +2854,16 @@ thread_local! {
     static FIND: std::cell::RefCell<Find> = std::cell::RefCell::new(Find::default());
 }
 
+thread_local! {
+    /// While a Simple View panel draws: the sections it keeps.
+    static SIMPLE_KEEP: std::cell::Cell<Option<&'static [&'static str]>> = const { std::cell::Cell::new(None) };
+}
+
+/// A section Simple View leaves out of the panel being drawn.
+fn simple_hides(title: &str) -> bool {
+    SIMPLE_KEEP.with(|k| k.get()).is_some_and(|keep| !title.is_empty() && !keep.contains(&title))
+}
+
 fn find_on() -> bool {
     FIND.with(|f| !f.borrow().q.is_empty())
 }
@@ -3189,6 +3263,10 @@ fn slider_row(ui: &mut egui::Ui, label: &str, s: Spin<'_>) -> egui::Response {
 /// A dot on it means something inside differs from its default. While
 /// searching it opens, so matches inside show.
 fn more<R>(ui: &mut egui::Ui, key: &str, changed: bool, add: impl FnOnce(&mut egui::Ui) -> R) -> Option<R> {
+    // Simple View leaves the extras out
+    if SIMPLE_KEEP.with(|k| k.get()).is_some() {
+        return None;
+    }
     let pal = *p();
     let id = egui::Id::unique(("gifkit-more", key));
     let mut open: bool = ui.ctx().data_mut(|d| *d.get_persisted_mut_or(id, false));
@@ -3643,6 +3721,64 @@ fn paint_label(painter: &egui::Painter, r: Rect, c: [u8; 3]) {
     painter.rect_filled(cell, egui::CornerRadius { nw: 3, sw: 3, ne: 0, se: 0 }, mix(pal.view, col, 0.55));
 }
 
+/// Where a scrolling panel has more above or below: a soft fade at that
+/// edge with an arrow on it, which scrolls a little when clicked.
+fn scroll_hints<R>(ui: &egui::Ui, out: &egui::scroll_area::ScrollAreaOutput<R>, bg: Color32, key: &str) {
+    let r = out.inner_rect;
+    let off = out.state.clamped_offset().y;
+    let above = off > 1.0;
+    let below = off + r.height() < out.content_size.y - 1.0;
+    if !above && !below {
+        return;
+    }
+    let pal = *p();
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique(("scroll-hints", key)))).with_clip_rect(r);
+    let band = 26.0f32.min(r.height() / 3.0);
+    let mut step = 0.0;
+    for (top, show) in [(true, above), (false, below)] {
+        if !show {
+            continue;
+        }
+        let edge = if top { r.top() } else { r.bottom() };
+        let inner = if top { r.top() + band } else { r.bottom() - band };
+        // the fade, solid at the edge to clear inward
+        let mut mesh = egui::Mesh::default();
+        let solid = bg.gamma_multiply(0.95);
+        let clear = Color32::TRANSPARENT;
+        let i = mesh.vertices.len() as u32;
+        mesh.colored_vertex(pos2(r.left(), edge), solid);
+        mesh.colored_vertex(pos2(r.right(), edge), solid);
+        mesh.colored_vertex(pos2(r.right(), inner), clear);
+        mesh.colored_vertex(pos2(r.left(), inner), clear);
+        mesh.add_triangle(i, i + 1, i + 2);
+        mesh.add_triangle(i, i + 2, i + 3);
+        painter.add(egui::Shape::mesh(mesh));
+        let c = pos2(r.center().x, if top { r.top() + 10.0 } else { r.bottom() - 10.0 });
+        let hit = Rect::from_center_size(c, vec2(28.0, 18.0));
+        let resp = ui.interact(hit, egui::Id::unique(("scroll-hint", key, top)), Sense::click());
+        let col = if resp.hovered() { pal.highlight } else { pal.fg_muted };
+        painter.rect_filled(hit, 9.0, if resp.hovered() { mix(bg, pal.highlight, 0.2) } else { bg });
+        painter.rect_stroke(hit, 9.0, Stroke::new(1.0, mix(bg, pal.fg, 0.2)), egui::StrokeKind::Inside);
+        crate::icons::paint(&painter, if top { "go-up" } else { "go-down" }, c, 14.0, col);
+        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(if top { "More above" } else { "More below" }).clicked() {
+            step = if top { -r.height() * 0.6 } else { r.height() * 0.6 };
+        }
+    }
+    if step != 0.0 {
+        let to = (off + step).clamp(0.0, (out.content_size.y - r.height()).max(0.0));
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique(("scroll-jump", key)), to));
+        ui.ctx().request_repaint();
+    }
+}
+
+/// A scroll area with any jump its hint arrows asked for (see `scroll_hints`).
+fn with_jump(ui: &egui::Ui, sa: egui::ScrollArea, key: &str) -> egui::ScrollArea {
+    match ui.ctx().data_mut(|d| d.remove_temp::<f32>(egui::Id::unique(("scroll-jump", key)))) {
+        Some(v) => sa.vertical_scroll_offset(v),
+        None => sa,
+    }
+}
+
 /// A name field drawn over a list row, exactly the size of `r`: it never
 /// grows the row or spills over the buttons beside it.
 fn row_rename(ui: &mut egui::Ui, r: Rect, buf: &mut String, size: f32) -> egui::Response {
@@ -3960,6 +4096,7 @@ impl GifKitApp {
             pack_last: 0.0,
             cmp_key_seen: 0,
             cmp_key_since: 0.0,
+            cmp_key_first: 0.0,
             cmp_gen: 0,
             crop_lock: AspectLock::Free,
             trim_tol: 8,
@@ -3993,6 +4130,9 @@ impl GifKitApp {
             timeline_open_h: 270.0,
             layer_drag: None,
             export_open: false,
+            simple_target: theme::get_setting("simple_target").and_then(|v| v.parse().ok()).filter(|v: &usize| *v < SIMPLE_TARGETS.len()).unwrap_or(0),
+            simple_fit_for: None,
+            export_full: false,
             export_fmt: ExportFormat::Gif,
             frames_zip: false,
             presets: Vec::new(),
@@ -4054,6 +4194,10 @@ impl GifKitApp {
             shortcuts_open: false,
             win_title: String::new(),
             show_timeline: theme::get_setting("show_timeline").as_deref() == Some("1"),
+            simple: theme::get_setting("simple_view").as_deref() == Some("1"),
+            // asked once; not when a test or screenshot starts it on a tool
+            view_stash: None,
+            welcome_open: theme::get_setting("simple_view").is_none() && std::env::var("GIFKIT_TOOL").is_err() && std::env::var("GIFKIT_SHOT").is_err(),
             tl_zoom: 0.0,
             tl_fit: 1.0,
             tl_zoom_now: 1.0,
@@ -4266,6 +4410,13 @@ impl GifKitApp {
         }
         if std::env::var("GIFKIT_SHORTCUTS").is_ok() {
             app.shortcuts_open = true;
+        }
+        if let Ok(v) = std::env::var("GIFKIT_SIMPLE") {
+            app.simple = v != "0";
+            app.welcome_open = false;
+        }
+        if app.simple {
+            app.stash_view(true);
         }
         if std::env::var("GIFKIT_EXPORT").is_ok() {
             app.export_open = true;
@@ -7280,22 +7431,29 @@ impl GifKitApp {
         if key != self.cmp_key_seen {
             self.cmp_key_seen = key;
             self.cmp_key_since = now;
+            self.cmp_key_first = now;
         }
         let up_to_date = self.cmp.as_ref().map(|c| c.key == key).unwrap_or(false);
         if up_to_date || self.cmp_job.is_some() {
             return;
         }
         // asked for: no waiting for edits to settle
-        let asked = self.cmp_go == key;
+        // the Export window always wants its preview, auto or not
+        let asked = self.cmp_go == key || self.export_open;
         if !self.auto_compress && !asked {
             return;
         }
         // wait until edits settle (and the user isn't mid-drag)
         // wait until edits have settled and nothing is being dragged / held
-        let busy_input = ctx.input(|i| i.pointer.any_down()) || ctx.dragged_id().is_some() || self.box_drag.is_some() || self.drag.is_some();
+        // only the main window's own pointer counts: a button let go over
+        // a dialog never reaches it, and it would wait for ever
+        let main_focused = ctx.input(|i| i.viewport().focused) != Some(false);
+        let busy_input = main_focused && (ctx.input(|i| i.pointer.any_down()) || ctx.dragged_id().is_some() || self.box_drag.is_some() || self.drag.is_some());
         if busy_input {
             self.cmp_key_since = now;
         }
+        // never more than a few seconds behind, whatever else is going on
+        let busy_input = busy_input && now - self.cmp_key_first < 3.0;
         // half a second after the last change, so quick tweaks don't each start an encode
         if !asked && (now - self.cmp_key_since < 0.5 || busy_input) {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
@@ -7643,13 +7801,13 @@ impl eframe::App for GifKitApp {
                 .show(ui, |ui| self.toolbar(ui, &ctx));
         }
 
-        if self.show_statusbar {
+        if self.show_statusbar || self.simple {
             egui::Panel::bottom("status").frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin::symmetric(10, 3))).show(ui, |ui| self.status_bar(ui));
         }
 
         // the names slide in and out
         let names = theme::openness(&ctx, egui::Id::unique("rail-names"), !self.sidebar_compact);
-        let rail_w = (40.0 + 100.0 * names).round();
+        let rail_w = if self.simple { 196.0 } else { (40.0 + 100.0 * names).round() };
         if names > 0.0 && names < 1.0 {
             ctx.request_repaint();
         }
@@ -7661,14 +7819,16 @@ impl eframe::App for GifKitApp {
                 .frame(egui::Frame::new().fill(pal.window))
                 .show(ui, |ui| {
                     // the tool's settings always keep at least half the height
-                    let lmax = (ui.available_height() * 0.5).clamp(140.0, 800.0);
+                    // and the layers keep room for their header, a few rows and the buttons
+                    let lmin = if self.simple { 200.0 } else { 250.0 };
+                    let lmax = (ui.available_height() * 0.5).clamp(lmin, 800.0);
                     // it slides open and shut between its header and the height it had
                     let t = theme::openness(&ctx, egui::Id::unique("layers-open"), !self.layers_collapsed);
-                    let open_h = self.layers_open_h.clamp(140.0, lmax);
+                    let open_h = self.layers_open_h.clamp(lmin, lmax);
                     let mut panel = egui::Panel::bottom("layers_panel")
                         .resizable(!self.layers_collapsed)
                         .default_size(380.0f32.min(lmax))
-                        .size_range(if self.layers_collapsed { 34.0..=34.0 } else { 140.0..=lmax });
+                        .size_range(if self.layers_collapsed { 34.0..=34.0 } else { lmin..=lmax });
                     let sliding = t > 0.0 && t < 1.0;
                     if sliding {
                         panel = panel.resizable(false).exact_size(34.0 + (open_h - 34.0) * t);
@@ -7692,10 +7852,14 @@ impl eframe::App for GifKitApp {
                         self.layers_open_h = shown.response.rect.height();
                     }
                     egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.window).inner_margin(egui::Margin { left: 10, right: 8, top: 8, bottom: 4 })).show(ui, |ui| {
+                        let simple = self.simple;
                         ui.horizontal(|ui| {
                             let (ir, _) = ui.allocate_exact_size(vec2(22.0, 24.0), Sense::hover());
                             paint_tool_icon(ui.painter(), self.tool, ir.center(), 22.0, pal.fg);
                             ui.label(RichText::new(self.tool.title()).font(theme::medium(16.0)).color(pal.fg));
+                            if simple {
+                                return;
+                            }
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 ui.spacing_mut().item_spacing.x = 2.0;
                                 if small_icon(ui, "collapse-all", "Collapse all sections") {
@@ -7713,12 +7877,22 @@ impl eframe::App for GifKitApp {
                             self.panel_find = std::env::var("GIFKIT_FIND").unwrap_or_default();
                             self.panel_find_tool = Some(self.tool);
                         }
-                        search_box(ui, &mut self.panel_find, "Search settings", egui::Id::unique("panel-find"));
+                        if simple {
+                            self.panel_find.clear();
+                        } else {
+                            search_box(ui, &mut self.panel_find, "Search settings", egui::Id::unique("panel-find"));
+                        }
                         ui.add_space(8.0);
                         let q = self.panel_find.trim().to_lowercase();
-                        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        let out = with_jump(ui, egui::ScrollArea::vertical().auto_shrink([false, false]), "tool-panel").show(ui, |ui| {
                             FIND.with(|f| *f.borrow_mut() = Find { q: q.clone(), ..Default::default() });
-                            ui.add_enabled_ui(!self.busy(), |ui| self.tool_panel(ui, &ctx));
+                            if simple && !self.tool.simple() {
+                                self.simple_elsewhere(ui);
+                            } else {
+                                SIMPLE_KEEP.with(|k| k.set(if simple { simple_sections(self.tool) } else { None }));
+                                ui.add_enabled_ui(!self.busy(), |ui| self.tool_panel(ui, &ctx));
+                                SIMPLE_KEEP.with(|k| k.set(None));
+                            }
                             let shown = FIND.with(|f| std::mem::take(&mut *f.borrow_mut()).shown);
                             if !q.is_empty() && shown == 0 {
                                 ui.add_space(8.0);
@@ -7726,6 +7900,7 @@ impl eframe::App for GifKitApp {
                             }
                             ui.add_space(8.0);
                         });
+                        scroll_hints(ui, &out, pal.window, "tool-panel");
                     });
                 });
         }
@@ -7739,13 +7914,17 @@ impl eframe::App for GifKitApp {
                 let r = ui.max_rect();
                 ui.painter().vline(r.right() + 4.0, r.y_range().expand(6.0), Stroke::new(1.0, pal.border));
                 ui.painter().vline(r.left() - 4.0, r.y_range().expand(6.0), Stroke::new(1.0, pal.border));
-                self.rail(ui);
+                if self.simple {
+                    self.simple_rail(ui);
+                } else {
+                    self.rail(ui);
+                }
             });
 
         if self.base.is_some() {
             // the timeline at the bottom, the play controls under the view as in Kdenlive
             // it slides up and down from the height it had
-            let t = theme::openness(&ctx, egui::Id::unique("timeline-open"), self.show_timeline);
+            let t = theme::openness(&ctx, egui::Id::unique("timeline-open"), self.show_timeline && !self.simple);
             if t > 0.0 {
                 // never more than about half the height, so the view keeps room
                 let tmax = ((ui.available_height() - 60.0) * 0.5).clamp(110.0, 640.0);
@@ -7811,6 +7990,7 @@ impl eframe::App for GifKitApp {
         });
 
         self.export_window(&ctx);
+        self.welcome_window(&ctx);
         self.history_window(&ctx);
         self.confirm_window(&ctx);
         self.poll_updates(&ctx);
@@ -7860,6 +8040,7 @@ impl GifKitApp {
         let has = self.base.is_some();
         let theme_before = self.theme;
         let backdrop_before = (self.backdrop, self.backdrop_col);
+        let mut simple_to: Option<bool> = None;
         egui::MenuBar::new().ui(ui, |ui| {
             top_menu(ui, "&File", |ui| {
                 ui.set_min_width(250.0);
@@ -8018,8 +8199,14 @@ impl GifKitApp {
                     self.bake(ctx, true);
                 }
             });
+            let simple = self.simple;
+            if !simple {
             top_menu(ui, "&View", |ui| {
                 ui.set_min_width(250.0);
+                if menu_check(ui, false, "Si&mple View", "") {
+                    simple_to = Some(true);
+                }
+                ui.separator();
                 if menu_check(ui, !self.compare, "&Single View", &self.keymap.text(crate::keys::Action::SplitView)) {
                     self.compare = false;
                 }
@@ -8086,6 +8273,7 @@ impl GifKitApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!full));
                 }
             });
+            }
             top_menu(ui, "&Settings", |ui| {
                 ui.set_min_width(290.0);
                 if menu_item_tip(ui, "", "Configure &ffmpeg…", "", true, "Where GIFkit finds ffmpeg, for video and AVIF") {
@@ -8185,71 +8373,100 @@ impl GifKitApp {
                 }
                 ui.separator();
                 sub_menu(ui, "", "&Colour Scheme", |ui| {
-                    ui.set_min_width(220.0);
+                    // a fixed width: rows sized to what's left would widen it every frame
+                    const W: f32 = 236.0;
+                    ui.set_width(W);
+                    let pal = *p();
                     let pick = theme::scheme_pick();
                     let accent = theme::accent_pick();
+                    // one row: a mark (check or a scheme's swatch), then its name
+                    let row = |ui: &mut egui::Ui, on: bool, name: &str, swatch: Option<[Color32; 3]>| -> egui::Response {
+                        let (r, resp) = ui.allocate_exact_size(vec2(W, 28.0), Sense::click());
+                        if resp.hovered() {
+                            ui.painter().rect_filled(r, 4.0, mix(pal.window, pal.highlight, 0.25));
+                        } else if on {
+                            ui.painter().rect_filled(r, 4.0, mix(pal.window, pal.highlight, 0.14));
+                        }
+                        let mark = Rect::from_center_size(pos2(r.left() + 20.0, r.center().y), vec2(24.0, 16.0));
+                        match swatch {
+                            Some(sw) => {
+                                for (i, c) in sw.iter().enumerate() {
+                                    let x0 = mark.left() + i as f32 * 8.0;
+                                    ui.painter().rect_filled(Rect::from_min_max(pos2(x0, mark.top()), pos2(x0 + 8.0, mark.bottom())), 0.0, *c);
+                                }
+                                ui.painter().rect_stroke(mark, 2.0, Stroke::new(1.0, mix(pal.fg, pal.window, 0.55)), egui::StrokeKind::Outside);
+                            }
+                            None => {
+                                if on {
+                                    crate::icons::paint(ui.painter(), "dialog-ok-apply", mark.center(), 16.0, pal.fg);
+                                }
+                            }
+                        }
+                        ui.painter().text(pos2(r.left() + 42.0, r.center().y), egui::Align2::LEFT_CENTER, name, egui::FontId::proportional(13.0), pal.fg);
+                        if on && swatch.is_some() {
+                            crate::icons::paint(ui.painter(), "dialog-ok-apply", pos2(r.right() - 14.0, r.center().y), 14.0, pal.highlight);
+                        }
+                        resp
+                    };
                     // the system's own: KDE's on Plasma, light or dark elsewhere
-                    let follow = if cfg!(all(unix, not(target_os = "macos"))) { "&Follow System (KDE)" } else { "&Follow System" };
-                    if menu_check(ui, pick.is_empty() && self.theme == ThemeChoice::System, follow, "") {
+                    let follow = if cfg!(all(unix, not(target_os = "macos"))) { "Follow System (KDE)" } else { "Follow System" };
+                    if row(ui, pick.is_empty() && self.theme == ThemeChoice::System, follow, None).clicked() {
                         self.theme = ThemeChoice::System;
                         theme::set_scheme(ctx, "", accent);
                     }
-                    if pick.is_empty() {
-                        for (t, l) in [(ThemeChoice::Dark, "    Always &Dark"), (ThemeChoice::Light, "    Always &Light")] {
-                            if menu_check(ui, self.theme == t, l, "") {
-                                self.theme = t;
-                            }
-                        }
-                    }
                     ui.separator();
-                    // KDE's own schemes, on any system
+                    // light to darkest, on any system
                     for (key, name, _) in theme::SCHEMES {
-                        let on = pick == key;
-                        let r = ui.add(egui::Button::selectable(on, format!("      {name}")).min_size(vec2(ui.available_width(), 26.0)));
-                        if let Some(sw) = theme::scheme_swatch(key) {
-                            for (i, c) in sw.iter().enumerate() {
-                                let cell = Rect::from_center_size(pos2(r.rect.left() + 10.0 + i as f32 * 7.0, r.rect.center().y), vec2(8.0, 14.0));
-                                ui.painter().rect_filled(cell, 1.5, *c);
-                            }
-                            ui.painter().rect_stroke(Rect::from_min_max(pos2(r.rect.left() + 6.0, r.rect.center().y - 7.0), pos2(r.rect.left() + 28.0, r.rect.center().y + 7.0)), 2.0, Stroke::new(1.0, mix(p().fg, p().window, 0.6)), egui::StrokeKind::Outside);
-                        }
-                        if r.clicked() {
+                        if row(ui, pick == key, name, theme::scheme_swatch(key)).clicked() {
                             self.theme = ThemeChoice::System;
                             theme::set_scheme(ctx, key, accent);
                         }
                     }
                     ui.separator();
-                    ui.label(RichText::new("Accent").color(p().fg_muted).size(12.0));
-                    ui.horizontal_wrapped(|ui| {
-                        ui.set_max_width(220.0);
-                        ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
-                        // the scheme's (or the desktop's) own accent
-                        let (r, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
-                        let own = accent.is_none();
-                        ui.painter().circle_stroke(r.center(), 8.0, Stroke::new(if own { 2.5 } else { 1.0 }, p().fg));
-                        ui.painter().line_segment([r.center() + vec2(-5.0, 5.0), r.center() + vec2(5.0, -5.0)], Stroke::new(1.0, p().fg_muted));
-                        if resp.on_hover_text("The scheme's own accent").clicked() {
-                            theme::set_scheme(ctx, &pick, None);
-                        }
-                        for (name, c) in theme::ACCENTS {
-                            let (r, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
-                            let on = accent == Some(c);
-                            ui.painter().circle_filled(r.center(), 8.0, Color32::from_rgb(c[0], c[1], c[2]));
-                            if on || resp.hovered() {
-                                ui.painter().circle_stroke(r.center(), 10.0, Stroke::new(2.0, p().fg));
+                    ui.add_space(2.0);
+                    ui.label(RichText::new("Accent").color(pal.fg_muted).size(12.0));
+                    ui.add_space(2.0);
+                    // ten dots in two even rows of five, the scheme's own first
+                    let dots: Vec<Option<(&str, [u8; 3])>> = std::iter::once(None).chain(theme::ACCENTS.iter().map(|a| Some(*a))).collect();
+                    for chunk in dots.chunks(5) {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            for d in chunk {
+                                let (r, resp) = ui.allocate_exact_size(vec2(W / 5.0, 30.0), Sense::click());
+                                let c = r.center();
+                                let on = match d {
+                                    None => accent.is_none(),
+                                    Some((_, col)) => accent == Some(*col),
+                                };
+                                match d {
+                                    None => {
+                                        ui.painter().circle_stroke(c, 9.0, Stroke::new(1.5, pal.fg_muted));
+                                        ui.painter().line_segment([c + vec2(-6.0, 6.0), c + vec2(6.0, -6.0)], Stroke::new(1.5, pal.fg_muted));
+                                    }
+                                    Some((_, col)) => {
+                                        ui.painter().circle_filled(c, 9.0, Color32::from_rgb(col[0], col[1], col[2]));
+                                    }
+                                }
+                                if on || resp.hovered() {
+                                    ui.painter().circle_stroke(c, 12.5, Stroke::new(2.0, if on { pal.fg } else { pal.fg_muted }));
+                                }
+                                let tip = d.map(|(n, _)| n).unwrap_or("The scheme's own accent");
+                                if resp.on_hover_text(tip).clicked() {
+                                    theme::set_scheme(ctx, &pick, d.map(|(_, c)| c));
+                                }
                             }
-                            if resp.on_hover_text(name).clicked() {
-                                theme::set_scheme(ctx, &pick, Some(c));
-                            }
-                        }
-                    });
-                    let mut c = accent.map(|c| [c[0], c[1], c[2], 255]).unwrap_or([p().highlight.r(), p().highlight.g(), p().highlight.b(), 255]);
+                        });
+                    }
+                    ui.add_space(4.0);
+                    let mut c = accent.map(|c| [c[0], c[1], c[2], 255]).unwrap_or([pal.highlight.r(), pal.highlight.g(), pal.highlight.b(), 255]);
                     ui.horizontal(|ui| {
+                        ui.add_space(8.0);
                         if colour_edit(ui, &mut c, false).changed() {
                             theme::set_scheme(ctx, &pick, Some([c[0], c[1], c[2]]));
                         }
                         ui.label("Other accent");
                     });
+                    ui.add_space(2.0);
                 });
                 if cfg!(all(unix, not(target_os = "macos"))) {
                     let native = theme::get_setting("wayland").as_deref() == Some("native");
@@ -8304,7 +8521,17 @@ impl GifKitApp {
                     self.about_open = true;
                 }
             });
+            // the Simple View switch, always in reach at the right
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let mut on = self.simple;
+                if check(ui, &mut on, "Simple View").on_hover_text("Ten tools, no timeline and a one-step export. Nothing in your work changes").changed() {
+                    simple_to = Some(on);
+                }
+            });
         });
+        if let Some(on) = simple_to {
+            self.set_simple(on);
+        }
         if theme_before != self.theme {
             self.theme.apply(ctx);
             theme::save_theme_choice(self.theme);
@@ -8661,6 +8888,11 @@ impl GifKitApp {
 
     /// Switch tools (the rail, the menus and the layer list all use this).
     fn open_tool(&mut self, t: Tool) {
+        // Simple View's tools only: the rest say where they are
+        if self.simple && !t.simple() {
+            self.info(format!("{} is in Full View. View ▸ Simple View switches back", t.label()));
+            return;
+        }
         if t == Tool::Presets && self.tool != Tool::Presets {
             let (l, pr) = crate::presets::list_with_problems();
             self.presets = l;
@@ -8844,6 +9076,10 @@ impl GifKitApp {
 
     /// Main toolbar: file actions, undo, and the view controls, each as its own button.
     fn toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.simple {
+            self.simple_toolbar(ui, ctx);
+            return;
+        }
         let (_, tb_icon) = theme::toolbar_style();
         let tb_h = tb_icon + 10.0;
         // right-clicking the bar gives KDE's toolbar menu
@@ -8925,12 +9161,18 @@ impl GifKitApp {
         let r = ui.max_rect();
         ui.painter().hline(r.x_range(), r.top() - 3.0, Stroke::new(1.0, pal.border));
         let mut stop = false;
+        let mut full_view = false;
         ui.horizontal(|ui| {
             if let Some(job) = &self.job {
                 ui.spinner();
                 ui.label(RichText::new(format!("{}…", job.label)).size(12.5));
             } else if let Some(s) = &self.status {
                 ui.label(RichText::new(&s.text).size(12.5).color(if s.error { pal.negative } else { pal.fg_muted }));
+            } else if self.simple {
+                ui.label(RichText::new("Simple View. The timeline, masks, layer styles and the rest are in Full View.").size(12.5).color(pal.fg_muted));
+                if ui.link(RichText::new("Switch to Full View").size(12.5)).clicked() {
+                    full_view = true;
+                }
             } else {
                 ui.label(RichText::new("Ready").size(12.5).color(pal.fg_muted));
             }
@@ -8978,6 +9220,9 @@ impl GifKitApp {
         });
         if stop {
             self.stop_job();
+        }
+        if full_view {
+            self.set_simple(false);
         }
     }
 
@@ -9172,7 +9417,7 @@ impl GifKitApp {
         let compact = self.sidebar_compact;
         // how far the names are shown (0 icons only .. 1 names), while it slides
         let names = theme::openness(ui.ctx(), egui::Id::unique("rail-names"), !compact);
-        egui::ScrollArea::vertical().auto_shrink([false, false]).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
+        let out = with_jump(ui, egui::ScrollArea::vertical().auto_shrink([false, false]).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden), "rail").show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             let divider = |ui: &mut egui::Ui| {
                 ui.add_space(4.0);
@@ -9213,6 +9458,181 @@ impl GifKitApp {
                 self.set_rail_compact(!compact);
             }
         });
+        scroll_hints(ui, &out, pal.window, "rail");
+    }
+
+    /// Simple View hides the rulers, guides and grid; Full View gets them back.
+    fn stash_view(&mut self, simple: bool) {
+        if simple {
+            if self.view_stash.is_none() {
+                self.view_stash = Some((self.show_rulers, self.show_guides, self.show_grid));
+            }
+            (self.show_rulers, self.show_guides, self.show_grid) = (false, false, false);
+        } else if let Some((r, g, d)) = self.view_stash.take() {
+            (self.show_rulers, self.show_guides, self.show_grid) = (r, g, d);
+        }
+    }
+
+    /// Into or out of Simple View. Only what shows changes, never the work.
+    fn set_simple(&mut self, on: bool) {
+        self.stash_view(on);
+        self.simple = on;
+        self.welcome_open = false;
+        theme::set_setting("simple_view", if on { "1" } else { "0" });
+        if on {
+            self.compare = false;
+            self.history_open = false;
+            if !self.tool.simple() {
+                self.tool = Tool::Text;
+                self.drag = None;
+            }
+        }
+    }
+
+    /// Simple View's rail: its ten tools, each with a line on what it does.
+    fn simple_rail(&mut self, ui: &mut egui::Ui) {
+        let pal = *p();
+        let has = self.base.is_some();
+        let out = with_jump(ui, egui::ScrollArea::vertical().auto_shrink([false, false]).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden), "rail").show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            for (t, desc) in SIMPLE_TOOLS {
+                let sel = self.tool == t && has;
+                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::click());
+                let painter = ui.painter();
+                if sel {
+                    painter.rect_filled(r, 5.0, mix(pal.window, pal.highlight, 0.42));
+                } else if resp.hovered() {
+                    painter.rect_filled(r, 5.0, mix(pal.window, pal.highlight, 0.14));
+                }
+                let fg = if has || sel { pal.fg } else { pal.fg_muted };
+                // the icon on a small tile, then the name over its line
+                let tile = Rect::from_center_size(pos2(r.left() + 22.0, r.center().y), vec2(30.0, 30.0));
+                painter.rect_filled(tile, 6.0, if sel { Color32::from_white_alpha(36) } else { pal.button });
+                crate::icons::paint(painter, t.breeze(), tile.center(), 18.0, fg);
+                painter.text(pos2(r.left() + 46.0, r.center().y - 8.0), egui::Align2::LEFT_CENTER, t.label(), egui::FontId::proportional(13.5), fg);
+                painter.text(pos2(r.left() + 46.0, r.center().y + 9.0), egui::Align2::LEFT_CENTER, desc, egui::FontId::proportional(11.5), if sel { mix(pal.fg, pal.highlight, 0.15) } else { pal.fg_muted });
+                if let Some(k) = t.layer_kind() {
+                    let n = self.stack.count(k);
+                    if n > 0 {
+                        painter.text(r.right_center() - vec2(8.0, 0.0), egui::Align2::RIGHT_CENTER, n.to_string(), egui::FontId::proportional(12.0), pal.fg_muted);
+                    }
+                }
+                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(t.tip()).clicked() {
+                    self.open_tool(t);
+                }
+            }
+        });
+        scroll_hints(ui, &out, pal.window, "rail");
+    }
+
+    /// In Simple View, a tool it doesn't have (a layer of that kind was
+    /// picked): what it is, and the way to it.
+    fn simple_elsewhere(&mut self, ui: &mut egui::Ui) {
+        let pal = *p();
+        ui.add_space(12.0);
+        ui.label(RichText::new(format!("{} is part of Full View", self.tool.label())).color(pal.fg).size(14.0));
+        ui.add_space(4.0);
+        hint(ui, "This layer still shows and plays as it was made. Its settings are in Full View.");
+        ui.add_space(10.0);
+        if wide_button(ui, egui::Button::new("Switch to Full View").stroke(Stroke::new(1.0, pal.highlight))).clicked() {
+            self.set_simple(false);
+        }
+    }
+
+    /// Simple View's toolbar: Open, Undo and Redo, then the file and Export.
+    fn simple_toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let pal = *p();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let idle = !self.busy();
+            let has = self.base.is_some();
+            if tb_tool(ui, "document-open", "Open…", "Open a GIF, image or video (Ctrl+O)", idle).clicked() {
+                self.open_dialog(ctx);
+            }
+            toolbar_sep(ui);
+            let pending = self.committed.as_ref().map(|c| c.0 != self.live_sig()).unwrap_or(false);
+            if tb_tool(ui, "edit-undo", "", "Undo (Ctrl+Z)", idle && (pending || !self.undo.is_empty())).clicked() {
+                self.do_undo();
+            }
+            if tb_tool(ui, "edit-redo", "", "Redo (Ctrl+Y)", idle && !self.redo.is_empty()).clicked() {
+                self.do_redo();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                if has {
+                    let b = egui::Button::image_and_text(crate::icons::image(ui.ctx(), "document-export", 16.0, pal.fg), RichText::new("Export").strong().color(pal.fg))
+                        .fill(mix(pal.button, pal.highlight, 0.45))
+                        .stroke(Stroke::new(1.0, pal.highlight))
+                        .min_size(vec2(108.0, 30.0));
+                    if ui.add_enabled(idle, b).on_hover_text("Save it as a GIF, MP4 or WebP (Ctrl+E)").clicked() {
+                        self.export_open = true;
+                    }
+                    let name = self.path.as_ref().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Untitled".into());
+                    let size = self.file_size.map(|n| format!(" · {}", fmt_size(n))).unwrap_or_default();
+                    if ui.available_width() > 200.0 {
+                        ui.label(RichText::new(format!("{}{size}", elide(&name, 36))).color(pal.fg_muted));
+                    }
+                }
+            });
+        });
+    }
+
+    /// The first-launch question: Simple View or everything.
+    fn welcome_window(&mut self, ctx: &egui::Context) {
+        if !self.welcome_open {
+            return;
+        }
+        let pal = *p();
+        let mut open = true;
+        let mut pick: Option<bool> = None;
+        let choice_id = egui::Id::unique("welcome-choice");
+        let mut simple: bool = ctx.data_mut(|d| *d.get_temp_mut_or(choice_id, true));
+        dialog(ctx, "welcome", "Welcome to GIFkit", vec2(560.0, 360.0), false, &mut open, |ui| {
+            ui.add_space(6.0);
+            ui.label(RichText::new("How much do you want to see?").font(theme::medium(19.0)).color(pal.fg));
+            ui.add_space(2.0);
+            hint(ui, "You can change this any time with the Simple View switch at the top right. Nothing you make is lost either way.");
+            ui.add_space(12.0);
+            let w = ((ui.available_width() - 12.0) / 2.0).floor();
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
+                for (val, title, body, icon) in [
+                    (true, "Simple", "Text, emoji, stickers, crop, cut and speed. The ten tools most people need.", "view-list-details"),
+                    (false, "Everything", "Adds the timeline, keyframes, masks, layer styles and every effect.", "view-list-tree"),
+                ] {
+                    let on = simple == val;
+                    let (r, resp) = ui.allocate_exact_size(vec2(w, 150.0), Sense::click());
+                    ui.painter().rect_filled(r, 6.0, if on { mix(pal.button, pal.highlight, 0.4) } else { pal.button });
+                    ui.painter().rect_stroke(r, 6.0, Stroke::new(if on { 1.5 } else { 1.0 }, if on { pal.highlight } else { pal.border }), egui::StrokeKind::Inside);
+                    crate::icons::paint(ui.painter(), icon, pos2(r.left() + 28.0, r.top() + 28.0), 26.0, pal.fg);
+                    ui.painter().text(pos2(r.left() + 16.0, r.top() + 62.0), egui::Align2::LEFT_CENTER, title, theme::medium(15.0), pal.fg);
+                    let galley = ui.painter().layout(body.to_string(), egui::FontId::proportional(12.5), if on { pal.fg } else { pal.fg_muted }, w - 32.0);
+                    ui.painter().galley(pos2(r.left() + 16.0, r.top() + 80.0), galley, pal.fg);
+                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        simple = val;
+                    }
+                    if ui.ctx().input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)) && ui.rect_contains_pointer(r) {
+                        pick = Some(val);
+                    }
+                }
+            });
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                hint(ui, "Asked once, on first launch");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::new("Start").stroke(Stroke::new(1.0, pal.highlight)).min_size(vec2(96.0, CHIP_H))).clicked() {
+                        pick = Some(simple);
+                    }
+                });
+            });
+        });
+        ctx.data_mut(|d| d.insert_temp(choice_id, simple));
+        if let Some(v) = pick {
+            self.set_simple(v);
+        } else if !open {
+            // closed without choosing: everything, as it was
+            self.set_simple(false);
+        }
     }
 
     /// A rail group's button: the tool it last opened, with a small corner
@@ -9613,7 +10033,9 @@ impl GifKitApp {
         if self.sel_group.is_some_and(|g| self.stack.group(g).is_none()) {
             self.sel_group = None;
         }
-        if let Some(g) = self.sel_group.and_then(|g| self.stack.group(g).cloned()) {
+        // Simple View: just the list, no lock, opacity or blend row
+        if self.simple {
+        } else if let Some(g) = self.sel_group.and_then(|g| self.stack.group(g).cloned()) {
             // a group picked: its lock, opacity and blend, as Photoshop has them
             let mut gg = g.clone();
             ui.horizontal(|ui| {
@@ -9771,7 +10193,7 @@ impl GifKitApp {
         let mut edit_remove: Option<Tool> = None;
         let idle = !self.busy();
         let frame_edits = !self.stack.transform.is_identity();
-        egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
+        let list_out = with_jump(ui, egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, false]), "layers").show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             // each row: the layer (or a group's top layer), where it is, its
             // group, and whether it's the group's own row
@@ -10220,12 +10642,16 @@ impl GifKitApp {
                 }
             }
             if n == 0 {
-                ui.add_space(8.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("Nothing added yet").color(pal.fg).size(14.0));
-                    ui.label(RichText::new("Start with one of these, or pick any tool from the list").color(pal.fg_muted).size(12.0));
-                });
-                ui.add_space(8.0);
+                // the words only where there's room; the buttons always
+                let roomy = list_h > 150.0;
+                ui.add_space(if roomy { 8.0 } else { 4.0 });
+                if roomy {
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new("Nothing added yet").color(pal.fg).size(14.0));
+                        ui.add(egui::Label::new(RichText::new("Start with one of these, or pick any tool from the list").color(pal.fg_muted).size(12.0)).wrap());
+                    });
+                    ui.add_space(8.0);
+                }
                 let w = ui.available_width() - 16.0;
                 let gap = 6.0;
                 let bw = ((w - gap * 2.0) / 3.0).floor();
@@ -10246,6 +10672,7 @@ impl GifKitApp {
                 });
             }
         });
+        scroll_hints(ui, &list_out, pal.view, "layers");
         match quick_add {
             Some(0) => {
                 self.open_tool(Tool::Text);
@@ -10277,11 +10704,12 @@ impl GifKitApp {
             if icon_tool(ui, "edit-duplicate", "Duplicate the selected layer", sel_layer.is_some()).clicked() {
                 menu_act = sel_layer.map(LayerAct::Duplicate);
             }
+            let simple = self.simple;
             let grouped = sel_layer.is_some_and(|li| self.stack.layers[li].group.is_some());
             let gk = self.keymap.text(crate::keys::Action::GroupLayer);
             let several = self.multi.len() > 1;
             let tip = if several { format!("Put the {} picked layers in a group ({gk})", self.multi.len()) } else if grouped { "Take the selected layer out of its group".to_string() } else { format!("Put the selected layer in a new group ({gk})") };
-            if icon_tool(ui, if grouped && !several { "object-ungroup" } else { "folder-new" }, &tip, sel_layer.is_some()).clicked() {
+            if !simple && icon_tool(ui, if grouped && !several { "object-ungroup" } else { "folder-new" }, &tip, sel_layer.is_some()).clicked() {
                 if several {
                     group_many = true;
                 } else {
@@ -10301,7 +10729,7 @@ impl GifKitApp {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if icon_tool(ui, "merge", "Collapse all layers and frame edits into the frames", idle && (n > 0 || frame_edits)).clicked() {
+                if !simple && icon_tool(ui, "merge", "Collapse all layers and frame edits into the frames", idle && (n > 0 || frame_edits)).clicked() {
                     menu_act = Some(LayerAct::CollapseAll);
                 }
             });
@@ -10891,9 +11319,10 @@ impl GifKitApp {
         let (delay, enabled) = self.plan.get(self.cur).map(|f| (f.delay, f.enabled)).unwrap_or((0, true));
         let total: f32 = self.plan.iter().filter(|f| f.enabled).map(|f| effective_delay(f.delay) as f32 / 100.0).sum();
         let now_t = self.play_time().min(total);
+        let simple = self.simple;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            if icon_tool(ui, "media-skip-backward", "Previous frame (←)", true).clicked() {
+            if !simple && icon_tool(ui, "media-skip-backward", "Previous frame (←)", true).clicked() {
                 self.step(-1);
             }
             let (icon, tip) = if self.playing { ("media-playback-pause", "Pause (Space)") } else { ("media-playback-start", "Play (Space)") };
@@ -10901,7 +11330,7 @@ impl GifKitApp {
             if icon_tool(ui, icon, tip, true).clicked() {
                 self.playing = !self.playing;
             }
-            if icon_tool(ui, "media-skip-forward", "Next frame (→)", true).clicked() {
+            if !simple && icon_tool(ui, "media-skip-forward", "Next frame (→)", true).clicked() {
                 self.step(1);
             }
             ui.add_space(6.0);
@@ -10915,6 +11344,7 @@ impl GifKitApp {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 // show or hide the timeline dock
                 let on = self.show_timeline;
+                if !simple {
                 // shut, it says what it is, so it's easy to find
                 let b = if on {
                     let b = ui.add(sel_btn(egui::Button::new("").frame_when_inactive(on).min_size(vec2(TOOLBAR_H, TOOLBAR_H)), on)).on_hover_text("Hide the timeline");
@@ -10930,9 +11360,10 @@ impl GifKitApp {
                     theme::set_setting("show_timeline", if self.show_timeline { "1" } else { "0" });
                     self.timeline_auto = false;
                 }
+                }
                 // in a narrow window the time goes first, then the speed menu
                 let room = ui.available_width() - 90.0;
-                let (show_speed, show_frame, show_time) = (room > speed_w + frame_w + 8.0, room > frame_w, room > speed_w + frame_w + time_w + 12.0);
+                let (show_speed, show_frame, show_time) = if simple { (false, false, room > time_w) } else { (room > speed_w + frame_w + 8.0, room > frame_w, room > speed_w + frame_w + time_w + 12.0) };
                 let speeds = [0.25f32, 0.5, 0.75, 1.0, 1.5, 2.0, 4.0];
                 let label = |v: f32| if v == 1.0 { "1×".to_string() } else { format!("{v}×") };
                 if show_speed {
@@ -10956,7 +11387,8 @@ impl GifKitApp {
                         .on_hover_text(format!("Frame. Delay {delay} cs{}", if enabled { "" } else { " · skipped" }));
                 }
                 if show_time {
-                    ui.add_sized(vec2(time_w, TOOLBAR_H), egui::Label::new(mono(format!("{now_t:.2} / {total:.2} s")))).on_hover_text("Time and length in seconds");
+                    let t = if simple { format!("{now_t:.1} / {total:.1} s") } else { format!("{now_t:.2} / {total:.2} s") };
+                    ui.add_sized(vec2(time_w, TOOLBAR_H), egui::Label::new(mono(t))).on_hover_text("Time and length in seconds");
                 }
                 ui.add_space(6.0);
                 ui.spacing_mut().slider_width = (ui.available_width() - 4.0).max(60.0);
@@ -10990,6 +11422,13 @@ impl GifKitApp {
 
     fn export_window(&mut self, ctx: &egui::Context) {
         if !self.export_open || self.base.is_none() {
+            // shut: the next time starts fresh
+            self.simple_fit_for = None;
+            self.export_full = false;
+            return;
+        }
+        if self.simple && !self.export_full {
+            self.simple_export_window(ctx);
             return;
         }
         let pal = *p();
@@ -11075,6 +11514,143 @@ impl GifKitApp {
                     });
                 });
             });
+        if !open || cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.export_open = false;
+        }
+        if go {
+            self.export_open = false;
+            self.do_export(ctx);
+        }
+    }
+
+    /// Simple View's export: the format, where it's going, a preview of the
+    /// file as it'll be saved, and Save. Picking a site searches for the
+    /// best quality under its limit, as Optimize's Find Settings does.
+    fn simple_export_window(&mut self, ctx: &egui::Context) {
+        let pal = *p();
+        let mut open = true;
+        let mut go = false;
+        let mut cancel = false;
+        if !matches!(self.export_fmt, ExportFormat::Gif | ExportFormat::Mp4 | ExportFormat::Webp) {
+            self.export_fmt = ExportFormat::Gif;
+        }
+        if !self.export_name_edited {
+            self.export_name = self.default_stem();
+        }
+        // the size search, when the format or target changed
+        let fits = matches!(self.export_fmt, ExportFormat::Gif | ExportFormat::Webp);
+        let want = (self.export_fmt, self.simple_target);
+        if self.simple_fit_for != Some(want) && !self.busy() {
+            self.simple_fit_for = Some(want);
+            match SIMPLE_TARGETS[self.simple_target].1 {
+                Some(mb) if fits => self.start_fit(ctx, (mb as f64 * 1_048_576.0) as u64),
+                // best quality: back from any earlier search
+                _ => {
+                    self.undo_last_fit();
+                    self.fit_record = None;
+                }
+            }
+        }
+        let searching = self.job.as_ref().is_some_and(|j| j.label.starts_with("Finding settings"));
+        let mut more = false;
+        dialog(ctx, "export-simple", "Export", vec2(700.0, 440.0), false, &mut open, |ui| {
+            ui.set_width(660.0);
+            ui.horizontal_top(|ui| {
+                // what the saved file will look like
+                let (rect, _) = ui.allocate_exact_size(vec2(300.0, 300.0), Sense::hover());
+                self.export_preview(ui, ctx, rect);
+                ui.add_space(12.0);
+                ui.vertical(|ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new("Save as").font(theme::medium(13.5)).color(pal.fg));
+                    ui.add_space(4.0);
+                    let w = ((ui.available_width() - 16.0) / 3.0).floor();
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        for (f, desc) in [(ExportFormat::Gif, "Plays everywhere"), (ExportFormat::Mp4, "Smallest, no sound"), (ExportFormat::Webp, "Sharper, newer apps")] {
+                            let en = !f.needs_ffmpeg() || self.ffmpeg;
+                            let on = self.export_fmt == f;
+                            let (r, resp) = ui.allocate_exact_size(vec2(w, 52.0), if en { Sense::click() } else { Sense::hover() });
+                            ui.painter().rect_filled(r, 5.0, if on { mix(pal.button, pal.highlight, 0.4) } else { pal.button });
+                            ui.painter().rect_stroke(r, 5.0, Stroke::new(1.0, if on { pal.highlight } else { pal.border }), egui::StrokeKind::Inside);
+                            let col = if en { pal.fg } else { pal.fg_muted };
+                            ui.painter().text(pos2(r.left() + 10.0, r.top() + 17.0), egui::Align2::LEFT_CENTER, f.label(), theme::medium(14.0), col);
+                            ui.painter().text(pos2(r.left() + 10.0, r.top() + 36.0), egui::Align2::LEFT_CENTER, if en { desc } else { "Needs ffmpeg" }, egui::FontId::proportional(11.5), pal.fg_muted);
+                            let resp = if en { resp.on_hover_text(f.tip()) } else { resp.on_hover_text("Needs ffmpeg: Settings ▸ Configure ffmpeg") };
+                            if resp.clicked() {
+                                self.export_fmt = f;
+                            }
+                        }
+                    });
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("Where it's going").font(theme::medium(13.5)).color(pal.fg));
+                    ui.add_space(4.0);
+                    for (i, (name, _, note)) in SIMPLE_TARGETS.iter().enumerate() {
+                        let on = self.simple_target == i;
+                        let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
+                        if on {
+                            ui.painter().rect_filled(r, 4.0, mix(pal.window, pal.highlight, 0.22));
+                        } else if resp.hovered() {
+                            ui.painter().rect_filled(r, 4.0, mix(pal.window, pal.highlight, 0.1));
+                        }
+                        let c = pos2(r.left() + 14.0, r.center().y);
+                        ui.painter().circle_stroke(c, 7.0, Stroke::new(1.0, if on { pal.highlight } else { pal.fg_muted }));
+                        if on {
+                            ui.painter().circle_filled(c, 4.0, pal.highlight);
+                        }
+                        ui.painter().text(pos2(r.left() + 30.0, r.center().y), egui::Align2::LEFT_CENTER, *name, egui::FontId::proportional(13.0), pal.fg);
+                        ui.painter().text(pos2(r.right() - 10.0, r.center().y), egui::Align2::RIGHT_CENTER, *note, egui::FontId::proportional(12.0), pal.fg_muted);
+                        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && !on {
+                            self.simple_target = i;
+                            theme::set_setting("simple_target", &i.to_string());
+                        }
+                    }
+                    ui.add_space(10.0);
+                    // how big it comes out, against the limit
+                    let limit = SIMPLE_TARGETS[self.simple_target].1.map(|mb| (mb as f64 * 1_048_576.0) as u64);
+                    let site = SIMPLE_TARGETS[self.simple_target].0;
+                    let fresh = self.cmp.as_ref().filter(|c| c.key == self.cmp_key()).map(|c| (c.size, c.size_text()));
+                    let (w_, h_) = (self.out_size.0 as u32, self.out_size.1 as u32);
+                    let (icon, line, col) = match fresh {
+                        _ if searching => ("view-refresh", "Finding the best quality that fits…".to_string(), pal.fg_muted),
+                        Some((n, text)) => match limit {
+                            Some(l) if n <= l => ("dialog-ok-apply", format!("{text}, fits {site}"), pal.positive),
+                            Some(_) => ("dialog-warning", format!("{text}, too big for {site}. Try MP4 or Cut it shorter"), pal.neutral),
+                            None => ("dialog-ok-apply", text, pal.positive),
+                        },
+                        None if self.preview_format().is_none() => ("help-about", "Size shown after saving".to_string(), pal.fg_muted),
+                        None => ("view-refresh", "Working out the size…".to_string(), pal.fg_muted),
+                    };
+                    egui::Frame::new().fill(pal.view).stroke(Stroke::new(1.0, pal.border)).corner_radius(5.0).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            let (ir, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+                            crate::icons::paint(ui.painter(), icon, ir.center(), 16.0, col);
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(line).color(col));
+                                hint(ui, &format!("{w_} × {h_}"));
+                            });
+                        });
+                    });
+                });
+            });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.link("More settings…").on_hover_text("The full export window: every format and setting").clicked() {
+                    more = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::image_and_text(crate::icons::image(ui.ctx(), "dialog-cancel", 16.0, pal.fg), "Cancel").min_size(vec2(96.0, CHIP_H))).clicked() {
+                        cancel = true;
+                    }
+                    let icon = crate::icons::image(ui.ctx(), "document-save", 16.0, pal.fg);
+                    go = ui.add_enabled(!searching, egui::Button::image_and_text(icon, "Save…").stroke(Stroke::new(1.0, pal.highlight)).min_size(vec2(96.0, CHIP_H))).clicked();
+                });
+            });
+        });
+        if more {
+            self.export_full = true;
+        }
         if !open || cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.export_open = false;
         }
@@ -12067,6 +12643,11 @@ impl GifKitApp {
 
     /// Source chooser floating in a viewport's top-left corner.
     fn view_picker(&mut self, ui: &mut egui::Ui, rect: Rect, src: ViewSource, vi: usize) {
+        // Simple View shows the edit; the export window previews the file
+        if self.simple {
+            self.view_single = ViewSource::Edit;
+            return;
+        }
         let pal = *p();
         let info = self.view_info(src);
         let zoom_w = Self::zoom_bar_w(rect);
@@ -13553,10 +14134,104 @@ impl GifKitApp {
             Tool::Mask => self.ui_mask(ui),
             Tool::Presets => self.ui_presets(ui, ctx),
         }
+        // Simple View: when the picked layer shows, in seconds, instead of the timeline
+        if self.simple && matches!(self.tool, Tool::Text | Tool::Shapes | Tool::Emoji | Tool::AddImage) {
+            if let Some(li) = self.tool.layer_kind().and_then(|k| self.sel_index(k)) {
+                self.simple_when(ui, li);
+            }
+        }
+    }
+
+    /// "When It Shows": a layer's time on the GIF in seconds, and its fades.
+    fn simple_when(&mut self, ui: &mut egui::Ui, li: usize) {
+        let n = self.plan.len();
+        if n == 0 {
+            return;
+        }
+        let starts = stack::plan_times(&self.plan);
+        let end_of = |f: usize| starts[f] + if self.plan[f].enabled { effective_delay(self.plan[f].delay) as f32 / 100.0 } else { 0.0 };
+        let total = end_of(n - 1);
+        let timing = self.stack.layers[li].timing.clone();
+        let spans = timing.spans(n);
+        let (a, b) = match (spans.first(), spans.last()) {
+            (Some(f), Some(l)) => (f.0, l.1),
+            _ => (0, n - 1),
+        };
+        let (mut from, mut to) = (starts[a], end_of(b));
+        // a frame's time is its start; the last one counts to its end
+        let frame_at = |t: f32| starts.iter().rposition(|s| *s <= t + 1e-4).unwrap_or(0);
+        let frame_ending = |t: f32| (0..n).find(|&f| end_of(f) >= t - 1e-4).unwrap_or(n - 1);
+        // a fade of about half a second, in frames
+        let avg = (total / n as f32).max(0.01);
+        let half_s = ((0.5 / avg).round() as u32).max(1);
+        let mut fade_in = timing.fade_in > 0;
+        let mut fade_out = timing.fade_out > 0;
+        let mut new_span: Option<(usize, usize)> = None;
+        let mut whole = false;
+        group(ui, "When It Shows", |ui| {
+            form_row(ui, "From", |ui| {
+                ui.horizontal(|ui| {
+                    let w = ((ui.available_width() - 30.0) / 2.0).max(60.0);
+                    let r1 = spin(ui, vec2(w, CHIP_H), &mut from, 0.1, |d| d.range(0.0..=total).speed(0.02).max_decimals(2).suffix(" s"));
+                    ui.label("to");
+                    let r2 = spin(ui, vec2(w, CHIP_H), &mut to, 0.1, |d| d.range(0.0..=total).speed(0.02).max_decimals(2).suffix(" s"));
+                    if r1.changed() || r2.changed() {
+                        let fa = frame_at(from.min(total));
+                        let fb = frame_ending(to.max(from)).max(fa);
+                        new_span = Some((fa, fb));
+                    }
+                })
+            });
+            form_row(ui, "", |ui| {
+                ui.horizontal(|ui| {
+                    whole = ui.add_enabled(spans.len() != 1 || a != 0 || b != n - 1, egui::Button::new("Whole GIF")).on_hover_text("Show it from start to finish").clicked();
+                    if spans.len() > 1 {
+                        hint(ui, &format!("Shows in {} parts", spans.len()));
+                    }
+                })
+            });
+            form_row(ui, "", |ui| {
+                ui.horizontal(|ui| {
+                    check(ui, &mut fade_in, "Fade in").on_hover_text("Fades in over about half a second");
+                    ui.add_space(12.0);
+                    check(ui, &mut fade_out, "Fade out").on_hover_text("Fades out over about half a second");
+                })
+            });
+        });
+        let fi = if fade_in { timing.fade_in.max(1).max(if timing.fade_in == 0 { half_s } else { 0 }) } else { 0 };
+        let fo = if fade_out { timing.fade_out.max(1).max(if timing.fade_out == 0 { half_s } else { 0 }) } else { 0 };
+        if new_span.is_none() && !whole && fi == timing.fade_in && fo == timing.fade_out {
+            return;
+        }
+        let now = ui.input(|i| i.time);
+        self.snapshot(&format!("when{li}"), now);
+        let t = &mut self.stack.layers[li].timing;
+        if whole {
+            t.clips = None;
+        } else if let Some((fa, fb)) = new_span {
+            t.clips = Some(vec![crate::timeline::Clip { start: fa, end: (fb + 1 < n).then_some(fb) }]);
+        }
+        t.fade_in = fi;
+        t.fade_out = fo;
+        self.modified = true;
     }
 
     /// Enable switch, reset and bake for live frame-edit tools.
     fn transform_header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, on: impl Fn(&mut Transform) -> &mut bool, reset: impl Fn(&mut Transform)) {
+        if self.simple {
+            // Simple View: on or off, and Reset; no collapsing into the frames
+            ui.horizontal(|ui| {
+                check(ui, on(&mut self.stack.transform), "On");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::new("Reset").min_size(vec2(84.0, CHIP_H))).on_hover_text("Back to how it was").clicked() {
+                        reset(&mut self.stack.transform);
+                        *on(&mut self.stack.transform) = false;
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            return;
+        }
         let mut enabled = *on(&mut self.stack.transform);
         let mut do_reset = false;
         let mut do_bake = false;
@@ -13865,7 +14540,10 @@ impl GifKitApp {
         let _defaults = spin::Defaults::new(&*tr, &Transform::default());
         let before = (tr.speed_mode, tr.speed_val.to_bits());
         group(ui, "Speed", |ui| {
-            form_row(ui, "Set as", |ui| combo(ui, "spmode", &mut tr.speed_mode, &[(SpeedMode::Percent, "% of original"), (SpeedMode::DelayAll, "Delay per frame (cs)"), (SpeedMode::Fps, "Frame rate (fps)")]));
+            // Simple View keeps to percent, unless Full View set another way
+            if SIMPLE_KEEP.with(|k| k.get()).is_none() || tr.speed_mode != SpeedMode::Percent {
+                form_row(ui, "Set as", |ui| combo(ui, "spmode", &mut tr.speed_mode, &[(SpeedMode::Percent, "% of original"), (SpeedMode::DelayAll, "Delay per frame (cs)"), (SpeedMode::Fps, "Frame rate (fps)")]));
+            }
             match tr.speed_mode {
                 SpeedMode::Percent => {
                     slider_row(ui, "Speed", soft_slider(&mut tr.speed_val, 10.0..=400.0, "").suffix(" %").max_decimals(0));
@@ -13900,6 +14578,21 @@ impl GifKitApp {
         });
         if before != (tr.speed_mode, tr.speed_val.to_bits()) {
             tr.speed_on = true;
+        }
+        if self.simple {
+            // backwards and back-and-forth live here in Simple View
+            let tr = &mut self.stack.transform;
+            let was = (tr.reverse, tr.boomerang);
+            group_ex(ui, "", true, None, |ui| {
+                form_row(ui, "Direction", |ui| {
+                    check(ui, &mut tr.reverse, "Backwards");
+                    check(ui, &mut tr.boomerang, "Back and forth").on_hover_text("Plays forward, then backward");
+                });
+            });
+            if was != (tr.reverse, tr.boomerang) {
+                tr.play_on = true;
+            }
+            return;
         }
         self.ui_frame_rate(ui, ctx, avg_fps as f64);
     }
@@ -14119,9 +14812,18 @@ impl GifKitApp {
             self.info("Compression reset");
         }
         if find {
+            let max = self.target_bytes();
+            self.start_fit(ctx, max);
+        }
+        self.optimize_format_ui(ui);
+    }
+
+    /// Find Settings: the best quality under `max` bytes, shrinking the
+    /// frames only if it must. Runs in the background.
+    fn start_fit(&mut self, ctx: &egui::Context, max: u64) {
+        {
             // start from the settings before the previous search, not its result
             self.undo_last_fit();
-            let max = self.target_bytes();
             let tf = match self.export_fmt {
                 ExportFormat::Webp => crate::target::TargetFormat::Webp(self.webp_opts),
                 ExportFormat::Avif => crate::target::TargetFormat::Avif(self.avif_quality),
@@ -14146,6 +14848,10 @@ impl GifKitApp {
                 });
             }
         }
+    }
+
+    /// Optimize's settings for the export format.
+    fn optimize_format_ui(&mut self, ui: &mut egui::Ui) {
         match self.export_fmt {
             ExportFormat::Gif => {}
             ExportFormat::Webp => {

@@ -366,7 +366,11 @@ impl GifKitApp {
         egui::containers::menu::MenuButton::from_button(menu).ui(ui, |ui| {
             ui.set_min_width(220.0);
             for (k, name) in adjust::KINDS.iter().enumerate() {
-                if adjust::MENU_BREAKS.contains(&k) {
+                // Simple View: the everyday few
+                if self.simple && !super::SIMPLE_ADJUST.contains(&k) {
+                    continue;
+                }
+                if adjust::MENU_BREAKS.contains(&k) && !self.simple {
                     ui.separator();
                 }
                 let b = egui::Button::image_and_text(crate::icons::image(ui.ctx(), Adjust::icon(k), 16.0, pal.fg), *name);

@@ -99,13 +99,14 @@ fn palettes() -> &'static (Palette, Palette) {
     }
 }
 
-/// KDE's own colour schemes, in kdeglobals form, for picking by hand on
-/// any system: (key, name, the scheme).
+/// Colour schemes in kdeglobals form, lightest to darkest, for picking by
+/// hand on any system: (key, name, the scheme). Breeze Grey and Breeze
+/// Black are GIFkit's own, between Breeze Dark and Light and past Dark.
 pub const SCHEMES: [(&str, &str, &str); 4] = [
     ("breeze-light", "Breeze Light", "[Colors:Window]\nBackgroundNormal=239,240,241\nForegroundNormal=35,38,41\nForegroundInactive=112,125,138\nForegroundNegative=218,68,83\nForegroundNeutral=246,116,0\nForegroundPositive=39,174,96\n[Colors:View]\nBackgroundNormal=255,255,255\nBackgroundAlternate=247,247,247\n[Colors:Button]\nBackgroundNormal=252,252,252\n[Colors:Header]\nBackgroundNormal=222,224,226\n[Colors:Header][Inactive]\nBackgroundNormal=239,240,241\n[Colors:Selection]\nBackgroundNormal=61,174,233\n"),
+    ("breeze-grey", "Breeze Grey", "[Colors:Window]\nBackgroundNormal=62,66,71\nForegroundNormal=245,246,247\nForegroundInactive=176,182,188\nForegroundNegative=233,93,106\nForegroundNeutral=250,140,40\nForegroundPositive=60,195,115\n[Colors:View]\nBackgroundNormal=49,52,56\nBackgroundAlternate=56,59,64\n[Colors:Button]\nBackgroundNormal=74,78,84\n[Colors:Header]\nBackgroundNormal=72,76,82\n[Colors:Header][Inactive]\nBackgroundNormal=62,66,71\n[Colors:Selection]\nBackgroundNormal=61,174,233\n"),
     ("breeze-dark", "Breeze Dark", "[Colors:Window]\nBackgroundNormal=32,35,38\nForegroundNormal=252,252,252\nForegroundInactive=161,169,177\nForegroundNegative=218,68,83\nForegroundNeutral=246,116,0\nForegroundPositive=39,174,96\n[Colors:View]\nBackgroundNormal=20,22,24\nBackgroundAlternate=29,31,34\n[Colors:Button]\nBackgroundNormal=41,44,48\n[Colors:Header]\nBackgroundNormal=41,44,48\n[Colors:Header][Inactive]\nBackgroundNormal=32,35,38\n[Colors:Selection]\nBackgroundNormal=61,174,233\n"),
-    ("breeze-classic", "Breeze Classic", "[Colors:Window]\nBackgroundNormal=239,240,241\nForegroundNormal=35,38,41\nForegroundInactive=127,140,141\nForegroundNegative=218,68,83\nForegroundNeutral=246,116,0\nForegroundPositive=39,174,96\n[Colors:View]\nBackgroundNormal=252,252,252\nBackgroundAlternate=239,240,241\n[Colors:Button]\nBackgroundNormal=239,240,241\n[Colors:Header]\nBackgroundNormal=239,240,241\n[Colors:Selection]\nBackgroundNormal=61,174,233\n"),
-    ("oxygen", "Oxygen", "[Colors:Window]\nBackgroundNormal=224,223,222\nForegroundNormal=20,19,18\nForegroundInactive=136,135,134\nForegroundNegative=191,3,3\nForegroundNeutral=176,128,0\nForegroundPositive=0,110,40\n[Colors:View]\nBackgroundNormal=255,255,255\nBackgroundAlternate=248,247,246\n[Colors:Button]\nBackgroundNormal=232,231,230\n[Colors:Header]\nBackgroundNormal=224,223,222\n[Colors:Selection]\nBackgroundNormal=67,172,232\n"),
+    ("breeze-black", "Breeze Black", "[Colors:Window]\nBackgroundNormal=0,0,0\nForegroundNormal=232,232,234\nForegroundInactive=140,142,148\nForegroundNegative=218,68,83\nForegroundNeutral=246,116,0\nForegroundPositive=39,174,96\n[Colors:View]\nBackgroundNormal=0,0,0\nBackgroundAlternate=12,12,13\n[Colors:Button]\nBackgroundNormal=20,21,23\n[Colors:Header]\nBackgroundNormal=8,8,9\n[Colors:Header][Inactive]\nBackgroundNormal=0,0,0\n[Colors:Selection]\nBackgroundNormal=61,174,233\n"),
 ];
 
 /// Accent colours to pick from, as Plasma offers: (name, colour).

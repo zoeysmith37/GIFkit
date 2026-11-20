@@ -197,11 +197,31 @@ pub struct Timing {
     pub clips: Option<Vec<Clip>>,
     /// sorted by frame
     pub keys: Vec<Key>,
+    /// frames it fades in over at the start of each clip, and out over at
+    /// the end (0: none)
+    pub fade_in: u32,
+    pub fade_out: u32,
 }
 
 impl Timing {
     pub fn is_default(&self) -> bool {
-        self.clips.is_none() && self.keys.is_empty()
+        self.clips.is_none() && self.keys.is_empty() && self.fade_in == 0 && self.fade_out == 0
+    }
+
+    /// How much its fades let through at frame `i` of `n` (1: all).
+    pub fn fade_at(&self, i: usize, n: usize) -> f32 {
+        if self.fade_in == 0 && self.fade_out == 0 {
+            return 1.0;
+        }
+        let Some((a, b)) = self.spans(n).into_iter().find(|(a, b)| i >= *a && i <= *b) else { return 1.0 };
+        let mut k: f32 = 1.0;
+        if self.fade_in > 0 && i < a + self.fade_in as usize {
+            k = k.min((i - a + 1) as f32 / (self.fade_in + 1) as f32);
+        }
+        if self.fade_out > 0 && i + (self.fade_out as usize) > b {
+            k = k.min((b - i + 1) as f32 / (self.fade_out + 1) as f32);
+        }
+        k
     }
 
     /// Clips sorted, clamped to `n` frames, as (first, last).
