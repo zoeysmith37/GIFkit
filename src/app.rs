@@ -3805,6 +3805,13 @@ fn row_rename(ui: &mut egui::Ui, r: Rect, buf: &mut String, size: f32) -> egui::
     child.add(egui::TextEdit::singleline(buf).font(font).frame(egui::Frame::NONE).margin(egui::Margin::ZERO).desired_width(inner.width()).min_size(vec2(0.0, text_h)))
 }
 
+/// How wide an export preview `h` tall is for a picture of `size`: its
+/// shape, kept between a tall portrait and a wide strip.
+fn preview_width(size: (f32, f32), h: f32) -> f32 {
+    let aspect = if size.1 > 0.0 { size.0 / size.1 } else { 1.0 };
+    (h * aspect).clamp(h * 0.7, h * 1.8).round()
+}
+
 /// Without waiting for the screen, frames could come as fast as the card can
 /// draw them: keep to about 120 a second, plenty for any preview.
 fn pace_frames() {
@@ -3824,6 +3831,10 @@ fn pace_frames() {
 /// Whether any GIFkit window had focus last frame (its dialogs then stay
 /// above the main window).
 static APP_FOCUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// The main window has focus: its dialogs are held above it. While a dialog
+/// itself has focus it's on top anyway, and holding it there would keep the
+/// system's file pickers (Save…, Browse…) behind it.
+static MAIN_FOCUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 /// A dialog had focus this frame.
 static DIALOG_FOCUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -3833,6 +3844,9 @@ fn track_app_focus(ctx: &egui::Context) {
     use std::sync::atomic::Ordering::Relaxed;
     static AWAY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let main = ctx.input(|i| i.viewport().focused) != Some(false);
+    if MAIN_FOCUSED.swap(main, Relaxed) != main {
+        ctx.request_repaint();
+    }
     let any = main || DIALOG_FOCUSED.swap(false, Relaxed);
     // focus passing between our own windows takes a frame or two: only let
     // go once it's been away for a few
@@ -3896,7 +3910,7 @@ fn dialog_ex(ctx: &egui::Context, id: &str, title: &str, size: Vec2, resizable: 
     }
     // GIFkit's own windows always sit above the main one: kept on top while
     // any GIFkit window has focus, and let go when you switch to another app
-    if on_top || APP_FOCUSED.load(std::sync::atomic::Ordering::Relaxed) {
+    if on_top || MAIN_FOCUSED.load(std::sync::atomic::Ordering::Relaxed) {
         b = b.with_window_level(egui::WindowLevel::AlwaysOnTop);
     } else {
         b = b.with_window_level(egui::WindowLevel::Normal);
@@ -5769,7 +5783,7 @@ impl GifKitApp {
             ctx.request_repaint();
             return;
         }
-        dialog_ex(ctx, "ffmpeg", "ffmpeg", vec2(470.0, 280.0), false, true, &mut open, |ui| {
+        dialog_ex(ctx, "ffmpeg", "ffmpeg", vec2(470.0, 280.0), false, false, &mut open, |ui| {
             ui.set_width(440.0);
             let big = |ui: &mut egui::Ui, t: &str| ui.label(RichText::new(t).font(theme::medium(16.0)).color(pal.fg));
             if let Some(pr) = &job {
@@ -11524,15 +11538,18 @@ impl GifKitApp {
         if !self.export_name_edited {
             self.export_name = self.default_stem();
         }
-        dialog(ctx, "export", "Export", vec2(660.0, 400.0), false, &mut open, |ui| {
-                ui.set_width(600.0);
+        let col_id = egui::Id::unique("export-col");
+        let side = ctx.data_mut(|d| d.get_temp::<f32>(col_id)).unwrap_or(380.0).clamp(260.0, 460.0);
+        let pw = preview_width(self.out_size, side);
+        dialog(ctx, "export", "Export", vec2(pw + 400.0, 400.0), false, &mut open, |ui| {
+                ui.set_width(pw + 340.0);
                 ui.horizontal_top(|ui| {
-                    // ---- preview of the file as it will be saved
-                    let (rect, _) = ui.allocate_exact_size(vec2(260.0, 260.0), Sense::hover());
+                    // ---- preview of the file as it will be saved: its shape, as tall as the settings
+                    let (rect, _) = ui.allocate_exact_size(vec2(pw, side), Sense::hover());
                     self.export_preview(ui, ctx, rect);
-                    ui.add_space(8.0);
-                    ui.vertical(|ui| {
-                        ui.set_width(ui.available_width());
+                    ui.add_space(10.0);
+                    let col = ui.vertical(|ui| {
+                        ui.set_width(330.0);
                         ui.label(RichText::new(self.export_fmt.label()).font(theme::medium(17.0)).color(pal.fg));
                         let fresh = self.cmp.as_ref().filter(|c| c.key == self.cmp_key());
                         match fresh {
@@ -11585,6 +11602,7 @@ impl GifKitApp {
                             self.save_options_ui(ui);
                         });
                     });
+                    ctx.data_mut(|d| d.insert_temp(col_id, col.response.rect.height()));
                 });
                 ui.add_space(8.0);
                 let folder = self.export_fmt == ExportFormat::Frames && !self.frames_zip;
@@ -11643,11 +11661,13 @@ impl GifKitApp {
         let col_id = egui::Id::unique("simple-export-col");
         let col_h: f32 = ctx.data_mut(|d| d.get_temp(col_id)).unwrap_or(330.0);
         let side = col_h.clamp(300.0, 460.0);
-        dialog(ctx, "export-simple", "Export", vec2(side + 420.0, side + 90.0), false, &mut open, |ui| {
-            ui.set_width(side + 380.0);
+        // the preview takes the picture's shape, as tall as the settings
+        let pw = preview_width(self.out_size, side);
+        dialog(ctx, "export-simple", "Export", vec2(pw + 420.0, side + 90.0), false, &mut open, |ui| {
+            ui.set_width(pw + 380.0);
             ui.horizontal_top(|ui| {
                 // what the saved file will look like
-                let (rect, _) = ui.allocate_exact_size(vec2(side, side), Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(vec2(pw, side), Sense::hover());
                 self.export_preview(ui, ctx, rect);
                 ui.add_space(14.0);
                 let col = ui.vertical(|ui| {
