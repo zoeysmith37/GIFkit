@@ -1279,7 +1279,7 @@ dependencies = [
 
 [[package]]
 name = "gifkit"
-version = "1.8.1"
+version = "1.9.0"
 dependencies = [
  "ab_glyph",
  "anyhow",
